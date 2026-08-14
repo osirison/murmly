@@ -1,0 +1,11 @@
+[Unit]
+Description=murmly local voice-to-text daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/murmly daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
