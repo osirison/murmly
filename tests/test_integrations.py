@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from murmly.integrations import choose_clipboard_copy_command, choose_paste_command
+from murmly.integrations import MissingToolError, choose_clipboard_copy_command, choose_paste_command
 
 
 def fake_which_factory(*available: str):
@@ -26,3 +26,8 @@ class IntegrationSelectionTests(unittest.TestCase):
         which = fake_which_factory("xclip", "xdotool", "wl-copy")
         self.assertEqual(["xclip", "-selection", "clipboard"], choose_clipboard_copy_command(env, which))
         self.assertEqual(["xdotool", "key", "--clearmodifiers", "ctrl+v"], choose_paste_command(env, which))
+
+    def test_x11_does_not_select_wl_copy_without_xclip(self) -> None:
+        env = {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"}
+        with self.assertRaises(MissingToolError):
+            choose_clipboard_copy_command(env, fake_which_factory("wl-copy", "xdotool"))

@@ -24,25 +24,29 @@ def choose_clipboard_copy_command(
     env: dict[str, str] | None = None,
     which: Which = shutil_which,
 ) -> list[str]:
-    if is_wayland_session(env) and which("wl-copy"):
-        return ["wl-copy"]
-    if which("xclip"):
+    if is_wayland_session(env):
+        if which("wl-copy"):
+            return ["wl-copy"]
+        if which("xclip"):
+            return ["xclip", "-selection", "clipboard"]
+    elif which("xclip"):
         return ["xclip", "-selection", "clipboard"]
-    if which("wl-copy"):
-        return ["wl-copy"]
-    raise MissingToolError("No clipboard command found; install wl-clipboard or xclip.")
+    if is_wayland_session(env):
+        raise MissingToolError("No Wayland clipboard command found; install wl-clipboard or xclip.")
+    raise MissingToolError("No X11 clipboard command found; install xclip.")
 
 
 def choose_clipboard_read_command(
     env: dict[str, str] | None = None,
     which: Which = shutil_which,
 ) -> list[str] | None:
-    if is_wayland_session(env) and which("wl-paste"):
-        return ["wl-paste", "--no-newline"]
-    if which("xclip"):
+    if is_wayland_session(env):
+        if which("wl-paste"):
+            return ["wl-paste", "--no-newline"]
+        if which("xclip"):
+            return ["xclip", "-selection", "clipboard", "-o"]
+    elif which("xclip"):
         return ["xclip", "-selection", "clipboard", "-o"]
-    if which("wl-paste"):
-        return ["wl-paste", "--no-newline"]
     return None
 
 
@@ -55,13 +59,11 @@ def choose_paste_command(
             return ["wtype", "-M", "ctrl", "v", "-m", "ctrl"]
         if which("ydotool"):
             return ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]
-    if which("xdotool"):
+    elif which("xdotool"):
         return ["xdotool", "key", "--clearmodifiers", "ctrl+v"]
-    if which("wtype"):
-        return ["wtype", "-M", "ctrl", "v", "-m", "ctrl"]
-    if which("ydotool"):
-        return ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]
-    raise MissingToolError("No paste injector found; install wtype, ydotool, or xdotool.")
+    if is_wayland_session(env):
+        raise MissingToolError("No Wayland paste injector found; install wtype or ydotool.")
+    raise MissingToolError("No X11 paste injector found; install xdotool.")
 
 
 class ClipboardPaster:
