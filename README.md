@@ -50,6 +50,60 @@ uv run murmly doctor
 murmly doctor
 ```
 
+## How to run it
+
+1. Install the project dependencies and create the local environment:
+
+   ```bash
+   uv sync
+   ```
+
+2. Check that the desktop environment, clipboard tools, and model configuration are detected correctly:
+
+   ```bash
+   uv run murmly doctor
+   ```
+
+3. Start the background daemon that listens for toggle requests:
+
+   ```bash
+   uv run murmly daemon
+   ```
+
+4. Ask the daemon to start or stop capture from a desktop shortcut or shell:
+
+   ```bash
+   uv run murmly toggle
+   ```
+
+   If you installed the CUDA extra and want the GPU-backed runtime to be used for the active transcription session, run the same toggle through the CUDA-enabled environment:
+
+   ```bash
+   uv run --extra cuda murmly toggle
+   ```
+
+   The daemon cycles through `IDLE -> LISTENING -> THINKING -> DONE -> IDLE` and writes socket state updates for the active desktop environment.
+
+5. Check the current daemon state:
+
+   ```bash
+   uv run murmly status
+   ```
+
+6. Run a one-off recording test without a daemon:
+
+   ```bash
+   uv run murmly spike --seconds 5
+   ```
+
+   Add `--paste` to copy the transcription and inject it into the active input field.
+
+7. For GNOME or KDE shortcuts, point the hotkey to the venv entrypoint:
+
+   ```bash
+   /path/to/murmly/.venv/bin/murmly toggle
+   ```
+
 ### Fedora-first spike
 
 ```bash
@@ -66,10 +120,16 @@ Start the daemon:
 uv run murmly daemon
 ```
 
-Then bind a GNOME or KDE shortcut to:
+Then bind a GNOME or KDE shortcut to either of these commands:
 
 ```bash
 /path/to/murmly/.venv/bin/murmly toggle
+```
+
+or, when using the CUDA-enabled environment:
+
+```bash
+uv run --extra cuda murmly toggle
 ```
 
 Press once to begin capture, then press again to stop, transcribe, copy, and paste.
