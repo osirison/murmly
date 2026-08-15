@@ -23,7 +23,11 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             transcriber = FasterWhisperTranscriber(config)
 
         with (
-            patch.object(transcriber, "_resolve_runtime", return_value=("cuda", "float16")),
+            patch.object(
+                FasterWhisperTranscriber,
+                "resolve_runtime",
+                return_value=("cuda", "float16"),
+            ),
             patch("faster_whisper.WhisperModel") as model_class,
         ):
             transcriber._load_model()
@@ -65,9 +69,12 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
 
         with (
             patch("ctranslate2.get_cuda_device_count", return_value=1),
-            patch.object(transcriber, "_load_cuda_runtime", return_value=True),
+            patch.object(FasterWhisperTranscriber, "_load_cuda_runtime", return_value=True),
         ):
-            self.assertEqual(("cuda", "float16"), transcriber._resolve_runtime())
+            self.assertEqual(
+                ("cuda", "float16"),
+                FasterWhisperTranscriber.resolve_runtime(config),
+            )
 
     def test_auto_runtime_falls_back_to_cpu_int8(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -78,7 +85,10 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             transcriber = FasterWhisperTranscriber(config)
 
         with patch("ctranslate2.get_cuda_device_count", return_value=0):
-            self.assertEqual(("cpu", "int8"), transcriber._resolve_runtime())
+            self.assertEqual(
+                ("cpu", "int8"),
+                FasterWhisperTranscriber.resolve_runtime(config),
+            )
 
     def test_auto_runtime_falls_back_when_cuda_probe_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -92,7 +102,10 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             "ctranslate2.get_cuda_device_count",
             side_effect=RuntimeError("incompatible driver"),
         ):
-            self.assertEqual(("cpu", "int8"), transcriber._resolve_runtime())
+            self.assertEqual(
+                ("cpu", "int8"),
+                FasterWhisperTranscriber.resolve_runtime(config),
+            )
 
     def test_auto_runtime_falls_back_when_cuda_libraries_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -104,9 +117,12 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
 
         with (
             patch("ctranslate2.get_cuda_device_count", return_value=1),
-            patch.object(transcriber, "_load_cuda_runtime", return_value=False),
+            patch.object(FasterWhisperTranscriber, "_load_cuda_runtime", return_value=False),
         ):
-            self.assertEqual(("cpu", "int8"), transcriber._resolve_runtime())
+            self.assertEqual(
+                ("cpu", "int8"),
+                FasterWhisperTranscriber.resolve_runtime(config),
+            )
 
     def test_explicit_cuda_requires_runtime_extra(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -117,9 +133,9 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             )
             transcriber = FasterWhisperTranscriber(config)
 
-        with patch.object(transcriber, "_load_cuda_runtime", return_value=False):
+        with patch.object(FasterWhisperTranscriber, "_load_cuda_runtime", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "uv sync --extra cuda"):
-                transcriber._resolve_runtime()
+                FasterWhisperTranscriber.resolve_runtime(config)
 
     def test_cuda_runtime_loads_libraries_from_installed_distributions(self) -> None:
         relative_paths = [

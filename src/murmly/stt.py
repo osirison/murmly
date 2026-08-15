@@ -47,7 +47,7 @@ class FasterWhisperTranscriber:
                 raise RuntimeError(
                     "faster-whisper is required for transcription. Install it before starting murmly."
                 ) from error
-            device, compute_type = self._resolve_runtime()
+            device, compute_type = self.resolve_runtime(self._config)
             self._model = WhisperModel(
                 self._config.model_name,
                 device=device,
@@ -56,8 +56,9 @@ class FasterWhisperTranscriber:
             )
         return self._model
 
-    def _resolve_runtime(self) -> tuple[str, str]:
-        device = self._config.device
+    @classmethod
+    def resolve_runtime(cls, config: MurmlyConfig) -> tuple[str, str]:
+        device = config.device
         if device == "auto":
             try:
                 import ctranslate2
@@ -69,18 +70,18 @@ class FasterWhisperTranscriber:
                 except RuntimeError as error:
                     logger.warning("CUDA device probe failed; falling back to CPU: %s", error)
                     cuda_device_count = 0
-                cuda_available = cuda_device_count > 0 and self._load_cuda_runtime()
+                cuda_available = cuda_device_count > 0 and cls._load_cuda_runtime()
                 if cuda_device_count > 0 and not cuda_available:
                     logger.warning(
                         "CUDA runtime libraries are unavailable; falling back to CPU."
                     )
                 device = "cuda" if cuda_available else "cpu"
-        elif device == "cuda" and not self._load_cuda_runtime():
+        elif device == "cuda" and not cls._load_cuda_runtime():
             raise RuntimeError(
                 "CUDA requires the Murmly CUDA extra. Run `uv sync --extra cuda`."
             )
 
-        compute_type = self._config.compute_type
+        compute_type = config.compute_type
         if compute_type == "auto":
             compute_type = "float16" if device == "cuda" else "int8"
         return device, compute_type
