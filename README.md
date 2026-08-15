@@ -21,7 +21,15 @@ description: Fedora-first local voice-to-text daemon for Linux desktops
 
 ## Runtime dependencies
 
-`uv sync` or `pip install -e .` installs the Python runtime dependencies. Install these desktop tools separately:
+`uv sync` or `pip install -e .` installs the Python runtime dependencies. For
+GPU-accelerated balanced and accurate profiles, install the CUDA runtime extra:
+
+```bash
+uv sync --extra cuda
+uv run --extra cuda murmly doctor
+```
+
+Install these desktop tools separately:
 
 - Python 3.12+
 - `wl-clipboard` on Wayland (`wl-copy`, `wl-paste`)
@@ -80,7 +88,10 @@ channels = 1
 
 [stt]
 model_profile = "balanced" # fast | balanced | accurate
-compute_type = "int8"
+device = "auto" # auto | cpu | cuda
+compute_type = "auto"
+beam_size = 5
+vad_filter = true
 lazy_load_model = true
 
 [clipboard]
@@ -91,8 +102,16 @@ restore_delay_ms = 200
 Profile mapping:
 
 - `fast` -> `tiny.en`
-- `balanced` -> `base.en`
-- `accurate` -> `small.en`
+- `balanced` -> `large-v3-turbo`
+- `accurate` -> `large-v3`
+
+With `device = "auto"`, Murmly uses CUDA `float16` when a compatible GPU and
+the CUDA extra are available. It falls back to CPU `int8` otherwise. The first
+use of a profile downloads its model; later daemon sessions reuse the local
+model cache. The tested CUDA runtime wheels use about 1.4 GB of downloads, and
+the cached `large-v3-turbo` model uses about 1.6 GB. Include `--extra cuda` in
+`uv run` commands, or invoke `.venv/bin/murmly` after syncing the extra. The
+balanced model revision is pinned for reproducible downloads.
 
 ## Development
 

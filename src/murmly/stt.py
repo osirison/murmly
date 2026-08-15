@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import ctypes
+from importlib.metadata import PackageNotFoundError, distribution
+import logging
 from pathlib import Path
+import sys
 import tempfile
 import wave
 
 from murmly.config import MurmlyConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 class FasterWhisperTranscriber:
@@ -25,7 +32,8 @@ class FasterWhisperTranscriber:
             segments, _info = model.transcribe(
                 str(wav_path),
                 language="en",
-                beam_size=1,
+                beam_size=self._config.beam_size,
+                vad_filter=self._config.vad_filter,
             )
             return " ".join(segment.text.strip() for segment in segments).strip()
         finally:
@@ -39,12 +47,103 @@ class FasterWhisperTranscriber:
                 raise RuntimeError(
                     "faster-whisper is required for transcription. Install it before starting murmly."
                 ) from error
+            device, compute_type = self.resolve_runtime(self._config)
             self._model = WhisperModel(
                 self._config.model_name,
-                device="cpu",
-                compute_type=self._config.compute_type,
+                device=device,
+                compute_type=compute_type,
+                revision=self._config.model_revision,
             )
         return self._model
+
+    @classmethod
+    def resolve_runtime(cls, config: MurmlyConfig) -> tuple[str, str]:
+        device = config.device
+        if device == "auto":
+            try:
+                import ctranslate2
+            except ModuleNotFoundError:
+                device = "cpu"
+            else:
+                try:
+                    cuda_device_count = ctranslate2.get_cuda_device_count()
+                except RuntimeError as error:
+                    logger.warning("CUDA device probe failed; falling back to CPU: %s", error)
+                    cuda_device_count = 0
+                cuda_available = cuda_device_count > 0 and cls._load_cuda_runtime()
+                if cuda_device_count > 0 and not cuda_available:
+                    logger.warning(
+                        "CUDA runtime libraries are unavailable; falling back to CPU."
+                    )
+                device = "cuda" if cuda_available else "cpu"
+        elif device == "cuda" and not cls._load_cuda_runtime():
+            raise RuntimeError(
+                "CUDA requires the Murmly CUDA extra. Run `uv sync --extra cuda`."
+            )
+
+        compute_type = config.compute_type
+        if compute_type == "auto":
+            compute_type = "float16" if device == "cuda" else "int8"
+        return device, compute_type
+
+    @staticmethod
+    def _load_cuda_runtime() -> bool:
+        libraries = (
+            ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublasLt.so.12"),
+            ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublas.so.12"),
+            ("nvidia-cudnn-cu12", "nvidia/cudnn/lib/libcudnn.so.9"),
+        )
+        for distribution_name, relative_path in libraries:
+            library_path = FasterWhisperTranscriber._trusted_library_path(
+                distribution_name,
+                relative_path,
+            )
+            if library_path is None:
+                return False
+            try:
+                ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+            except OSError as error:
+                raise RuntimeError(
+                    f"Unable to load trusted CUDA runtime library {library_path}: {error}"
+                ) from error
+        return True
+
+    @staticmethod
+    def _trusted_library_path(
+        distribution_name: str,
+        relative_path: str,
+    ) -> Path | None:
+        try:
+            package = distribution(distribution_name)
+        except PackageNotFoundError:
+            return None
+
+        package_file = next(
+            (file for file in package.files or () if str(file) == relative_path),
+            None,
+        )
+        if package_file is None:
+            return None
+
+        unresolved_path = Path(package.locate_file(package_file))
+        if unresolved_path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked CUDA runtime library: {unresolved_path}")
+
+        try:
+            library_path = unresolved_path.resolve(strict=True)
+            library_path.relative_to(Path(sys.prefix).resolve(strict=True))
+        except (OSError, ValueError) as error:
+            raise RuntimeError(
+                f"CUDA runtime library is outside the active environment: {unresolved_path}"
+            ) from error
+
+        if not library_path.is_file():
+            return None
+        if library_path.stat().st_mode & 0o022:
+            raise RuntimeError(
+                f"Refusing writable CUDA runtime library: {library_path}"
+            )
+        return library_path
 
     def _write_wav(self, path: Path, pcm_audio: bytes, sample_rate_hz: int) -> None:
         with wave.open(str(path), "wb") as wav_handle:

@@ -86,6 +86,8 @@ def _run_doctor(config: MurmlyConfig) -> None:
     except MissingToolError as error:
         paste_command = f"unavailable: {error}"
 
+    runtime_device, runtime_compute_type = FasterWhisperTranscriber.resolve_runtime(config)
+
     print(
         json.dumps(
             {
@@ -96,6 +98,12 @@ def _run_doctor(config: MurmlyConfig) -> None:
                 "paste_command": paste_command,
                 "model_profile": config.model_profile,
                 "model_name": config.model_name,
+                "device": config.device,
+                "compute_type": config.compute_type,
+                "runtime_device": runtime_device,
+                "runtime_compute_type": runtime_compute_type,
+                "beam_size": config.beam_size,
+                "vad_filter": config.vad_filter,
             },
             indent=2,
         )
