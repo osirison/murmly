@@ -28,7 +28,10 @@ class ConfigTests(unittest.TestCase):
 
                     [stt]
                     model_profile = "accurate"
-                    compute_type = "int8"
+                    device = "cpu"
+                    compute_type = "float32"
+                    beam_size = 3
+                    vad_filter = false
                     lazy_load_model = false
 
                     [clipboard]
@@ -42,7 +45,21 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(Path("/tmp/custom.sock"), config.socket_path)
         self.assertEqual("accurate", config.model_profile)
-        self.assertEqual("small.en", config.model_name)
+        self.assertEqual("large-v3", config.model_name)
+        self.assertEqual("cpu", config.device)
+        self.assertEqual("float32", config.compute_type)
+        self.assertEqual(3, config.beam_size)
+        self.assertFalse(config.vad_filter)
         self.assertFalse(config.lazy_load_model)
         self.assertFalse(config.restore_clipboard)
         self.assertEqual(150, config.restore_clipboard_delay_ms)
+
+    def test_balanced_profile_uses_accuracy_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(Path(temp_dir) / "missing.toml")
+
+        self.assertEqual("large-v3-turbo", config.model_name)
+        self.assertEqual("auto", config.device)
+        self.assertEqual("auto", config.compute_type)
+        self.assertEqual(5, config.beam_size)
+        self.assertTrue(config.vad_filter)
