@@ -61,7 +61,7 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
     recorder = SoundDeviceRecorder(config)
     transcriber = FasterWhisperTranscriber(config)
     clip = recorder.record_for_seconds(seconds)
-    text = transcriber.transcribe_pcm16(clip)
+    text = transcriber.transcribe_pcm16(clip, recorder.sample_rate_hz)
     if text:
         print(text)
         paster = ClipboardPaster(
