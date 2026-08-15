@@ -17,7 +17,7 @@ Find the SOF card number and inspect its digital microphone controls:
 
 ```bash
 arecord -l
-amixer -c 1 scontrols | rg -i dmic
+amixer -c 1 scontrols | grep -i dmic
 amixer -c 1 sget Dmic0
 ```
 
