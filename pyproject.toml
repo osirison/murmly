@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
 authors = [{ name = "osirison" }]
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "sounddevice>=0.5.5",
+]
 
 [project.scripts]
 murmly = "murmly.cli:main"

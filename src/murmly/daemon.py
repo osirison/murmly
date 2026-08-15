@@ -29,7 +29,7 @@ class SpeechSession:
 
     def stop_and_process(self) -> ProcessingResult:
         pcm_audio = self._recorder.stop()
-        text = self._transcriber.transcribe_pcm16(pcm_audio)
+        text = self._transcriber.transcribe_pcm16(pcm_audio, self._recorder.sample_rate_hz)
         if text:
             self._ensure_paster().copy_and_paste(text)
         return ProcessingResult(text=text, state="DONE")

@@ -1,4 +1,9 @@
-# murmly
+---
+title: murmly
+description: Fedora-first local voice-to-text daemon for Linux desktops
+---
+
+## Overview
 
 `murmly` is a Fedora-first, local voice-to-text tool for Linux desktops. It is designed around Wayland defaults: instead of trying to grab a global hotkey directly, the daemon listens on a per-user UNIX socket and the desktop environment shortcut calls `murmly toggle`.
 
@@ -16,43 +21,47 @@
 
 ## Runtime dependencies
 
-The Python package keeps the heavy runtime integrations optional, but the implementation expects these tools to be installed at runtime:
+`uv sync` or `pip install -e .` installs the Python runtime dependencies. Install these desktop tools separately:
 
 - Python 3.12+
-- `sounddevice`
-- `faster-whisper`
 - `wl-clipboard` on Wayland (`wl-copy`, `wl-paste`)
 - `wtype` or `ydotool` for Wayland paste simulation
-- `xclip` / `xdotool` for X11 fallback
+- `xclip` and `xdotool` on X11; `wl-copy` cannot access an X11 clipboard
 
 ## Quick start
 
 ```bash
-python -m venv .venv
+uv sync
+uv run murmly doctor
+```
+
+`uv run murmly <command>` works from the repository without activating `.venv`. To use the bare `murmly` command in the current shell, activate the environment first:
+
+```bash
 . .venv/bin/activate
-pip install -e .
+murmly doctor
 ```
 
 ### Fedora-first spike
 
 ```bash
-murmly spike --seconds 5
+uv run murmly spike --seconds 5
 ```
 
-This records 16kHz mono PCM from the default microphone, transcribes it with the balanced profile (`base.en`, `int8`, CPU), prints the result, and copies it to the clipboard.
+This first requests 16kHz mono PCM from the default microphone, transcribes it with the balanced profile (`base.en`, `int8`, CPU), prints the result, and copies it to the clipboard. If the selected input does not support 16kHz, `murmly` retries a usable physical microphone at its native rate and lets `faster-whisper` resample the correctly labeled WAV during decoding.
 
 ### Daemon and DE shortcut flow
 
 Start the daemon:
 
 ```bash
-murmly daemon
+uv run murmly daemon
 ```
 
 Then bind a GNOME or KDE shortcut to:
 
 ```bash
-murmly toggle
+/path/to/murmly/.venv/bin/murmly toggle
 ```
 
 Press once to begin capture, then press again to stop, transcribe, copy, and paste.
@@ -66,7 +75,7 @@ Configuration lives at `~/.config/murmly/config.toml` (or `$XDG_CONFIG_HOME/murm
 socket_path = "/run/user/1000/murmly.sock"
 
 [audio]
-sample_rate_hz = 16000
+sample_rate_hz = 16000 # Preferred capture rate
 channels = 1
 
 [stt]
