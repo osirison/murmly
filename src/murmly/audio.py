@@ -64,7 +64,7 @@ class SoundDeviceRecorder:
                     continue
 
                 self._stream = stream
-                self._sample_rate_hz = sample_rate_hz
+                self._sample_rate_hz = int(round(stream.samplerate))
                 return
 
         details = "; ".join(failures) or "No input devices were available."
@@ -88,7 +88,7 @@ class SoundDeviceRecorder:
         candidates: list[int | None] = []
         try:
             default_device = sounddevice.query_devices(kind="input")
-        except (TypeError, ValueError):
+        except (sounddevice.PortAudioError, TypeError, ValueError):
             default_device = None
 
         if default_device is not None:
@@ -110,7 +110,7 @@ class SoundDeviceRecorder:
             else:
                 properties = sounddevice.query_devices(device)
             native_sample_rate_hz = int(properties["default_samplerate"])
-        except (KeyError, TypeError, ValueError):
+        except (sounddevice.PortAudioError, KeyError, TypeError, ValueError):
             return sample_rates
 
         if native_sample_rate_hz > 0 and native_sample_rate_hz not in sample_rates:

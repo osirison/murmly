@@ -16,9 +16,10 @@ class FakePortAudioError(Exception):
 
 
 class FakeStream:
-    def __init__(self) -> None:
+    def __init__(self, sample_rate_hz: float = 48_000) -> None:
         self.started = False
         self.closed = False
+        self.samplerate = sample_rate_hz
 
     def start(self) -> None:
         self.started = True
@@ -32,7 +33,7 @@ class FakeStream:
 
 class AudioTests(unittest.TestCase):
     def test_recorder_prefers_default_input(self) -> None:
-        stream = FakeStream()
+        stream = FakeStream(48_000.4)
         sounddevice = ModuleType("sounddevice")
         sounddevice.PortAudioError = FakePortAudioError
         sounddevice.query_devices = self._fake_query_devices
@@ -58,7 +59,38 @@ class AudioTests(unittest.TestCase):
                 recorder = SoundDeviceRecorder(config)
                 recorder.start()
 
-        self.assertEqual(44_100, recorder.sample_rate_hz)
+        self.assertEqual(48_000, recorder.sample_rate_hz)
+        self.assertTrue(stream.started)
+
+    def test_recorder_falls_back_when_default_input_is_unavailable(self) -> None:
+        stream = FakeStream()
+        sounddevice = ModuleType("sounddevice")
+        sounddevice.PortAudioError = FakePortAudioError
+
+        def query_devices(device: int | None = None, kind: str | None = None):
+            if kind == "input":
+                raise FakePortAudioError("no default input")
+            return self._fake_query_devices(device)
+
+        sounddevice.query_devices = query_devices
+
+        def check_input_settings(**kwargs: object) -> None:
+            if kwargs["device"] != 0 or kwargs["samplerate"] != 48_000:
+                raise FakePortAudioError("unsupported input setting")
+
+        sounddevice.check_input_settings = check_input_settings
+        sounddevice.RawInputStream = lambda **_kwargs: stream
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+                recorder = SoundDeviceRecorder(config)
+                recorder.start()
+
+        self.assertEqual(48_000, recorder.sample_rate_hz)
         self.assertTrue(stream.started)
 
     def test_recorder_falls_back_to_physical_input_native_rate(self) -> None:
