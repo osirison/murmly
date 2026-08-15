@@ -9,14 +9,37 @@ import tomllib
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
     model_name: str
+    model_revision: str | None
     beam_size: int
     vad_filter: bool
 
 
 MODEL_PROFILES = {
-    "fast": ModelProfile("tiny.en", beam_size=1, vad_filter=False),
-    "balanced": ModelProfile("large-v3-turbo", beam_size=5, vad_filter=True),
-    "accurate": ModelProfile("large-v3", beam_size=5, vad_filter=True),
+    "fast": ModelProfile("tiny.en", model_revision=None, beam_size=1, vad_filter=False),
+    "balanced": ModelProfile(
+        "large-v3-turbo",
+        model_revision="0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+        beam_size=5,
+        vad_filter=True,
+    ),
+    "accurate": ModelProfile(
+        "large-v3",
+        model_revision=None,
+        beam_size=5,
+        vad_filter=True,
+    ),
+}
+VALID_DEVICES = {"auto", "cpu", "cuda"}
+VALID_COMPUTE_TYPES = {
+    "auto",
+    "bfloat16",
+    "float16",
+    "float32",
+    "int8",
+    "int8_bfloat16",
+    "int8_float16",
+    "int8_float32",
+    "int16",
 }
 
 
@@ -59,6 +82,13 @@ class MurmlyConfig:
     def model_name(self) -> str:
         return MODEL_PROFILES.get(self.model_profile, MODEL_PROFILES["balanced"]).model_name
 
+    @property
+    def model_revision(self) -> str | None:
+        return MODEL_PROFILES.get(
+            self.model_profile,
+            MODEL_PROFILES["balanced"],
+        ).model_revision
+
 
 def load_config(path: str | Path | None = None, env: dict[str, str] | None = None) -> MurmlyConfig:
     config_path = Path(path) if path else default_config_path(env)
@@ -77,6 +107,13 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
     if model_profile not in MODEL_PROFILES:
         model_profile = "balanced"
     model = MODEL_PROFILES[model_profile]
+    device = str(stt.get("device", "auto"))
+    if device not in VALID_DEVICES:
+        device = "auto"
+    compute_type = str(stt.get("compute_type", "auto"))
+    if compute_type not in VALID_COMPUTE_TYPES:
+        compute_type = "auto"
+    beam_size = _bounded_int(stt.get("beam_size"), model.beam_size, minimum=1, maximum=10)
 
     return MurmlyConfig(
         socket_path=socket_path,
@@ -84,9 +121,9 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         model_profile=model_profile,
         sample_rate_hz=int(audio.get("sample_rate_hz", 16_000)),
         channels=int(audio.get("channels", 1)),
-        device=str(stt.get("device", "auto")),
-        compute_type=str(stt.get("compute_type", "auto")),
-        beam_size=int(stt.get("beam_size", model.beam_size)),
+        device=device,
+        compute_type=compute_type,
+        beam_size=beam_size,
         vad_filter=bool(stt.get("vad_filter", model.vad_filter)),
         lazy_load_model=bool(stt.get("lazy_load_model", True)),
         restore_clipboard=bool(clipboard.get("restore", True)),
@@ -99,3 +136,11 @@ def _get_table(data: dict[str, object], key: str) -> dict[str, object]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _bounded_int(value: object, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return parsed if minimum <= parsed <= maximum else default

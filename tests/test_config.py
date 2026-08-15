@@ -59,7 +59,32 @@ class ConfigTests(unittest.TestCase):
             config = load_config(Path(temp_dir) / "missing.toml")
 
         self.assertEqual("large-v3-turbo", config.model_name)
+        self.assertEqual("0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf", config.model_revision)
         self.assertEqual("auto", config.device)
         self.assertEqual("auto", config.compute_type)
         self.assertEqual(5, config.beam_size)
         self.assertTrue(config.vad_filter)
+
+    def test_invalid_stt_settings_fall_back_to_profile_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [stt]
+                    model_profile = "fast"
+                    device = "remote"
+                    compute_type = "unsafe"
+                    beam_size = 1000000
+                    """
+                ).strip()
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual("tiny.en", config.model_name)
+        self.assertIsNone(config.model_revision)
+        self.assertEqual("auto", config.device)
+        self.assertEqual("auto", config.compute_type)
+        self.assertEqual(1, config.beam_size)
+        self.assertFalse(config.vad_filter)

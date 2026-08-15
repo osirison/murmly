@@ -59,14 +59,17 @@ The resolved wheels include cuBLAS, cuDNN, and NVRTC and require roughly
 6. Run a short transcription with a cached small model on CUDA `float16` before
    selecting GPU mode.
 7. Keep CPU `int8` fallback when CUDA libraries are absent or fail to load.
-   Namespace-package discovery can raise `ModuleNotFoundError` when the extra
-   is not installed; treat that as an unavailable CUDA runtime.
+   A missing NVIDIA distribution is an unavailable runtime. A present library
+   with invalid provenance, permissions, or ABI must fail closed.
 
 ## Confirmed wheel layout and validation
 
 On Fedora with Python 3.14, both `nvidia.cublas.lib` and `nvidia.cudnn.lib` are
-namespace packages. Their module specs have `origin = None`; library discovery
-must iterate `submodule_search_locations` rather than read `module.__file__`.
+namespace packages with `origin = None`. Do not load bare sonames or trust
+namespace search locations because `LD_LIBRARY_PATH` and `PYTHONPATH` can alter
+those results. Resolve exact library files from the locked distributions'
+metadata, require canonical paths inside `sys.prefix`, and reject symlinked or
+group/world-writable binaries.
 
 After preloading `libcublasLt.so.12`, `libcublas.so.12`, and `libcudnn.so.9`
 with `RTLD_GLOBAL`, a cached `base.en` model completed CUDA `float16`
@@ -86,4 +89,5 @@ The full balanced path was also validated with `large-v3-turbo`, CUDA
 `float16`, beam size 5, and VAD enabled. The model completed transcription of
 the retained diagnostic WAV after its one-time Hugging Face download. Its
 cache directory used 1.6 GB, bringing the tested CUDA runtime and balanced
-model footprint to roughly 3 GB.
+model footprint to roughly 3 GB. The balanced model is pinned to Hugging Face
+revision `0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf`.

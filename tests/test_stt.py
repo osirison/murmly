@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import wave
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -13,6 +14,27 @@ from murmly.stt import FasterWhisperTranscriber
 
 
 class FasterWhisperTranscriberTests(unittest.TestCase):
+    def test_model_load_pins_balanced_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            transcriber = FasterWhisperTranscriber(config)
+
+        with (
+            patch.object(transcriber, "_resolve_runtime", return_value=("cuda", "float16")),
+            patch("faster_whisper.WhisperModel") as model_class,
+        ):
+            transcriber._load_model()
+
+        model_class.assert_called_once_with(
+            "large-v3-turbo",
+            device="cuda",
+            compute_type="float16",
+            revision="0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+        )
+
     def test_transcribe_uses_balanced_decoding_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
@@ -99,35 +121,88 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "uv sync --extra cuda"):
                 transcriber._resolve_runtime()
 
-    def test_cuda_runtime_loads_namespace_package_libraries(self) -> None:
-        package_spec = SimpleNamespace(submodule_search_locations=["/cuda/lib"])
+    def test_cuda_runtime_loads_libraries_from_installed_distributions(self) -> None:
+        relative_paths = [
+            "nvidia/cublas/lib/libcublasLt.so.12",
+            "nvidia/cublas/lib/libcublas.so.12",
+            "nvidia/cudnn/lib/libcudnn.so.9",
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment_path = Path(temp_dir)
+            for relative_path in relative_paths:
+                library_path = environment_path / relative_path
+                library_path.parent.mkdir(parents=True, exist_ok=True)
+                library_path.touch(mode=0o644)
 
-        with (
-            patch("murmly.stt.find_spec", return_value=package_spec),
-            patch("murmly.stt.ctypes.CDLL") as load_library,
-        ):
-            load_library.side_effect = [OSError(), None, OSError(), None, OSError(), None]
-            loaded = FasterWhisperTranscriber._load_cuda_runtime()
+            package = SimpleNamespace(
+                files=[Path(path) for path in relative_paths],
+                locate_file=lambda path: environment_path / path,
+            )
+            with (
+                patch("murmly.stt.distribution", return_value=package),
+                patch("murmly.stt.sys.prefix", temp_dir),
+                patch("murmly.stt.ctypes.CDLL") as load_library,
+            ):
+                loaded = FasterWhisperTranscriber._load_cuda_runtime()
 
         self.assertTrue(loaded)
         self.assertEqual(
-            [
-                "libcublasLt.so.12",
-                "/cuda/lib/libcublasLt.so.12",
-                "libcublas.so.12",
-                "/cuda/lib/libcublas.so.12",
-                "libcudnn.so.9",
-                "/cuda/lib/libcudnn.so.9",
-            ],
+            [str(environment_path / path) for path in relative_paths],
             [call.args[0] for call in load_library.call_args_list],
         )
 
-    def test_cuda_runtime_handles_missing_nvidia_namespace(self) -> None:
-        with (
-            patch("murmly.stt.find_spec", side_effect=ModuleNotFoundError),
-            patch("murmly.stt.ctypes.CDLL", side_effect=OSError),
+    def test_cuda_runtime_handles_missing_nvidia_distribution(self) -> None:
+        with patch(
+            "murmly.stt.distribution",
+            side_effect=PackageNotFoundError,
         ):
             self.assertFalse(FasterWhisperTranscriber._load_cuda_runtime())
+
+    def test_cuda_runtime_rejects_library_outside_environment(self) -> None:
+        relative_path = Path("nvidia/cublas/lib/libcublasLt.so.12")
+        with (
+            tempfile.TemporaryDirectory() as environment_dir,
+            tempfile.TemporaryDirectory() as external_dir,
+        ):
+            library_path = Path(external_dir) / relative_path
+            library_path.parent.mkdir(parents=True)
+            library_path.touch(mode=0o644)
+            package = SimpleNamespace(
+                files=[relative_path],
+                locate_file=lambda path: Path(external_dir) / path,
+            )
+
+            with (
+                patch("murmly.stt.distribution", return_value=package),
+                patch("murmly.stt.sys.prefix", environment_dir),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "outside the active environment"):
+                    FasterWhisperTranscriber._trusted_library_path(
+                        "nvidia-cublas-cu12",
+                        str(relative_path),
+                    )
+
+    def test_cuda_runtime_rejects_writable_library(self) -> None:
+        relative_path = Path("nvidia/cublas/lib/libcublasLt.so.12")
+        with tempfile.TemporaryDirectory() as environment_dir:
+            library_path = Path(environment_dir) / relative_path
+            library_path.parent.mkdir(parents=True)
+            library_path.touch()
+            library_path.chmod(0o666)
+            package = SimpleNamespace(
+                files=[relative_path],
+                locate_file=lambda path: Path(environment_dir) / path,
+            )
+
+            with (
+                patch("murmly.stt.distribution", return_value=package),
+                patch("murmly.stt.sys.prefix", environment_dir),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "writable CUDA runtime"):
+                    FasterWhisperTranscriber._trusted_library_path(
+                        "nvidia-cublas-cu12",
+                        str(relative_path),
+                    )
 
     def test_transcribe_skips_digital_silence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

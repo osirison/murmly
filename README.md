@@ -110,7 +110,8 @@ the CUDA extra are available. It falls back to CPU `int8` otherwise. The first
 use of a profile downloads its model; later daemon sessions reuse the local
 model cache. The tested CUDA runtime wheels use about 1.4 GB of downloads, and
 the cached `large-v3-turbo` model uses about 1.6 GB. Include `--extra cuda` in
-`uv run` commands, or invoke `.venv/bin/murmly` after syncing the extra.
+`uv run` commands, or invoke `.venv/bin/murmly` after syncing the extra. The
+balanced model revision is pinned for reproducible downloads.
 
 ## Development
 
