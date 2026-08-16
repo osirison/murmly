@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 from collections.abc import Callable
 
 from murmly.audio import SoundDeviceRecorder
@@ -18,6 +19,7 @@ from murmly.integrations import (
     choose_paste_command,
     is_wayland_session,
 )
+from murmly.focus import create_focus_observer, record_target, should_deliver
 from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend
 from murmly.stt import FasterWhisperTranscriber
 
@@ -86,18 +88,24 @@ def _run_daemon(config: MurmlyConfig) -> int:
 def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
     recorder = SoundDeviceRecorder(config)
     transcriber = FasterWhisperTranscriber(config)
+    observer = create_focus_observer()
     clip = recorder.record_for_seconds(seconds)
+    target = record_target(observer)
     text = transcriber.transcribe_pcm16(clip, recorder.sample_rate_hz)
-    if text:
-        print(text)
-        paster = ClipboardPaster(
-            restore_clipboard=config.restore_clipboard and paste,
-            restore_delay_ms=config.restore_clipboard_delay_ms,
-        )
-        if paste:
-            paster.copy_and_paste(text)
-        else:
-            paster.copy(text)
+    if not text:
+        return 0
+    print(text)
+    allowed, reason = should_deliver(observer, target, config.verify_target) if paste else (False, None)
+    paster = ClipboardPaster(
+        restore_clipboard=config.restore_clipboard and allowed,
+        restore_delay_ms=config.restore_clipboard_delay_ms,
+    )
+    if allowed:
+        paster.copy_and_paste(text)
+        return 0
+    paster.copy(text)
+    if paste:
+        print(f"Transcript copied to the clipboard but not pasted: {reason}.", file=sys.stderr)
     return 0
 
 

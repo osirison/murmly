@@ -77,6 +77,7 @@ class MurmlyConfig:
     lazy_load_model: bool = True
     restore_clipboard: bool = True
     restore_clipboard_delay_ms: int = 200
+    verify_target: bool = True
     overlay_enabled: bool = True
     overlay_bottom_margin_px: int = 32
     overlay_reduced_motion: bool = False
@@ -132,6 +133,7 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         lazy_load_model=bool(stt.get("lazy_load_model", True)),
         restore_clipboard=bool(clipboard.get("restore", True)),
         restore_clipboard_delay_ms=int(clipboard.get("restore_delay_ms", 200)),
+        verify_target=_boolean(clipboard.get("verify_target"), True),
         overlay_enabled=_boolean(overlay.get("enabled"), True),
         overlay_bottom_margin_px=_bounded_int(
             overlay.get("bottom_margin_px"),

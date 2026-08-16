@@ -108,6 +108,55 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(32, config.overlay_bottom_margin_px)
             self.assertFalse(config.overlay_reduced_motion)
 
+    def test_verify_target_defaults_to_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(Path(temp_dir) / "missing.toml")
+
+        self.assertTrue(config.verify_target)
+
+    def test_verify_target_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [clipboard]
+                    verify_target = false
+                    """
+                ).strip()
+            )
+
+            config = load_config(config_path)
+
+        self.assertFalse(config.verify_target)
+
+    def test_invalid_verify_target_values_use_defaults(self) -> None:
+        for value in ('"no"', "0", "[]"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [clipboard]
+                        verify_target = {value}
+                        """
+                    ).strip()
+                )
+
+                config = load_config(config_path)
+
+            self.assertTrue(config.verify_target)
+
+    def test_invalid_clipboard_table_uses_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('clipboard = "invalid"')
+
+            config = load_config(config_path)
+
+        self.assertTrue(config.verify_target)
+        self.assertTrue(config.restore_clipboard)
+
     def test_invalid_stt_settings_fall_back_to_profile_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"

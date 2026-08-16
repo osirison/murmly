@@ -182,6 +182,69 @@ class CliTests(unittest.TestCase):
         self.assertFalse(report["available"])
         self.assertIn("system interpreter missing", report["detail"])
 
+    def _run_spike(self, *, paste: bool, focus_changed: bool, verify_target: bool = True):
+        from murmly.focus import WindowIdentity
+
+        target = WindowIdentity(1, 10, "editor")
+        current = WindowIdentity(2, 20, "browser") if focus_changed else target
+
+        class Observer:
+            supported = True
+            detail = None
+
+            def active_window(self):
+                return Observer.window
+
+        Observer.window = target
+        config = MurmlyConfig(
+            socket_path=Path("/tmp/murmly.sock"),
+            config_path=Path("/tmp/config.toml"),
+            verify_target=verify_target,
+        )
+        with (
+            patch("murmly.cli.SoundDeviceRecorder") as recorder,
+            patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
+            patch("murmly.cli.ClipboardPaster") as paster,
+            patch("murmly.cli.create_focus_observer", return_value=Observer()),
+            redirect_stdout(StringIO()),
+        ):
+            recorder.return_value.record_for_seconds.return_value = b"pcm"
+            recorder.return_value.sample_rate_hz = 16_000
+
+            def transcribe_while_focus_moves(*_args, **_kwargs):
+                # Focus moves during transcription, after the target was recorded.
+                Observer.window = current
+                return "hello world"
+
+            transcriber.return_value.transcribe_pcm16.side_effect = transcribe_while_focus_moves
+            from murmly.cli import _run_spike
+
+            _run_spike(config, 1.0, paste)
+        return paster.return_value
+
+    def test_spike_pastes_when_focus_is_unchanged(self) -> None:
+        paster = self._run_spike(paste=True, focus_changed=False)
+
+        paster.copy_and_paste.assert_called_once_with("hello world")
+        paster.copy.assert_not_called()
+
+    def test_spike_copies_without_pasting_when_focus_changed(self) -> None:
+        paster = self._run_spike(paste=True, focus_changed=True)
+
+        paster.copy.assert_called_once_with("hello world")
+        paster.copy_and_paste.assert_not_called()
+
+    def test_spike_with_verification_disabled_pastes_despite_focus_change(self) -> None:
+        paster = self._run_spike(paste=True, focus_changed=True, verify_target=False)
+
+        paster.copy_and_paste.assert_called_once_with("hello world")
+
+    def test_spike_without_paste_flag_only_copies(self) -> None:
+        paster = self._run_spike(paste=False, focus_changed=False)
+
+        paster.copy.assert_called_once_with("hello world")
+        paster.copy_and_paste.assert_not_called()
+
     @staticmethod
     def _config(overlay_enabled: bool = True) -> MurmlyConfig:
         return MurmlyConfig(
