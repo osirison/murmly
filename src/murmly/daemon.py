@@ -8,6 +8,13 @@ import threading
 
 from murmly.audio import SoundDeviceRecorder
 from murmly.config import MurmlyConfig
+from murmly.focus import (
+    FocusObserver,
+    WindowIdentity,
+    create_focus_observer,
+    record_target,
+    should_deliver,
+)
 from murmly.integrations import ClipboardPaster
 from murmly.overlay import (
     detect_overlay_backend,
@@ -29,14 +36,26 @@ COMMAND_TIMEOUT_SECONDS = 2.0
 class ProcessingResult:
     text: str
     state: str
+    delivered: bool = False
+    detail: str | None = None
 
 
 class SpeechSession:
-    def __init__(self, config: MurmlyConfig, level_sink=None) -> None:
+    def __init__(
+        self,
+        config: MurmlyConfig,
+        level_sink=None,
+        focus_observer: FocusObserver | None = None,
+    ) -> None:
         self._config = config
         self._recorder = SoundDeviceRecorder(config, level_sink=level_sink)
         self._transcriber = FasterWhisperTranscriber(config)
         self._paster: ClipboardPaster | None = None
+        self._focus = focus_observer if focus_observer is not None else create_focus_observer()
+
+    @property
+    def focus_observer(self) -> FocusObserver:
+        return self._focus
 
     def start_recording(self) -> None:
         self._recorder.start()
@@ -44,11 +63,29 @@ class SpeechSession:
     def stop_recording(self) -> bytes:
         return self._recorder.stop()
 
-    def process_recording(self, pcm_audio: bytes) -> ProcessingResult:
+    def capture_delivery_target(self) -> WindowIdentity | None:
+        return record_target(self._focus)
+
+    def process_recording(
+        self,
+        pcm_audio: bytes,
+        target: WindowIdentity | None = None,
+    ) -> ProcessingResult:
         text = self._transcriber.transcribe_pcm16(pcm_audio, self._recorder.sample_rate_hz)
-        if text:
+        if not text:
+            return ProcessingResult(text=text, state="DONE")
+        allowed, reason = should_deliver(self._focus, target, self._config.verify_target)
+        if allowed:
             self._ensure_paster().copy_and_paste(text)
-        return ProcessingResult(text=text, state="DONE")
+            return ProcessingResult(text=text, state="DONE", delivered=True)
+        logger.warning("Transcript delivery refused: %s", reason)
+        self._ensure_paster().copy(text)
+        return ProcessingResult(
+            text=text,
+            state="DONE",
+            delivered=False,
+            detail="Transcript copied to the clipboard but not pasted.",
+        )
 
     def _ensure_paster(self) -> ClipboardPaster:
         if self._paster is None:
@@ -216,13 +253,25 @@ class MurmlyDaemon:
                 self._state = "IDLE"
                 self._publish_error()
                 return {"ok": False, "state": "IDLE", "error": str(error)}
+            target = self._session.capture_delivery_target()
             self._state = "THINKING"
         self._publish_state(OverlayState.THINKING)
 
         try:
-            result = self._session.process_recording(pcm_audio)
-            self._publish_state(OverlayState.IDLE)
-            return {"ok": True, "state": result.state, "text": result.text}
+            result = self._session.process_recording(pcm_audio, target)
+            if result.detail is None:
+                self._publish_state(OverlayState.IDLE)
+            else:
+                self._publish_error()
+            response: dict[str, object] = {
+                "ok": True,
+                "state": result.state,
+                "text": result.text,
+                "delivered": result.delivered,
+            }
+            if result.detail is not None:
+                response["detail"] = result.detail
+            return response
         except Exception as error:
             self._publish_error()
             return {"ok": False, "state": "IDLE", "error": str(error)}

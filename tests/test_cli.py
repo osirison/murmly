@@ -13,7 +13,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from murmly.cli import _run_doctor, overlay_diagnostics
+from murmly.cli import _run_doctor, delivery_diagnostics, overlay_diagnostics
 from murmly.config import MurmlyConfig
 from murmly.stt import FasterWhisperTranscriber
 
@@ -181,6 +181,125 @@ class CliTests(unittest.TestCase):
 
         self.assertFalse(report["available"])
         self.assertIn("system interpreter missing", report["detail"])
+
+    def _run_spike(self, *, paste: bool, focus_changed: bool, verify_target: bool = True):
+        from murmly.focus import WindowIdentity
+
+        target = WindowIdentity(1, 10, "editor")
+        current = WindowIdentity(2, 20, "browser") if focus_changed else target
+
+        class Observer:
+            supported = True
+            detail = None
+
+            def active_window(self):
+                return Observer.window
+
+        Observer.window = target
+        config = MurmlyConfig(
+            socket_path=Path("/tmp/murmly.sock"),
+            config_path=Path("/tmp/config.toml"),
+            verify_target=verify_target,
+        )
+        with (
+            patch("murmly.cli.SoundDeviceRecorder") as recorder,
+            patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
+            patch("murmly.cli.ClipboardPaster") as paster,
+            patch("murmly.cli.create_focus_observer", return_value=Observer()),
+            redirect_stdout(StringIO()),
+        ):
+            recorder.return_value.record_for_seconds.return_value = b"pcm"
+            recorder.return_value.sample_rate_hz = 16_000
+
+            def transcribe_while_focus_moves(*_args, **_kwargs):
+                # Focus moves during transcription, after the target was recorded.
+                Observer.window = current
+                return "hello world"
+
+            transcriber.return_value.transcribe_pcm16.side_effect = transcribe_while_focus_moves
+            from murmly.cli import _run_spike
+
+            _run_spike(config, 1.0, paste)
+        return paster.return_value
+
+    def test_spike_pastes_when_focus_is_unchanged(self) -> None:
+        paster = self._run_spike(paste=True, focus_changed=False)
+
+        paster.copy_and_paste.assert_called_once_with("hello world")
+        paster.copy.assert_not_called()
+
+    def test_spike_copies_without_pasting_when_focus_changed(self) -> None:
+        paster = self._run_spike(paste=True, focus_changed=True)
+
+        paster.copy.assert_called_once_with("hello world")
+        paster.copy_and_paste.assert_not_called()
+
+    def test_spike_with_verification_disabled_pastes_despite_focus_change(self) -> None:
+        paster = self._run_spike(paste=True, focus_changed=True, verify_target=False)
+
+        paster.copy_and_paste.assert_called_once_with("hello world")
+
+    def test_spike_without_paste_flag_only_copies(self) -> None:
+        paster = self._run_spike(paste=False, focus_changed=False)
+
+        paster.copy.assert_called_once_with("hello world")
+        paster.copy_and_paste.assert_not_called()
+
+    class _Focus:
+        def __init__(self, supported: bool, detail: str | None = None) -> None:
+            self.supported = supported
+            self.detail = detail
+
+        def active_window(self):
+            return None
+
+    def test_delivery_diagnostics_reports_supported_and_enabled(self) -> None:
+        report = delivery_diagnostics(self._config(), observer=self._Focus(True))
+
+        self.assertTrue(report["verification_supported"])
+        self.assertTrue(report["verification_enabled"])
+        self.assertEqual(500, report["restore_delay_ms"])
+        self.assertIn("supported and enabled", report["detail"])
+
+    def test_delivery_diagnostics_reports_supported_but_disabled(self) -> None:
+        config = MurmlyConfig(
+            socket_path=Path("/tmp/murmly.sock"),
+            config_path=Path("/tmp/config.toml"),
+            verify_target=False,
+        )
+
+        report = delivery_diagnostics(config, observer=self._Focus(True))
+
+        self.assertTrue(report["verification_supported"])
+        self.assertFalse(report["verification_enabled"])
+        self.assertIn("disabled in configuration", report["detail"])
+
+    def test_delivery_diagnostics_reports_unverified_session(self) -> None:
+        observer = self._Focus(False, "Delivery target verification requires an X11 session.")
+
+        report = delivery_diagnostics(self._config(), observer=observer)
+
+        self.assertFalse(report["verification_supported"])
+        self.assertIn("X11 session", report["detail"])
+
+    def test_doctor_includes_delivery_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch("murmly.cli.choose_paste_command", return_value=["xdotool"]),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIn("delivery", report)
+        self.assertIn("verification_supported", report["delivery"])
+        self.assertEqual(500, report["delivery"]["restore_delay_ms"])
 
     @staticmethod
     def _config(overlay_enabled: bool = True) -> MurmlyConfig:
