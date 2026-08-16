@@ -1,19 +1,60 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from murmly.cli import _run_doctor
+from murmly.cli import _run_doctor, overlay_diagnostics
 from murmly.config import MurmlyConfig
 from murmly.stt import FasterWhisperTranscriber
 
 
 class CliTests(unittest.TestCase):
+    def test_daemon_exits_cleanly_on_sigterm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                f'[daemon]\nsocket_path = "{socket_path}"\n\n[overlay]\nenabled = false\n',
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+            process = subprocess.Popen(
+                [sys.executable, "-m", "murmly", "--config", str(config_path), "daemon"],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while not socket_path.exists():
+                    if process.poll() is not None:
+                        self.fail(f"daemon exited before creating its socket: {process.stderr.read()}")
+                    if time.monotonic() >= deadline:
+                        self.fail("daemon socket was not created")
+                    time.sleep(0.01)
+
+                process.send_signal(signal.SIGTERM)
+                _stdout, stderr = process.communicate(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+        self.assertEqual(0, process.returncode, stderr)
+        self.assertFalse(socket_path.exists())
+
     def test_doctor_reports_effective_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
@@ -38,3 +79,105 @@ class CliTests(unittest.TestCase):
         self.assertEqual("auto", report["compute_type"])
         self.assertEqual("cuda", report["runtime_device"])
         self.assertEqual("float16", report["runtime_compute_type"])
+
+    def test_overlay_diagnostics_reports_available_plasma_x11_runtime(self) -> None:
+        config = self._config()
+        completed = self._helper_result(
+            {
+                "available": True,
+                "pygobject": True,
+                "gtk4": "4.22.4",
+                "gdk_x11": True,
+                "native_x11": True,
+                "gtk4_layer_shell": False,
+            }
+        )
+
+        report = overlay_diagnostics(
+            config,
+            env={
+                "XDG_SESSION_TYPE": "x11",
+                "DISPLAY": ":0",
+                "XDG_CURRENT_DESKTOP": "KDE",
+            },
+            run_command=lambda *_args, **_kwargs: completed,
+        )
+
+        self.assertTrue(report["available"])
+        self.assertTrue(report["supported_session"])
+        self.assertEqual("x11", report["backend"])
+        self.assertTrue(report["gdk_x11"])
+        self.assertTrue(report["native_x11"])
+        self.assertEqual("4.22.4", report["gtk4"])
+
+    def test_overlay_diagnostics_reports_partial_install(self) -> None:
+        config = self._config()
+        completed = self._helper_result(
+            {
+                "available": False,
+                "pygobject": True,
+                "gtk4": "4.22.4",
+                "gdk_x11": False,
+                "native_x11": False,
+                "gtk4_layer_shell": False,
+                "error": "Gtk4LayerShell namespace not available",
+            },
+            returncode=1,
+        )
+
+        report = overlay_diagnostics(
+            config,
+            env={
+                "XDG_SESSION_TYPE": "wayland",
+                "WAYLAND_DISPLAY": "wayland-0",
+                "XDG_CURRENT_DESKTOP": "KDE",
+            },
+            run_command=lambda *_args, **_kwargs: completed,
+        )
+
+        self.assertFalse(report["available"])
+        self.assertEqual("wayland", report["backend"])
+        self.assertTrue(report["pygobject"])
+        self.assertFalse(report["gtk4_layer_shell"])
+        self.assertIn("Gtk4LayerShell", report["detail"])
+
+    def test_overlay_diagnostics_rejects_unsupported_session(self) -> None:
+        config = self._config()
+        report = overlay_diagnostics(
+            config,
+            env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+            run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+        )
+
+        self.assertFalse(report["available"])
+        self.assertFalse(report["supported_session"])
+        self.assertIsNone(report["backend"])
+        self.assertIn("KDE Plasma", report["detail"])
+
+    def test_overlay_diagnostics_handles_helper_failure(self) -> None:
+        config = self._config()
+
+        def failed_helper(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise OSError("system interpreter missing")
+
+        report = overlay_diagnostics(
+            config,
+            env={"XDG_SESSION_TYPE": "x11", "XDG_CURRENT_DESKTOP": "KDE", "DISPLAY": ":0"},
+            run_command=failed_helper,
+        )
+
+        self.assertFalse(report["available"])
+        self.assertIn("system interpreter missing", report["detail"])
+
+    @staticmethod
+    def _config() -> MurmlyConfig:
+        return MurmlyConfig(socket_path=Path("/tmp/murmly.sock"), config_path=Path("/tmp/config.toml"))
+
+    @staticmethod
+    def _helper_result(report: dict[str, object], returncode: int = 0) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["/usr/bin/python3", "overlay_renderer.py", "--check"],
+            returncode=returncode,
+            stdout=json.dumps(report),
+            stderr="",
+        )

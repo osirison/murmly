@@ -1,16 +1,71 @@
 from __future__ import annotations
 
+from array import array
+import math
+import sys
+import threading
 import time
 from typing import Any
 
 from murmly.config import MurmlyConfig
+from murmly.overlay import LevelSink
+
+
+MIN_LEVEL_DBFS = -60.0
+MAX_LEVEL_DBFS = -6.0
+
+
+def pcm16_rms(pcm_audio: bytes) -> float:
+    usable_length = len(pcm_audio) - (len(pcm_audio) % 2)
+    if usable_length == 0:
+        return 0.0
+    samples = array("h")
+    samples.frombytes(pcm_audio[:usable_length])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    mean_square = sum(sample * sample for sample in samples) / len(samples)
+    return min(math.sqrt(mean_square) / 32_768.0, 1.0)
+
+
+def rms_to_level(rms: float) -> float:
+    if rms <= 0.0:
+        return 0.0
+    dbfs = 20.0 * math.log10(min(rms, 1.0))
+    return min(max((dbfs - MIN_LEVEL_DBFS) / (MAX_LEVEL_DBFS - MIN_LEVEL_DBFS), 0.0), 1.0)
+
+
+class LevelSmoother:
+    def __init__(self, attack: float = 0.55, release: float = 0.18) -> None:
+        self._attack = attack
+        self._release = release
+        self._level = 0.0
+
+    @property
+    def level(self) -> float:
+        return self._level
+
+    def update(self, target: float) -> float:
+        bounded_target = min(max(target, 0.0), 1.0)
+        alpha = self._attack if bounded_target > self._level else self._release
+        self._level = alpha * bounded_target + (1.0 - alpha) * self._level
+        return self._level
+
+    def reset(self) -> None:
+        self._level = 0.0
 
 
 class SoundDeviceRecorder:
-    def __init__(self, config: MurmlyConfig) -> None:
+    def __init__(self, config: MurmlyConfig, level_sink: LevelSink | None = None) -> None:
         self._config = config
+        self._level_sink = level_sink
+        self._level_smoother = LevelSmoother()
+        self._latest_level_frame: bytes | None = None
+        self._meter_stop: threading.Event | None = None
+        self._meter_thread: threading.Thread | None = None
         self._stream = None
         self._buffer = bytearray()
+        self._level_smoother.reset()
+        self._latest_level_frame = None
         self._sample_rate_hz = config.sample_rate_hz
 
     @property
@@ -31,7 +86,10 @@ class SoundDeviceRecorder:
             del frames, time_info
             if status:
                 raise RuntimeError(f"Audio capture error: {status}")
-            self._buffer.extend(bytes(indata))
+            pcm_audio = bytes(indata)
+            self._buffer.extend(pcm_audio)
+            if self._level_sink is not None:
+                self._latest_level_frame = pcm_audio
 
         failures: list[str] = []
         for device in self._candidate_devices(sd):
@@ -65,17 +123,27 @@ class SoundDeviceRecorder:
 
                 self._stream = stream
                 self._sample_rate_hz = int(round(stream.samplerate))
+                self._start_meter()
                 return
 
         details = "; ".join(failures) or "No input devices were available."
         raise RuntimeError(f"Unable to open a microphone input. {details}")
 
     def stop(self) -> bytes:
-        if self._stream is None:
-            return b""
-        self._stream.stop()
-        self._stream.close()
+        stream = self._stream
         self._stream = None
+        if stream is None:
+            self._stop_meter()
+            return b""
+        try:
+            stream.stop()
+        finally:
+            try:
+                stream.close()
+            finally:
+                self._stop_meter()
+                self._level_smoother.reset()
+                self._latest_level_frame = None
         return bytes(self._buffer)
 
     def record_for_seconds(self, seconds: float) -> bytes:
@@ -116,3 +184,58 @@ class SoundDeviceRecorder:
         if native_sample_rate_hz > 0 and native_sample_rate_hz not in sample_rates:
             sample_rates.append(native_sample_rate_hz)
         return sample_rates
+
+    def _start_meter(self) -> None:
+        if self._level_sink is None:
+            return
+        existing = self._meter_thread
+        if existing is not None:
+            if existing.is_alive():
+                self._level_sink = None
+                return
+            self._meter_thread = None
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._run_meter,
+            args=(stop_event,),
+            name="murmly-audio-meter",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError:
+            self._level_sink = None
+            return
+        self._meter_stop = stop_event
+        self._meter_thread = thread
+
+    def _stop_meter(self) -> None:
+        stop_event = self._meter_stop
+        thread = self._meter_thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None:
+            thread.join(timeout=0.2)
+            if thread.is_alive():
+                self._level_sink = None
+                return
+        self._meter_thread = None
+        self._meter_stop = None
+
+    def _run_meter(self, stop_event: threading.Event) -> None:
+        last_frame: bytes | None = None
+        while not stop_event.wait(1.0 / 30.0):
+            last_frame = self._publish_latest_frame(last_frame)
+            if self._level_sink is None:
+                return
+
+    def _publish_latest_frame(self, last_frame: bytes | None) -> bytes | None:
+        frame = self._latest_level_frame
+        if frame is None or frame is last_frame or self._level_sink is None:
+            return last_frame
+        level = self._level_smoother.update(rms_to_level(pcm16_rms(frame)))
+        try:
+            self._level_sink(level)
+        except Exception:
+            self._level_sink = None
+        return frame

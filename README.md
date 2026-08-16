@@ -36,6 +36,25 @@ Install these desktop tools separately:
 - `wtype` or `ydotool` for Wayland paste simulation
 - `xclip` and `xdotool` on X11; `wl-copy` cannot access an X11 clipboard
 
+For the recording overlay on Fedora KDE Plasma, install the shared native
+visual runtime:
+
+```bash
+sudo dnf install gtk4 python3-gobject libX11 libXext
+```
+
+Plasma Wayland also requires Layer Shell:
+
+```bash
+sudo dnf install gtk4-layer-shell
+```
+
+The daemon runs from the project's isolated `uv` environment. The overlay is a
+separate helper launched with `/usr/bin/python3` so it can use Fedora's tested
+PyGObject and GTK introspection packages without compiling duplicate bindings
+inside the virtual environment. Missing visual packages disable only the
+overlay; recording, transcription, clipboard, and paste handling continue.
+
 ## Quick start
 
 ```bash
@@ -83,6 +102,13 @@ murmly doctor
    ```
 
    The daemon cycles through `IDLE -> LISTENING -> THINKING -> DONE -> IDLE` and writes socket state updates for the active desktop environment.
+
+      On KDE Plasma X11 or Wayland, the overlay appears at the bottom center after the
+      microphone opens successfully. Its seven bars follow the smoothed live
+      microphone level while listening, switch to a processing animation during
+      transcription and paste handling, and disappear on success. Capture or
+      processing failures show a brief error symbol without exposing audio or
+      transcript content.
 
 5. Check the current daemon state:
 
@@ -157,7 +183,20 @@ lazy_load_model = true
 [clipboard]
 restore = true
 restore_delay_ms = 200
+
+[overlay]
+enabled = true
+bottom_margin_px = 32 # Logical pixels from the display's bottom edge, 0-512
+reduced_motion = false
 ```
+
+The recording overlay supports KDE Plasma on X11 and Wayland. It uses X11 EWMH
+window state plus the X Shape extension on X11, and Layer Shell on Wayland. Both
+backends display the same fixed 156 by 48 logical-pixel surface, do not request
+keyboard focus, and do not receive pointer input. On multiple displays, Murmly
+selects the display containing the desktop origin and keeps that selection for
+the recording session. Reduced motion uses stable state symbols and stepped
+level feedback instead of continuous animation.
 
 Profile mapping:
 
@@ -180,3 +219,37 @@ Run the focused stdlib test suite with:
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
+
+## Overlay troubleshooting
+
+Inspect the same system-Python imports used by the renderer:
+
+```bash
+uv run murmly doctor
+/usr/bin/python3 src/murmly/overlay_renderer.py --check
+```
+
+The helper infers `x11` or `wayland` from `XDG_SESSION_TYPE`. To inspect another
+backend explicitly, add `--backend x11` or `--backend wayland`. The doctor report
+shows GDK X11 and native X11 availability for X11 sessions, or GTK4 Layer Shell
+availability for Wayland sessions.
+
+When the daemon runs as a user service, inspect renderer launch failures in the
+user journal:
+
+```bash
+journalctl --user -u murmly.service -b
+```
+
+Confirm that the service receives the active Plasma session environment after
+login. Restart it after installing visual packages or changing configuration:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart murmly.service
+```
+
+To disable or roll back the visual surface without changing voice-to-text
+behavior, set `overlay.enabled = false` and restart the daemon. If the overlay
+is unavailable or exits during recording, use the second shortcut press as
+normal; Murmly still stops capture and processes the buffered audio.

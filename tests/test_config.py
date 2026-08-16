@@ -37,6 +37,11 @@ class ConfigTests(unittest.TestCase):
                     [clipboard]
                     restore = false
                     restore_delay_ms = 150
+
+                    [overlay]
+                    enabled = false
+                    bottom_margin_px = 48
+                    reduced_motion = true
                     """
                 ).strip()
             )
@@ -53,6 +58,9 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.lazy_load_model)
         self.assertFalse(config.restore_clipboard)
         self.assertEqual(150, config.restore_clipboard_delay_ms)
+        self.assertFalse(config.overlay_enabled)
+        self.assertEqual(48, config.overlay_bottom_margin_px)
+        self.assertTrue(config.overlay_reduced_motion)
 
     def test_balanced_profile_uses_accuracy_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -64,6 +72,41 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual("auto", config.compute_type)
         self.assertEqual(5, config.beam_size)
         self.assertTrue(config.vad_filter)
+        self.assertTrue(config.overlay_enabled)
+        self.assertEqual(32, config.overlay_bottom_margin_px)
+        self.assertFalse(config.overlay_reduced_motion)
+
+    def test_invalid_overlay_table_uses_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('overlay = "invalid"')
+
+            config = load_config(config_path)
+
+        self.assertTrue(config.overlay_enabled)
+        self.assertEqual(32, config.overlay_bottom_margin_px)
+        self.assertFalse(config.overlay_reduced_motion)
+
+    def test_invalid_overlay_values_use_defaults(self) -> None:
+        for margin in (-1, 513):
+            with self.subTest(margin=margin), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [overlay]
+                        enabled = "yes"
+                        bottom_margin_px = {margin}
+                        reduced_motion = 1
+                        """
+                    ).strip()
+                )
+
+                config = load_config(config_path)
+
+            self.assertTrue(config.overlay_enabled)
+            self.assertEqual(32, config.overlay_bottom_margin_px)
+            self.assertFalse(config.overlay_reduced_motion)
 
     def test_invalid_stt_settings_fall_back_to_profile_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
