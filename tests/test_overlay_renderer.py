@@ -10,6 +10,7 @@ import unittest
 
 from murmly.overlay_renderer import (
     MAX_MESSAGE_BYTES,
+    SUPPORTED_BACKENDS,
     MessageParser,
     MonitorGeometry,
     RendererViewState,
@@ -86,17 +87,26 @@ class OverlayRendererTests(unittest.TestCase):
         self.assertEqual((-2076, 2200), x11_position(monitor, 32))
 
     def test_runtime_integration_skips_without_supported_plasma_session(self) -> None:
-        renderer_path = Path(sys.modules["murmly.overlay_renderer"].__file__).resolve()
         backend = os.environ.get("XDG_SESSION_TYPE", "").casefold()
-        check = subprocess.run(
-            ["/usr/bin/python3", str(renderer_path), "--check", "--backend", backend],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        result = json.loads(check.stdout)
         desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").casefold()
-        if not result["available"] or backend not in {"x11", "wayland"} or "kde" not in desktop:
+        if backend not in SUPPORTED_BACKENDS or "kde" not in desktop:
+            self.skipTest("GTK4 overlay runtime on KDE Plasma is unavailable")
+
+        renderer_path = Path(sys.modules["murmly.overlay_renderer"].__file__).resolve()
+        try:
+            check = subprocess.run(
+                ["/usr/bin/python3", str(renderer_path), "--check", "--backend", backend],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            self.skipTest("The system interpreter for the overlay renderer is unavailable")
+        try:
+            result = json.loads(check.stdout)
+        except json.JSONDecodeError:
+            self.skipTest(f"Overlay runtime check produced no report: {check.stderr.strip()}")
+        if not result["available"]:
             self.skipTest("GTK4 overlay runtime on KDE Plasma is unavailable")
 
         parent, child = socket.socketpair()

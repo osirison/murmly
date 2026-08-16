@@ -154,6 +154,19 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(report["backend"])
         self.assertIn("KDE Plasma", report["detail"])
 
+    def test_overlay_diagnostics_reports_disabled_overlay_on_unsupported_session(self) -> None:
+        config = self._config(overlay_enabled=False)
+        report = overlay_diagnostics(
+            config,
+            env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+            run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+        )
+
+        self.assertFalse(report["enabled"])
+        self.assertFalse(report["available"])
+        self.assertFalse(report["supported_session"])
+        self.assertEqual("Overlay is disabled in configuration.", report["detail"])
+
     def test_overlay_diagnostics_handles_helper_failure(self) -> None:
         config = self._config()
 
@@ -170,8 +183,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("system interpreter missing", report["detail"])
 
     @staticmethod
-    def _config() -> MurmlyConfig:
-        return MurmlyConfig(socket_path=Path("/tmp/murmly.sock"), config_path=Path("/tmp/config.toml"))
+    def _config(overlay_enabled: bool = True) -> MurmlyConfig:
+        return MurmlyConfig(
+            socket_path=Path("/tmp/murmly.sock"),
+            config_path=Path("/tmp/config.toml"),
+            overlay_enabled=overlay_enabled,
+        )
 
     @staticmethod
     def _helper_result(report: dict[str, object], returncode: int = 0) -> subprocess.CompletedProcess[str]:

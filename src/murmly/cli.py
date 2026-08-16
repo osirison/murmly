@@ -165,7 +165,10 @@ def overlay_diagnostics(
         "available": False,
     }
     if backend is None:
-        report["detail"] = "Overlay requires KDE Plasma on X11 or Wayland."
+        if not config.overlay_enabled:
+            report["detail"] = "Overlay is disabled in configuration."
+        else:
+            report["detail"] = "Overlay requires KDE Plasma on X11 or Wayland."
         return report
     try:
         result = run_command(
