@@ -182,7 +182,8 @@ lazy_load_model = true
 
 [clipboard]
 restore = true
-restore_delay_ms = 200
+restore_delay_ms = 500 # Wait before restoring the previous clipboard, 0-5000
+verify_target = true # Refuse to paste if focus left the window you dictated into
 
 [overlay]
 enabled = true
@@ -219,6 +220,80 @@ Run the focused stdlib test suite with:
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
+
+## Transcript delivery
+
+Murmly decides where a transcript goes at the moment it presses Ctrl+V, which is
+seconds after you stop speaking. To stop transcripts landing in whatever happened
+to take focus in the meantime, Murmly records the focused window when capture
+stops and checks it again just before pasting.
+
+If the focused window changed, Murmly **does not paste**. The transcript is left
+on your clipboard so you can place it yourself, the previous clipboard is not
+restored, and the overlay shows its error symbol. The daemon reports this as
+`"delivered": false`:
+
+```json
+{
+  "ok": true,
+  "state": "DONE",
+  "text": "the words you spoke",
+  "delivered": false,
+  "detail": "Transcript copied to the clipboard but not pasted."
+}
+```
+
+The same check applies to `murmly spike --paste`.
+
+### What each session gets
+
+Verification needs to read the focused window, which only X11 exposes to
+applications:
+
+| Session | Target verification | Clipboard preservation |
+| --- | --- | --- |
+| X11 with an EWMH window manager | yes | yes |
+| X11 without EWMH | no | yes |
+| Wayland | no | yes |
+
+`murmly doctor` reports which applies under `delivery`:
+
+```json
+"delivery": {
+  "verification_supported": true,
+  "verification_enabled": true,
+  "restore_clipboard": true,
+  "restore_delay_ms": 500,
+  "detail": "Delivery target verification is supported and enabled."
+}
+```
+
+### Restoring your previous clipboard
+
+Pasting overwrites your clipboard, so Murmly puts the previous contents back
+afterwards. It waits `restore_delay_ms` first, giving the receiving application
+time to read the transcript. This is a margin, not a guarantee: Murmly cannot
+tell whether the application has read the clipboard, because a desktop clipboard
+manager such as Klipper takes a copy of every clipboard change immediately, so
+any "someone read it" signal reports the manager rather than the application.
+
+Raise `restore_delay_ms` if a slow application ever pastes your previous
+clipboard instead of the transcript. Values outside 0-5000 fall back to 500. Set
+`restore = false` to keep the transcript on the clipboard and never restore.
+
+### Behavior change and rollback
+
+Murmly previously pasted unconditionally. If you relied on changing focus during
+transcription to redirect a paste, that now refuses instead; paste manually from
+the clipboard, or turn verification off:
+
+```toml
+[clipboard]
+verify_target = false
+```
+
+Restart the daemon afterwards. With verification off, Murmly pastes into whatever
+holds focus, exactly as before, and still bounds the clipboard restore.
 
 ## Overlay troubleshooting
 

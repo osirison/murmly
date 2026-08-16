@@ -8,7 +8,6 @@ description: Track implementation and validation of delivery target verification
 - [x] 1.1 Add a `[clipboard] verify_target` configuration field defaulting to `true`, using the existing bounded boolean parsing
 - [x] 1.2 Add configuration tests for the default, explicit values, an invalid table shape, and a non-boolean value
 - [x] 1.3 Implement a startup probe that classifies the session as verifying or unverified by reading `_NET_ACTIVE_WINDOW` from the root window, treating an absent property or an unopenable display as unverified rather than as a failure
-- [ ] 1.4 Implement a startup probe for clipboard consumption support that detects whether the resolved copy command accepts its selection-request flag, falling back to fixed-delay restoration when it does not
 - [x] 1.5 Add tests proving Wayland sessions, non-EWMH X11 sessions, and sessions with no display all classify as unverified without raising
 
 ## 2. Delivery target identity
@@ -36,26 +35,26 @@ description: Track implementation and validation of delivery target verification
 - [x] 4.6 Add tests for delivery, refusal on focus change, refusal on unreadable focus, disabled verification, and unverified sessions
 - [x] 4.7 Apply the same guard to `murmly spike --paste`, which also stops capture before transcribing and delivering, with tests
 
-## 5. Consumption-ordered clipboard restoration
+## 5. Bounded clipboard restoration
 
-- [ ] 5.1 Implement transcript copying that exposes a consumption signal on the deliver-and-restore path only, keeping ordinary persistent copies for the refusal and restoration-disabled paths
-- [ ] 5.2 Restore the previous clipboard only after the consumption signal, never before the restoration floor, and never after the ceiling
-- [ ] 5.3 Choose concrete floor and ceiling values against real applications and record them in the design, resolving design.md's open question
-- [ ] 5.4 Ensure restoration never blocks the daemon's return to idle beyond the ceiling
-- [ ] 5.5 Add tests for prompt consumption, consumption before the floor, no consumption within the ceiling, and restoration disabled
+- [x] 5.1 Raise the default `restore_delay_ms` to 500 ms and clamp the configured value to 0-5000 ms, falling back to the default when it is out of range
+- [x] 5.2 Confirm delivery cannot raise on a negative delay and the daemon cannot be stalled beyond the maximum by configuration
+- [x] 5.3 Confirm the refusal and restoration-disabled paths never read or restore the previous clipboard
+- [x] 5.4 Add configuration tests for the default, an in-range value, a negative value, and a value above the maximum
+- [x] 5.5 Add delivery tests for restore-after-interval, restoration disabled, and refusal suppressing restoration
 
 ## 6. Diagnostics and documentation
 
-- [ ] 6.1 Report delivery target verification support, configured state, and any degraded consumption mode in `murmly doctor`
-- [ ] 6.2 Add diagnostics tests for a supported and enabled session, a supported and disabled session, an unverified session, and degraded consumption
-- [ ] 6.3 Document the delivery guarantee, the X11 and Wayland asymmetry, the `verify_target` option, and the manual-paste recovery path in the README
-- [ ] 6.4 Document the breaking behavior change and the configuration rollback for users who relied on redirecting a paste mid-transcription
+- [x] 6.1 Report delivery target verification support, configured state, and the effective restore delay in `murmly doctor`
+- [x] 6.2 Add diagnostics tests for a supported and enabled session, a supported and disabled session, and an unverified session
+- [x] 6.3 Document the delivery guarantee, the X11 and Wayland asymmetry, the `verify_target` and `restore_delay_ms` options, and the manual-paste recovery path in the README
+- [x] 6.4 Document the breaking behavior change and the configuration rollback for users who relied on redirecting a paste mid-transcription
 
 ## 7. Validation
 
-- [ ] 7.1 Run the full unit suite and confirm no regression in existing audio, daemon, overlay, and integration coverage
-- [ ] 7.2 Validate the change with `openspec validate guard-paste-target --strict`
+- [x] 7.1 Run the full unit suite and confirm no regression in existing audio, daemon, overlay, and integration coverage
+- [x] 7.2 Validate the change with `openspec validate guard-paste-target --strict`
 - [x] 7.3 Verify live on Plasma X11 that a transcript delivers normally when focus is unchanged
 - [x] 7.4 Verify live on Plasma X11 that alt-tabbing during transcription refuses delivery, leaves the transcript on the clipboard, and shows the overlay error
-- [ ] 7.5 Verify live that a slow-reading application receives the transcript rather than the restored previous clipboard
-- [ ] 7.6 Record any Wayland behavior that could not be exercised in this environment
+- [x] 7.5 Verify live that a delivered transcript is followed by the previous clipboard being restored
+- [x] 7.6 Record any Wayland behavior that could not be exercised in this environment

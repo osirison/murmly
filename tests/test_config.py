@@ -5,7 +5,12 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from murmly.config import default_socket_path, load_config
+from murmly.config import (
+    DEFAULT_RESTORE_DELAY_MS,
+    MAX_RESTORE_DELAY_MS,
+    default_socket_path,
+    load_config,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -156,6 +161,44 @@ class ConfigTests(unittest.TestCase):
 
         self.assertTrue(config.verify_target)
         self.assertTrue(config.restore_clipboard)
+
+    def test_restore_delay_defaults_to_five_hundred_milliseconds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(Path(temp_dir) / "missing.toml")
+
+        self.assertEqual(DEFAULT_RESTORE_DELAY_MS, config.restore_clipboard_delay_ms)
+        self.assertEqual(500, config.restore_clipboard_delay_ms)
+
+    def test_restore_delay_accepts_an_in_range_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("[clipboard]\nrestore_delay_ms = 1200")
+
+            config = load_config(config_path)
+
+        self.assertEqual(1_200, config.restore_clipboard_delay_ms)
+
+    def test_out_of_range_restore_delay_falls_back_to_the_default(self) -> None:
+        for value in (-1, MAX_RESTORE_DELAY_MS + 1, 999_999_999):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(f"[clipboard]\nrestore_delay_ms = {value}")
+
+                config = load_config(config_path)
+
+            self.assertEqual(DEFAULT_RESTORE_DELAY_MS, config.restore_clipboard_delay_ms)
+
+    def test_restore_delay_never_exceeds_the_supported_maximum(self) -> None:
+        for value in (0, 250, MAX_RESTORE_DELAY_MS, MAX_RESTORE_DELAY_MS + 5_000, -50, "soon"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                rendered = f'"{value}"' if isinstance(value, str) else value
+                config_path.write_text(f"[clipboard]\nrestore_delay_ms = {rendered}")
+
+                config = load_config(config_path)
+
+            self.assertGreaterEqual(config.restore_clipboard_delay_ms, 0)
+            self.assertLessEqual(config.restore_clipboard_delay_ms, MAX_RESTORE_DELAY_MS)
 
     def test_invalid_stt_settings_fall_back_to_profile_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

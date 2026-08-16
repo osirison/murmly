@@ -19,7 +19,7 @@ from murmly.integrations import (
     choose_paste_command,
     is_wayland_session,
 )
-from murmly.focus import create_focus_observer, record_target, should_deliver
+from murmly.focus import FocusObserver, create_focus_observer, record_target, should_deliver
 from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend
 from murmly.stt import FasterWhisperTranscriber
 
@@ -139,11 +139,33 @@ def _run_doctor(config: MurmlyConfig) -> None:
                 "runtime_compute_type": runtime_compute_type,
                 "beam_size": config.beam_size,
                 "vad_filter": config.vad_filter,
+                "delivery": delivery_diagnostics(config),
                 "overlay": overlay,
             },
             indent=2,
         )
     )
+
+
+def delivery_diagnostics(
+    config: MurmlyConfig,
+    env: dict[str, str] | None = None,
+    observer: FocusObserver | None = None,
+) -> dict[str, object]:
+    focus = observer if observer is not None else create_focus_observer(env)
+    report: dict[str, object] = {
+        "verification_supported": focus.supported,
+        "verification_enabled": config.verify_target,
+        "restore_clipboard": config.restore_clipboard,
+        "restore_delay_ms": config.restore_clipboard_delay_ms,
+    }
+    if not focus.supported:
+        report["detail"] = focus.detail or "Delivery target verification is unavailable in this session."
+    elif not config.verify_target:
+        report["detail"] = "Delivery target verification is supported but disabled in configuration."
+    else:
+        report["detail"] = "Delivery target verification is supported and enabled."
+    return report
 
 
 def overlay_diagnostics(

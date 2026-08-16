@@ -30,6 +30,8 @@ MODEL_PROFILES = {
     ),
 }
 VALID_DEVICES = {"auto", "cpu", "cuda"}
+DEFAULT_RESTORE_DELAY_MS = 500
+MAX_RESTORE_DELAY_MS = 5_000
 VALID_COMPUTE_TYPES = {
     "auto",
     "bfloat16",
@@ -76,7 +78,7 @@ class MurmlyConfig:
     vad_filter: bool = True
     lazy_load_model: bool = True
     restore_clipboard: bool = True
-    restore_clipboard_delay_ms: int = 200
+    restore_clipboard_delay_ms: int = DEFAULT_RESTORE_DELAY_MS
     verify_target: bool = True
     overlay_enabled: bool = True
     overlay_bottom_margin_px: int = 32
@@ -132,7 +134,12 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         vad_filter=bool(stt.get("vad_filter", model.vad_filter)),
         lazy_load_model=bool(stt.get("lazy_load_model", True)),
         restore_clipboard=bool(clipboard.get("restore", True)),
-        restore_clipboard_delay_ms=int(clipboard.get("restore_delay_ms", 200)),
+        restore_clipboard_delay_ms=_bounded_int(
+            clipboard.get("restore_delay_ms"),
+            DEFAULT_RESTORE_DELAY_MS,
+            minimum=0,
+            maximum=MAX_RESTORE_DELAY_MS,
+        ),
         verify_target=_boolean(clipboard.get("verify_target"), True),
         overlay_enabled=_boolean(overlay.get("enabled"), True),
         overlay_bottom_margin_px=_bounded_int(

@@ -13,7 +13,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from murmly.cli import _run_doctor, overlay_diagnostics
+from murmly.cli import _run_doctor, delivery_diagnostics, overlay_diagnostics
 from murmly.config import MurmlyConfig
 from murmly.stt import FasterWhisperTranscriber
 
@@ -244,6 +244,62 @@ class CliTests(unittest.TestCase):
 
         paster.copy.assert_called_once_with("hello world")
         paster.copy_and_paste.assert_not_called()
+
+    class _Focus:
+        def __init__(self, supported: bool, detail: str | None = None) -> None:
+            self.supported = supported
+            self.detail = detail
+
+        def active_window(self):
+            return None
+
+    def test_delivery_diagnostics_reports_supported_and_enabled(self) -> None:
+        report = delivery_diagnostics(self._config(), observer=self._Focus(True))
+
+        self.assertTrue(report["verification_supported"])
+        self.assertTrue(report["verification_enabled"])
+        self.assertEqual(500, report["restore_delay_ms"])
+        self.assertIn("supported and enabled", report["detail"])
+
+    def test_delivery_diagnostics_reports_supported_but_disabled(self) -> None:
+        config = MurmlyConfig(
+            socket_path=Path("/tmp/murmly.sock"),
+            config_path=Path("/tmp/config.toml"),
+            verify_target=False,
+        )
+
+        report = delivery_diagnostics(config, observer=self._Focus(True))
+
+        self.assertTrue(report["verification_supported"])
+        self.assertFalse(report["verification_enabled"])
+        self.assertIn("disabled in configuration", report["detail"])
+
+    def test_delivery_diagnostics_reports_unverified_session(self) -> None:
+        observer = self._Focus(False, "Delivery target verification requires an X11 session.")
+
+        report = delivery_diagnostics(self._config(), observer=observer)
+
+        self.assertFalse(report["verification_supported"])
+        self.assertIn("X11 session", report["detail"])
+
+    def test_doctor_includes_delivery_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch("murmly.cli.choose_paste_command", return_value=["xdotool"]),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIn("delivery", report)
+        self.assertIn("verification_supported", report["delivery"])
+        self.assertEqual(500, report["delivery"]["restore_delay_ms"])
 
     @staticmethod
     def _config(overlay_enabled: bool = True) -> MurmlyConfig:

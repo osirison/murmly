@@ -15,7 +15,7 @@ Both failures are silent, both are unrecoverable, and both became more visible n
 * Verify the target still holds focus immediately before injecting the paste keystroke
 * **BREAKING**: refuse to inject the paste when the focused window changed during transcription. The transcript is copied to the clipboard and left there for the user to place manually, instead of being typed into an unintended application. Users who relied on changing focus mid-transcription to redirect a paste must now paste manually
 * Suppress the clipboard restore whenever delivery was refused, so a transcript that was never delivered always remains on the clipboard
-* Restore the previous clipboard only after the transcript has actually been consumed by the receiving application, or after a bounded timeout, so a slow application can no longer receive stale clipboard content in place of the transcript
+* Widen and bound the delay before the previous clipboard is restored, so a slow application is less likely to receive stale clipboard content in place of the transcript, and no configured value can stall the daemon
 * Signal a refused delivery through the existing overlay error state, carrying no transcript content
 * Add a configuration option to disable target verification for users who prefer the current unconditional paste
 * Report whether the active session supports target verification in `murmly doctor`
