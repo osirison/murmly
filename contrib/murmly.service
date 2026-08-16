@@ -6,6 +6,8 @@ After=graphical-session.target
 Type=simple
 ExecStart=%h/.local/bin/murmly daemon
 Restart=on-failure
+RestartSec=2
+SyslogIdentifier=murmly
 
 [Install]
 WantedBy=default.target

@@ -77,6 +77,9 @@ class MurmlyConfig:
     lazy_load_model: bool = True
     restore_clipboard: bool = True
     restore_clipboard_delay_ms: int = 200
+    overlay_enabled: bool = True
+    overlay_bottom_margin_px: int = 32
+    overlay_reduced_motion: bool = False
 
     @property
     def model_name(self) -> str:
@@ -101,6 +104,7 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
     audio = _get_table(data, "audio")
     stt = _get_table(data, "stt")
     clipboard = _get_table(data, "clipboard")
+    overlay = _get_table(data, "overlay")
 
     socket_path = Path(str(daemon.get("socket_path", default_socket_path(env))))
     model_profile = str(stt.get("model_profile", "balanced"))
@@ -128,6 +132,14 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         lazy_load_model=bool(stt.get("lazy_load_model", True)),
         restore_clipboard=bool(clipboard.get("restore", True)),
         restore_clipboard_delay_ms=int(clipboard.get("restore_delay_ms", 200)),
+        overlay_enabled=_boolean(overlay.get("enabled"), True),
+        overlay_bottom_margin_px=_bounded_int(
+            overlay.get("bottom_margin_px"),
+            32,
+            minimum=0,
+            maximum=512,
+        ),
+        overlay_reduced_motion=_boolean(overlay.get("reduced_motion"), False),
     )
 
 
@@ -144,3 +156,7 @@ def _bounded_int(value: object, default: int, *, minimum: int, maximum: int) -> 
     except (TypeError, ValueError):
         return default
     return parsed if minimum <= parsed <= maximum else default
+
+
+def _boolean(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default

@@ -1,0 +1,817 @@
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+from dataclasses import dataclass
+import json
+import math
+import os
+import socket
+import sys
+import threading
+import time
+from typing import Any
+import warnings
+
+
+MAX_MESSAGE_BYTES = 1_024
+MIN_ERROR_DURATION_MS = 100
+MAX_ERROR_DURATION_MS = 10_000
+WINDOW_WIDTH = 156
+WINDOW_HEIGHT = 48
+SUPPORTED_BACKENDS = {"x11", "wayland"}
+XA_ATOM = 4
+XA_CARDINAL = 6
+PROP_MODE_REPLACE = 0
+SHAPE_SET = 0
+SHAPE_INPUT = 2
+UNSORTED = 0
+CLIENT_MESSAGE = 33
+NET_WM_STATE_ADD = 1
+SUBSTRUCTURE_NOTIFY_MASK = 1 << 19
+SUBSTRUCTURE_REDIRECT_MASK = 1 << 20
+
+
+class _XClientMessageData(ctypes.Union):
+    _fields_ = [
+        ("bytes", ctypes.c_char * 20),
+        ("shorts", ctypes.c_short * 10),
+        ("longs", ctypes.c_long * 5),
+    ]
+
+
+class _XClientMessageEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("data", _XClientMessageData),
+    ]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("xclient", _XClientMessageEvent),
+        ("padding", ctypes.c_long * 24),
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorGeometry:
+    connector: str
+    x: int
+    y: int
+    width: int
+    height: int
+    scale: int = 1
+
+
+def select_monitor_index(monitors: list[MonitorGeometry]) -> int | None:
+    for index, monitor in enumerate(monitors):
+        if monitor.x <= 0 < monitor.x + monitor.width and monitor.y <= 0 < monitor.y + monitor.height:
+            return index
+    if not monitors:
+        return None
+    return min(range(len(monitors)), key=lambda index: monitors[index].connector)
+
+
+def x11_position(monitor: MonitorGeometry, bottom_margin_px: int) -> tuple[int, int]:
+    return (
+        (monitor.x + (monitor.width - WINDOW_WIDTH) // 2) * monitor.scale,
+        (monitor.y + monitor.height - WINDOW_HEIGHT - bottom_margin_px) * monitor.scale,
+    )
+
+
+def x11_surface_id(gdk_x11: Any, surface: Any) -> int:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="GdkX11.X11Surface.get_xid is deprecated",
+            category=DeprecationWarning,
+        )
+        return int(gdk_x11.X11Surface.get_xid(surface))
+
+
+def validate_message(message: object) -> dict[str, object] | None:
+    if not isinstance(message, dict):
+        return None
+    message_type = message.get("type")
+    if message_type == "state":
+        if set(message) != {"type", "value"} or message.get("value") not in {
+            "IDLE",
+            "LISTENING",
+            "THINKING",
+        }:
+            return None
+    elif message_type == "level":
+        value = message.get("value")
+        if (
+            set(message) != {"type", "value"}
+            or isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0.0 <= value <= 1.0
+        ):
+            return None
+    elif message_type == "error":
+        duration_ms = message.get("duration_ms")
+        if (
+            set(message) != {"type", "duration_ms"}
+            or isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, int)
+            or not MIN_ERROR_DURATION_MS <= duration_ms <= MAX_ERROR_DURATION_MS
+        ):
+            return None
+    elif message_type == "shutdown":
+        if set(message) != {"type"}:
+            return None
+    else:
+        return None
+    return message
+
+
+class MessageParser:
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, data: bytes) -> list[dict[str, object]]:
+        self._buffer.extend(data)
+        messages: list[dict[str, object]] = []
+        while b"\n" in self._buffer:
+            line, _, remainder = self._buffer.partition(b"\n")
+            self._buffer = bytearray(remainder)
+            if not line or len(line) + 1 > MAX_MESSAGE_BYTES:
+                continue
+            try:
+                decoded = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            validated = validate_message(decoded)
+            if validated is not None:
+                messages.append(validated)
+        if len(self._buffer) >= MAX_MESSAGE_BYTES:
+            self._buffer.clear()
+        return messages
+
+
+@dataclass(slots=True)
+class RendererViewState:
+    state: str = "IDLE"
+    level: float = 0.0
+    error_generation: int = 0
+
+    @property
+    def visible(self) -> bool:
+        return self.state != "IDLE"
+
+    def apply(self, message: dict[str, object]) -> bool:
+        message_type = message["type"]
+        if message_type == "state":
+            self.state = str(message["value"])
+            if self.state != "LISTENING":
+                self.level = 0.0
+            return False
+        if message_type == "level":
+            if self.state == "LISTENING":
+                self.level = float(message["value"])
+            return False
+        if message_type == "error":
+            self.state = "ERROR"
+            self.level = 0.0
+            self.error_generation += 1
+            return False
+        return message_type == "shutdown"
+
+
+def check_visual_runtime(backend: str) -> dict[str, object]:
+    result: dict[str, object] = {
+        "backend": backend,
+        "system_python": sys.executable,
+        "pygobject": False,
+        "gtk4": None,
+        "gdk_x11": False,
+        "native_x11": False,
+        "gtk4_layer_shell": False,
+        "available": False,
+    }
+    if backend not in SUPPORTED_BACKENDS:
+        result["error"] = f"Unsupported overlay backend: {backend}"
+        return result
+    try:
+        import cairo
+        import gi
+
+        del cairo
+
+        result["pygobject"] = True
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gtk
+
+        result["gtk4"] = f"{Gtk.get_major_version()}.{Gtk.get_minor_version()}.{Gtk.get_micro_version()}"
+        if backend == "wayland":
+            gi.require_version("Gtk4LayerShell", "1.0")
+            from gi.repository import Gtk4LayerShell
+
+            Gtk.init()
+            if not Gtk4LayerShell.is_supported():
+                raise OSError("The active Wayland compositor does not support Layer Shell.")
+            result["gtk4_layer_shell"] = True
+        else:
+            gi.require_version("GdkX11", "4.0")
+            from gi.repository import GdkX11
+
+            del GdkX11
+            result["gdk_x11"] = True
+            X11WindowAdapter().check_runtime()
+            result["native_x11"] = True
+        result["available"] = True
+    except (AttributeError, ImportError, OSError, ValueError) as error:
+        result["error"] = str(error)
+    return result
+
+
+def _load_x11_libraries() -> tuple[ctypes.CDLL, ctypes.CDLL]:
+    x11_path = ctypes.util.find_library("X11")
+    xext_path = ctypes.util.find_library("Xext")
+    if not x11_path or not xext_path:
+        raise OSError("libX11 and libXext are required for the X11 overlay backend.")
+    return ctypes.CDLL(x11_path), ctypes.CDLL(xext_path)
+
+
+class X11WindowAdapter:
+    def __init__(self, x11: ctypes.CDLL | None = None, xext: ctypes.CDLL | None = None) -> None:
+        if x11 is None or xext is None:
+            x11, xext = _load_x11_libraries()
+        self._x11 = x11
+        self._xext = xext
+        self._configure_signatures()
+
+    def check_runtime(self) -> None:
+        display = self._x11.XOpenDisplay(None)
+        if not display:
+            raise OSError("Unable to open the active X11 display.")
+        try:
+            event_base = ctypes.c_int()
+            error_base = ctypes.c_int()
+            if self._xext.XShapeQueryExtension(
+                display,
+                ctypes.byref(event_base),
+                ctypes.byref(error_base),
+            ) == 0:
+                raise OSError("The active X11 display does not support the Shape extension.")
+        finally:
+            self._x11.XCloseDisplay(display)
+
+    def prepare(self, xid: int, monitor: MonitorGeometry, bottom_margin_px: int) -> None:
+        display = self._x11.XOpenDisplay(None)
+        if not display:
+            raise OSError("Unable to open the X11 display for overlay placement.")
+        try:
+            window_type_property = self._atom(display, "_NET_WM_WINDOW_TYPE")
+            notification_type = self._atom(display, "_NET_WM_WINDOW_TYPE_NOTIFICATION")
+            self._replace_atoms(display, xid, window_type_property, [notification_type])
+
+            state_property = self._atom(display, "_NET_WM_STATE")
+            states = [
+                self._atom(display, "_NET_WM_STATE_ABOVE"),
+                self._atom(display, "_NET_WM_STATE_STICKY"),
+                self._atom(display, "_NET_WM_STATE_SKIP_TASKBAR"),
+                self._atom(display, "_NET_WM_STATE_SKIP_PAGER"),
+            ]
+            self._replace_atoms(display, xid, state_property, states)
+            desktop_property = self._atom(display, "_NET_WM_DESKTOP")
+            self._replace_cardinal(display, xid, desktop_property, 0xFFFFFFFF)
+
+            x, y = x11_position(monitor, bottom_margin_px)
+            self._x11.XMoveResizeWindow(
+                display,
+                xid,
+                x,
+                y,
+                WINDOW_WIDTH * monitor.scale,
+                WINDOW_HEIGHT * monitor.scale,
+            )
+            self._xext.XShapeCombineRectangles(
+                display,
+                xid,
+                SHAPE_INPUT,
+                0,
+                0,
+                None,
+                0,
+                SHAPE_SET,
+                UNSORTED,
+            )
+            self._x11.XFlush(display)
+        finally:
+            self._x11.XCloseDisplay(display)
+
+    def activate(self, xid: int, monitor: MonitorGeometry, bottom_margin_px: int) -> None:
+        display = self._x11.XOpenDisplay(None)
+        if not display:
+            raise OSError("Unable to open the X11 display for overlay activation.")
+        try:
+            x, y = x11_position(monitor, bottom_margin_px)
+            self._x11.XMoveResizeWindow(
+                display,
+                xid,
+                x,
+                y,
+                WINDOW_WIDTH * monitor.scale,
+                WINDOW_HEIGHT * monitor.scale,
+            )
+            root = self._x11.XDefaultRootWindow(display)
+            state_property = self._atom(display, "_NET_WM_STATE")
+            for state_name in (
+                "_NET_WM_STATE_ABOVE",
+                "_NET_WM_STATE_STICKY",
+                "_NET_WM_STATE_SKIP_TASKBAR",
+                "_NET_WM_STATE_SKIP_PAGER",
+            ):
+                self._send_state_add(display, root, xid, state_property, self._atom(display, state_name))
+            self._send_desktop_all(display, root, xid)
+            self._x11.XRaiseWindow(display, xid)
+            self._x11.XFlush(display)
+        finally:
+            self._x11.XCloseDisplay(display)
+
+    def _send_state_add(
+        self,
+        display: int,
+        root: int,
+        xid: int,
+        state_property: int,
+        state_atom: int,
+    ) -> None:
+        event = _XEvent()
+        event.xclient.type = CLIENT_MESSAGE
+        event.xclient.send_event = True
+        event.xclient.display = display
+        event.xclient.window = xid
+        event.xclient.message_type = state_property
+        event.xclient.format = 32
+        event.xclient.data.longs[0] = NET_WM_STATE_ADD
+        event.xclient.data.longs[1] = state_atom
+        event.xclient.data.longs[2] = 0
+        event.xclient.data.longs[3] = 1
+        status = self._x11.XSendEvent(
+            display,
+            root,
+            False,
+            SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
+            ctypes.byref(event),
+        )
+        if status == 0:
+            raise OSError("X11 window manager rejected an overlay state request.")
+
+    def _send_desktop_all(self, display: int, root: int, xid: int) -> None:
+        event = _XEvent()
+        event.xclient.type = CLIENT_MESSAGE
+        event.xclient.send_event = True
+        event.xclient.display = display
+        event.xclient.window = xid
+        event.xclient.message_type = self._atom(display, "_NET_WM_DESKTOP")
+        event.xclient.format = 32
+        event.xclient.data.longs[0] = 0xFFFFFFFF
+        event.xclient.data.longs[1] = 1
+        status = self._x11.XSendEvent(
+            display,
+            root,
+            False,
+            SUBSTRUCTURE_NOTIFY_MASK | SUBSTRUCTURE_REDIRECT_MASK,
+            ctypes.byref(event),
+        )
+        if status == 0:
+            raise OSError("X11 window manager rejected the all-desktops request.")
+
+    def _replace_atoms(self, display: int, xid: int, property_atom: int, values: list[int]) -> None:
+        atom_values = (ctypes.c_ulong * len(values))(*values)
+        status = self._x11.XChangeProperty(
+            display,
+            xid,
+            property_atom,
+            XA_ATOM,
+            32,
+            PROP_MODE_REPLACE,
+            ctypes.cast(atom_values, ctypes.POINTER(ctypes.c_ubyte)),
+            len(values),
+        )
+        if status == 0:
+            raise OSError("X11 rejected an overlay window property.")
+
+    def _replace_cardinal(self, display: int, xid: int, property_atom: int, value: int) -> None:
+        cardinal = ctypes.c_ulong(value)
+        status = self._x11.XChangeProperty(
+            display,
+            xid,
+            property_atom,
+            XA_CARDINAL,
+            32,
+            PROP_MODE_REPLACE,
+            ctypes.cast(ctypes.pointer(cardinal), ctypes.POINTER(ctypes.c_ubyte)),
+            1,
+        )
+        if status == 0:
+            raise OSError("X11 rejected the overlay desktop property.")
+
+    def _atom(self, display: int, name: str) -> int:
+        atom = self._x11.XInternAtom(display, name.encode("ascii"), False)
+        if atom == 0:
+            raise OSError(f"X11 atom is unavailable: {name}")
+        return int(atom)
+
+    def _configure_signatures(self) -> None:
+        self._x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self._x11.XOpenDisplay.restype = ctypes.c_void_p
+        self._x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self._x11.XCloseDisplay.restype = ctypes.c_int
+        self._x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        self._x11.XInternAtom.restype = ctypes.c_ulong
+        self._x11.XChangeProperty.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ubyte),
+            ctypes.c_int,
+        ]
+        self._x11.XChangeProperty.restype = ctypes.c_int
+        self._x11.XMoveResizeWindow.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        self._x11.XMoveResizeWindow.restype = ctypes.c_int
+        self._x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self._x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        self._x11.XSendEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_long,
+            ctypes.POINTER(_XEvent),
+        ]
+        self._x11.XSendEvent.restype = ctypes.c_int
+        self._x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self._x11.XRaiseWindow.restype = ctypes.c_int
+        self._x11.XFlush.argtypes = [ctypes.c_void_p]
+        self._x11.XFlush.restype = ctypes.c_int
+        self._xext.XShapeCombineRectangles.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self._xext.XShapeCombineRectangles.restype = None
+        self._xext.XShapeQueryExtension.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self._xext.XShapeQueryExtension.restype = ctypes.c_int
+
+
+class OverlayApplication:
+    def __init__(
+        self,
+        file_descriptor: int,
+        bottom_margin_px: int,
+        reduced_motion: bool,
+        backend: str,
+    ) -> None:
+        import cairo
+        import gi
+
+        gi.require_version("Gtk", "4.0")
+        from gi.repository import Gio, GLib, Gtk
+
+        self._cairo = cairo
+        self._Gio = Gio
+        self._GLib = GLib
+        self._Gtk = Gtk
+        self._backend = backend
+        self._layer_shell = None
+        self._GdkX11 = None
+        self._x11_adapter = None
+        if backend == "wayland":
+            gi.require_version("Gtk4LayerShell", "1.0")
+            from gi.repository import Gtk4LayerShell
+
+            self._layer_shell = Gtk4LayerShell
+        else:
+            gi.require_version("GdkX11", "4.0")
+            from gi.repository import GdkX11
+
+            self._GdkX11 = GdkX11
+            self._x11_adapter = X11WindowAdapter()
+        self._socket = socket.socket(fileno=file_descriptor)
+        self._bottom_margin_px = bottom_margin_px
+        self._reduced_motion = reduced_motion
+        self._view = RendererViewState()
+        self._window = None
+        self._drawing_area = None
+        self._selected_monitor = None
+        self._selected_geometry = None
+        self._phase = 0.0
+        self._last_reduced_level_at = float("-inf")
+        self._application = Gtk.Application(
+            application_id="io.murmly.RecordingOverlay",
+            flags=Gio.ApplicationFlags.NON_UNIQUE,
+        )
+        self._application.connect("activate", self._activate)
+
+    def run(self) -> int:
+        return int(self._application.run([]))
+
+    def _activate(self, application: Any) -> None:
+        window = self._Gtk.ApplicationWindow(application=application)
+        window.set_decorated(False)
+        window.set_resizable(False)
+        window.set_focusable(False)
+        window.set_default_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+        window.add_css_class("murmly-overlay")
+        if self._layer_shell is not None:
+            self._layer_shell.init_for_window(window)
+            self._layer_shell.set_layer(window, self._layer_shell.Layer.OVERLAY)
+            self._layer_shell.set_anchor(window, self._layer_shell.Edge.BOTTOM, True)
+            self._layer_shell.set_margin(window, self._layer_shell.Edge.BOTTOM, self._bottom_margin_px)
+            self._layer_shell.set_keyboard_mode(window, self._layer_shell.KeyboardMode.NONE)
+
+        css = self._Gtk.CssProvider()
+        css.load_from_string("window.murmly-overlay { background: transparent; box-shadow: none; }")
+        self._Gtk.StyleContext.add_provider_for_display(
+            window.get_display(),
+            css,
+            self._Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        drawing_area = self._Gtk.DrawingArea()
+        drawing_area.set_size_request(WINDOW_WIDTH, WINDOW_HEIGHT)
+        drawing_area.set_can_target(False)
+        drawing_area.set_draw_func(self._draw)
+        window.set_child(drawing_area)
+        window.connect("realize", self._on_realize)
+        window.connect("map", self._on_map)
+        self._window = window
+        self._drawing_area = drawing_area
+
+        threading.Thread(target=self._read_messages, name="murmly-overlay-reader", daemon=True).start()
+        self._GLib.timeout_add(33, self._animate)
+
+    def _read_messages(self) -> None:
+        parser = MessageParser()
+        try:
+            while data := self._socket.recv(4_096):
+                for message in parser.feed(data):
+                    self._GLib.idle_add(self._handle_message, message)
+        except OSError:
+            pass
+        self._GLib.idle_add(self._application.quit)
+
+    def _handle_message(self, message: dict[str, object]) -> bool:
+        if message["type"] == "level" and self._reduced_motion:
+            now = time.monotonic()
+            if now - self._last_reduced_level_at < 0.25:
+                return False
+            self._last_reduced_level_at = now
+
+        stop = self._view.apply(message)
+        if stop:
+            self._application.quit()
+            return False
+        if message["type"] == "error":
+            generation = self._view.error_generation
+            self._GLib.timeout_add(
+                int(message["duration_ms"]),
+                self._hide_error,
+                generation,
+            )
+        self._sync_visibility()
+        if self._drawing_area is not None:
+            self._drawing_area.queue_draw()
+        return False
+
+    def _sync_visibility(self) -> None:
+        if self._window is None:
+            return
+        if self._view.visible:
+            if self._selected_monitor is None:
+                selection = self._select_monitor()
+                if selection is not None:
+                    self._selected_monitor, self._selected_geometry = selection
+                if self._selected_monitor is not None and self._layer_shell is not None:
+                    self._layer_shell.set_monitor(self._window, self._selected_monitor)
+            if self._backend == "x11":
+                self._window.set_visible(True)
+            else:
+                self._window.present()
+        else:
+            self._window.set_visible(False)
+            self._selected_monitor = None
+            self._selected_geometry = None
+
+    def _select_monitor(self) -> tuple[object, MonitorGeometry] | None:
+        display = self._window.get_display()
+        model = display.get_monitors()
+        monitors = [model.get_item(index) for index in range(model.get_n_items())]
+        geometries = []
+        for monitor in monitors:
+            geometry = monitor.get_geometry()
+            geometries.append(
+                MonitorGeometry(
+                    connector=monitor.get_connector() or "",
+                    x=geometry.x,
+                    y=geometry.y,
+                    width=geometry.width,
+                    height=geometry.height,
+                    scale=monitor.get_scale_factor(),
+                )
+            )
+        selected_index = select_monitor_index(geometries)
+        if selected_index is None:
+            return None
+        return monitors[selected_index], geometries[selected_index]
+
+    def _on_realize(self, window: Any) -> None:
+        try:
+            surface = window.get_surface()
+            if surface is not None:
+                surface.set_input_region(self._cairo.Region())
+            if (
+                self._x11_adapter is not None
+                and self._GdkX11 is not None
+                and surface is not None
+                and self._selected_geometry is not None
+            ):
+                xid = x11_surface_id(self._GdkX11, surface)
+                self._x11_adapter.prepare(xid, self._selected_geometry, self._bottom_margin_px)
+        except Exception as error:
+            self._fail_visual("setup", error)
+
+    def _on_map(self, window: Any) -> None:
+        try:
+            surface = window.get_surface()
+            if (
+                self._x11_adapter is not None
+                and self._GdkX11 is not None
+                and surface is not None
+                and self._selected_geometry is not None
+            ):
+                xid = x11_surface_id(self._GdkX11, surface)
+                self._x11_adapter.activate(xid, self._selected_geometry, self._bottom_margin_px)
+        except Exception as error:
+            self._fail_visual("activation", error)
+
+    def _fail_visual(self, operation: str, error: Exception) -> None:
+        print(f"Error: X11 overlay {operation} failed: {error}", file=sys.stderr)
+        if self._window is not None:
+            self._window.set_visible(False)
+        self._application.quit()
+
+    def _hide_error(self, generation: int) -> bool:
+        if self._view.state == "ERROR" and self._view.error_generation == generation:
+            self._view.state = "IDLE"
+            self._sync_visibility()
+        return False
+
+    def _animate(self) -> bool:
+        if self._view.state == "THINKING" and not self._reduced_motion:
+            self._phase = (self._phase + 0.16) % (2 * math.pi)
+            if self._drawing_area is not None:
+                self._drawing_area.queue_draw()
+        return True
+
+    def _draw(self, _area: Any, context: Any, width: int, height: int) -> None:
+        context.set_operator(self._cairo.OPERATOR_SOURCE)
+        context.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+        context.paint()
+        context.set_operator(self._cairo.OPERATOR_OVER)
+        self._rounded_rectangle(context, 0.5, 0.5, width - 1.0, height - 1.0, 8.0)
+        context.set_source_rgba(0.07, 0.08, 0.09, 0.92)
+        context.fill()
+
+        if self._view.state == "ERROR":
+            self._draw_error(context)
+            return
+        self._draw_microphone(context, active=self._view.state == "LISTENING")
+        if self._view.state == "THINKING" and self._reduced_motion:
+            self._draw_static_processing(context)
+        else:
+            self._draw_bars(context)
+
+    def _draw_microphone(self, context: Any, *, active: bool) -> None:
+        if active:
+            context.set_source_rgb(1.0, 0.27, 0.29)
+        else:
+            context.set_source_rgb(0.88, 0.9, 0.92)
+        context.set_line_width(2.2)
+        context.arc(25.0, 20.0, 5.0, math.pi, 0.0)
+        context.line_to(30.0, 23.0)
+        context.arc(25.0, 23.0, 5.0, 0.0, math.pi)
+        context.close_path()
+        context.stroke()
+        context.arc(25.0, 23.0, 9.0, 0.0, math.pi)
+        context.stroke()
+        context.move_to(25.0, 32.0)
+        context.line_to(25.0, 36.0)
+        context.move_to(20.0, 36.0)
+        context.line_to(30.0, 36.0)
+        context.stroke()
+
+    def _draw_bars(self, context: Any) -> None:
+        context.set_source_rgb(0.9, 0.92, 0.94)
+        multipliers = (0.5, 0.72, 0.9, 1.0, 0.82, 0.65, 0.45)
+        for index, multiplier in enumerate(multipliers):
+            if self._view.state == "THINKING":
+                amplitude = (math.sin(self._phase + index * 0.75) + 1.0) / 2.0
+            elif self._view.state == "LISTENING":
+                amplitude = self._view.level * multiplier
+            else:
+                amplitude = 0.0
+            if self._reduced_motion and self._view.state == "LISTENING":
+                amplitude = round(amplitude * 3.0) / 3.0
+            bar_height = 4.0 + amplitude * 22.0
+            x = 53.0 + index * 13.0
+            y = (WINDOW_HEIGHT - bar_height) / 2.0
+            self._rounded_rectangle(context, x, y, 6.0, bar_height, 3.0)
+            context.fill()
+
+    def _draw_static_processing(self, context: Any) -> None:
+        context.set_source_rgb(0.9, 0.92, 0.94)
+        for index in range(3):
+            context.arc(76.0 + index * 18.0, 24.0, 3.0, 0.0, 2 * math.pi)
+            context.fill()
+
+    def _draw_error(self, context: Any) -> None:
+        context.set_source_rgb(1.0, 0.3, 0.3)
+        context.set_line_width(3.0)
+        context.arc(WINDOW_WIDTH / 2.0, 24.0, 12.0, 0.0, 2 * math.pi)
+        context.stroke()
+        context.move_to(WINDOW_WIDTH / 2.0, 16.0)
+        context.line_to(WINDOW_WIDTH / 2.0, 26.0)
+        context.stroke()
+        context.arc(WINDOW_WIDTH / 2.0, 31.0, 1.5, 0.0, 2 * math.pi)
+        context.fill()
+
+    @staticmethod
+    def _rounded_rectangle(context: Any, x: float, y: float, width: float, height: float, radius: float) -> None:
+        radius = min(radius, width / 2.0, height / 2.0)
+        context.new_sub_path()
+        context.arc(x + width - radius, y + radius, radius, -math.pi / 2.0, 0.0)
+        context.arc(x + width - radius, y + height - radius, radius, 0.0, math.pi / 2.0)
+        context.arc(x + radius, y + height - radius, radius, math.pi / 2.0, math.pi)
+        context.arc(x + radius, y + radius, radius, math.pi, 3.0 * math.pi / 2.0)
+        context.close_path()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Render the Murmly recording overlay.")
+    parser.add_argument("--check", action="store_true", help="Check visual runtime dependencies.")
+    parser.add_argument("--fd", type=int, default=None, help="Inherited overlay protocol socket.")
+    parser.add_argument("--bottom-margin-px", type=int, default=32)
+    parser.add_argument("--reduced-motion", action="store_true")
+    parser.add_argument("--backend", choices=sorted(SUPPORTED_BACKENDS), default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    backend = args.backend or os.environ.get("XDG_SESSION_TYPE", "").casefold()
+    if args.check:
+        result = check_visual_runtime(backend)
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["available"] else 1
+    if args.fd is None:
+        print("Error: --fd is required unless --check is used.", file=sys.stderr)
+        return 2
+    if backend not in SUPPORTED_BACKENDS:
+        print("Error: --backend must select x11 or wayland.", file=sys.stderr)
+        return 2
+    if not 0 <= args.bottom_margin_px <= 512:
+        print("Error: --bottom-margin-px must be between 0 and 512.", file=sys.stderr)
+        return 2
+    try:
+        return OverlayApplication(args.fd, args.bottom_margin_px, args.reduced_motion, backend).run()
+    except (ImportError, OSError, ValueError) as error:
+        print(f"Error: overlay runtime unavailable: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
