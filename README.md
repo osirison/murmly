@@ -5,164 +5,127 @@ description: Fedora-first local voice-to-text daemon for Linux desktops
 
 ## Overview
 
-`murmly` is a Fedora-first, local voice-to-text tool for Linux desktops. It is designed around Wayland defaults: instead of trying to grab a global hotkey directly, the daemon listens on a per-user UNIX socket and the desktop environment shortcut calls `murmly toggle`.
+`murmly` is a Fedora-first, local voice-to-text tool for Linux desktops. Press a
+hotkey, speak, press it again: the transcript is typed into whatever you were
+working in. Everything runs locally.
 
-## Implemented shape
+It is built around Wayland's refusal to hand out global hotkeys. Rather than
+grabbing a key itself, `murmly` runs a small daemon on a per-user UNIX socket
+and lets the desktop's own shortcut system call `murmly toggle`.
 
-- `murmly daemon` starts a UNIX socket server at `/run/user/$UID/murmly.sock` (or `$XDG_RUNTIME_DIR/murmly.sock`).
-- `murmly toggle` sends a socket message that moves the daemon from `IDLE -> LISTENING -> THINKING -> DONE -> IDLE`.
-- `murmly spike` records a short clip from the default microphone with `sounddevice`, transcribes it with `faster-whisper`, prints the text, and copies it to the clipboard.
-- Clipboard and paste integration is Fedora/Wayland-aware:
-  - Wayland clipboard: `wl-copy`
-  - X11 clipboard fallback: `xclip`
-  - Wayland paste injection: `wtype`, then `ydotool`
-  - X11 paste fallback: `xdotool`
-- `contrib/murmly.service` provides a user-systemd service template.
-
-## Runtime dependencies
-
-`uv sync` or `pip install -e .` installs the Python runtime dependencies. For
-GPU-accelerated balanced and accurate profiles, install the CUDA runtime extra:
-
-```bash
-uv sync --extra cuda
-uv run --extra cuda murmly doctor
-```
-
-Install these desktop tools separately:
+## Requirements
 
 - Python 3.12+
-- `wl-clipboard` on Wayland (`wl-copy`, `wl-paste`)
-- `wtype` or `ydotool` for Wayland paste simulation
-- `xclip` and `xdotool` on X11; `wl-copy` cannot access an X11 clipboard
+- KDE Plasma, for the hotkey and the recording overlay
+- Clipboard and paste tools for your session:
+  - Wayland: `wl-clipboard` plus `wtype` or `ydotool`
+  - X11: `xclip` and `xdotool`
 
-For the recording overlay on Fedora KDE Plasma, install the shared native
-visual runtime:
+For the recording overlay:
 
 ```bash
 sudo dnf install gtk4 python3-gobject libX11 libXext
+sudo dnf install gtk4-layer-shell   # Plasma Wayland only
 ```
 
-Plasma Wayland also requires Layer Shell:
-
-```bash
-sudo dnf install gtk4-layer-shell
-```
-
-The daemon runs from the project's isolated `uv` environment. The overlay is a
-separate helper launched with `/usr/bin/python3` so it can use Fedora's tested
-PyGObject and GTK introspection packages without compiling duplicate bindings
+The overlay runs as a separate helper under `/usr/bin/python3` so it can use
+Fedora's tested PyGObject and GTK packages instead of compiling duplicates
 inside the virtual environment. Missing visual packages disable only the
 overlay; recording, transcription, clipboard, and paste handling continue.
 
-## Quick start
+## Install
 
 ```bash
 uv sync
+uv run murmly install Meta+X
+```
+
+That is the whole installation. It:
+
+- writes a systemd user service that starts `murmly` with your graphical
+  session and stops it at logout,
+- registers `Meta+X` as a global hotkey, taking effect immediately, and
+- refuses, naming the current owner, if that hotkey already belongs to another
+  application.
+
+For the GPU-backed runtime, sync the CUDA extra first so the same environment
+carries it:
+
+```bash
+uv sync --extra cuda
+uv run --extra cuda murmly install Meta+X
+```
+
+Check everything was detected correctly:
+
+```bash
 uv run murmly doctor
 ```
 
-`uv run murmly <command>` works from the repository without activating `.venv`. To use the bare `murmly` command in the current shell, activate the environment first:
+### Choosing a hotkey
+
+A hotkey needs at least one modifier: `Meta`, `Ctrl`, `Alt`, or `Shift`.
+`Super` and `Win` are accepted as aliases for `Meta`. Keys may be `A`-`Z`,
+`0`-`9`, `F1`-`F35`, or a named key such as `Space`, `End`, or `Escape`.
+
+Pick something free. `Meta+V` is Plasma's clipboard history, for example.
+Murmly checks before binding and tells you who owns a key it will not take.
+
+### What installation writes
+
+| Path | Purpose |
+| --- | --- |
+| `~/.config/systemd/user/murmly.service` | starts the daemon with your session |
+| `~/.local/share/applications/net.local.murmly.desktop` | carries the hotkey |
+
+Nothing else. Murmly never edits your global shortcut configuration, and
+`murmly uninstall` removes both files.
+
+## Use it
+
+1. Press your hotkey. The overlay appears at the bottom of the screen and its
+   bars follow your voice.
+2. Speak.
+3. Press the hotkey again. Murmly transcribes, copies, and pastes into the
+   window you started in.
+
+Registration is confirmed at install time, but only a keypress proves the
+desktop actually delivers the key — so press it once after installing.
+
+## Change or remove the hotkey
+
+Rebind by installing again with a different key:
 
 ```bash
-. .venv/bin/activate
-murmly doctor
+uv run murmly install Meta+Shift+Space
 ```
 
-## How to run it
-
-1. Install the project dependencies and create the local environment:
-
-   ```bash
-   uv sync
-   ```
-
-2. Check that the desktop environment, clipboard tools, and model configuration are detected correctly:
-
-   ```bash
-   uv run murmly doctor
-   ```
-
-3. Start the background daemon that listens for toggle requests:
-
-   ```bash
-   uv run murmly daemon
-   ```
-
-4. Ask the daemon to start or stop capture from a desktop shortcut or shell:
-
-   ```bash
-   uv run murmly toggle
-   ```
-
-   If you installed the CUDA extra and want the GPU-backed runtime to be used for the active transcription session, run the same toggle through the CUDA-enabled environment:
-
-   ```bash
-   uv run --extra cuda murmly toggle
-   ```
-
-   The daemon cycles through `IDLE -> LISTENING -> THINKING -> DONE -> IDLE` and writes socket state updates for the active desktop environment.
-
-      On KDE Plasma X11 or Wayland, the overlay appears at the bottom center after the
-      microphone opens successfully. Its seven bars follow the smoothed live
-      microphone level while listening, switch to a processing animation during
-      transcription and paste handling, and disappear on success. Capture or
-      processing failures show a brief error symbol without exposing audio or
-      transcript content.
-
-5. Check the current daemon state:
-
-   ```bash
-   uv run murmly status
-   ```
-
-6. Run a one-off recording test without a daemon:
-
-   ```bash
-   uv run murmly spike --seconds 5
-   ```
-
-   Add `--paste` to copy the transcription and inject it into the active input field.
-
-7. For GNOME or KDE shortcuts, point the hotkey to the venv entrypoint:
-
-   ```bash
-   /path/to/murmly/.venv/bin/murmly toggle
-   ```
-
-### Fedora-first spike
+Remove everything:
 
 ```bash
-uv run murmly spike --seconds 5
+uv run murmly uninstall
 ```
 
-This first requests 16kHz mono PCM from the default microphone, transcribes it with the balanced profile (`base.en`, `int8`, CPU), prints the result, and copies it to the clipboard. If the selected input does not support 16kHz, `murmly` retries a usable physical microphone at its native rate and lets `faster-whisper` resample the correctly labeled WAV during decoding.
+If you move the project directory or rebuild its environment, the recorded path
+goes stale. Run `murmly install <hotkey>` again from the new location to repair
+it; `murmly doctor` shows the path currently recorded.
 
-### Daemon and DE shortcut flow
+## Scope and limitations
 
-Start the daemon:
-
-```bash
-uv run murmly daemon
-```
-
-Then bind a GNOME or KDE shortcut to either of these commands:
-
-```bash
-/path/to/murmly/.venv/bin/murmly toggle
-```
-
-or, when using the CUDA-enabled environment:
-
-```bash
-uv run --extra cuda murmly toggle
-```
-
-Press once to begin capture, then press again to stop, transcribe, copy, and paste.
+- **Hotkey registration is KDE Plasma only.** On other desktops `murmly install`
+  still installs the service and prints the command to bind manually.
+- **Verified on X11.** Plasma Wayland uses the same registration path but a
+  different key-grab mechanism, and has not been verified end-to-end. Murmly
+  says so during installation and checks whether the binding took effect.
+- **The daemon runs for the whole session.** From the first toggle it keeps the
+  transcription model in memory — roughly 1.6 GB for the balanced profile, in
+  VRAM when running on CUDA — until you log out. Set a smaller
+  `stt.model_profile` if that matters on your machine.
 
 ## Configuration
 
-Configuration lives at `~/.config/murmly/config.toml` (or `$XDG_CONFIG_HOME/murmly/config.toml`).
+Configuration lives at `~/.config/murmly/config.toml` (or
+`$XDG_CONFIG_HOME/murmly/config.toml`).
 
 ```toml
 [daemon]
@@ -191,34 +154,23 @@ bottom_margin_px = 32 # Logical pixels from the display's bottom edge, 0-512
 reduced_motion = false
 ```
 
-The recording overlay supports KDE Plasma on X11 and Wayland. It uses X11 EWMH
-window state plus the X Shape extension on X11, and Layer Shell on Wayland. Both
-backends display the same fixed 156 by 48 logical-pixel surface, do not request
-keyboard focus, and do not receive pointer input. On multiple displays, Murmly
-selects the display containing the desktop origin and keeps that selection for
-the recording session. Reduced motion uses stable state symbols and stepped
-level feedback instead of continuous animation.
-
 Profile mapping:
 
 - `fast` -> `tiny.en`
 - `balanced` -> `large-v3-turbo`
 - `accurate` -> `large-v3`
 
-With `device = "auto"`, Murmly uses CUDA `float16` when a compatible GPU and
-the CUDA extra are available. It falls back to CPU `int8` otherwise. The first
-use of a profile downloads its model; later daemon sessions reuse the local
-model cache. The tested CUDA runtime wheels use about 1.4 GB of downloads, and
-the cached `large-v3-turbo` model uses about 1.6 GB. Include `--extra cuda` in
-`uv run` commands, or invoke `.venv/bin/murmly` after syncing the extra. The
-balanced model revision is pinned for reproducible downloads.
+With `device = "auto"`, Murmly uses CUDA `float16` when a compatible GPU and the
+CUDA extra are available, and falls back to CPU `int8` otherwise. The first use
+of a profile downloads its model; later sessions reuse the local cache. The
+tested CUDA runtime wheels are about 1.4 GB and the cached `large-v3-turbo`
+model about 1.6 GB. The balanced model revision is pinned for reproducible
+downloads.
 
-## Development
-
-Run the focused stdlib test suite with:
+Restart the service after changing configuration:
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
+systemctl --user restart murmly.service
 ```
 
 ## Transcript delivery
@@ -256,17 +208,7 @@ applications:
 | X11 without EWMH | no | yes |
 | Wayland | no | yes |
 
-`murmly doctor` reports which applies under `delivery`:
-
-```json
-"delivery": {
-  "verification_supported": true,
-  "verification_enabled": true,
-  "restore_clipboard": true,
-  "restore_delay_ms": 500,
-  "detail": "Delivery target verification is supported and enabled."
-}
-```
+`murmly doctor` reports which applies under `delivery`.
 
 ### Restoring your previous clipboard
 
@@ -281,50 +223,88 @@ Raise `restore_delay_ms` if a slow application ever pastes your previous
 clipboard instead of the transcript. Values outside 0-5000 fall back to 500. Set
 `restore = false` to keep the transcript on the clipboard and never restore.
 
-### Behavior change and rollback
-
-Murmly previously pasted unconditionally. If you relied on changing focus during
-transcription to redirect a paste, that now refuses instead; paste manually from
-the clipboard, or turn verification off:
+To paste unconditionally, as Murmly did before target verification existed:
 
 ```toml
 [clipboard]
 verify_target = false
 ```
 
-Restart the daemon afterwards. With verification off, Murmly pastes into whatever
-holds focus, exactly as before, and still bounds the clipboard restore.
+## The recording overlay
 
-## Overlay troubleshooting
+The overlay supports KDE Plasma on X11 and Wayland. It uses X11 EWMH window
+state plus the X Shape extension on X11, and Layer Shell on Wayland. Both
+backends display the same fixed 156 by 48 logical-pixel surface, do not request
+keyboard focus, and do not receive pointer input. On multiple displays, Murmly
+selects the display containing the desktop origin and keeps that selection for
+the recording session. Reduced motion uses stable state symbols and stepped
+level feedback instead of continuous animation.
 
-Inspect the same system-Python imports used by the renderer:
+Set `overlay.enabled = false` and restart the service to turn it off without
+changing voice-to-text behavior.
+
+## Troubleshooting
+
+Start with the diagnostics, which report the session, clipboard tools, model
+runtime, delivery verification, overlay, and installation state:
 
 ```bash
 uv run murmly doctor
-/usr/bin/python3 src/murmly/overlay_renderer.py --check
 ```
 
-The helper infers `x11` or `wayland` from `XDG_SESSION_TYPE`. To inspect another
-backend explicitly, add `--backend x11` or `--backend wayland`. The doctor report
-shows GDK X11 and native X11 availability for X11 sessions, or GTK4 Layer Shell
-availability for Wayland sessions.
-
-When the daemon runs as a user service, inspect renderer launch failures in the
-user journal:
+Service logs:
 
 ```bash
+systemctl --user status murmly.service
 journalctl --user -u murmly.service -b
 ```
 
-Confirm that the service receives the active Plasma session environment after
-login. Restart it after installing visual packages or changing configuration:
+**The hotkey does nothing.** Check `installation.hotkey_held` in `murmly doctor`.
+If another application holds the key, it will be named there. Pressing the hotkey
+also starts the service if it is installed but not running, so a hotkey that does
+nothing at all usually means the binding, not the daemon.
+
+**Overlay problems.** Inspect the same system-Python imports the renderer uses:
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user restart murmly.service
+/usr/bin/python3 src/murmly/overlay_renderer.py --check
 ```
 
-To disable or roll back the visual surface without changing voice-to-text
-behavior, set `overlay.enabled = false` and restart the daemon. If the overlay
-is unavailable or exits during recording, use the second shortcut press as
-normal; Murmly still stops capture and processes the buffered audio.
+Add `--backend x11` or `--backend wayland` to inspect a specific backend. Restart
+the service after installing visual packages.
+
+**Silent recordings on Intel SOF hardware.** See
+[docs/agent-notes/murmly-spike-sof-dmic.md](docs/agent-notes/murmly-spike-sof-dmic.md).
+
+## Development
+
+Run commands against the project environment without installing anything:
+
+```bash
+uv run murmly doctor
+uv run murmly daemon          # run the daemon in the foreground
+uv run murmly toggle          # drive it from another shell
+uv run murmly status
+uv run murmly spike --seconds 5   # one-off recording, no daemon
+```
+
+Add `--extra cuda` to any of these to use the GPU-backed runtime, or activate
+the environment and use the bare command:
+
+```bash
+. .venv/bin/activate
+murmly doctor
+```
+
+Run the test suite:
+
+```bash
+uv run --extra cuda python -m unittest discover -s tests
+```
+
+The suite is stdlib `unittest` with no external test dependencies. Tests that
+need a live desktop session skip themselves when it is unavailable.
+
+Behavioral changes are planned with OpenSpec; see `openspec/specs/` for the
+current capability baseline. Operational preconditions that are not documented
+elsewhere live in [docs/agent-notes/](docs/agent-notes/).
