@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -317,3 +317,302 @@ class CliTests(unittest.TestCase):
             stdout=json.dumps(report),
             stderr="",
         )
+
+class StubService:
+    """A stand-in for the installed systemd user unit."""
+
+    def __init__(self, installed: bool = True, on_start=None) -> None:
+        self.is_installed = installed
+        self.starts = 0
+        self._on_start = on_start
+
+    def start(self) -> bool:
+        self.starts += 1
+        if self._on_start is not None:
+            self._on_start()
+        return True
+
+
+class CountingSender:
+    """Counts send_command attempts and replays scripted outcomes."""
+
+    def __init__(self, outcomes) -> None:
+        self._outcomes = list(outcomes)
+        self.attempts = 0
+
+    def __call__(self, _socket_path, command):
+        self.attempts += 1
+        outcome = self._outcomes.pop(0) if self._outcomes else self._outcomes
+        if isinstance(outcome, Exception):
+            raise outcome
+        return {"ok": True, "state": "LISTENING", "command": command}
+
+
+class ToggleRecoveryTests(unittest.TestCase):
+    def _config(self, socket_path: Path) -> MurmlyConfig:
+        return MurmlyConfig(socket_path=socket_path, config_path=Path("/tmp/config.toml"))
+
+    def test_running_daemon_is_used_without_touching_the_service(self) -> None:
+        from murmly.cli import send_command_with_recovery
+
+        service = StubService()
+        sender = CountingSender([None])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir) / "murmly.sock")
+            with patch("murmly.cli.send_command", sender):
+                response = send_command_with_recovery(config, "toggle", service=service)
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(1, sender.attempts)
+        self.assertEqual(0, service.starts, "a healthy daemon must not be restarted")
+
+    def test_installed_but_not_listening_starts_the_service_and_retries_once(self) -> None:
+        from murmly.cli import send_command_with_recovery
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            config = self._config(socket_path)
+
+            def create_socket() -> None:
+                socket_path.write_text("", encoding="utf-8")
+
+            service = StubService(installed=True, on_start=create_socket)
+            sender = CountingSender([FileNotFoundError("no socket"), None])
+
+            with patch("murmly.cli.send_command", sender):
+                response = send_command_with_recovery(
+                    config, "toggle", service=service, sleep=lambda _s: None
+                )
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(1, service.starts)
+        self.assertEqual(2, sender.attempts, "exactly one retry after the initial attempt")
+
+    def test_not_installed_names_the_install_command(self) -> None:
+        from murmly.cli import DaemonUnavailableError, send_command_with_recovery
+
+        service = StubService(installed=False)
+        sender = CountingSender([FileNotFoundError("no socket")])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir) / "murmly.sock")
+            with patch("murmly.cli.send_command", sender):
+                with self.assertRaises(DaemonUnavailableError) as raised:
+                    send_command_with_recovery(config, "toggle", service=service)
+
+        self.assertIn("murmly install", str(raised.exception))
+        self.assertEqual(0, service.starts)
+        self.assertEqual(1, sender.attempts, "no retry when nothing can be started")
+
+    def test_service_that_never_comes_up_fails_within_the_bound(self) -> None:
+        from murmly.cli import DaemonUnavailableError, send_command_with_recovery
+
+        service = StubService(installed=True)
+        sender = CountingSender([FileNotFoundError("no socket")])
+        ticks = iter([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir) / "murmly.sock")
+            with patch("murmly.cli.send_command", sender):
+                with self.assertRaises(DaemonUnavailableError) as raised:
+                    send_command_with_recovery(
+                        config,
+                        "toggle",
+                        service=service,
+                        sleep=lambda _s: None,
+                        clock=lambda: next(ticks),
+                        timeout=1.0,
+                    )
+
+        self.assertIn("did not start", str(raised.exception))
+        self.assertEqual(1, service.starts)
+        self.assertEqual(1, sender.attempts, "the command is not retried when the socket never appears")
+
+    def test_daemon_that_starts_but_refuses_the_command_is_reported(self) -> None:
+        from murmly.cli import DaemonUnavailableError, send_command_with_recovery
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            config = self._config(socket_path)
+            socket_path.write_text("", encoding="utf-8")
+            service = StubService(installed=True)
+            sender = CountingSender([ConnectionRefusedError("refused"), ConnectionRefusedError("refused")])
+
+            with patch("murmly.cli.send_command", sender):
+                with self.assertRaises(DaemonUnavailableError) as raised:
+                    send_command_with_recovery(config, "toggle", service=service, sleep=lambda _s: None)
+
+        self.assertIn("did not accept", str(raised.exception))
+        self.assertEqual(2, sender.attempts)
+
+    def test_client_command_reports_the_failure_without_a_traceback(self) -> None:
+        from murmly.cli import _run_client_command
+
+        service = StubService(installed=False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir) / "murmly.sock")
+            with (
+                patch("murmly.cli.send_command", CountingSender([FileNotFoundError("no socket")])),
+                patch("murmly.cli.UserService", return_value=service),
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = _run_client_command(config, "toggle")
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("murmly install", errors.getvalue())
+
+
+class InstallCommandTests(unittest.TestCase):
+    def test_rejects_an_unparseable_hotkey_before_touching_anything(self) -> None:
+        from murmly.cli import _run_install
+
+        with (
+            patch("murmly.cli.Installer") as installer,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            exit_code = _run_install("Meta+Frobnicate")
+
+        self.assertEqual(2, exit_code)
+        self.assertIn("Frobnicate", errors.getvalue())
+        installer.assert_not_called()
+
+    def test_prints_outcome_messages_on_success(self) -> None:
+        from murmly.cli import _run_install
+        from murmly.installer import InstallOutcome
+
+        outcome = InstallOutcome(
+            entrypoint=Path("/bin/murmly"),
+            hotkey=None,
+            service_installed=True,
+            hotkey_registered=True,
+            already_bound=False,
+            session_supported=True,
+            session_verified=True,
+            user_override=None,
+            messages=("Registered Meta+X.", "Press it once to confirm."),
+        )
+        with (
+            patch("murmly.cli.Installer") as installer,
+            redirect_stdout(StringIO()) as output,
+        ):
+            installer.return_value.install.return_value = outcome
+            exit_code = _run_install("Meta+X")
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("Registered Meta+X.", output.getvalue())
+
+    def test_conflict_exits_non_zero_naming_the_owner(self) -> None:
+        from murmly.cli import _run_install
+        from murmly.installer import HotkeyConflictError
+
+        with (
+            patch("murmly.cli.Installer") as installer,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            installer.return_value.install.side_effect = HotkeyConflictError("Meta+X is used by Klipper.")
+            exit_code = _run_install("Meta+X")
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("Klipper", errors.getvalue())
+
+    def test_unconfirmed_binding_reports_next_login_and_fails(self) -> None:
+        from murmly.cli import _run_install
+        from murmly.installer import HotkeyNotConfirmedError
+
+        with (
+            patch("murmly.cli.Installer") as installer,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            installer.return_value.install.side_effect = HotkeyNotConfirmedError("timed out")
+            exit_code = _run_install("Meta+X")
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("next login", errors.getvalue())
+        self.assertIn("not active in this session", errors.getvalue())
+
+
+class UninstallCommandTests(unittest.TestCase):
+    def test_prints_what_was_removed(self) -> None:
+        from murmly.cli import _run_uninstall
+        from murmly.installer import InstallOutcome
+
+        outcome = InstallOutcome(
+            entrypoint=None,
+            hotkey=None,
+            service_installed=False,
+            hotkey_registered=False,
+            already_bound=False,
+            session_supported=True,
+            session_verified=True,
+            user_override=None,
+            messages=("Removed the Murmly service.", "Released the Murmly hotkey."),
+        )
+        with (
+            patch("murmly.cli.Installer") as installer,
+            redirect_stdout(StringIO()) as output,
+        ):
+            installer.return_value.uninstall.return_value = outcome
+            exit_code = _run_uninstall()
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("Removed the Murmly service.", output.getvalue())
+
+    def test_reports_a_failure_without_a_traceback(self) -> None:
+        from murmly.cli import _run_uninstall
+        from murmly.installer import InstallError
+
+        with (
+            patch("murmly.cli.Installer") as installer,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            installer.return_value.uninstall.side_effect = InstallError("systemctl unavailable")
+            exit_code = _run_uninstall()
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("systemctl unavailable", errors.getvalue())
+
+
+class InstallationDiagnosticsTests(unittest.TestCase):
+    def test_reports_the_installer_status(self) -> None:
+        from murmly.cli import installation_diagnostics
+
+        class Stub:
+            def status(self):
+                return {"installed": True, "hotkey": "Meta+X", "hotkey_held": True}
+
+        report = installation_diagnostics(Stub())
+
+        self.assertTrue(report["installed"])
+        self.assertEqual("Meta+X", report["hotkey"])
+
+    def test_never_raises_when_the_desktop_is_unreachable(self) -> None:
+        from murmly.cli import installation_diagnostics
+
+        class Broken:
+            def status(self):
+                raise RuntimeError("bus is down")
+
+        report = installation_diagnostics(Broken())
+
+        self.assertFalse(report["installed"])
+        self.assertIn("bus is down", report["detail"])
+
+    def test_doctor_includes_the_installation_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch("murmly.cli.choose_paste_command", return_value=["xdotool"]),
+                patch(
+                    "murmly.cli.installation_diagnostics",
+                    return_value={"installed": False, "detail": "not installed"},
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIn("installation", report)
+        self.assertFalse(report["installation"]["installed"])

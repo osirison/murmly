@@ -108,10 +108,15 @@ def encode_overlay_message(message: dict[str, object]) -> bytes:
     return encoded
 
 
-def detect_overlay_backend(environment: dict[str, str] | None = None) -> OverlayBackend | None:
+def is_plasma_desktop(environment: dict[str, str] | None = None) -> bool:
     source = environment if environment is not None else os.environ
     desktop = f"{source.get('XDG_CURRENT_DESKTOP', '')}:{source.get('XDG_SESSION_DESKTOP', '')}"
-    if not any(name in desktop.casefold() for name in ("kde", "plasma")):
+    return any(name in desktop.casefold() for name in ("kde", "plasma"))
+
+
+def detect_overlay_backend(environment: dict[str, str] | None = None) -> OverlayBackend | None:
+    source = environment if environment is not None else os.environ
+    if not is_plasma_desktop(source):
         return None
     session_type = source.get("XDG_SESSION_TYPE", "").casefold()
     if session_type == "wayland":

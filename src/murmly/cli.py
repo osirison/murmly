@@ -5,13 +5,22 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 
 from murmly.audio import SoundDeviceRecorder
 from murmly.config import MurmlyConfig, load_config
 from murmly.daemon import MurmlyDaemon, send_command
+from murmly.hotkey import HotkeyError, parse_hotkey
+from murmly.installer import (
+    HotkeyNotConfirmedError,
+    InstallError,
+    Installer,
+    UserService,
+)
 from murmly.integrations import (
     ClipboardPaster,
     MissingToolError,
@@ -26,6 +35,17 @@ from murmly.stt import FasterWhisperTranscriber
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 
+DAEMON_START_TIMEOUT_SECONDS = 10.0
+DAEMON_POLL_INTERVAL_SECONDS = 0.1
+
+
+class DaemonUnavailableError(RuntimeError):
+    """The daemon is not accepting commands and could not be brought up.
+
+    A hotkey has no visible output channel, so this is raised and reported as a
+    single line rather than allowed to surface as a traceback.
+    """
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local voice-to-text for Fedora-first Linux desktops.")
@@ -36,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("daemon", help="Run the UNIX socket daemon.")
     subparsers.add_parser("toggle", help="Toggle capture via the running daemon.")
     subparsers.add_parser("status", help="Query the daemon state.")
+
+    install = subparsers.add_parser(
+        "install",
+        help="Install the session service and bind a hotkey.",
+    )
+    install.add_argument(
+        "hotkey",
+        help="Hotkey to bind, such as Meta+X. Requires at least one modifier.",
+    )
+    subparsers.add_parser("uninstall", help="Remove the session service and release the hotkey.")
 
     spike = subparsers.add_parser("spike", help="Record a short clip, transcribe it, print it, and copy it.")
     spike.add_argument("--seconds", type=float, default=5.0, help="How long to record before transcribing.")
@@ -52,12 +82,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "daemon":
         return _run_daemon(config)
-    if args.command == "toggle":
-        print(json.dumps(send_command(str(config.socket_path), "toggle"), indent=2))
-        return 0
-    if args.command == "status":
-        print(json.dumps(send_command(str(config.socket_path), "status"), indent=2))
-        return 0
+    if args.command in {"toggle", "status"}:
+        return _run_client_command(config, args.command)
+    if args.command == "install":
+        return _run_install(args.hotkey)
+    if args.command == "uninstall":
+        return _run_uninstall()
     if args.command == "spike":
         return _run_spike(config, args.seconds, args.paste)
     if args.command == "doctor":
@@ -65,6 +95,124 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     parser.error(f"Unsupported command: {args.command}")
     return 2
+
+
+def _run_client_command(config: MurmlyConfig, command: str) -> int:
+    try:
+        response = send_command_with_recovery(config, command)
+    except DaemonUnavailableError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(json.dumps(response, indent=2))
+    return 0
+
+
+def send_command_with_recovery(
+    config: MurmlyConfig,
+    command: str,
+    service: UserService | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    timeout: float = DAEMON_START_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Send a command, starting the installed service once if nothing answers.
+
+    A hotkey press is the main caller and has nowhere to show a traceback, so a
+    daemon that is merely not running yet must be recovered rather than raising.
+    Exactly one retry is attempted; a daemon that will not come up is reported.
+    """
+    socket_path = str(config.socket_path)
+    try:
+        return send_command(socket_path, command)
+    except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, socket.timeout, OSError):
+        pass
+
+    controller = service if service is not None else UserService()
+    try:
+        installed = controller.is_installed
+    except InstallError as error:
+        raise DaemonUnavailableError(f"Unable to check the Murmly service: {error}") from error
+
+    if not installed:
+        raise DaemonUnavailableError(
+            "The Murmly daemon is not running and no service is installed. "
+            "Run 'murmly install <hotkey>' to install it, for example: murmly install Meta+X"
+        )
+
+    try:
+        controller.start()
+    except InstallError as error:
+        raise DaemonUnavailableError(f"Unable to start the Murmly service: {error}") from error
+
+    # Wait for the daemon to publish its socket, then retry the command exactly
+    # once. Polling the socket rather than the command keeps a daemon that comes
+    # up broken from being hammered.
+    if not _wait_for_socket(config.socket_path, sleep, clock, timeout):
+        raise DaemonUnavailableError(
+            f"The Murmly daemon did not start within {timeout:g} seconds. "
+            "Check 'systemctl --user status murmly.service' and "
+            "'journalctl --user -u murmly.service -b'."
+        )
+
+    try:
+        return send_command(socket_path, command)
+    except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, socket.timeout, OSError) as error:
+        raise DaemonUnavailableError(
+            f"The Murmly daemon started but did not accept the '{command}' command: {error}"
+        ) from error
+
+
+def _wait_for_socket(
+    socket_path: Path,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+    timeout: float,
+) -> bool:
+    deadline = clock() + timeout
+    while True:
+        if socket_path.exists():
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(DAEMON_POLL_INTERVAL_SECONDS)
+
+
+def _run_install(hotkey_text: str) -> int:
+    try:
+        hotkey = parse_hotkey(hotkey_text)
+    except HotkeyError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+
+    try:
+        outcome = Installer().install(hotkey)
+    except HotkeyNotConfirmedError as error:
+        print(str(error), file=sys.stderr)
+        print(
+            f"{hotkey.portable} is not active in this session. The binding is saved and will "
+            "take effect at your next login.",
+            file=sys.stderr,
+        )
+        return 1
+    except InstallError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    for message in outcome.messages:
+        print(message)
+    return 0
+
+
+def _run_uninstall() -> int:
+    try:
+        outcome = Installer().uninstall()
+    except InstallError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+
+    for message in outcome.messages:
+        print(message)
+    return 0
 
 
 def _run_daemon(config: MurmlyConfig) -> int:
@@ -141,10 +289,30 @@ def _run_doctor(config: MurmlyConfig) -> None:
                 "vad_filter": config.vad_filter,
                 "delivery": delivery_diagnostics(config),
                 "overlay": overlay,
+                "installation": installation_diagnostics(),
             },
             indent=2,
         )
     )
+
+
+def installation_diagnostics(installer: Installer | None = None) -> dict[str, object]:
+    """Installation state for `murmly doctor`.
+
+    Diagnostics must never fail, so an unreachable desktop or service manager is
+    reported rather than raised.
+    """
+    try:
+        return (installer if installer is not None else Installer()).status()
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return {
+            "installed": False,
+            "service_active": False,
+            "entrypoint": None,
+            "hotkey": None,
+            "hotkey_held": False,
+            "detail": f"Unable to determine installation state: {error}",
+        }
 
 
 def delivery_diagnostics(
