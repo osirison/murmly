@@ -908,3 +908,74 @@ class LiveTranscriptionSessionTests(unittest.TestCase):
 
         session._transcriber.stop_partials.assert_called_once()
         self.assertTrue(session._live_stop.is_set())
+
+
+class LiveWorkerCadenceTests(unittest.TestCase):
+    """Silence detection must not be starved by the partial transcription pass.
+
+    A pause only slightly longer than the configured threshold is wiped by the
+    next utterance, so sampling silence once per partial interval misses it.
+    """
+
+    def _session(self, temp_dir: str, **overrides: object) -> SpeechSession:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+            **overrides,
+        )
+        with patch("murmly.daemon.SoundDeviceRecorder"), patch("murmly.daemon.FasterWhisperTranscriber"):
+            return SpeechSession(config, focus_observer=NullFocusObserver("unsupported"))
+
+    def test_silence_is_polled_far_more_often_than_partials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(
+                temp_dir,
+                live_transcribe=True,
+                live_interval_ms=1_000,
+                auto_transcribe="continuous",
+            )
+            silence_ticks = 0
+            partial_ticks = 0
+
+            def count_silence() -> None:
+                nonlocal silence_ticks
+                silence_ticks += 1
+
+            def count_partial() -> None:
+                nonlocal partial_ticks
+                partial_ticks += 1
+
+            session._silence_tick = count_silence
+            session._partial_tick = count_partial
+
+            stop = threading.Event()
+            worker = threading.Thread(target=session._run_live, args=(stop,), daemon=True)
+            worker.start()
+            time.sleep(1.2)
+            stop.set()
+            worker.join(timeout=2)
+
+        # One partial per second; silence polled every 250 ms.
+        self.assertGreaterEqual(silence_ticks, 3)
+        self.assertLessEqual(partial_ticks, 2)
+        self.assertGreater(silence_ticks, partial_ticks)
+
+    def test_silence_polling_survives_partials_being_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, auto_transcribe="stop", live_interval_ms=1_000)
+            silence_ticks = 0
+
+            def count_silence() -> None:
+                nonlocal silence_ticks
+                silence_ticks += 1
+
+            session._silence_tick = count_silence
+            stop = threading.Event()
+            worker = threading.Thread(target=session._run_live, args=(stop,), daemon=True)
+            worker.start()
+            time.sleep(0.9)
+            stop.set()
+            worker.join(timeout=2)
+
+        self.assertGreaterEqual(silence_ticks, 2)

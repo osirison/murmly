@@ -39,8 +39,8 @@ description: Track implementation and validation of partial transcription during
 - [x] 5.2 Bound the partial text at encode time, keeping the tail, and reject or truncate before anything crosses the pipe
 - [x] 5.3 Add `publish_partial` to `OverlayLifecycle`, `OverlayController`, and `NullOverlayController`
 - [x] 5.4 Add an `overlay.text_size_px` config key with bounds, and pass it plus the live-transcription flag to the renderer process
-- [ ] 5.5 Render partial text in a separate transcript panel below the recording indicator, leaving the indicator's dimensions and position unchanged, including under reduced motion
-- [ ] 5.6 Size the transcript panel to its text, bounded to 75% of the selected monitor's width, truncating text that still does not fit
+- [x] 5.5 Render partial text in a separate transcript panel below the recording indicator, leaving the indicator's dimensions and position unchanged, including under reduced motion
+- [x] 5.6 Size the transcript panel to its text, bounded to 75% of the selected monitor's width, truncating text that still does not fit
 - [x] 5.7 Clear displayed partial text on every transition out of listening, including the error presentation
 - [x] 5.8 Extend `tests/test_overlay.py` and `tests/test_overlay_renderer.py` with encode bounds, truncation, panel sizing, clearing on state change, and the null controller accepting partials
 
@@ -72,4 +72,4 @@ description: Track implementation and validation of partial transcription during
 - [x] 8.3 Add daemon tests for `continuous` mode: multiple segments delivered, per-segment target verification, refusal ending the session, and the final segment on toggle
 - [x] 8.4 Confirm the public `IDLE`/`LISTENING`/`THINKING` state names and every existing toggle response field are unchanged
 - [x] 8.5 Run `uv run --extra cuda python -m unittest discover -s tests` and confirm the suite passes
-- [ ] 8.6 Exercise both modes end to end in a live desktop session on the balanced profile, confirming partial text appears, silence triggers each mode, and delivery behaves as specified
+- [x] 8.6 Exercise both modes end to end in a live desktop session on the balanced profile, confirming partial text appears, silence triggers each mode, and delivery behaves as specified

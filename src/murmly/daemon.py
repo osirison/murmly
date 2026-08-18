@@ -35,6 +35,7 @@ MAX_COMMAND_WORKERS = 8
 COMMAND_TIMEOUT_SECONDS = 2.0
 LIVE_WORKER_JOIN_SECONDS = 0.5
 MIN_LIVE_TICK_SECONDS = 0.05
+SILENCE_TICK_SECONDS = 0.25
 
 
 @dataclass(slots=True)
@@ -174,28 +175,49 @@ class SpeechSession:
         self._live_thread = None
 
     def _run_live(self, stop_event: threading.Event) -> None:
-        interval = max(self._config.live_interval_ms / 1_000, MIN_LIVE_TICK_SECONDS)
-        next_tick = self._clock() + interval
+        """Poll silence often; transcribe partials on their own slower cadence.
+
+        Silence detection costs a few milliseconds and decides when a recording
+        ends, so it runs on a fast fixed tick. Tying it to the partial interval
+        made a pause only observable once per second, and a pause barely longer
+        than the threshold is wiped by the next utterance before the next tick
+        sees it -- so a recording would keep running through pauses the user
+        expected to end it.
+        """
+        partial_interval = max(self._config.live_interval_ms / 1_000, MIN_LIVE_TICK_SECONDS)
+        silence_interval = min(SILENCE_TICK_SECONDS, partial_interval)
+        next_partial = self._clock() + partial_interval
+        next_silence = self._clock() + silence_interval
         while True:
-            delay = next_tick - self._clock()
+            now = self._clock()
+            delay = min(next_silence, next_partial) - now
             if stop_event.wait(delay if delay > 0 else MIN_LIVE_TICK_SECONDS):
                 return
+            now = self._clock()
             try:
-                self._live_tick()
+                if now >= next_silence:
+                    self._silence_tick()
+                    while next_silence <= now:
+                        next_silence += silence_interval
+                if now >= next_partial:
+                    self._partial_tick()
+                    # A pass slower than its interval skips the ticks it overran
+                    # rather than firing them back to back.
+                    after = self._clock()
+                    while next_partial <= after:
+                        next_partial += partial_interval
             except Exception as error:
                 logger.warning("Live worker tick failed: %s", error)
                 return
-            now = self._clock()
-            # A pass slower than the interval skips the ticks it overran rather
-            # than firing them back to back.
-            while next_tick <= now:
-                next_tick += interval
 
-    def _live_tick(self) -> None:
-        if self._silence is not None and self._silence.available:
-            reading = self._silence.observe(self._recorder.snapshot(self._silence.window_seconds))
-            if reading.triggered and self._on_silence is not None:
-                self._on_silence()
+    def _silence_tick(self) -> None:
+        if self._silence is None or not self._silence.available:
+            return
+        reading = self._silence.observe(self._recorder.snapshot(self._silence.window_seconds))
+        if reading.triggered and self._on_silence is not None:
+            self._on_silence()
+
+    def _partial_tick(self) -> None:
         if not self._config.live_transcribe or not self._transcriber.partials_available:
             return
         audio = self._recorder.snapshot(self._config.live_window_seconds)
