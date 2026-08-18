@@ -7,6 +7,7 @@ import time
 import unittest
 
 from murmly.overlay import (
+    LAYER_SHELL_PRELOAD,
     MAX_MESSAGE_BYTES,
     MAX_PARTIAL_CHARS,
     NullOverlayController,
@@ -206,7 +207,7 @@ class OverlayTests(unittest.TestCase):
             ordered,
         )
 
-    def test_renderer_environment_excludes_code_injection_variables(self) -> None:
+    def test_renderer_environment_replaces_inherited_code_injection_variables(self) -> None:
         environment = renderer_environment(
             OverlayBackend.WAYLAND,
             {
@@ -226,9 +227,11 @@ class OverlayTests(unittest.TestCase):
         self.assertEqual("1", environment["PYTHONNOUSERSITE"])
         self.assertNotIn("PYTHONPATH", environment)
         self.assertNotIn("PYTHONHOME", environment)
-        self.assertNotIn("LD_PRELOAD", environment)
         self.assertNotIn("GTK_PATH", environment)
         self.assertNotIn("SECRET", environment)
+        # The inherited preload is discarded and replaced by Murmly's own, which is
+        # what makes the renderer's layer-shell placement take effect at all.
+        self.assertEqual(LAYER_SHELL_PRELOAD, environment["LD_PRELOAD"])
 
         x11_environment = renderer_environment(
             OverlayBackend.X11,
@@ -242,6 +245,7 @@ class OverlayTests(unittest.TestCase):
         self.assertEqual("/run/user/1000/xauth", x11_environment["XAUTHORITY"])
         self.assertNotIn("WAYLAND_DISPLAY", x11_environment)
         self.assertEqual("x11", x11_environment["GDK_BACKEND"])
+        self.assertNotIn("LD_PRELOAD", x11_environment)
 
     def test_backend_detection_requires_plasma_and_selects_display_protocol(self) -> None:
         self.assertEqual(

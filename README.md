@@ -18,8 +18,38 @@ and lets the desktop's own shortcut system call `murmly toggle`.
 - Python 3.12+
 - KDE Plasma, for the hotkey and the recording overlay
 - Clipboard and paste tools for your session:
-  - Wayland: `wl-clipboard` plus `wtype` or `ydotool`
+  - Wayland: `wl-clipboard`, plus a paste injector — `wtype` where the compositor
+    offers the virtual keyboard protocol (`zwp_virtual_keyboard_manager_v1`), or
+    `ydotool` where it does not. Plasma's KWin does not advertise that protocol on
+    the sessions Murmly has been tested on, so a Plasma Wayland session needs
+    `ydotool` and its daemon (see below).
   - X11: `xclip` and `xdotool`
+
+Murmly picks an injector by running the tool's own no-op invocation, so a tool
+that is installed but cannot run in your session is never chosen. When none can
+run, every transcript is still copied to the clipboard and `murmly doctor` reports
+the reason under `paste_injection` along with the commands that fix it.
+
+### Pasting on a Plasma Wayland session
+
+`ydotool` injects through `/dev/uinput`, so its daemon runs as root while Murmly
+runs as you. The shipped unit puts its socket where the client does not look for
+it, so point it at your own socket path and give it to your user:
+
+```bash
+sudo dnf install ydotool
+sudo mkdir -p /etc/systemd/system/ydotool.service.d
+sudo tee /etc/systemd/system/ydotool.service.d/murmly.conf >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=/usr/bin/ydotoold --socket-path=$XDG_RUNTIME_DIR/.ydotool_socket --socket-own=$(id -u):$(id -g)
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now ydotool.service
+```
+
+`murmly doctor` prints these same commands, filled in for your session, whenever
+it cannot inject a paste.
 
 For the recording overlay:
 
@@ -32,6 +62,13 @@ The overlay runs as a separate helper under `/usr/bin/python3` so it can use
 Fedora's tested PyGObject and GTK packages instead of compiling duplicates
 inside the virtual environment. Missing visual packages disable only the
 overlay; recording, transcription, clipboard, and paste handling continue.
+
+On Wayland the helper is started with `LD_PRELOAD=libgtk4-layer-shell.so.0`,
+because gtk4-layer-shell has to be loaded before libwayland-client and nothing
+inside a running interpreter can reorder that. Murmly sets this itself; a helper
+launched by hand needs the same preload, or its placement calls do nothing and
+the compositor puts the overlay wherever it likes. Rather than draw an overlay it
+cannot place, the helper refuses to start and reports the reason.
 
 ## Install
 
@@ -352,10 +389,14 @@ nothing at all usually means the binding, not the daemon.
 
 ```bash
 /usr/bin/python3 src/murmly/overlay_renderer.py --check
+LD_PRELOAD=libgtk4-layer-shell.so.0 \
+  /usr/bin/python3 src/murmly/overlay_renderer.py --check --backend wayland
 ```
 
-Add `--backend x11` or `--backend wayland` to inspect a specific backend. Restart
-the service after installing visual packages.
+Add `--backend x11` or `--backend wayland` to inspect a specific backend. The
+Wayland check needs the preload Murmly uses; without it the report says the
+renderer started without `libgtk4-layer-shell.so.0`. Restart the service after
+installing visual packages.
 
 **Silent recordings on Intel SOF hardware.** See
 [docs/agent-notes/murmly-spike-sof-dmic.md](docs/agent-notes/murmly-spike-sof-dmic.md).

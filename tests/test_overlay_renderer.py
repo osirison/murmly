@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+from io import StringIO
 import json
-import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
+from murmly.overlay import detect_overlay_backend, renderer_environment
 from murmly.overlay_renderer import (
+    LAYER_SHELL_PRELOAD,
     MAX_MESSAGE_BYTES,
     MAX_PARTIAL_CHARS,
     PANEL_GAP_PX,
@@ -20,6 +24,8 @@ from murmly.overlay_renderer import (
     MessageParser,
     MonitorGeometry,
     RendererViewState,
+    layer_shell_unsupported_reason,
+    main,
     panel_height,
     panel_max_width,
     panel_position,
@@ -201,11 +207,37 @@ class OverlayRendererTests(unittest.TestCase):
         self.assertEqual("…world", truncate_to_width("hello world", measure, 60))
         self.assertEqual("", truncate_to_width("hello", measure, 0))
 
+    def test_layer_shell_reason_separates_a_missing_preload_from_the_compositor(self) -> None:
+        without_preload = layer_shell_unsupported_reason({})
+        with_preload = layer_shell_unsupported_reason({"LD_PRELOAD": LAYER_SHELL_PRELOAD})
+
+        self.assertIn(LAYER_SHELL_PRELOAD, without_preload)
+        self.assertNotIn("compositor", without_preload)
+        self.assertIn("compositor", with_preload)
+        self.assertNotIn(LAYER_SHELL_PRELOAD, with_preload)
+
+    def test_an_unplaceable_overlay_is_reported_instead_of_presented(self) -> None:
+        reason = "The active Wayland compositor does not support Layer Shell."
+
+        def refuse(*arguments: object, **keywords: object) -> None:
+            raise OSError(reason)
+
+        errors = StringIO()
+        with patch("murmly.overlay_renderer.OverlayApplication", refuse), redirect_stderr(errors):
+            status = main(["--fd", "3", "--backend", "wayland"])
+
+        self.assertEqual(1, status)
+        self.assertIn(reason, errors.getvalue())
+
     def test_runtime_integration_skips_without_supported_plasma_session(self) -> None:
-        backend = os.environ.get("XDG_SESSION_TYPE", "").casefold()
-        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").casefold()
-        if backend not in SUPPORTED_BACKENDS or "kde" not in desktop:
+        selected = detect_overlay_backend()
+        if selected is None or selected.value not in SUPPORTED_BACKENDS:
             self.skipTest("GTK4 overlay runtime on KDE Plasma is unavailable")
+        backend = selected.value
+        # The renderer's own environment, not the test runner's: on Wayland the
+        # difference is the layer-shell preload, without which this exercises a
+        # renderer that refuses to start.
+        environment = renderer_environment(selected)
 
         renderer_path = Path(sys.modules["murmly.overlay_renderer"].__file__).resolve()
         try:
@@ -214,6 +246,7 @@ class OverlayRendererTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                env=environment,
             )
         except OSError:
             self.skipTest("The system interpreter for the overlay renderer is unavailable")
@@ -239,6 +272,7 @@ class OverlayRendererTests(unittest.TestCase):
             ],
             close_fds=True,
             pass_fds=(child.fileno(),),
+            env=environment,
         )
         child.close()
         try:

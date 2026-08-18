@@ -27,12 +27,13 @@ from murmly.installer import (
 from murmly.integrations import (
     ClipboardPaster,
     MissingToolError,
+    PasteInjection,
     choose_clipboard_copy_command,
-    choose_paste_command,
     is_wayland_session,
+    select_paste_injection,
 )
 from murmly.focus import FocusObserver, create_focus_observer, record_target, should_deliver
-from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend
+from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend, renderer_environment
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
 
@@ -253,9 +254,12 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
         restore_delay_ms=config.restore_clipboard_delay_ms,
     )
     if allowed:
-        paster.copy_and_paste(text)
-        return 0
-    paster.copy(text)
+        outcome = paster.copy_and_paste(text)
+        if outcome.injected:
+            return 0
+        reason = outcome.reason
+    else:
+        paster.copy(text)
     if paste:
         print(f"Transcript copied to the clipboard but not pasted: {reason}.", file=sys.stderr)
     return 0
@@ -267,10 +271,7 @@ def _run_doctor(config: MurmlyConfig) -> None:
     except MissingToolError as error:
         clipboard_command = f"unavailable: {error}"
 
-    try:
-        paste_command: list[str] | str = choose_paste_command()
-    except MissingToolError as error:
-        paste_command = f"unavailable: {error}"
+    injection = select_paste_injection()
 
     runtime_device, runtime_compute_type = FasterWhisperTranscriber.resolve_runtime(config)
     overlay = overlay_diagnostics(config)
@@ -282,7 +283,7 @@ def _run_doctor(config: MurmlyConfig) -> None:
                 "socket_path": str(config.socket_path),
                 "session": "wayland" if is_wayland_session() else "x11",
                 "clipboard_command": clipboard_command,
-                "paste_command": paste_command,
+                "paste_injection": paste_injection_diagnostics(injection),
                 "model_profile": config.model_profile,
                 "model_name": config.model_name,
                 "device": config.device,
@@ -299,6 +300,20 @@ def _run_doctor(config: MurmlyConfig) -> None:
             indent=2,
         )
     )
+
+
+def paste_injection_diagnostics(injection: PasteInjection) -> dict[str, object]:
+    """What `murmly doctor` says about pasting: the method, or the way to get one."""
+    report: dict[str, object] = {
+        "available": injection.available,
+        "method": injection.method,
+    }
+    if injection.available:
+        report["command"] = list(injection.command or ())
+        return report
+    report["reason"] = injection.reason
+    report["remedy"] = list(injection.remedy)
+    return report
 
 
 def live_transcription_diagnostics(
@@ -529,6 +544,9 @@ def overlay_diagnostics(
             text=True,
             check=False,
             timeout=5,
+            # The environment the renderer is launched with, not this process's:
+            # checking under anything else answers a question the user did not ask.
+            env=renderer_environment(backend, environment),
         )
         helper_report = json.loads(result.stdout)
         if not isinstance(helper_report, dict):

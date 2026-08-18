@@ -28,6 +28,9 @@ PANEL_HORIZONTAL_PADDING = 12
 PANEL_VERTICAL_PADDING = 6
 PANEL_GAP_PX = 6
 SUPPORTED_BACKENDS = {"x11", "wayland"}
+# Repeated from murmly.overlay rather than imported: this helper runs standalone
+# under the system interpreter, which cannot see the Murmly package.
+LAYER_SHELL_PRELOAD = "libgtk4-layer-shell.so.0"
 XA_ATOM = 4
 XA_CARDINAL = 6
 PROP_MODE_REPLACE = 0
@@ -273,6 +276,21 @@ class RendererViewState:
         return message_type == "shutdown"
 
 
+def layer_shell_unsupported_reason(environment: dict[str, str] | None = None) -> str:
+    """Name the cause of unsupported layer shell, because the remedies differ.
+
+    A missing preload is Murmly's own runtime to fix; with the preload in place the
+    only remaining cause is a compositor that does not implement the protocol.
+    """
+    source = environment if environment is not None else os.environ
+    if LAYER_SHELL_PRELOAD not in source.get("LD_PRELOAD", ""):
+        return (
+            f"The overlay renderer started without {LAYER_SHELL_PRELOAD} preloaded, so "
+            "Layer Shell cannot place its windows."
+        )
+    return "The active Wayland compositor does not support Layer Shell."
+
+
 def check_visual_runtime(backend: str) -> dict[str, object]:
     result: dict[str, object] = {
         "backend": backend,
@@ -304,7 +322,7 @@ def check_visual_runtime(backend: str) -> dict[str, object]:
 
             Gtk.init()
             if not Gtk4LayerShell.is_supported():
-                raise OSError("The active Wayland compositor does not support Layer Shell.")
+                raise OSError(layer_shell_unsupported_reason())
             result["gtk4_layer_shell"] = True
         else:
             gi.require_version("GdkX11", "4.0")
@@ -605,6 +623,12 @@ class OverlayApplication:
             gi.require_version("Gtk4LayerShell", "1.0")
             from gi.repository import Gtk4LayerShell
 
+            # Checked before any window exists: init_for_window does not raise when
+            # Layer Shell is unavailable, it quietly leaves an ordinary toplevel that
+            # the compositor places itself. Refusing here keeps a mis-placed overlay
+            # off the screen and reports through the existing unavailable path.
+            if not Gtk4LayerShell.is_supported():
+                raise OSError(layer_shell_unsupported_reason())
             self._layer_shell = Gtk4LayerShell
         else:
             gi.require_version("GdkX11", "4.0")

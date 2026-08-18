@@ -24,6 +24,7 @@ import time
 
 from murmly.desktop import PlasmaShortcuts
 from murmly.hotkey import Hotkey, parse_hotkey
+from murmly.integrations import PasteInjection, select_paste_injection
 
 
 logger = logging.getLogger(__name__)
@@ -452,12 +453,14 @@ class Installer:
         shortcuts: PlasmaShortcuts | None = None,
         session=None,
         entrypoint_resolver: Callable[[], Path] = resolve_entrypoint,
+        injection_selector: Callable[[], PasteInjection] = select_paste_injection,
     ) -> None:
         self._shortcuts = shortcuts if shortcuts is not None else PlasmaShortcuts()
         self._service = service if service is not None else UserService()
         self._launcher = launcher if launcher is not None else ShortcutLauncher(self._shortcuts)
         self._session = session
         self._resolve_entrypoint = entrypoint_resolver
+        self._select_injection = injection_selector
 
     def _current_session(self):
         if self._session is not None:
@@ -478,6 +481,7 @@ class Installer:
                 "Murmly did not register a hotkey. Bind this command to a shortcut "
                 f"in your desktop settings:\n    {entrypoint} toggle"
             )
+            messages.extend(self._paste_injection_messages())
             return InstallOutcome(
                 entrypoint=entrypoint,
                 hotkey=None,
@@ -533,6 +537,7 @@ class Installer:
             f"Registered {hotkey.portable}. Press it once to confirm it reaches Murmly: "
             "registration is confirmed, but only a keypress proves the desktop delivers it."
         )
+        messages.extend(self._paste_injection_messages())
         return InstallOutcome(
             entrypoint=entrypoint,
             hotkey=hotkey,
@@ -544,6 +549,26 @@ class Installer:
             user_override=override,
             messages=tuple(messages),
         )
+
+    def _paste_injection_messages(self) -> tuple[str, ...]:
+        """Say whether a transcript will reach the focused window.
+
+        Reported, never remedied: enabling an injector needs root, and Murmly
+        confines its writes to the files it owns. An installation without one still
+        works — every transcript is copied to the clipboard.
+        """
+        try:
+            injection = self._select_injection()
+        except Exception as error:  # noqa: BLE001 - a report must never fail an install
+            logger.debug("Paste injector selection failed during install: %s", error)
+            return ()
+        if injection.available:
+            return (f"Transcripts will be pasted into the focused window with {injection.method}.",)
+        messages = [f"Transcripts will be copied to the clipboard but not pasted: {injection.reason}"]
+        if injection.remedy:
+            remedy = "\n".join(f"    {line}" for line in injection.remedy)
+            messages.append(f"To paste in this session, run:\n{remedy}")
+        return tuple(messages)
 
     def _verify(self, hotkey: Hotkey) -> None:
         """Confirm the desktop resolved the launcher to the intended key.

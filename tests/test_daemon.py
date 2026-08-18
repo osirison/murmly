@@ -12,6 +12,7 @@ from unittest.mock import patch
 from murmly.config import MurmlyConfig
 from murmly.daemon import MAX_COMMAND_WORKERS, MurmlyDaemon, ProcessingResult, SpeechSession, send_command
 from murmly.focus import NullFocusObserver, WindowIdentity
+from murmly.integrations import DeliveryOutcome
 from murmly.overlay import OverlayHealth, OverlayState
 
 
@@ -539,15 +540,20 @@ class TranscriptDeliveryTests(unittest.TestCase):
         return session
 
     class RecordingPaster:
-        def __init__(self) -> None:
+        def __init__(self, injection_reason: str | None = None) -> None:
             self.copied: list[str] = []
             self.pasted: list[str] = []
+            self.injection_reason = injection_reason
 
         def copy(self, text: str) -> None:
             self.copied.append(text)
 
-        def copy_and_paste(self, text: str) -> None:
+        def copy_and_paste(self, text: str) -> DeliveryOutcome:
             self.pasted.append(text)
+            if self.injection_reason is not None:
+                self.copied.append(text)
+                return DeliveryOutcome(False, self.injection_reason)
+            return DeliveryOutcome(True)
 
     class Observer:
         def __init__(self, window, supported: bool = True) -> None:
@@ -581,6 +587,22 @@ class TranscriptDeliveryTests(unittest.TestCase):
         self.assertTrue(result.delivered)
         self.assertEqual(["hello world"], paster.pasted)
         self.assertEqual([], paster.copied)
+
+    def test_a_session_without_an_injector_copies_and_reports_it(self) -> None:
+        target = WindowIdentity(1, 10, "editor")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(target))
+            paster = self.RecordingPaster(injection_reason="No Wayland paste injector is installed.")
+            session._paster = paster
+            session._transcriber.transcribe_pcm16.return_value = "hello world"
+            session._recorder.sample_rate_hz = 16_000
+            result = session.process_recording(b"pcm", target)
+
+        # The same outcome as a refused delivery, so every path that already handles
+        # a refusal - the response, the overlay, ending a continuous session - applies.
+        self.assertFalse(result.delivered)
+        self.assertEqual("Transcript copied to the clipboard but not pasted.", result.detail)
+        self.assertEqual(["hello world"], paster.copied)
 
     def test_changed_focus_copies_without_pasting(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
