@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
+import re
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+
+import murmly.config
 
 from murmly.config import (
     DEFAULT_LIVE_INTERVAL_MS,
@@ -341,3 +345,63 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual("auto", config.compute_type)
         self.assertEqual(1, config.beam_size)
         self.assertFalse(config.vad_filter)
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+EXAMPLE_CONFIG_PATH = REPO_ROOT / "config.example.toml"
+README_PATH = REPO_ROOT / "README.md"
+
+
+def option_keys(text: str) -> set[tuple[str, str]]:
+    """Every (table, key) named in a TOML sample, commented out or not."""
+    keys: set[tuple[str, str]] = set()
+    table = ""
+    for line in text.splitlines():
+        header = re.fullmatch(r"\[(\w+)\]", line.strip())
+        if header:
+            table = header.group(1)
+            continue
+        entry = re.match(r"#?\s*(\w+)\s*=", line.strip())
+        if entry and table:
+            keys.add((table, entry.group(1)))
+    return keys
+
+
+class ExampleConfigTests(unittest.TestCase):
+    """The shipped example has to stay a faithful copy of the real defaults."""
+
+    def test_example_config_holds_nothing_but_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            defaults = load_config(Path(temp_dir) / "missing.toml")
+        example = load_config(EXAMPLE_CONFIG_PATH)
+
+        self.assertEqual(
+            dataclasses.replace(defaults, config_path=EXAMPLE_CONFIG_PATH),
+            example,
+        )
+
+    def test_example_config_names_every_option_the_loader_reads(self) -> None:
+        """A misspelled key is silently ignored, so equality alone proves nothing."""
+        source = Path(murmly.config.__file__).read_text()
+        read_keys = set(
+            re.findall(
+                r"\b(daemon|audio|stt|clipboard|overlay)\.get\(\s*\"(\w+)\"",
+                source,
+            )
+        )
+
+        self.assertTrue(read_keys, "no option lookups found in config.py")
+        self.assertEqual(read_keys, option_keys(EXAMPLE_CONFIG_PATH.read_text()))
+
+    def test_readme_sample_covers_the_same_options(self) -> None:
+        block = re.search(
+            r"## Configuration\b.*?```toml\n(.*?)```",
+            README_PATH.read_text(),
+            re.DOTALL,
+        )
+
+        self.assertIsNotNone(block, "no TOML sample under README's Configuration heading")
+        self.assertEqual(
+            option_keys(EXAMPLE_CONFIG_PATH.read_text()),
+            option_keys(block.group(1)),
+        )

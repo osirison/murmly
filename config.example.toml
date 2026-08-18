@@ -1,0 +1,57 @@
+# Murmly configuration.
+#
+# Every value below is already Murmly's default, so this file changes nothing
+# until you edit it. Murmly runs without it; copy it in when you want to adjust
+# something:
+#
+#     mkdir -p ~/.config/murmly
+#     cp config.example.toml ~/.config/murmly/config.toml
+#
+# It is read from ~/.config/murmly/config.toml, or from
+# $XDG_CONFIG_HOME/murmly/config.toml when that variable is set. A value outside
+# its documented range falls back to the default rather than refusing to start,
+# and `murmly doctor` reports the path actually in use.
+#
+# Restart the service after editing:
+#
+#     systemctl --user restart murmly.service
+
+[daemon]
+# Where the daemon listens. Defaults to $XDG_RUNTIME_DIR/murmly.sock, which is
+# /run/user/<your uid>/murmly.sock. Uncomment only to move it.
+# socket_path = "/run/user/1000/murmly.sock"
+
+[audio]
+sample_rate_hz = 16000  # Preferred capture rate; the device may negotiate another
+channels = 1
+
+[stt]
+model_profile = "balanced"  # fast (tiny.en) | balanced (large-v3-turbo) | accurate (large-v3)
+device = "auto"             # auto | cpu | cuda
+compute_type = "auto"       # auto means float16 on CUDA, int8 on CPU
+lazy_load_model = true      # Load the model on the first recording, not at startup
+
+# beam_size and vad_filter follow the profile: beam 1 without VAD for fast, beam 5
+# with VAD for balanced and accurate. Setting either here pins it across every
+# profile, so leave them commented unless you mean to override the profile.
+# beam_size = 5   # 1-10
+# vad_filter = true
+
+live_transcribe = false   # Show partial transcripts in the overlay while you speak
+live_interval_ms = 1000   # How often a partial is produced, 250-10000
+live_window_seconds = 15  # Trailing audio each partial re-reads, 5-60
+
+auto_transcribe = "off"              # off | stop | continuous - what silence does
+auto_transcribe_silence_ms = 2000    # Silence that triggers auto-transcribe, 250-30000
+auto_transcribe_min_speech_ms = 300  # Speech required before silence counts, 0-10000
+
+[clipboard]
+restore = true          # Put your previous clipboard back after pasting
+restore_delay_ms = 500  # Wait before restoring the previous clipboard, 0-5000
+verify_target = true    # Refuse to paste if focus left the window you dictated into
+
+[overlay]
+enabled = true
+bottom_margin_px = 32   # Logical pixels from the display's bottom edge, 0-512
+reduced_motion = false  # Stepped level feedback instead of continuous animation
+text_size_px = 13       # Live transcript panel text size, 8-48
