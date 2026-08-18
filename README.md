@@ -199,9 +199,15 @@ where a whole window is speech. Measured here with the default 15-second window:
 | CPU `int8` | `balanced` | 12364 ms | **falls behind** |
 
 `large-v3-turbo` on CPU is roughly twelve times over the default 1000 ms
-interval. Murmly degrades by skipping ticks rather than queuing them, so the
-partial display updates rarely instead of delaying delivery — but on CPU, pair
-live transcription with the `fast` profile.
+interval. Murmly skips ticks rather than queuing them, so the partial display
+simply updates rarely. Silence detection is unaffected: it runs on its own
+thread, so a slow partial pass cannot delay auto-transcribe.
+
+One cost does remain. A partial pass already inside the model cannot be
+cancelled, and the model decodes one request at a time, so stopping a recording
+can wait for an in-flight pass to finish before the final transcription starts —
+bounded by one pass, which is the ceiling in the table above. On CPU, pair live
+transcription with the `fast` profile.
 
 ### Auto-transcribe
 

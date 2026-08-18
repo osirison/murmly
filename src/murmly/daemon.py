@@ -67,7 +67,7 @@ class SpeechSession:
         self._clock = clock
         self._silence: SilenceDetector | None = None
         self._live_stop = threading.Event()
-        self._live_thread: threading.Thread | None = None
+        self._live_threads: list[threading.Thread] = []
         self._delivery_lock = threading.Lock()
         self._tick_failures = 0
 
@@ -138,78 +138,81 @@ class SpeechSession:
     def _start_live_worker(self) -> None:
         wants_partials = self._config.live_transcribe
         wants_silence = self._silence is not None and self._silence.available
-        if not wants_partials and not wants_silence:
-            return
         self._live_stop = threading.Event()
+        self._live_threads = []
+        if wants_silence:
+            # Its own thread, not a shared tick: a partial pass takes hundreds of
+            # milliseconds on CUDA and seconds on CPU, and running both on one
+            # thread would black out silence detection for that whole time --
+            # which is the defect that let recordings run through pauses.
+            self._spawn_live_thread(
+                self._run_silence_loop,
+                "murmly-silence",
+                SILENCE_TICK_SECONDS,
+            )
+        if wants_partials:
+            self._spawn_live_thread(
+                self._run_partial_loop,
+                "murmly-partial",
+                max(self._config.live_interval_ms / 1_000, MIN_LIVE_TICK_SECONDS),
+            )
+
+    def _spawn_live_thread(self, loop, name: str, interval: float) -> None:
         thread = threading.Thread(
-            target=self._run_live,
-            args=(self._live_stop,),
-            name="murmly-live",
+            target=loop,
+            args=(self._live_stop, interval),
+            name=name,
             daemon=True,
         )
         try:
             thread.start()
         except RuntimeError as error:
-            logger.warning("Live worker did not start: %s", error)
+            logger.warning("Live worker %s did not start: %s", name, error)
             return
-        self._live_thread = thread
+        self._live_threads.append(thread)
 
     def _stop_live_worker(self) -> None:
-        thread = self._live_thread
+        threads = list(self._live_threads)
         self._live_stop.set()
-        if thread is None or thread is threading.current_thread():
-            return
-        thread.join(timeout=LIVE_WORKER_JOIN_SECONDS)
-        if thread.is_alive():
-            # A pass already inside the engine cannot be interrupted. Its result
-            # is discarded by the transcriber, so the final pass proceeds now.
-            logger.debug("Live worker did not exit within the join timeout.")
-        self._live_thread = None
+        for thread in threads:
+            if thread is threading.current_thread():
+                continue
+            thread.join(timeout=LIVE_WORKER_JOIN_SECONDS)
+            if thread.is_alive():
+                # A pass already inside the engine cannot be interrupted. Its
+                # result is discarded by the transcriber, so the final pass
+                # proceeds now rather than waiting on it.
+                logger.debug("Live worker %s did not exit within the join timeout.", thread.name)
+        self._live_threads = [
+            thread for thread in threads if thread is threading.current_thread() and thread.is_alive()
+        ]
 
-    def _run_live(self, stop_event: threading.Event) -> None:
-        """Poll silence often; transcribe partials on their own slower cadence.
+    def _run_silence_loop(self, stop_event: threading.Event, interval: float) -> None:
+        self._run_tick_loop(stop_event, interval, self._silence_tick, "silence")
 
-        Silence detection costs a few milliseconds and decides when a recording
-        ends, so it runs on a fast fixed tick. Tying it to the partial interval
-        made a pause only observable once per second, and a pause barely longer
-        than the threshold is wiped by the next utterance before the next tick
-        sees it -- so a recording would keep running through pauses the user
-        expected to end it.
-        """
-        partial_interval = max(self._config.live_interval_ms / 1_000, MIN_LIVE_TICK_SECONDS)
-        silence_interval = min(SILENCE_TICK_SECONDS, partial_interval)
-        next_partial = self._clock() + partial_interval
-        next_silence = self._clock() + silence_interval
+    def _run_partial_loop(self, stop_event: threading.Event, interval: float) -> None:
+        self._run_tick_loop(stop_event, interval, self._partial_tick, "partial")
+
+    def _run_tick_loop(self, stop_event: threading.Event, interval: float, tick, label: str) -> None:
+        next_tick = self._clock() + interval
         while True:
-            now = self._clock()
-            delay = min(next_silence, next_partial) - now
+            delay = next_tick - self._clock()
             if stop_event.wait(delay if delay > 0 else MIN_LIVE_TICK_SECONDS):
                 return
-            now = self._clock()
-            if now >= next_silence:
-                if not self._guarded_tick(self._silence_tick, "silence"):
-                    return
-                # Advance against the time the tick finished, not the time it
-                # started: a slow tick would otherwise leave the schedule in the
-                # past and fire a burst of catch-up passes.
-                after = self._clock()
-                while next_silence <= after:
-                    next_silence += silence_interval
-            if now >= next_partial:
-                if not self._guarded_tick(self._partial_tick, "partial"):
-                    return
-                # A pass slower than its interval skips the ticks it overran
-                # rather than firing them back to back.
-                after = self._clock()
-                while next_partial <= after:
-                    next_partial += partial_interval
+            if not self._guarded_tick(tick, label):
+                return
+            # Advance against the time the tick finished: a slow tick would
+            # otherwise leave the schedule in the past and fire a catch-up burst.
+            after = self._clock()
+            while next_tick <= after:
+                next_tick += interval
 
     def _guarded_tick(self, tick, label: str) -> bool:
         """Run one tick, surviving transient failures.
 
         A single bad tick must not end silence polling: in stop mode that would
         leave the microphone open for the rest of the session with no way to end
-        it but the hotkey. The worker only gives up once failures are persistent.
+        it but the hotkey. The loop only gives up once failures are persistent.
         """
         try:
             tick()

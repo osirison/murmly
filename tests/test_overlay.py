@@ -163,12 +163,45 @@ class OverlayTests(unittest.TestCase):
             if message["type"] in {"state", "partial"}
         ]
 
+        # A superseded partial is dropped rather than replayed, but the survivor
+        # stays between the state changes that bracket it.
         self.assertEqual(
             [
                 ("state", "LISTENING"),
-                ("partial", "first"),
                 ("partial", "second"),
                 ("state", "THINKING"),
+            ],
+            ordered,
+        )
+
+    def test_a_partial_is_never_reordered_across_a_state_change(self) -> None:
+        """Coalescing must not let a partial jump a transition.
+
+        A partial emitted after the state that clears it would be shown for audio
+        that is no longer being captured.
+        """
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            popen_factory=lambda *_args, **_kwargs: FakeProcess(),
+            socket_pair_factory=lambda: (FakeSocket(21), FakeSocket(22)),
+            restart_delays=(0.0,),
+            autostart=False,
+        )
+        controller.publish_state(OverlayState.LISTENING)
+        controller.publish_partial("older")
+        controller.publish_state(OverlayState.THINKING)
+        controller.publish_partial("newer")
+
+        queued = [json.loads(message) for message in controller._control_messages]
+        ordered = [(message["type"], message.get("value")) for message in queued]
+
+        self.assertEqual(
+            [
+                ("state", "LISTENING"),
+                ("state", "THINKING"),
+                ("partial", "newer"),
             ],
             ordered,
         )

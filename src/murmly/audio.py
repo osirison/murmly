@@ -201,8 +201,8 @@ class SoundDeviceRecorder:
 
     def _window_bytes(self, window_seconds: float) -> int:
         frame_bytes = self._config.channels * 2
-        frames = int(self._sample_rate_hz * window_seconds)
-        return max(frames, 0) * frame_bytes
+        window = int(self.bytes_per_second * max(window_seconds, 0.0))
+        return window - (window % frame_bytes)
 
     def record_for_seconds(self, seconds: float) -> bytes:
         self.start()

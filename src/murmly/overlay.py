@@ -23,6 +23,7 @@ MAX_MESSAGE_BYTES = 1_024
 MIN_ERROR_DURATION_MS = 100
 MAX_ERROR_DURATION_MS = 10_000
 MAX_PARTIAL_CHARS = 200
+PARTIAL_MESSAGE_PREFIX = b'{"type":"partial"'
 SYSTEM_PYTHON = Path("/usr/bin/python3")
 COMMON_RENDERER_ENVIRONMENT_KEYS = {
     "DBUS_SESSION_BUS_ADDRESS",
@@ -84,9 +85,18 @@ def bound_partial_text(text: str) -> str:
     collapsed = " ".join(text.split())
     if len(collapsed) > MAX_PARTIAL_CHARS:
         collapsed = collapsed[-MAX_PARTIAL_CHARS:]
-    while collapsed and _partial_message_bytes(collapsed) > MAX_MESSAGE_BYTES:
-        collapsed = collapsed[1:]
-    return collapsed
+    if not collapsed or _partial_message_bytes(collapsed) <= MAX_MESSAGE_BYTES:
+        return collapsed
+    # Binary search the longest tail that fits, rather than re-encoding the whole
+    # message once per stripped character on the live worker's thread.
+    low, high = 0, len(collapsed)
+    while low < high:
+        middle = (low + high) // 2
+        if _partial_message_bytes(collapsed[middle:]) <= MAX_MESSAGE_BYTES:
+            high = middle
+        else:
+            low = middle + 1
+    return collapsed[low:]
 
 
 def _partial_message_bytes(text: str) -> int:
@@ -252,9 +262,24 @@ class OverlayController:
 
     def publish_partial(self, text: str) -> None:
         try:
-            # Queued with state changes rather than replacing the latest like a
-            # level, so a partial can never overtake the transition that clears it.
-            self._enqueue_control(encode_overlay_message({"type": "partial", "value": text}))
+            encoded = encode_overlay_message({"type": "partial", "value": text})
+            with self._condition:
+                if self._closed:
+                    return
+                # Latest-wins, but still in the queue: only the newest partial is
+                # worth showing, and appending every one lets a stalled renderer
+                # build an unbounded backlog and then replay stale speech. Dropping
+                # superseded partials in place keeps ordering against the state
+                # changes that clear them, which a separate slot would lose.
+                superseded = [
+                    message
+                    for message in self._control_messages
+                    if message.startswith(PARTIAL_MESSAGE_PREFIX)
+                ]
+                for message in superseded:
+                    self._control_messages.remove(message)
+                self._control_messages.append(encoded)
+                self._condition.notify()
         except Exception as error:
             self._set_health(False, f"Unable to queue overlay partial: {error}")
 

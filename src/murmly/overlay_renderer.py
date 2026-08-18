@@ -130,14 +130,22 @@ def panel_position(
 
 
 def truncate_to_width(text: str, measure, available_px: float) -> str:
-    """Drop leading characters until the tail fits, matching the encoder's bias."""
+    """Drop leading characters until the tail fits, matching the encoder's bias.
+
+    Binary searched: measuring one candidate per starting offset is quadratic
+    glyph shaping, and this runs on every draw.
+    """
     if not text or measure(text) <= available_px:
         return text
-    for start in range(1, len(text)):
-        candidate = "…" + text[start:]
-        if measure(candidate) <= available_px:
-            return candidate
-    return ""
+    low, high = 1, len(text)
+    while low < high:
+        middle = (low + high) // 2
+        if measure("…" + text[middle:]) <= available_px:
+            high = middle
+        else:
+            low = middle + 1
+    candidate = "…" + text[low:]
+    return candidate if low < len(text) and measure(candidate) <= available_px else ""
 
 
 def x11_surface_id(gdk_x11: Any, surface: Any) -> int:
@@ -606,7 +614,8 @@ class OverlayApplication:
         self._drawing_area = None
         self._panel_window = None
         self._panel_area = None
-        self._panel_width = WINDOW_WIDTH
+        self._panel_width = 0
+        self._panel_geometry = None
         self._selected_monitor = None
         self._selected_geometry = None
         self._phase = 0.0
@@ -750,14 +759,25 @@ class OverlayApplication:
             return
         width = panel_max_width(self._selected_geometry)
         height = panel_height(self._text_size_px)
-        if width == self._panel_width:
+        if width == self._panel_width and self._panel_geometry == self._selected_geometry:
             return
         self._panel_width = width
+        self._panel_geometry = self._selected_geometry
         self._panel_window.set_default_size(width, height)
         self._panel_window.set_size_request(width, height)
         if self._panel_area is not None:
             self._panel_area.set_size_request(width, height)
         self._place_panel(activate=False)
+
+    def _panel_monitor(self, width: int) -> MonitorGeometry:
+        """The geometry `panel_width` should bound against.
+
+        Falls back to the drawing width so a draw that arrives before a monitor
+        is selected still sizes sensibly.
+        """
+        if self._panel_geometry is not None:
+            return self._panel_geometry
+        return MonitorGeometry(connector="", x=0, y=0, width=width, height=0)
 
     def _select_panel_font(self, context: Any) -> None:
         context.select_font_face("sans-serif", self._cairo.FONT_SLANT_NORMAL, self._cairo.FONT_WEIGHT_NORMAL)
@@ -773,6 +793,11 @@ class OverlayApplication:
                     self._selected_monitor, self._selected_geometry = selection
                 if self._selected_monitor is not None and self._layer_shell is not None:
                     self._layer_shell.set_monitor(self._window, self._selected_monitor)
+                    if self._panel_window is not None:
+                        # Without this the panel follows the compositor's default
+                        # output and can land on a different display than the
+                        # indicator it belongs under.
+                        self._layer_shell.set_monitor(self._panel_window, self._selected_monitor)
             if self._backend == "x11":
                 self._window.set_visible(True)
             else:
@@ -781,6 +806,9 @@ class OverlayApplication:
             self._window.set_visible(False)
             if self._panel_window is not None:
                 self._panel_window.set_visible(False)
+            # Forget the panel geometry too: the next recording may select a
+            # different monitor, and a width-only check would skip re-placing it.
+            self._panel_width = 0
             self._selected_monitor = None
             self._selected_geometry = None
 
@@ -901,10 +929,7 @@ class OverlayApplication:
         if not text:
             return
 
-        background_width = max(
-            min(measure(text) + 2 * PANEL_HORIZONTAL_PADDING, float(width)),
-            float(WINDOW_WIDTH),
-        )
+        background_width = float(min(panel_width(measure(text), self._panel_monitor(width)), width))
         left = (width - background_width) / 2.0
         self._rounded_rectangle(context, left + 0.5, 0.5, background_width - 1.0, height - 1.0, 8.0)
         context.set_source_rgba(0.07, 0.08, 0.09, 0.92)

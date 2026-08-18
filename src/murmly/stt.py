@@ -33,6 +33,10 @@ class FasterWhisperTranscriber:
     def partials_available(self) -> bool:
         return not self._partials_disabled
 
+    @property
+    def vad_filter(self) -> bool:
+        return self._config.vad_filter
+
     def begin_capture(self) -> None:
         """Allow partial passes again for a new recording."""
         with self._state_lock:
@@ -91,7 +95,15 @@ class FasterWhisperTranscriber:
     ) -> str:
         model = self._load_model()
         rate = sample_rate_hz or self._config.sample_rate_hz
-        audio = self._as_array(pcm_audio) if allow_array and rate == WHISPER_SAMPLE_RATE_HZ else None
+        # Mono 16 kHz only: the array path has no de-interleaving, and handing
+        # Whisper interleaved stereo would show nonsense in the panel while the
+        # delivered transcript (written as a correct WAV) said something else.
+        fast_path = (
+            allow_array
+            and rate == WHISPER_SAMPLE_RATE_HZ
+            and self._config.channels == 1
+        )
+        audio = self._as_array(pcm_audio) if fast_path else None
         if audio is not None:
             with self._model_lock:
                 return self._decode(model, audio)

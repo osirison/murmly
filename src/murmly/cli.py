@@ -405,13 +405,13 @@ def measure_partial_pass_ms(
         # and the pass would time no decoding at all.
         if transcriber is None:
             transcriber = FasterWhisperTranscriber(replace(config, vad_filter=False))
-        elif getattr(transcriber, "_config", None) is not None and transcriber._config.vad_filter:
+        elif getattr(transcriber, "vad_filter", False):
             return None, (
                 "Refusing to measure with the voice activity filter enabled: "
                 "it discards the synthetic clip and would time no decoding."
             )
         transcriber.begin_capture()
-        clip = _measurement_clip(config.sample_rate_hz, config.live_window_seconds)
+        clip = _measurement_clip(config.sample_rate_hz, config.live_window_seconds, config.channels)
         # Discard one pass first. The daemon holds the model in memory for the
         # whole session, so steady-state latency is what decides whether partials
         # keep pace; a cold pass would report the one-time load instead.
@@ -426,13 +426,15 @@ def measure_partial_pass_ms(
         return None, f"Unable to measure a partial pass: {error}"
 
 
-def _measurement_clip(sample_rate_hz: int, window_seconds: int) -> bytes:
+def _measurement_clip(sample_rate_hz: int, window_seconds: int, channels: int = 1) -> bytes:
     """A quiet, deterministic clip that is not digital silence.
 
     Digital silence short-circuits before the model runs, which would measure
     nothing.
     """
-    sample_count = sample_rate_hz * window_seconds
+    # Frames, not samples: a stereo configuration would otherwise be handed half
+    # a window and under-report the ceiling by the channel count.
+    sample_count = sample_rate_hz * window_seconds * channels
     samples = array("h", (int(220 * math.sin(index / 37.0)) for index in range(sample_count)))
     if sys.byteorder != "little":
         samples.byteswap()

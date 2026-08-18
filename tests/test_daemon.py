@@ -879,7 +879,7 @@ class LiveTranscriptionSessionTests(unittest.TestCase):
             session.start_recording()
             self.addCleanup(session.stop_recording)
 
-        self.assertIsNone(session._live_thread)
+        self.assertEqual([], session._live_threads)
         self.assertIsNone(session._silence)
 
     def test_live_worker_starts_for_partials_alone(self) -> None:
@@ -913,8 +913,8 @@ class LiveTranscriptionSessionTests(unittest.TestCase):
 class LiveWorkerCadenceTests(unittest.TestCase):
     """Silence detection must not be starved by the partial transcription pass.
 
-    A pause only slightly longer than the configured threshold is wiped by the
-    next utterance, so sampling silence once per partial interval misses it.
+    A pause only slightly longer than the threshold is wiped by the next
+    utterance, so a partial pass that blocks silence polling loses it.
     """
 
     def _session(self, temp_dir: str, **overrides: object) -> SpeechSession:
@@ -927,43 +927,64 @@ class LiveWorkerCadenceTests(unittest.TestCase):
         with patch("murmly.daemon.SoundDeviceRecorder"), patch("murmly.daemon.FasterWhisperTranscriber"):
             return SpeechSession(config, focus_observer=NullFocusObserver("unsupported"))
 
-    def test_silence_is_polled_far_more_often_than_partials(self) -> None:
+    def test_a_slow_partial_pass_does_not_starve_silence_polling(self) -> None:
+        """The regression guard: a partial slower than the silence cadence.
+
+        Stubbing the partial with an instant no-op only measures scheduling
+        arithmetic and would pass even with both on one thread.
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
             session = self._session(
                 temp_dir,
                 live_transcribe=True,
-                live_interval_ms=1_000,
+                live_interval_ms=250,
                 auto_transcribe="continuous",
             )
             silence_ticks = 0
-            partial_ticks = 0
+            partials_started = threading.Event()
+
+            def slow_partial() -> None:
+                partials_started.set()
+                time.sleep(1.5)
 
             def count_silence() -> None:
                 nonlocal silence_ticks
-                silence_ticks += 1
+                # Only ticks observed while a partial pass is in flight count:
+                # that is exactly the window a shared thread would black out.
+                if partials_started.is_set():
+                    silence_ticks += 1
 
-            def count_partial() -> None:
-                nonlocal partial_ticks
-                partial_ticks += 1
-
+            session._partial_tick = slow_partial
             session._silence_tick = count_silence
-            session._partial_tick = count_partial
 
             stop = threading.Event()
-            worker = threading.Thread(target=session._run_live, args=(stop,), daemon=True)
-            worker.start()
-            time.sleep(1.2)
+            session._live_stop = stop
+            session._live_threads = []
+            session._spawn_live_thread(session._run_silence_loop, "murmly-silence", 0.25)
+            session._spawn_live_thread(session._run_partial_loop, "murmly-partial", 0.25)
+            self.assertTrue(partials_started.wait(timeout=2))
+            time.sleep(1.0)
             stop.set()
-            worker.join(timeout=2)
+            for thread in list(session._live_threads):
+                thread.join(timeout=3)
 
-        # One partial per second; silence polled every 250 ms.
+        # The observation window sits entirely inside one 1.5 s partial pass. A
+        # shared thread would record zero ticks here; separate loops give ~4.
         self.assertGreaterEqual(silence_ticks, 3)
-        self.assertLessEqual(partial_ticks, 2)
-        self.assertGreater(silence_ticks, partial_ticks)
 
-    def test_silence_polling_survives_partials_being_disabled(self) -> None:
+    def test_only_the_configured_loops_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            session = self._session(temp_dir, auto_transcribe="stop", live_interval_ms=1_000)
+            session = self._session(temp_dir, live_transcribe=True)
+            session.start_recording()
+            self.addCleanup(session.stop_recording)
+            names = sorted(thread.name for thread in session._live_threads)
+
+        # Auto-transcribe is off, so no silence loop should exist.
+        self.assertEqual(["murmly-partial"], names)
+
+    def test_silence_loop_runs_without_partials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, auto_transcribe="stop")
             silence_ticks = 0
 
             def count_silence() -> None:
@@ -972,11 +993,13 @@ class LiveWorkerCadenceTests(unittest.TestCase):
 
             session._silence_tick = count_silence
             stop = threading.Event()
-            worker = threading.Thread(target=session._run_live, args=(stop,), daemon=True)
-            worker.start()
+            session._live_stop = stop
+            session._live_threads = []
+            session._spawn_live_thread(session._run_silence_loop, "murmly-silence", 0.25)
             time.sleep(0.9)
             stop.set()
-            worker.join(timeout=2)
+            for thread in list(session._live_threads):
+                thread.join(timeout=3)
 
         self.assertGreaterEqual(silence_ticks, 2)
 
@@ -1076,10 +1099,21 @@ class SegmentToggleConcurrencyTests(unittest.TestCase):
             worker.join(timeout=5)
             toggler.join(timeout=5)
 
-        # The refusal must not be lost by the racing toggle's response.
+        # Both interleavings must be asserted: guarding on response["ok"] would
+        # let the branch where the session-end wins pass vacuously.
         if response.get("ok"):
             self.assertFalse(response["delivered"])
             self.assertIn("refused text", response["text"])
+        else:
+            # The session ended itself first. The toggle is told the daemon is
+            # busy, so the refusal has to be observable from the daemon state.
+            self.assertEqual("Daemon is busy.", response["error"])
+            deadline = time.time() + 3
+            while time.time() < deadline and daemon.state != "IDLE":
+                time.sleep(0.01)
+            self.assertEqual("IDLE", daemon.state)
+            self.assertFalse(daemon._session_delivered)
+            self.assertEqual(["refused text"], daemon._segments)
 
     def test_a_failed_transition_thread_does_not_wedge_the_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
