@@ -20,3 +20,6 @@ uv run --extra cuda python -m unittest discover -s tests
 
 The suite is stdlib `unittest` with no external test dependencies. Tests that need a
 live desktop session skip themselves when it is unavailable rather than failing.
+
+# Commit Comments
+NEVER USE `🤖 Generated with Claude Code`
