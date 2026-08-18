@@ -6,18 +6,16 @@ as **confirmed** (reproduced on the reporting machine: Fedora 44, Plasma Wayland
 `WAYLAND_DISPLAY=wayland-0`, gtk4-layer-shell 1.3.0, GTK 4.22.4) or **inferred**.
 
 - **Confirmed.** Under PyGObject, `Gtk4LayerShell.is_supported()` is `False` unless
-  the process was started with the library preloaded. `/usr/bin/python3
-  overlay_renderer.py --check --backend wayland` returns
+  the library reaches the global symbol scope before `gi` is imported. `/usr/bin/python3
+  overlay_renderer.py --check --backend wayland` returned
   `{"available": false, ... "error": "The active Wayland compositor does not support
-  Layer Shell."}` with no preload and `{"available": true, "gtk4_layer_shell": true}`
-  with `LD_PRELOAD=libgtk4-layer-shell.so.0`.
+  Layer Shell."}` before this change and `{"available": true, "gtk4_layer_shell": true}`
+  after it, with no `LD_PRELOAD` in the renderer's environment.
 - **Confirmed.** The bare soname `libgtk4-layer-shell.so.0` resolves through the
-  standard loader search path, so no distro-specific absolute path is needed.
-- **Confirmed.** An `LD_PRELOAD` naming a library that does not exist makes `ld.so`
-  print `ERROR: ld.so: object '...' from LD_PRELOAD cannot be preloaded ... ignored.`
-  on stderr and the process runs normally. Setting the preload unconditionally on the
-  Wayland backend therefore cannot stop the renderer from starting on a machine
-  without gtk4-layer-shell; the layer-shell check is what stops it.
+  standard loader search path, so no distro-specific absolute path is needed, whether
+  it is named to `ld.so` or to `ctypes.CDLL`.
+- **Confirmed.** `ctypes.CDLL(..., RTLD_GLOBAL)` establishes the same interposition as
+  `LD_PRELOAD` when it runs before any `gi` import, and does not when it runs after.
 - **Confirmed.** `Gtk4LayerShell.init_for_window()` does not raise when the library
   was not preloaded — it silently does nothing, which is why both overlay windows are
   presented as ordinary toplevels and KWin centres them, the panel overlapping the
@@ -36,7 +34,8 @@ as **confirmed** (reproduced on the reporting machine: Fedora 44, Plasma Wayland
   with no `env=`, so it inherits the caller's environment rather than the one
   `renderer_environment()` builds for the renderer.
 - **Confirmed.** `tests/test_overlay.py:209` asserts `LD_PRELOAD` is absent from the
-  renderer environment, as a code-injection guard against inherited values.
+  renderer environment, as a code-injection guard against inherited values. That
+  assertion survives this change unchanged.
 - **Confirmed.** Fedora's `ydotool` package ships `/usr/bin/ydotool`,
   `/usr/bin/ydotoold`, and `/usr/lib/systemd/system/ydotool.service`.
 - **Inferred.** `ydotool` is the only injector that can work on this session, because
@@ -64,27 +63,53 @@ as **confirmed** (reproduced on the reporting machine: Fedora 44, Plasma Wayland
 
 ## Decisions
 
-### 1. A controlled `LD_PRELOAD`, set by Murmly, only on the Wayland backend
+### 1. The renderer loads gtk4-layer-shell itself, before it imports `gi`
 
-`renderer_environment()` keeps building the child environment from an allowlist and
-keeps discarding any inherited `LD_PRELOAD`; on the Wayland backend it then sets its
-own constant value, `libgtk4-layer-shell.so.0`.
+`load_layer_shell()` runs `ctypes.CDLL("libgtk4-layer-shell.so.0",
+mode=RTLD_GLOBAL)` as the first thing the Wayland renderer does, ahead of every
+`import gi` in the process. That puts the library in the global symbol scope before
+PyGObject loads `libwayland-client`, which is the whole requirement. No environment
+variable is involved, so `renderer_environment()` keeps discarding `LD_PRELOAD`
+outright and the allowlist stays absolute.
+
+**Revised during apply.** This decision first shipped as a controlled
+`LD_PRELOAD=libgtk4-layer-shell.so.0` set by `renderer_environment()`, and rejected
+the in-process load on the grounds that "ordering inside an already-running
+interpreter is not something Murmly can guarantee". That reasoning was wrong and the
+test that settles it is cheap: `overlay_renderer.py` imports `gi` only inside
+functions, so the ctypes call can and does run first.
+
+Measured on this machine, `Gtk4LayerShell.is_supported()`:
+
+| how the library is loaded | supported |
+| --- | --- |
+| not loaded | `False` |
+| `LD_PRELOAD=libgtk4-layer-shell.so.0` | `True` |
+| `ctypes.CDLL(..., RTLD_GLOBAL)` before `import gi` | `True` |
+| `ctypes.CDLL(..., RTLD_GLOBAL)` after `import gi` | `False` |
+
+The in-process load wins on three counts: the renderer environment carries no
+`LD_PRELOAD` at all, so the code-injection guard is a plain absence rather than a
+value that must be audited; the requirement lives in the file that depends on it
+instead of in the launcher two modules away; and a missing library raises a
+catchable `OSError` naming it, where the preload could only print an `ld.so` line to
+stderr and carry on.
+
+Its one fragility is that the ordering is invisible: a future module-scope `import
+gi` would break it silently. Three guards, cheapest first — a test parses
+`overlay_renderer.py` and asserts no module-scope `gi` or `cairo` import;
+`load_layer_shell()` refuses when `gi` is already in `sys.modules` and says so; and
+the `is_supported()` check still refuses to present the overlay, so the worst case
+is a reported absence rather than a mis-placed window.
 
 Alternatives considered:
 
 - *Absolute path to the library.* Rejected: `/usr/lib64/...` is Fedora-specific and
   would need per-distro discovery for no benefit — the bare soname resolves.
-- *`ctypes.CDLL(..., mode=RTLD_GLOBAL)` before importing GTK.* Rejected: the library
-  has to be loaded ahead of `libwayland-client`, which PyGObject pulls in on import;
-  ordering inside an already-running interpreter is not something Murmly can
-  guarantee.
+- *`LD_PRELOAD` in the renderer environment.* Superseded, as above.
 - *Dropping the sanitized environment and inheriting the daemon's.* Rejected: the
   allowlist exists to keep code-injection variables out of a subprocess that runs
   under the system interpreter.
-
-The security property in `tests/test_overlay.py:209` is preserved but its assertion
-changes meaning: an inherited `LD_PRELOAD` is still stripped, and the value present
-on the Wayland backend is Murmly's constant, with no `LD_PRELOAD` on X11.
 
 ### 2. The renderer refuses to present an overlay it cannot anchor
 
@@ -177,13 +202,14 @@ the unit and socket details are verified during apply.
 
 ## Risks / Trade-offs
 
-- **Setting `LD_PRELOAD` on a subprocess is a code-injection surface.** → The value is
-  a constant chosen by Murmly, never taken from the environment, applied only on the
-  Wayland backend, and the inherited-value strip is kept and re-asserted in tests.
-- **The preload prints an `ld.so` error to the renderer's stderr when
-  gtk4-layer-shell is not installed.** → It is harmless (the process runs and then
-  refuses on the layer-shell check) and it lands in the journal where it explains
-  itself. `overlay_diagnostics` already falls back to stderr for the detail text.
+- **The in-process load depends on an import order nothing enforces at runtime.** →
+  Guarded three ways: a test that parses the file for module-scope `gi`/`cairo`
+  imports, a `sys.modules` check inside `load_layer_shell()` that names the ordering
+  bug, and the `is_supported()` refusal that keeps a mis-placed overlay off screen.
+- **A machine without gtk4-layer-shell now fails at the `ctypes` call.** → It raises
+  `OSError` naming the library, which `main()` already turns into an
+  `overlay runtime unavailable` message and a non-zero exit, and diagnostics report
+  as the cause. Capture and delivery are unaffected.
 - **Users on Plasma Wayland who never installed an injector will now see the overlay
   work while paste still does not.** → That is the honest state; doctor, install, and
   the toggle response all name it, and the transcript stays on the clipboard instead

@@ -24,8 +24,9 @@ Confirmed on this session (Fedora 44, Plasma Wayland, `wayland-0`):
 
 ## What Changes
 
-- Launch the Wayland overlay renderer with a controlled `LD_PRELOAD` for
-  `gtk4-layer-shell`, still discarding any `LD_PRELOAD` inherited from the caller.
+- Load `gtk4-layer-shell` inside the Wayland renderer, before it imports `gi`, so
+  layer-shell placement takes effect. No `LD_PRELOAD` is set for the renderer, and an
+  inherited one is still discarded.
 - Make the renderer refuse to present its windows when layer-shell anchoring cannot
   take effect, so a mis-anchored overlay is reported as unavailable through the
   existing visual-failure path instead of being drawn in the wrong place.
@@ -61,19 +62,19 @@ None.
 
 ## Impact
 
-- `src/murmly/overlay.py` — `renderer_environment()` gains a controlled `LD_PRELOAD`
-  on the Wayland backend.
-- `src/murmly/overlay_renderer.py` — layer-shell support is verified before windows
-  are built; the unsupported-reason text is split by cause.
+- `src/murmly/overlay.py` — unchanged behavior: `renderer_environment()` keeps
+  discarding `LD_PRELOAD` and sets none.
+- `src/murmly/overlay_renderer.py` — loads gtk4-layer-shell before importing `gi`,
+  verifies support before windows are built, and names each cause separately.
 - `src/murmly/cli.py` — `overlay_diagnostics()` runs the helper check under
   `renderer_environment()`; the doctor report gains injector state and remedy.
 - `src/murmly/integrations.py` — injector selection becomes capability-based;
   clipboard copy survives an unavailable injector.
 - `src/murmly/daemon.py` — delivery treats an unavailable injector as a refusal.
 - `src/murmly/installer.py` — post-install report names a missing injector.
-- `tests/test_overlay.py:209` asserts `LD_PRELOAD` is absent from the renderer
-  environment; that assertion changes meaning to "inherited value stripped,
-  controlled value present on Wayland".
+- `tests/test_overlay_renderer.py` gains a test that parses the renderer for
+  module-scope `gi`/`cairo` imports, because that import order is what makes the
+  in-process load work.
 - README.md Wayland requirements.
 - No new Python dependencies. `ydotool` becomes the documented Wayland injector for
   Plasma; installing it stays a user action.

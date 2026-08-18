@@ -63,12 +63,13 @@ Fedora's tested PyGObject and GTK packages instead of compiling duplicates
 inside the virtual environment. Missing visual packages disable only the
 overlay; recording, transcription, clipboard, and paste handling continue.
 
-On Wayland the helper is started with `LD_PRELOAD=libgtk4-layer-shell.so.0`,
-because gtk4-layer-shell has to be loaded before libwayland-client and nothing
-inside a running interpreter can reorder that. Murmly sets this itself; a helper
-launched by hand needs the same preload, or its placement calls do nothing and
-the compositor puts the overlay wherever it likes. Rather than draw an overlay it
-cannot place, the helper refuses to start and reports the reason.
+On Wayland the helper loads `libgtk4-layer-shell.so.0` itself, with
+`ctypes.CDLL(..., RTLD_GLOBAL)`, before it imports `gi`. gtk4-layer-shell works by
+interposing on libwayland-client, so it has to be in the global symbol scope first;
+PyGObject pulls libwayland in the moment it imports Gtk, and after that the
+layer-shell calls silently do nothing and the compositor places the overlay itself.
+Rather than draw an overlay it cannot place, the helper refuses to start and reports
+the reason.
 
 ## Install
 
@@ -389,14 +390,12 @@ nothing at all usually means the binding, not the daemon.
 
 ```bash
 /usr/bin/python3 src/murmly/overlay_renderer.py --check
-LD_PRELOAD=libgtk4-layer-shell.so.0 \
-  /usr/bin/python3 src/murmly/overlay_renderer.py --check --backend wayland
+/usr/bin/python3 src/murmly/overlay_renderer.py --check --backend wayland
 ```
 
-Add `--backend x11` or `--backend wayland` to inspect a specific backend. The
-Wayland check needs the preload Murmly uses; without it the report says the
-renderer started without `libgtk4-layer-shell.so.0`. Restart the service after
-installing visual packages.
+Add `--backend x11` or `--backend wayland` to inspect a specific backend. The check
+loads the layer-shell library the same way the running overlay does, so its report
+is what the overlay would do. Restart the service after installing visual packages.
 
 **Silent recordings on Intel SOF hardware.** See
 [docs/agent-notes/murmly-spike-sof-dmic.md](docs/agent-notes/murmly-spike-sof-dmic.md).

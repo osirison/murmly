@@ -25,12 +25,6 @@ MAX_ERROR_DURATION_MS = 10_000
 MAX_PARTIAL_CHARS = 200
 PARTIAL_MESSAGE_PREFIX = b'{"type":"partial"'
 SYSTEM_PYTHON = Path("/usr/bin/python3")
-# gtk4-layer-shell has to be loaded before libwayland-client, which PyGObject pulls
-# in as soon as the renderer imports Gtk. Nothing inside a running interpreter can
-# reorder that, so the loader is told before the process starts. Without it the
-# renderer's layer-shell calls silently do nothing and the compositor places the
-# overlay wherever it likes. The renderer repeats this name to check its own runtime.
-LAYER_SHELL_PRELOAD = "libgtk4-layer-shell.so.0"
 COMMON_RENDERER_ENVIRONMENT_KEYS = {
     "DBUS_SESSION_BUS_ADDRESS",
     "DESKTOP_SESSION",
@@ -190,10 +184,6 @@ def renderer_environment(
     sanitized = {key: source[key] for key in keys if key in source}
     sanitized["GDK_BACKEND"] = backend.value
     sanitized["PYTHONNOUSERSITE"] = "1"
-    if backend is OverlayBackend.WAYLAND:
-        # Murmly's own constant, never the caller's: an inherited LD_PRELOAD is
-        # dropped with the rest of the environment before this point.
-        sanitized["LD_PRELOAD"] = LAYER_SHELL_PRELOAD
     return sanitized
 
 

@@ -1,41 +1,43 @@
 ---
-title: The Wayland overlay needs LD_PRELOAD=libgtk4-layer-shell.so.0, and KWin cannot run wtype
+title: Load gtk4-layer-shell before gi imports, and know that KWin cannot run wtype
 description: Preconditions for running overlay_renderer.py by hand on Wayland and for injecting a paste on a Plasma Wayland session
-trigger: overlay_renderer.py --check --backend wayland, Gtk4LayerShell.is_supported, wtype, ydotool, ydotoold
+trigger: overlay_renderer.py --check --backend wayland, Gtk4LayerShell.is_supported, RTLD_GLOBAL, wtype, ydotool, ydotoold
 
 depends_on: src/murmly/overlay.py, src/murmly/overlay_renderer.py, src/murmly/integrations.py, README.md
 recorded: 2026-08-18
 verified_on: Plasma 6 Wayland, Fedora 44, gtk4-layer-shell 1.3.0, GTK 4.22.4, ydotool 1.0.4
 ---
 
-## Running the overlay renderer by hand on Wayland
+## Loading gtk4-layer-shell from PyGObject
 
-`gtk4-layer-shell` must be loaded before `libwayland-client`, which PyGObject pulls
-in as soon as the renderer imports Gtk. Nothing inside a running interpreter can
-reorder that, so the loader has to be told before the process starts:
+`gtk4-layer-shell` interposes on `libwayland-client`, so it has to reach the global
+symbol scope before libwayland does. PyGObject pulls libwayland in the moment it
+imports Gtk. `Gtk4LayerShell.is_supported()` on this machine:
 
-```bash
-# Reports available: false, "started without libgtk4-layer-shell.so.0 preloaded"
-/usr/bin/python3 src/murmly/overlay_renderer.py --check --backend wayland
+| how it is loaded | supported |
+| --- | --- |
+| not loaded | `False` |
+| `LD_PRELOAD=libgtk4-layer-shell.so.0` | `True` |
+| `ctypes.CDLL("libgtk4-layer-shell.so.0", mode=ctypes.RTLD_GLOBAL)` before `import gi` | `True` |
+| the same `ctypes` call after `import gi` | `False` |
 
-# Reports available: true
-LD_PRELOAD=libgtk4-layer-shell.so.0 \
-  /usr/bin/python3 src/murmly/overlay_renderer.py --check --backend wayland
-```
+Murmly uses the `ctypes` form, in `load_layer_shell()`, called at the top of
+`OverlayApplication.__init__` and of `check_visual_runtime` before either imports
+`gi`. It needs no environment variable, and a library that is not installed raises
+`OSError` naming it instead of printing an `ld.so` line to stderr. It depends on
+`overlay_renderer.py` importing `gi` only inside functions — a module-scope
+`import gi` would break it silently, so a test parses the file for one.
 
-The bare soname resolves through the standard loader search path, so no
-distro-specific absolute path is needed. An `LD_PRELOAD` naming a library that does
-not exist prints an `ld.so` warning and the process still runs.
+The failure this exists to prevent: without the library loaded first,
+`init_for_window()` **does not raise**. It quietly leaves an ordinary toplevel, which
+KWin then centres with the transcript panel stacked over the indicator. The renderer
+checks `is_supported()` before building any window and refuses to start rather than
+drawing in the wrong place.
 
-Without the preload, `Gtk4LayerShell.is_supported()` is `False` and
-`init_for_window()` **does not raise** — it quietly leaves an ordinary toplevel,
-which KWin then centres on screen with the transcript panel stacked over the
-indicator. That was the original bug. `murmly.overlay.renderer_environment()` sets
-the preload for the Wayland backend, and the renderer now refuses to start when
-Layer Shell is unavailable rather than drawing in the wrong place.
+Diagnostics have to run the check the way the renderer runs, under
+`renderer_environment(backend)`. A check that inherits the caller's environment
+answers a different question.
 
-Diagnostics have to run the check under `renderer_environment(backend)`. A check
-that inherits the caller's environment answers a different question.
 
 ## Injecting a paste on a Plasma Wayland session
 

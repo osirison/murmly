@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from contextlib import redirect_stderr
 from io import StringIO
 import json
@@ -12,7 +13,8 @@ from unittest.mock import patch
 
 from murmly.overlay import detect_overlay_backend, renderer_environment
 from murmly.overlay_renderer import (
-    LAYER_SHELL_PRELOAD,
+    COMPOSITOR_LACKS_LAYER_SHELL,
+    LAYER_SHELL_LIBRARY,
     MAX_MESSAGE_BYTES,
     MAX_PARTIAL_CHARS,
     PANEL_GAP_PX,
@@ -24,7 +26,7 @@ from murmly.overlay_renderer import (
     MessageParser,
     MonitorGeometry,
     RendererViewState,
-    layer_shell_unsupported_reason,
+    load_layer_shell,
     main,
     panel_height,
     panel_max_width,
@@ -207,14 +209,48 @@ class OverlayRendererTests(unittest.TestCase):
         self.assertEqual("…world", truncate_to_width("hello world", measure, 60))
         self.assertEqual("", truncate_to_width("hello", measure, 0))
 
-    def test_layer_shell_reason_separates_a_missing_preload_from_the_compositor(self) -> None:
-        without_preload = layer_shell_unsupported_reason({})
-        with_preload = layer_shell_unsupported_reason({"LD_PRELOAD": LAYER_SHELL_PRELOAD})
+    def test_layer_shell_load_names_its_own_failures_apart_from_the_compositor(self) -> None:
+        # A gi already imported is a bug in the renderer's own import order, and the
+        # message has to say so rather than blame the compositor for it.
+        ordering = load_layer_shell({"gi": object()})
+        self.assertIsNotNone(ordering)
+        self.assertIn("gi was imported before", ordering)
+        self.assertNotIn("compositor", ordering)
+        self.assertIn("compositor", COMPOSITOR_LACKS_LAYER_SHELL)
 
-        self.assertIn(LAYER_SHELL_PRELOAD, without_preload)
-        self.assertNotIn("compositor", without_preload)
-        self.assertIn("compositor", with_preload)
-        self.assertNotIn(LAYER_SHELL_PRELOAD, with_preload)
+        with patch("murmly.overlay_renderer.ctypes.CDLL", side_effect=OSError("no such file")):
+            missing = load_layer_shell({})
+        self.assertIn(LAYER_SHELL_LIBRARY, missing)
+        self.assertIn("no such file", missing)
+        self.assertNotIn("compositor", missing)
+
+        with patch("murmly.overlay_renderer.ctypes.CDLL") as load:
+            self.assertIsNone(load_layer_shell({}))
+        load.assert_called_once()
+
+    def test_the_renderer_imports_gi_lazily_so_layer_shell_can_load_first(self) -> None:
+        """The ordering that makes the ctypes load work, guarded against a future edit.
+
+        A module-scope `import gi` would pull in libwayland-client before
+        `load_layer_shell` ever runs, and layer-shell placement would then fail
+        silently - the exact bug this replaced.
+        """
+        source = Path(sys.modules["murmly.overlay_renderer"].__file__).read_text()
+        tree = ast.parse(source)
+        module_scope = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        ]
+        imported = set()
+        for node in module_scope:
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif node.module:
+                imported.add(node.module.split(".")[0])
+
+        self.assertNotIn("gi", imported)
+        self.assertNotIn("cairo", imported)
 
     def test_an_unplaceable_overlay_is_reported_instead_of_presented(self) -> None:
         reason = "The active Wayland compositor does not support Layer Shell."

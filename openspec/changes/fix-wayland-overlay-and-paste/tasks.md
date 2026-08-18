@@ -1,7 +1,7 @@
 ## 1. Overlay placement on Wayland
 
-- [x] 1.1 Set a controlled `LD_PRELOAD=libgtk4-layer-shell.so.0` in `renderer_environment()` for the Wayland backend only, keeping the inherited-value strip and leaving the X11 environment without it (`src/murmly/overlay.py`)
-- [x] 1.2 Rewrite `tests/test_overlay.py:209` so it asserts the new meaning: inherited `LD_PRELOAD` discarded, Murmly's constant present on Wayland, absent on X11
+- [x] 1.1 Load `libgtk4-layer-shell.so.0` with `ctypes.CDLL(..., RTLD_GLOBAL)` inside the Wayland renderer before any `gi` import (`src/murmly/overlay_renderer.py`). Shipped first as an `LD_PRELOAD` set by `renderer_environment()`, then replaced: the in-process load needs no environment variable, so the code-injection guard stays absolute and a missing library raises a catchable `OSError`
+- [x] 1.2 Guard the import order the in-process load depends on: a test parsing `overlay_renderer.py` for module-scope `gi`/`cairo` imports, and a `sys.modules` check in `load_layer_shell()` that names an ordering bug instead of blaming the compositor. `tests/test_overlay.py:209` keeps its original assertion that no `LD_PRELOAD` reaches the renderer
 - [x] 1.3 Make `OverlayApplication` verify `Gtk4LayerShell.is_supported()` before building any window on the Wayland backend and raise `OSError` when it is false, so `main()` reports it and exits non-zero instead of presenting unanchored windows (`src/murmly/overlay_renderer.py`)
 - [x] 1.4 Split the layer-shell unsupported reason in `check_visual_runtime` by whether Murmly's preload is present in the environment: preload absent names Murmly's own runtime preparation, preload present names the compositor
 - [x] 1.5 Add tests covering the refusal path and both reason strings, without requiring a live compositor (the suite skips rather than fails when a desktop session is unavailable)
