@@ -18,8 +18,14 @@ imports Gtk. `Gtk4LayerShell.is_supported()` on this machine:
 | --- | --- |
 | not loaded | `False` |
 | `LD_PRELOAD=libgtk4-layer-shell.so.0` | `True` |
-| `ctypes.CDLL("libgtk4-layer-shell.so.0", mode=ctypes.RTLD_GLOBAL)` before `import gi` | `True` |
-| the same `ctypes` call after `import gi` | `False` |
+| `ctypes.CDLL("libgtk4-layer-shell.so.0", mode=ctypes.RTLD_GLOBAL)` before any gi import | `True` |
+| the same call after a bare `import gi` | `True` |
+| the same call after `from gi.repository import Gtk` | `False` |
+| upstream's form, default `CDLL` mode, before any gi import | `True` |
+
+This is upstream's documented approach for language bindings — its own
+`examples/simple-example.py` loads the library this way before importing gi, and
+`linking.md` presents `LD_PRELOAD` as the workaround for programs you cannot modify.
 
 Murmly uses the `ctypes` form, in `load_layer_shell()`, called at the top of
 `OverlayApplication.__init__` and of `check_visual_runtime` before either imports

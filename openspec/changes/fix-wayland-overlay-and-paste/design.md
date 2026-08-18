@@ -15,7 +15,17 @@ as **confirmed** (reproduced on the reporting machine: Fedora 44, Plasma Wayland
   standard loader search path, so no distro-specific absolute path is needed, whether
   it is named to `ld.so` or to `ctypes.CDLL`.
 - **Confirmed.** `ctypes.CDLL(..., RTLD_GLOBAL)` establishes the same interposition as
-  `LD_PRELOAD` when it runs before any `gi` import, and does not when it runs after.
+  `LD_PRELOAD` when it runs before `from gi.repository import Gtk`, and does not when
+  it runs after. A bare `import gi` is harmless; the `gi.repository` import is what
+  loads libgtk-4 and with it libwayland-client. Murmly's guard refuses on a bare
+  `import gi` too, because the cheap check is the safe one.
+- **Confirmed.** Upstream's `examples/simple-example.py` performs this same ctypes
+  load before importing gi, and `linking.md` presents `LD_PRELOAD` as the workaround
+  for programs you cannot modify. Murmly owns the renderer, so the in-process load is
+  the documented path rather than a substitute for it. Upstream uses the default
+  `CDLL` mode, which also reports supported here; Murmly passes `RTLD_GLOBAL` because
+  that is the mode under which the documented symbol interposition holds, and it is
+  the one whose full render path was verified on screen.
 - **Confirmed.** `Gtk4LayerShell.init_for_window()` does not raise when the library
   was not preloaded — it silently does nothing, which is why both overlay windows are
   presented as ordinary toplevels and KWin centres them, the panel overlapping the
@@ -85,8 +95,9 @@ Measured on this machine, `Gtk4LayerShell.is_supported()`:
 | --- | --- |
 | not loaded | `False` |
 | `LD_PRELOAD=libgtk4-layer-shell.so.0` | `True` |
-| `ctypes.CDLL(..., RTLD_GLOBAL)` before `import gi` | `True` |
-| `ctypes.CDLL(..., RTLD_GLOBAL)` after `import gi` | `False` |
+| `ctypes.CDLL(..., RTLD_GLOBAL)` before any gi import | `True` |
+| after a bare `import gi`, before `from gi.repository import Gtk` | `True` |
+| after `from gi.repository import Gtk` | `False` |
 
 The in-process load wins on three counts: the renderer environment carries no
 `LD_PRELOAD` at all, so the code-injection guard is a plain absence rather than a
@@ -98,7 +109,8 @@ stderr and carry on.
 Its one fragility is that the ordering is invisible: a future module-scope `import
 gi` would break it silently. Three guards, cheapest first — a test parses
 `overlay_renderer.py` and asserts no module-scope `gi` or `cairo` import;
-`load_layer_shell()` refuses when `gi` is already in `sys.modules` and says so; and
+`load_layer_shell()` refuses when `gi` is already in `sys.modules` — conservative,
+since only the `gi.repository` import actually closes the window — and says so; and
 the `is_supported()` check still refuses to present the overlay, so the worst case
 is a reported absence rather than a mis-placed window.
 

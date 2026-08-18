@@ -214,7 +214,7 @@ class OverlayRendererTests(unittest.TestCase):
         # message has to say so rather than blame the compositor for it.
         ordering = load_layer_shell({"gi": object()})
         self.assertIsNotNone(ordering)
-        self.assertIn("gi was imported before", ordering)
+        self.assertIn("gi is already imported", ordering)
         self.assertNotIn("compositor", ordering)
         self.assertIn("compositor", COMPOSITOR_LACKS_LAYER_SHELL)
 

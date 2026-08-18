@@ -281,9 +281,10 @@ def load_layer_shell(modules: dict[str, object] | None = None) -> str | None:
     """Put gtk4-layer-shell in the global symbol scope, before GTK loads libwayland.
 
     The library works by interposing on libwayland-client's symbols, so it has to be
-    in the global scope first. PyGObject pulls libwayland in the moment it imports
-    Gtk, and once that has happened the layer-shell calls silently do nothing rather
-    than failing, so this runs before any `import gi` in the process.
+    in the global scope first. PyGObject pulls libwayland in when it imports
+    `gi.repository.Gtk`, and once that has happened the layer-shell calls silently do
+    nothing rather than failing, so this runs before any gi import in the process.
+    Upstream's own Python example loads the library this way for the same reason.
 
     Returns the reason it could not be done, or None. The two failures are told
     apart because they have different remedies: a library that is not installed is
@@ -291,9 +292,12 @@ def load_layer_shell(modules: dict[str, object] | None = None) -> str | None:
     """
     loaded = sys.modules if modules is None else modules
     if "gi" in loaded:
+        # Conservative: it is `from gi.repository import Gtk` that pulls in
+        # libwayland-client and closes the window, not `import gi` on its own. The
+        # cheap check is the safe one, because the failure it prevents is silent.
         return (
-            "gi was imported before gtk4-layer-shell, so Layer Shell cannot place "
-            "the overlay's windows."
+            "gtk4-layer-shell has to be loaded before gi.repository imports "
+            "libwayland-client, and gi is already imported."
         )
     try:
         ctypes.CDLL(LAYER_SHELL_LIBRARY, mode=ctypes.RTLD_GLOBAL)
