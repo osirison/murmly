@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import wave
 
 from murmly.config import MurmlyConfig
@@ -18,24 +19,69 @@ class FasterWhisperTranscriber:
     def __init__(self, config: MurmlyConfig) -> None:
         self._config = config
         self._model = None
+        self._model_lock = threading.Lock()
+        self._stopping = threading.Event()
+        self._partials_disabled = False
         if not self._config.lazy_load_model:
             self._load_model()
+
+    @property
+    def partials_available(self) -> bool:
+        return not self._partials_disabled
+
+    def begin_capture(self) -> None:
+        """Allow partial passes again for a new recording."""
+        self._stopping.clear()
+        self._partials_disabled = False
+
+    def stop_partials(self) -> None:
+        """Refuse to start further partial passes.
+
+        A pass already inside the engine cannot be interrupted, so it runs to
+        completion and its result is discarded instead.
+        """
+        self._stopping.set()
 
     def transcribe_pcm16(self, pcm_audio: bytes, sample_rate_hz: int | None = None) -> str:
         if not pcm_audio or not any(pcm_audio):
             return ""
+        return self._transcribe(pcm_audio, sample_rate_hz)
+
+    def transcribe_partial(self, pcm_audio: bytes, sample_rate_hz: int | None = None) -> str | None:
+        """Transcribe captured audio for display only.
+
+        Returns None when the result must not be shown: partials are disabled,
+        capture has stopped, or the pass failed. A failure never reaches the
+        caller, because a partial is feedback and must not disturb the recording.
+        """
+        if self._partials_disabled or self._stopping.is_set():
+            return None
+        if not pcm_audio or not any(pcm_audio):
+            return None
+        try:
+            text = self._transcribe(pcm_audio, sample_rate_hz)
+        except Exception as error:
+            self._partials_disabled = True
+            logger.warning("Live transcription disabled after a failed pass: %s", error)
+            return None
+        if self._stopping.is_set():
+            return None
+        return text
+
+    def _transcribe(self, pcm_audio: bytes, sample_rate_hz: int | None) -> str:
         model = self._load_model()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
             wav_path = Path(handle.name)
         try:
             self._write_wav(wav_path, pcm_audio, sample_rate_hz or self._config.sample_rate_hz)
-            segments, _info = model.transcribe(
-                str(wav_path),
-                language="en",
-                beam_size=self._config.beam_size,
-                vad_filter=self._config.vad_filter,
-            )
-            return " ".join(segment.text.strip() for segment in segments).strip()
+            with self._model_lock:
+                segments, _info = model.transcribe(
+                    str(wav_path),
+                    language="en",
+                    beam_size=self._config.beam_size,
+                    vad_filter=self._config.vad_filter,
+                )
+                return " ".join(segment.text.strip() for segment in segments).strip()
         finally:
             wav_path.unlink(missing_ok=True)
 

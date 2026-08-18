@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import logging
 import socket
 import threading
+import time
 
 from murmly.audio import SoundDeviceRecorder
 from murmly.config import MurmlyConfig
@@ -23,6 +25,7 @@ from murmly.overlay import (
     OverlayLifecycle,
     OverlayState,
 )
+from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
 
 
@@ -30,6 +33,8 @@ logger = logging.getLogger(__name__)
 MAX_COMMAND_BYTES = 4_096
 MAX_COMMAND_WORKERS = 8
 COMMAND_TIMEOUT_SECONDS = 2.0
+LIVE_WORKER_JOIN_SECONDS = 0.5
+MIN_LIVE_TICK_SECONDS = 0.05
 
 
 @dataclass(slots=True)
@@ -46,22 +51,53 @@ class SpeechSession:
         config: MurmlyConfig,
         level_sink=None,
         focus_observer: FocusObserver | None = None,
+        partial_sink: Callable[[str], None] | None = None,
+        on_silence: Callable[[], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._recorder = SoundDeviceRecorder(config, level_sink=level_sink)
         self._transcriber = FasterWhisperTranscriber(config)
         self._paster: ClipboardPaster | None = None
         self._focus = focus_observer if focus_observer is not None else create_focus_observer()
+        self._partial_sink = partial_sink
+        self._on_silence = on_silence
+        self._clock = clock
+        self._silence: SilenceDetector | None = None
+        self._silence_detail: str | None = None
+        self._live_stop = threading.Event()
+        self._live_thread: threading.Thread | None = None
+        self._delivery_lock = threading.Lock()
 
     @property
     def focus_observer(self) -> FocusObserver:
         return self._focus
 
+    @property
+    def silence_available(self) -> bool:
+        return self._silence is not None and self._silence.available
+
+    @property
+    def silence_detail(self) -> str | None:
+        return self._silence_detail
+
     def start_recording(self) -> None:
         self._recorder.start()
+        self._transcriber.begin_capture()
+        self._silence = self._create_silence_detector()
+        self._start_live_worker()
 
     def stop_recording(self) -> bytes:
+        self._stop_live_worker()
+        self._transcriber.stop_partials()
         return self._recorder.stop()
+
+    def take_segment(self) -> bytes:
+        """Close the current segment and start speech tracking over for the next."""
+        segment = self._recorder.take_segment()
+        if self._silence is not None:
+            self._silence.reset()
+        return segment
 
     def capture_delivery_target(self) -> WindowIdentity | None:
         return record_target(self._focus)
@@ -74,18 +110,98 @@ class SpeechSession:
         text = self._transcriber.transcribe_pcm16(pcm_audio, self._recorder.sample_rate_hz)
         if not text:
             return ProcessingResult(text=text, state="DONE")
-        allowed, reason = should_deliver(self._focus, target, self._config.verify_target)
-        if allowed:
-            self._ensure_paster().copy_and_paste(text)
-            return ProcessingResult(text=text, state="DONE", delivered=True)
-        logger.warning("Transcript delivery refused: %s", reason)
-        self._ensure_paster().copy(text)
+        # Held across delivery because clipboard restoration runs inside
+        # copy_and_paste: without it a restore could overwrite the next
+        # segment's transcript before that segment is pasted.
+        with self._delivery_lock:
+            allowed, reason = should_deliver(self._focus, target, self._config.verify_target)
+            if allowed:
+                self._ensure_paster().copy_and_paste(text)
+                return ProcessingResult(text=text, state="DONE", delivered=True)
+            logger.warning("Transcript delivery refused: %s", reason)
+            self._ensure_paster().copy(text)
         return ProcessingResult(
             text=text,
             state="DONE",
             delivered=False,
             detail="Transcript copied to the clipboard but not pasted.",
         )
+
+    def _create_silence_detector(self) -> SilenceDetector | None:
+        if self._config.auto_transcribe == "off":
+            self._silence_detail = None
+            return None
+        detector = SilenceDetector(
+            self._recorder.sample_rate_hz,
+            self._config.channels,
+            silence_ms=self._config.auto_transcribe_silence_ms,
+            min_speech_ms=self._config.auto_transcribe_min_speech_ms,
+        )
+        self._silence_detail = detector.unavailable_reason
+        if not detector.available:
+            logger.warning("Auto-transcribe disabled for this session: %s", detector.unavailable_reason)
+        return detector
+
+    def _start_live_worker(self) -> None:
+        wants_partials = self._config.live_transcribe
+        wants_silence = self._silence is not None and self._silence.available
+        if not wants_partials and not wants_silence:
+            return
+        self._live_stop = threading.Event()
+        thread = threading.Thread(
+            target=self._run_live,
+            args=(self._live_stop,),
+            name="murmly-live",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError as error:
+            logger.warning("Live worker did not start: %s", error)
+            return
+        self._live_thread = thread
+
+    def _stop_live_worker(self) -> None:
+        thread = self._live_thread
+        self._live_stop.set()
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=LIVE_WORKER_JOIN_SECONDS)
+        if thread.is_alive():
+            # A pass already inside the engine cannot be interrupted. Its result
+            # is discarded by the transcriber, so the final pass proceeds now.
+            logger.debug("Live worker did not exit within the join timeout.")
+        self._live_thread = None
+
+    def _run_live(self, stop_event: threading.Event) -> None:
+        interval = max(self._config.live_interval_ms / 1_000, MIN_LIVE_TICK_SECONDS)
+        next_tick = self._clock() + interval
+        while True:
+            delay = next_tick - self._clock()
+            if stop_event.wait(delay if delay > 0 else MIN_LIVE_TICK_SECONDS):
+                return
+            try:
+                self._live_tick()
+            except Exception as error:
+                logger.warning("Live worker tick failed: %s", error)
+                return
+            now = self._clock()
+            # A pass slower than the interval skips the ticks it overran rather
+            # than firing them back to back.
+            while next_tick <= now:
+                next_tick += interval
+
+    def _live_tick(self) -> None:
+        if self._silence is not None and self._silence.available:
+            reading = self._silence.observe(self._recorder.snapshot(self._silence.window_seconds))
+            if reading.triggered and self._on_silence is not None:
+                self._on_silence()
+        if not self._config.live_transcribe or not self._transcriber.partials_available:
+            return
+        audio = self._recorder.snapshot(self._config.live_window_seconds)
+        text = self._transcriber.transcribe_partial(audio, self._recorder.sample_rate_hz)
+        if text is not None and self._partial_sink is not None:
+            self._partial_sink(text)
 
     def _ensure_paster(self) -> ClipboardPaster:
         if self._paster is None:
@@ -105,7 +221,14 @@ class MurmlyDaemon:
     ) -> None:
         self._config = config
         self._overlay = overlay or self._create_overlay(config)
-        self._session = session or SpeechSession(config, level_sink=self._publish_level)
+        self._session = session or SpeechSession(
+            config,
+            level_sink=self._publish_level,
+            partial_sink=self._publish_partial,
+            on_silence=self._on_silence,
+        )
+        self._segments: list[str] = []
+        self._session_delivered = True
         self._state = "IDLE"
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
@@ -236,6 +359,8 @@ class MurmlyDaemon:
 
         with self._lock:
             if self._state == "IDLE":
+                self._segments = []
+                self._session_delivered = True
                 try:
                     self._session.start_recording()
                 except Exception as error:
@@ -263,19 +388,127 @@ class MurmlyDaemon:
                 self._publish_state(OverlayState.IDLE)
             else:
                 self._publish_error()
-            response: dict[str, object] = {
-                "ok": True,
-                "state": result.state,
-                "text": result.text,
-                "delivered": result.delivered,
-            }
-            if result.detail is not None:
-                response["detail"] = result.detail
-            return response
+            return self._session_response(result)
         except Exception as error:
             self._publish_error()
             return {"ok": False, "state": "IDLE", "error": str(error)}
         finally:
+            with self._lock:
+                self._state = "IDLE"
+
+    def _session_response(self, result: ProcessingResult) -> dict[str, object]:
+        """Report the whole session, keeping single-transcript responses identical."""
+        texts = [text for text in (*self._segments, result.text) if text]
+        if self._segments:
+            # A final segment that produced no text cannot make the session undelivered.
+            delivered = self._session_delivered and (result.delivered or not result.text)
+        else:
+            delivered = result.delivered
+        response: dict[str, object] = {
+            "ok": True,
+            "state": result.state,
+            "text": " ".join(texts),
+            "delivered": delivered,
+        }
+        if len(texts) > 1:
+            response["segments"] = len(texts)
+        detail = result.detail
+        if detail is None and self._segments and not delivered:
+            detail = "Transcript copied to the clipboard but not pasted."
+        if detail is not None:
+            response["detail"] = detail
+        return response
+
+    def _on_silence(self) -> None:
+        mode = self._config.auto_transcribe
+        if mode == "stop":
+            self._begin_auto_stop()
+        elif mode == "continuous":
+            self._deliver_segment()
+
+    def _claim_listening(self, *, advance: bool) -> bool:
+        """Take the state lock without waiting, and only while still listening.
+
+        Never blocks: a toggle already holding the lock is stopping this very
+        recording, and it also joins this worker thread. Waiting here would stall
+        that toggle for the whole join timeout, so an in-flight toggle simply wins.
+        """
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._state != "LISTENING":
+                return False
+            if advance:
+                self._state = "THINKING"
+            return True
+        finally:
+            self._lock.release()
+
+    def _begin_auto_stop(self) -> None:
+        # Claiming THINKING before releasing the lock means a toggle arriving now
+        # is told the daemon is busy instead of starting a second stop.
+        if not self._claim_listening(advance=True):
+            return
+        # Off the live worker thread: stopping capture joins that worker, and a
+        # thread cannot join itself.
+        threading.Thread(target=self._finish_auto_stop, name="murmly-auto-stop", daemon=True).start()
+
+    def _finish_auto_stop(self) -> None:
+        self._publish_state(OverlayState.THINKING)
+        try:
+            pcm_audio = self._session.stop_recording()
+            target = self._session.capture_delivery_target()
+            result = self._session.process_recording(pcm_audio, target)
+            if result.detail is None:
+                self._publish_state(OverlayState.IDLE)
+            else:
+                self._publish_error()
+        except Exception as error:
+            logger.warning("Auto-transcribe stop failed: %s", error)
+            self._publish_error()
+        finally:
+            with self._lock:
+                self._state = "IDLE"
+
+    def _deliver_segment(self) -> None:
+        if not self._claim_listening(advance=False):
+            return
+        segment = self._session.take_segment()
+        target = self._session.capture_delivery_target()
+        try:
+            result = self._session.process_recording(segment, target)
+        except Exception as error:
+            logger.warning("Segment transcription failed: %s", error)
+            self._end_continuous_session(failed=True)
+            return
+        if not result.text:
+            return
+        self._segments.append(result.text)
+        if not result.delivered:
+            self._session_delivered = False
+            self._end_continuous_session(failed=False)
+
+    def _end_continuous_session(self, *, failed: bool) -> None:
+        if not self._claim_listening(advance=True):
+            return
+        threading.Thread(
+            target=self._finish_continuous_session,
+            args=(failed,),
+            name="murmly-auto-end",
+            daemon=True,
+        ).start()
+
+    def _finish_continuous_session(self, failed: bool) -> None:
+        del failed
+        try:
+            # The audio captured since the refused segment closed is discarded:
+            # the session is ending because delivery was refused, so delivering
+            # more of it would repeat the mistake.
+            self._session.stop_recording()
+        except Exception as error:
+            logger.warning("Ending a continuous session failed: %s", error)
+        finally:
+            self._publish_error()
             with self._lock:
                 self._state = "IDLE"
 
@@ -289,6 +522,8 @@ class MurmlyDaemon:
         return OverlayController(
             bottom_margin_px=config.overlay_bottom_margin_px,
             reduced_motion=config.overlay_reduced_motion,
+            text_size_px=config.overlay_text_size_px,
+            transcript_panel=config.live_transcribe,
             backend=backend,
         )
 
@@ -303,6 +538,13 @@ class MurmlyDaemon:
             self._overlay.publish_level(level)
         except Exception as error:
             logger.warning("Overlay level update failed: %s", error)
+
+    def _publish_partial(self, text: str) -> None:
+        try:
+            self._overlay.publish_partial(text)
+        except Exception as error:
+            # Deliberately no transcript text in the log line.
+            logger.warning("Overlay partial update failed: %s", error)
 
     def _publish_error(self) -> None:
         try:

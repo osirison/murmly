@@ -18,8 +18,15 @@ import warnings
 MAX_MESSAGE_BYTES = 1_024
 MIN_ERROR_DURATION_MS = 100
 MAX_ERROR_DURATION_MS = 10_000
+MAX_PARTIAL_CHARS = 200
 WINDOW_WIDTH = 156
 WINDOW_HEIGHT = 48
+MIN_TEXT_SIZE_PX = 8
+MAX_TEXT_SIZE_PX = 48
+PANEL_MAX_DISPLAY_FRACTION = 0.75
+PANEL_HORIZONTAL_PADDING = 12
+PANEL_VERTICAL_PADDING = 6
+PANEL_GAP_PX = 6
 SUPPORTED_BACKENDS = {"x11", "wayland"}
 XA_ATOM = 4
 XA_CARDINAL = 6
@@ -88,6 +95,51 @@ def x11_position(monitor: MonitorGeometry, bottom_margin_px: int) -> tuple[int, 
     )
 
 
+def panel_height(text_size_px: int) -> int:
+    return text_size_px + 2 * PANEL_VERTICAL_PADDING
+
+
+def panel_max_width(monitor: MonitorGeometry) -> int:
+    return max(int(monitor.width * PANEL_MAX_DISPLAY_FRACTION), WINDOW_WIDTH)
+
+
+def panel_width(text_width_px: float, monitor: MonitorGeometry) -> int:
+    """Size the transcript panel to its text, bounded by the display fraction."""
+    requested = int(math.ceil(text_width_px)) + 2 * PANEL_HORIZONTAL_PADDING
+    return max(min(requested, panel_max_width(monitor)), WINDOW_WIDTH)
+
+
+def panel_position(
+    monitor: MonitorGeometry,
+    bottom_margin_px: int,
+    width: int,
+    height: int,
+) -> tuple[int, int]:
+    """Place the panel below the recording indicator without moving it.
+
+    The indicator keeps its own margin, so the panel occupies the space between
+    the indicator's bottom edge and the display edge, clamped so it never leaves
+    the screen.
+    """
+    top = monitor.y + monitor.height - bottom_margin_px + PANEL_GAP_PX
+    lowest_top = monitor.y + monitor.height - height
+    return (
+        (monitor.x + (monitor.width - width) // 2) * monitor.scale,
+        min(top, lowest_top) * monitor.scale,
+    )
+
+
+def truncate_to_width(text: str, measure, available_px: float) -> str:
+    """Drop leading characters until the tail fits, matching the encoder's bias."""
+    if not text or measure(text) <= available_px:
+        return text
+    for start in range(1, len(text)):
+        candidate = "…" + text[start:]
+        if measure(candidate) <= available_px:
+            return candidate
+    return ""
+
+
 def x11_surface_id(gdk_x11: Any, surface: Any) -> int:
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -108,6 +160,12 @@ def validate_message(message: object) -> dict[str, object] | None:
             "LISTENING",
             "THINKING",
         }:
+            return None
+    elif message_type == "partial":
+        value = message.get("value")
+        if set(message) != {"type", "value"} or not isinstance(value, str):
+            return None
+        if len(value) > MAX_PARTIAL_CHARS:
             return None
     elif message_type == "level":
         value = message.get("value")
@@ -164,6 +222,7 @@ class MessageParser:
 class RendererViewState:
     state: str = "IDLE"
     level: float = 0.0
+    partial: str = ""
     error_generation: int = 0
 
     @property
@@ -176,14 +235,23 @@ class RendererViewState:
             self.state = str(message["value"])
             if self.state != "LISTENING":
                 self.level = 0.0
+                # Partial text describes audio still being captured. Dropping it
+                # here, rather than at each call site, is what keeps it out of the
+                # processing and error presentations.
+                self.partial = ""
             return False
         if message_type == "level":
             if self.state == "LISTENING":
                 self.level = float(message["value"])
             return False
+        if message_type == "partial":
+            if self.state == "LISTENING":
+                self.partial = str(message["value"])
+            return False
         if message_type == "error":
             self.state = "ERROR"
             self.level = 0.0
+            self.partial = ""
             self.error_generation += 1
             return False
         return message_type == "shutdown"
@@ -268,7 +336,13 @@ class X11WindowAdapter:
         finally:
             self._x11.XCloseDisplay(display)
 
-    def prepare(self, xid: int, monitor: MonitorGeometry, bottom_margin_px: int) -> None:
+    def prepare(
+        self,
+        xid: int,
+        monitor: MonitorGeometry,
+        bottom_margin_px: int,
+        geometry: tuple[int, int, int, int] | None = None,
+    ) -> None:
         display = self._x11.XOpenDisplay(None)
         if not display:
             raise OSError("Unable to open the X11 display for overlay placement.")
@@ -288,15 +362,12 @@ class X11WindowAdapter:
             desktop_property = self._atom(display, "_NET_WM_DESKTOP")
             self._replace_cardinal(display, xid, desktop_property, 0xFFFFFFFF)
 
-            x, y = x11_position(monitor, bottom_margin_px)
-            self._x11.XMoveResizeWindow(
-                display,
-                xid,
-                x,
-                y,
+            x, y, width, height = geometry or (
+                *x11_position(monitor, bottom_margin_px),
                 WINDOW_WIDTH * monitor.scale,
                 WINDOW_HEIGHT * monitor.scale,
             )
+            self._x11.XMoveResizeWindow(display, xid, x, y, width, height)
             self._xext.XShapeCombineRectangles(
                 display,
                 xid,
@@ -312,20 +383,23 @@ class X11WindowAdapter:
         finally:
             self._x11.XCloseDisplay(display)
 
-    def activate(self, xid: int, monitor: MonitorGeometry, bottom_margin_px: int) -> None:
+    def activate(
+        self,
+        xid: int,
+        monitor: MonitorGeometry,
+        bottom_margin_px: int,
+        geometry: tuple[int, int, int, int] | None = None,
+    ) -> None:
         display = self._x11.XOpenDisplay(None)
         if not display:
             raise OSError("Unable to open the X11 display for overlay activation.")
         try:
-            x, y = x11_position(monitor, bottom_margin_px)
-            self._x11.XMoveResizeWindow(
-                display,
-                xid,
-                x,
-                y,
+            x, y, width, height = geometry or (
+                *x11_position(monitor, bottom_margin_px),
                 WINDOW_WIDTH * monitor.scale,
                 WINDOW_HEIGHT * monitor.scale,
             )
+            self._x11.XMoveResizeWindow(display, xid, x, y, width, height)
             root = self._x11.XDefaultRootWindow(display)
             state_property = self._atom(display, "_NET_WM_STATE")
             for state_name in (
@@ -494,6 +568,8 @@ class OverlayApplication:
         bottom_margin_px: int,
         reduced_motion: bool,
         backend: str,
+        text_size_px: int = 13,
+        transcript_panel: bool = False,
     ) -> None:
         import cairo
         import gi
@@ -523,9 +599,14 @@ class OverlayApplication:
         self._socket = socket.socket(fileno=file_descriptor)
         self._bottom_margin_px = bottom_margin_px
         self._reduced_motion = reduced_motion
+        self._text_size_px = text_size_px
+        self._transcript_panel = transcript_panel
         self._view = RendererViewState()
         self._window = None
         self._drawing_area = None
+        self._panel_window = None
+        self._panel_area = None
+        self._panel_width = WINDOW_WIDTH
         self._selected_monitor = None
         self._selected_geometry = None
         self._phase = 0.0
@@ -571,8 +652,45 @@ class OverlayApplication:
         self._window = window
         self._drawing_area = drawing_area
 
+        if self._transcript_panel:
+            self._build_panel(application, css)
+
         threading.Thread(target=self._read_messages, name="murmly-overlay-reader", daemon=True).start()
         self._GLib.timeout_add(33, self._animate)
+
+    def _build_panel(self, application: Any, css: Any) -> None:
+        height = panel_height(self._text_size_px)
+        window = self._Gtk.ApplicationWindow(application=application)
+        window.set_decorated(False)
+        window.set_resizable(False)
+        window.set_focusable(False)
+        window.set_default_size(WINDOW_WIDTH, height)
+        window.add_css_class("murmly-overlay")
+        if self._layer_shell is not None:
+            self._layer_shell.init_for_window(window)
+            self._layer_shell.set_layer(window, self._layer_shell.Layer.OVERLAY)
+            self._layer_shell.set_anchor(window, self._layer_shell.Edge.BOTTOM, True)
+            self._layer_shell.set_margin(
+                window,
+                self._layer_shell.Edge.BOTTOM,
+                max(self._bottom_margin_px - height - PANEL_GAP_PX, 0),
+            )
+            self._layer_shell.set_keyboard_mode(window, self._layer_shell.KeyboardMode.NONE)
+        self._Gtk.StyleContext.add_provider_for_display(
+            window.get_display(),
+            css,
+            self._Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        area = self._Gtk.DrawingArea()
+        area.set_size_request(WINDOW_WIDTH, height)
+        area.set_can_target(False)
+        area.set_draw_func(self._draw_panel)
+        window.set_child(area)
+        window.connect("realize", self._on_panel_realize)
+        window.connect("map", self._on_panel_map)
+        self._panel_window = window
+        self._panel_area = area
 
     def _read_messages(self) -> None:
         parser = MessageParser()
@@ -605,7 +723,45 @@ class OverlayApplication:
         self._sync_visibility()
         if self._drawing_area is not None:
             self._drawing_area.queue_draw()
+        self._sync_panel()
         return False
+
+    def _sync_panel(self) -> None:
+        if self._panel_window is None:
+            return
+        showing = bool(self._view.partial) and self._view.state == "LISTENING"
+        if not showing:
+            self._panel_window.set_visible(False)
+            return
+        if not self._panel_window.get_visible():
+            # Size and place only while hidden. Resizing a mapped window means
+            # racing the compositor for its geometry: the width applies but the
+            # old left edge survives, which pushes text off the display.
+            self._resize_panel_while_hidden()
+            if self._backend == "x11":
+                self._panel_window.set_visible(True)
+            else:
+                self._panel_window.present()
+        if self._panel_area is not None:
+            self._panel_area.queue_draw()
+
+    def _resize_panel_while_hidden(self) -> None:
+        if self._selected_geometry is None:
+            return
+        width = panel_max_width(self._selected_geometry)
+        height = panel_height(self._text_size_px)
+        if width == self._panel_width:
+            return
+        self._panel_width = width
+        self._panel_window.set_default_size(width, height)
+        self._panel_window.set_size_request(width, height)
+        if self._panel_area is not None:
+            self._panel_area.set_size_request(width, height)
+        self._place_panel(activate=False)
+
+    def _select_panel_font(self, context: Any) -> None:
+        context.select_font_face("sans-serif", self._cairo.FONT_SLANT_NORMAL, self._cairo.FONT_WEIGHT_NORMAL)
+        context.set_font_size(self._text_size_px)
 
     def _sync_visibility(self) -> None:
         if self._window is None:
@@ -623,6 +779,8 @@ class OverlayApplication:
                 self._window.present()
         else:
             self._window.set_visible(False)
+            if self._panel_window is not None:
+                self._panel_window.set_visible(False)
             self._selected_monitor = None
             self._selected_geometry = None
 
@@ -677,6 +835,86 @@ class OverlayApplication:
                 self._x11_adapter.activate(xid, self._selected_geometry, self._bottom_margin_px)
         except Exception as error:
             self._fail_visual("activation", error)
+
+    def _on_panel_realize(self, window: Any) -> None:
+        try:
+            surface = window.get_surface()
+            if surface is not None:
+                surface.set_input_region(self._cairo.Region())
+            self._place_panel(activate=False)
+        except Exception as error:
+            self._fail_visual("transcript panel setup", error)
+
+    def _on_panel_map(self, window: Any) -> None:
+        del window
+        try:
+            self._place_panel(activate=True)
+        except Exception as error:
+            self._fail_visual("transcript panel activation", error)
+
+    def _place_panel(self, *, activate: bool) -> None:
+        if (
+            self._x11_adapter is None
+            or self._GdkX11 is None
+            or self._panel_window is None
+            or self._selected_geometry is None
+        ):
+            return
+        surface = self._panel_window.get_surface()
+        if surface is None:
+            return
+        monitor = self._selected_geometry
+        height = panel_height(self._text_size_px)
+        x, y = panel_position(monitor, self._bottom_margin_px, self._panel_width, height)
+        geometry = (x, y, self._panel_width * monitor.scale, height * monitor.scale)
+        xid = x11_surface_id(self._GdkX11, surface)
+        if activate:
+            self._x11_adapter.activate(xid, monitor, self._bottom_margin_px, geometry)
+        else:
+            self._x11_adapter.prepare(xid, monitor, self._bottom_margin_px, geometry)
+
+    def _draw_panel(self, _area: Any, context: Any, width: int, height: int) -> None:
+        """Draw a content-sized panel inside a window whose size never changes.
+
+        The window is created at the maximum width and stays there; what the user
+        sees as the panel is this background, sized to the text it holds. That is
+        what keeps the visible panel content-sized without ever moving a mapped
+        window.
+        """
+        context.set_operator(self._cairo.OPERATOR_SOURCE)
+        context.set_source_rgba(0.0, 0.0, 0.0, 0.0)
+        context.paint()
+        context.set_operator(self._cairo.OPERATOR_OVER)
+
+        if not self._view.partial:
+            return
+        self._select_panel_font(context)
+
+        def measure(candidate: str) -> float:
+            return float(context.text_extents(candidate).x_advance)
+
+        text = truncate_to_width(
+            self._view.partial,
+            measure,
+            width - 2 * PANEL_HORIZONTAL_PADDING,
+        )
+        if not text:
+            return
+
+        background_width = max(
+            min(measure(text) + 2 * PANEL_HORIZONTAL_PADDING, float(width)),
+            float(WINDOW_WIDTH),
+        )
+        left = (width - background_width) / 2.0
+        self._rounded_rectangle(context, left + 0.5, 0.5, background_width - 1.0, height - 1.0, 8.0)
+        context.set_source_rgba(0.07, 0.08, 0.09, 0.92)
+        context.fill()
+
+        extents = context.font_extents()
+        baseline = (height + extents[0] - extents[1]) / 2.0
+        context.set_source_rgb(0.9, 0.92, 0.94)
+        context.move_to(left + PANEL_HORIZONTAL_PADDING, baseline)
+        context.show_text(text)
 
     def _fail_visual(self, operation: str, error: Exception) -> None:
         print(f"Error: X11 overlay {operation} failed: {error}", file=sys.stderr)
@@ -785,6 +1023,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check", action="store_true", help="Check visual runtime dependencies.")
     parser.add_argument("--fd", type=int, default=None, help="Inherited overlay protocol socket.")
     parser.add_argument("--bottom-margin-px", type=int, default=32)
+    parser.add_argument("--text-size-px", type=int, default=13)
+    parser.add_argument("--transcript-panel", action="store_true")
     parser.add_argument("--reduced-motion", action="store_true")
     parser.add_argument("--backend", choices=sorted(SUPPORTED_BACKENDS), default=None)
     return parser
@@ -806,8 +1046,21 @@ def main(argv: list[str] | None = None) -> int:
     if not 0 <= args.bottom_margin_px <= 512:
         print("Error: --bottom-margin-px must be between 0 and 512.", file=sys.stderr)
         return 2
+    if not MIN_TEXT_SIZE_PX <= args.text_size_px <= MAX_TEXT_SIZE_PX:
+        print(
+            f"Error: --text-size-px must be between {MIN_TEXT_SIZE_PX} and {MAX_TEXT_SIZE_PX}.",
+            file=sys.stderr,
+        )
+        return 2
     try:
-        return OverlayApplication(args.fd, args.bottom_margin_px, args.reduced_motion, backend).run()
+        return OverlayApplication(
+            args.fd,
+            args.bottom_margin_px,
+            args.reduced_motion,
+            backend,
+            text_size_px=args.text_size_px,
+            transcript_panel=args.transcript_panel,
+        ).run()
     except (ImportError, OSError, ValueError) as error:
         print(f"Error: overlay runtime unavailable: {error}", file=sys.stderr)
         return 1

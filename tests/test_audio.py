@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import threading
@@ -132,6 +133,97 @@ class AudioTests(unittest.TestCase):
 
         self.assertLess(callback_elapsed, 0.005)
         self.assertEqual(pcm_audio * 2, captured)
+
+    def test_segments_partition_the_recording_without_loss_or_duplication(self) -> None:
+        recorder, callback_holder = self._started_recorder()
+        callback = callback_holder["callback"]
+
+        blocks = [bytes([index % 256, 0]) * 8 for index in range(9)]
+        segments: list[bytes] = []
+        for index, block in enumerate(blocks):
+            callback(block, 8, object(), None)
+            if index in (2, 5):
+                segments.append(recorder.take_segment())
+        segments.append(recorder.stop())
+
+        self.assertEqual(b"".join(blocks), b"".join(segments))
+        self.assertEqual(b"".join(blocks[0:3]), segments[0])
+        self.assertEqual(b"".join(blocks[3:6]), segments[1])
+        self.assertEqual(b"".join(blocks[6:9]), segments[2])
+
+    def test_take_segment_leaves_nothing_behind(self) -> None:
+        recorder, callback_holder = self._started_recorder()
+        callback = callback_holder["callback"]
+
+        callback(b"\x01\x00" * 8, 8, object(), None)
+        first = recorder.take_segment()
+        second = recorder.take_segment()
+
+        self.assertEqual(b"\x01\x00" * 8, first)
+        self.assertEqual(b"", second)
+
+    def test_snapshot_does_not_consume_or_stop_capture(self) -> None:
+        recorder, callback_holder = self._started_recorder()
+        callback = callback_holder["callback"]
+
+        callback(b"\x02\x00" * 8, 8, object(), None)
+        first_snapshot = recorder.snapshot()
+        callback(b"\x03\x00" * 8, 8, object(), None)
+        second_snapshot = recorder.snapshot()
+
+        self.assertEqual(b"\x02\x00" * 8, first_snapshot)
+        self.assertEqual(b"\x02\x00" * 8 + b"\x03\x00" * 8, second_snapshot)
+        self.assertIsNotNone(recorder._stream)
+        self.assertEqual(second_snapshot, recorder.stop())
+
+    def test_snapshot_window_keeps_the_trailing_audio_on_frame_boundaries(self) -> None:
+        recorder, callback_holder = self._started_recorder()
+        callback = callback_holder["callback"]
+
+        # 48 kHz mono int16: one second is 96_000 bytes.
+        self.assertEqual(96_000, recorder.bytes_per_second)
+        for value in (1, 2, 3):
+            callback(bytes([value, 0]) * 48_000, 48_000, object(), None)
+
+        windowed = recorder.snapshot(window_seconds=1)
+
+        self.assertEqual(96_000, len(windowed))
+        self.assertEqual(bytes([3, 0]) * 48_000, windowed)
+        self.assertEqual(0, len(windowed) % 2)
+        self.assertEqual(288_000, len(recorder.snapshot()))
+
+    def test_snapshot_window_larger_than_the_recording_returns_everything(self) -> None:
+        recorder, callback_holder = self._started_recorder()
+        callback_holder["callback"](b"\x04\x00" * 8, 8, object(), None)
+
+        self.assertEqual(b"\x04\x00" * 8, recorder.snapshot(window_seconds=30))
+
+    def _started_recorder(self) -> tuple[SoundDeviceRecorder, dict[str, object]]:
+        callback_holder: dict[str, object] = {}
+        stream = FakeStream()
+        sounddevice = ModuleType("sounddevice")
+        sounddevice.PortAudioError = FakePortAudioError
+        sounddevice.query_devices = self._fake_query_devices
+        sounddevice.check_input_settings = lambda **_kwargs: None
+
+        def raw_input_stream(**kwargs: object) -> FakeStream:
+            callback_holder["callback"] = kwargs["callback"]
+            return stream
+
+        sounddevice.RawInputStream = raw_input_stream
+
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+        patcher = patch.dict(sys.modules, {"sounddevice": sounddevice})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        recorder = SoundDeviceRecorder(config)
+        recorder.start()
+        return recorder, callback_holder
 
     def test_stop_failure_still_closes_stream_and_meter(self) -> None:
         callback_holder: dict[str, object] = {}

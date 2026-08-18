@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from array import array
+from dataclasses import replace
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -30,6 +33,7 @@ from murmly.integrations import (
 )
 from murmly.focus import FocusObserver, create_focus_observer, record_target, should_deliver
 from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend
+from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
 
 
@@ -287,6 +291,7 @@ def _run_doctor(config: MurmlyConfig) -> None:
                 "runtime_compute_type": runtime_compute_type,
                 "beam_size": config.beam_size,
                 "vad_filter": config.vad_filter,
+                "live_transcription": live_transcription_diagnostics(config),
                 "delivery": delivery_diagnostics(config),
                 "overlay": overlay,
                 "installation": installation_diagnostics(),
@@ -294,6 +299,105 @@ def _run_doctor(config: MurmlyConfig) -> None:
             indent=2,
         )
     )
+
+
+def live_transcription_diagnostics(
+    config: MurmlyConfig,
+    transcriber: FasterWhisperTranscriber | None = None,
+) -> dict[str, object]:
+    """Live transcription and auto-transcribe state for `murmly doctor`.
+
+    The silence check uses the configured capture rate. The rate a session
+    actually negotiates can differ, so the daemon repeats this check when capture
+    starts and disables auto-transcribe there if the negotiated rate cannot work.
+    """
+    report: dict[str, object] = {
+        "live_transcribe": config.live_transcribe,
+        "live_interval_ms": config.live_interval_ms,
+        "live_window_seconds": config.live_window_seconds,
+        "auto_transcribe": config.auto_transcribe,
+        "auto_transcribe_silence_ms": config.auto_transcribe_silence_ms,
+        "auto_transcribe_min_speech_ms": config.auto_transcribe_min_speech_ms,
+        "overlay_text_size_px": config.overlay_text_size_px,
+        "configured_sample_rate_hz": config.sample_rate_hz,
+    }
+    if config.auto_transcribe_rejected_value is not None:
+        report["auto_transcribe_rejected_value"] = config.auto_transcribe_rejected_value
+
+    try:
+        detector = SilenceDetector(
+            config.sample_rate_hz,
+            config.channels,
+            silence_ms=config.auto_transcribe_silence_ms,
+            min_speech_ms=config.auto_transcribe_min_speech_ms,
+        )
+        report["silence_detection_available"] = detector.available
+        if not detector.available:
+            report["silence_detection_detail"] = detector.unavailable_reason
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        report["silence_detection_available"] = False
+        report["silence_detection_detail"] = f"Unable to check silence detection: {error}"
+
+    report["partial_pass_ceiling_ms"] = None
+    if config.live_transcribe:
+        measured, detail = measure_partial_pass_ms(config, transcriber)
+        report["partial_pass_ceiling_ms"] = measured
+        if detail is not None:
+            report["partial_pass_detail"] = detail
+        elif measured is not None:
+            report["partial_pass_keeps_pace"] = measured <= config.live_interval_ms
+            report["partial_pass_detail"] = (
+                "Worst case: a full window of speech. Real partials are usually faster "
+                "because the voice activity filter trims silence."
+            )
+    else:
+        report["partial_pass_detail"] = "Live transcription is disabled."
+    return report
+
+
+def measure_partial_pass_ms(
+    config: MurmlyConfig,
+    transcriber: FasterWhisperTranscriber | None = None,
+) -> tuple[int | None, str | None]:
+    """Time the slowest partial pass this configuration can produce.
+
+    Measures a full window decoded end to end, which is the case that decides
+    whether partials keep pace. The voice activity filter is disabled for the
+    measurement on purpose: with it on, synthetic audio is discarded as non-speech
+    and the pass would time almost no decoding at all.
+
+    Only runs when live transcription is enabled, because it loads the model.
+    """
+    try:
+        if transcriber is None:
+            transcriber = FasterWhisperTranscriber(replace(config, vad_filter=False))
+        transcriber.begin_capture()
+        clip = _measurement_clip(config.sample_rate_hz, config.live_window_seconds)
+        # Discard one pass first. The daemon holds the model in memory for the
+        # whole session, so steady-state latency is what decides whether partials
+        # keep pace; a cold pass would report the one-time load instead.
+        transcriber.transcribe_partial(clip, config.sample_rate_hz)
+        started = time.perf_counter()
+        transcriber.transcribe_partial(clip, config.sample_rate_hz)
+        elapsed_ms = round((time.perf_counter() - started) * 1_000)
+        if not transcriber.partials_available:
+            return None, "A partial pass failed during measurement."
+        return elapsed_ms, None
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return None, f"Unable to measure a partial pass: {error}"
+
+
+def _measurement_clip(sample_rate_hz: int, window_seconds: int) -> bytes:
+    """A quiet, deterministic clip that is not digital silence.
+
+    Digital silence short-circuits before the model runs, which would measure
+    nothing.
+    """
+    sample_count = sample_rate_hz * window_seconds
+    samples = array("h", (int(220 * math.sin(index / 37.0)) for index in range(sample_count)))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
 
 
 def installation_diagnostics(installer: Installer | None = None) -> dict[str, object]:

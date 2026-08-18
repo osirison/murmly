@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_BYTES = 1_024
 MIN_ERROR_DURATION_MS = 100
 MAX_ERROR_DURATION_MS = 10_000
+MAX_PARTIAL_CHARS = 200
 SYSTEM_PYTHON = Path("/usr/bin/python3")
 COMMON_RENDERER_ENVIRONMENT_KEYS = {
     "DBUS_SESSION_BUS_ADDRESS",
@@ -67,14 +68,44 @@ class OverlayLifecycle(Protocol):
 
     def publish_level(self, level: float) -> None: ...
 
+    def publish_partial(self, text: str) -> None: ...
+
     def publish_error(self, duration_ms: int = 2_000) -> None: ...
 
     def close(self) -> None: ...
 
 
+def bound_partial_text(text: str) -> str:
+    """Collapse a partial transcript to something the overlay protocol can carry.
+
+    The tail is kept rather than the head: the newest speech is what the user is
+    checking against what they just said.
+    """
+    collapsed = " ".join(text.split())
+    if len(collapsed) > MAX_PARTIAL_CHARS:
+        collapsed = collapsed[-MAX_PARTIAL_CHARS:]
+    while collapsed and _partial_message_bytes(collapsed) > MAX_MESSAGE_BYTES:
+        collapsed = collapsed[1:]
+    return collapsed
+
+
+def _partial_message_bytes(text: str) -> int:
+    encoded = json.dumps(
+        {"type": "partial", "value": text},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return len(encoded) + 1
+
+
 def encode_overlay_message(message: dict[str, object]) -> bytes:
     message_type = message.get("type")
-    if message_type == "state":
+    if message_type == "partial":
+        value = message.get("value")
+        if set(message) != {"type", "value"} or not isinstance(value, str):
+            raise ValueError("Invalid overlay partial message.")
+        message = {"type": "partial", "value": bound_partial_text(value)}
+    elif message_type == "state":
         if set(message) != {"type", "value"} or message.get("value") not in OverlayState:
             raise ValueError("Invalid overlay state message.")
     elif message_type == "level":
@@ -152,6 +183,8 @@ class OverlayController:
         *,
         bottom_margin_px: int,
         reduced_motion: bool,
+        text_size_px: int = 13,
+        transcript_panel: bool = False,
         backend: OverlayBackend | None = None,
         helper_path: Path | None = None,
         popen_factory: Callable[..., object] = subprocess.Popen,
@@ -162,6 +195,8 @@ class OverlayController:
     ) -> None:
         self._bottom_margin_px = bottom_margin_px
         self._reduced_motion = reduced_motion
+        self._text_size_px = text_size_px
+        self._transcript_panel = transcript_panel
         self._backend = backend or detect_overlay_backend()
         self._helper_path = (helper_path or Path(__file__).with_name("overlay_renderer.py")).resolve()
         self._popen_factory = popen_factory
@@ -214,6 +249,14 @@ class OverlayController:
                 self._condition.notify()
         except Exception as error:
             self._set_health(False, f"Unable to queue overlay level: {error}")
+
+    def publish_partial(self, text: str) -> None:
+        try:
+            # Queued with state changes rather than replacing the latest like a
+            # level, so a partial can never overtake the transition that clears it.
+            self._enqueue_control(encode_overlay_message({"type": "partial", "value": text}))
+        except Exception as error:
+            self._set_health(False, f"Unable to queue overlay partial: {error}")
 
     def publish_error(self, duration_ms: int = 2_000) -> None:
         try:
@@ -303,11 +346,15 @@ class OverlayController:
                 str(child_transport.fileno()),
                 "--bottom-margin-px",
                 str(self._bottom_margin_px),
+                "--text-size-px",
+                str(self._text_size_px),
                 "--backend",
                 self._backend.value,
             ]
             if self._reduced_motion:
                 command.append("--reduced-motion")
+            if self._transcript_panel:
+                command.append("--transcript-panel")
             process = self._popen_factory(
                 command,
                 close_fds=True,
@@ -426,6 +473,9 @@ class NullOverlayController:
 
     def publish_level(self, level: float) -> None:
         del level
+
+    def publish_partial(self, text: str) -> None:
+        del text
 
     def publish_error(self, duration_ms: int = 2_000) -> None:
         del duration_ms

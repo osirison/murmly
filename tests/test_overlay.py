@@ -7,9 +7,13 @@ import time
 import unittest
 
 from murmly.overlay import (
+    MAX_MESSAGE_BYTES,
+    MAX_PARTIAL_CHARS,
+    NullOverlayController,
     OverlayBackend,
     OverlayController,
     OverlayState,
+    bound_partial_text,
     detect_overlay_backend,
     encode_overlay_message,
     renderer_environment,
@@ -77,6 +81,97 @@ class OverlayTests(unittest.TestCase):
         for message in invalid_messages:
             with self.subTest(message=message), self.assertRaises(ValueError):
                 encode_overlay_message(message)
+
+    def test_partial_messages_are_validated_like_every_other_type(self) -> None:
+        encoded = encode_overlay_message({"type": "partial", "value": "hello there"})
+        self.assertEqual({"type": "partial", "value": "hello there"}, json.loads(encoded))
+
+        for message in (
+            {"type": "partial"},
+            {"type": "partial", "value": 5},
+            {"type": "partial", "value": None},
+            {"type": "partial", "value": "text", "extra": True},
+        ):
+            with self.subTest(message=message), self.assertRaises(ValueError):
+                encode_overlay_message(message)
+
+    def test_partial_text_is_truncated_to_the_tail_at_encode_time(self) -> None:
+        long_text = "".join(str(index % 10) for index in range(MAX_PARTIAL_CHARS * 3))
+
+        encoded = encode_overlay_message({"type": "partial", "value": long_text})
+        value = json.loads(encoded)["value"]
+
+        self.assertEqual(MAX_PARTIAL_CHARS, len(value))
+        self.assertTrue(long_text.endswith(value))
+        self.assertLessEqual(len(encoded), MAX_MESSAGE_BYTES)
+
+    def test_partial_text_never_exceeds_the_message_budget(self) -> None:
+        for text in ("😀" * MAX_PARTIAL_CHARS, '"\\' * MAX_PARTIAL_CHARS, "\n" * 400):
+            with self.subTest(text=text[:8]):
+                encoded = encode_overlay_message({"type": "partial", "value": text})
+                self.assertLessEqual(len(encoded), MAX_MESSAGE_BYTES)
+
+    def test_partial_text_collapses_whitespace_to_stay_on_one_line(self) -> None:
+        self.assertEqual("one two three", bound_partial_text("  one\ttwo\n\nthree  "))
+        self.assertEqual("", bound_partial_text("   \n\t "))
+
+    def test_empty_partial_is_a_valid_clear(self) -> None:
+        encoded = encode_overlay_message({"type": "partial", "value": ""})
+
+        self.assertEqual({"type": "partial", "value": ""}, json.loads(encoded))
+
+    def test_null_controller_accepts_partials(self) -> None:
+        controller = NullOverlayController()
+
+        controller.publish_partial("anything at all")
+
+        self.assertFalse(controller.health.available)
+
+    def test_controller_queues_partials_in_order_with_state_changes(self) -> None:
+        socket_holder: list[FakeSocket] = []
+
+        def socket_pair_factory() -> tuple[object, object]:
+            parent = FakeSocket(11)
+            socket_holder.append(parent)
+            return parent, FakeSocket(12)
+
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            popen_factory=lambda *_args, **_kwargs: FakeProcess(),
+            socket_pair_factory=socket_pair_factory,
+            restart_delays=(0.0,),
+        )
+        try:
+            controller.publish_state(OverlayState.LISTENING)
+            controller.publish_partial("first")
+            controller.publish_partial("second")
+            controller.publish_state(OverlayState.THINKING)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if socket_holder and len(socket_holder[0].messages) >= 4:
+                    break
+                time.sleep(0.01)
+        finally:
+            controller.close()
+
+        sent = [json.loads(message) for message in socket_holder[0].messages]
+        ordered = [
+            (message["type"], message.get("value"))
+            for message in sent
+            if message["type"] in {"state", "partial"}
+        ]
+
+        self.assertEqual(
+            [
+                ("state", "LISTENING"),
+                ("partial", "first"),
+                ("partial", "second"),
+                ("state", "THINKING"),
+            ],
+            ordered,
+        )
 
     def test_renderer_environment_excludes_code_injection_variables(self) -> None:
         environment = renderer_environment(

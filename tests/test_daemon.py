@@ -98,6 +98,11 @@ class FakeOverlay:
             raise RuntimeError("overlay unavailable")
         self.events.append(("level", level))
 
+    def publish_partial(self, text: str) -> None:
+        if self.fail:
+            raise RuntimeError("overlay unavailable")
+        self.events.append(("partial", text))
+
     def publish_error(self, duration_ms: int = 2_000) -> None:
         if self.fail:
             raise RuntimeError("overlay unavailable")
@@ -636,3 +641,270 @@ class TranscriptDeliveryTests(unittest.TestCase):
         self.assertNotIn("my private words", recorded)
         self.assertNotIn("browser", recorded)
         self.assertNotIn("editor", recorded)
+
+
+class SegmentSession(DummySession):
+    """A session double that can close segments while capture continues."""
+
+    def __init__(self, *, texts: list[str] | None = None, delivered: list[bool] | None = None) -> None:
+        super().__init__()
+        self.texts = texts or ["hello world"]
+        self.delivered = delivered or []
+        self.segments_taken = 0
+        self.processed_audio: list[bytes] = []
+
+    def take_segment(self) -> bytes:
+        self.segments_taken += 1
+        return b"recording"
+
+    def process_recording(
+        self,
+        pcm_audio: bytes,
+        target: WindowIdentity | None = None,
+    ) -> ProcessingResult:
+        self.processed += 1
+        self.processed_audio.append(pcm_audio)
+        self.received_targets.append(target)
+        index = self.processed - 1
+        text = self.texts[index] if index < len(self.texts) else ""
+        delivered = self.delivered[index] if index < len(self.delivered) else True
+        if not text:
+            return ProcessingResult(text="", state="DONE")
+        if delivered:
+            return ProcessingResult(text=text, state="DONE", delivered=True)
+        return ProcessingResult(
+            text=text,
+            state="DONE",
+            delivered=False,
+            detail="Transcript copied to the clipboard but not pasted.",
+        )
+
+
+class AutoTranscribeTests(unittest.TestCase):
+    def _daemon(self, temp_dir: str, session, **overrides: object) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+            **overrides,
+        )
+        return MurmlyDaemon(config, session=session)
+
+    def _wait_for_state(self, daemon: MurmlyDaemon, state: str) -> None:
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if daemon.state == state:
+                return
+            time.sleep(0.01)
+        self.fail(f"daemon never reached {state}; it is {daemon.state}")
+
+    def test_silence_ends_the_recording_in_stop_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="stop")
+            daemon.handle_command("toggle")
+            self.assertEqual("LISTENING", daemon.state)
+
+            daemon._on_silence()
+            self._wait_for_state(daemon, "IDLE")
+
+        self.assertEqual(1, session.stopped)
+        self.assertEqual(1, session.processed)
+        self.assertEqual(1, session.targets_captured)
+
+    def test_silence_is_ignored_when_auto_transcribe_is_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session)
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+
+            self.assertEqual("LISTENING", daemon.state)
+            self.assertEqual(0, session.stopped)
+            self.assertEqual(0, session.processed)
+
+    def test_a_toggle_before_the_silence_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="stop")
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+            self.assertEqual("IDLE", daemon.state)
+
+            daemon._on_silence()
+
+            self.assertEqual(1, session.stopped)
+            self.assertEqual(1, session.processed)
+
+    def test_toggle_during_auto_stopped_processing_reports_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = BlockingSession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="stop")
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+            self.assertTrue(session.processing.wait(timeout=3))
+
+            response = daemon.handle_command("toggle")
+            session.release.set()
+            self._wait_for_state(daemon, "IDLE")
+
+        self.assertFalse(response["ok"])
+        self.assertEqual("THINKING", response["state"])
+        self.assertEqual("Daemon is busy.", response["error"])
+        self.assertEqual(1, session.started)
+
+    def test_continuous_mode_delivers_segments_and_keeps_listening(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["first segment", "second segment", "final segment"])
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+            self.assertEqual("LISTENING", daemon.state)
+            daemon._on_silence()
+            self.assertEqual("LISTENING", daemon.state)
+
+            response = daemon.handle_command("toggle")
+
+        self.assertEqual(2, session.segments_taken)
+        self.assertEqual(1, session.stopped)
+        self.assertEqual(3, session.processed)
+        self.assertEqual("first segment second segment final segment", response["text"])
+        self.assertTrue(response["delivered"])
+        self.assertEqual(3, response["segments"])
+        self.assertEqual("IDLE", daemon.state)
+
+    def test_each_segment_records_its_own_delivery_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["one", "two"])
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+            daemon.handle_command("toggle")
+
+        self.assertEqual(2, session.targets_captured)
+        self.assertEqual(2, len(session.received_targets))
+
+    def test_a_refused_segment_ends_the_continuous_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["refused text"], delivered=[False])
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+            self._wait_for_state(daemon, "IDLE")
+
+        self.assertEqual(1, session.segments_taken)
+        self.assertEqual(1, session.stopped)
+        # The trailing audio is not delivered after a refusal.
+        self.assertEqual(1, session.processed)
+
+    def test_continuous_session_with_no_trailing_speech_delivers_nothing_more(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["only segment", ""])
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+            response = daemon.handle_command("toggle")
+
+        self.assertEqual("only segment", response["text"])
+        self.assertTrue(response["delivered"])
+        self.assertNotIn("segments", response)
+
+    def test_single_transcript_response_is_unchanged_by_this_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous", live_transcribe=True)
+            daemon.handle_command("toggle")
+
+            response = daemon.handle_command("toggle")
+
+        self.assertEqual(
+            {"ok": True, "state": "DONE", "text": "hello world", "delivered": True},
+            response,
+        )
+
+    def test_public_states_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["a", "b"])
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous", live_transcribe=True)
+
+            self.assertEqual("IDLE", daemon.state)
+            self.assertEqual({"ok": True, "state": "IDLE"}, daemon.handle_command("status"))
+            daemon.handle_command("toggle")
+            self.assertEqual("LISTENING", daemon.state)
+            daemon._on_silence()
+            self.assertEqual("LISTENING", daemon.state)
+            daemon.handle_command("toggle")
+            self.assertEqual("IDLE", daemon.state)
+
+
+class LiveTranscriptionSessionTests(unittest.TestCase):
+    def _session(self, temp_dir: str, **overrides: object) -> SpeechSession:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+            **overrides,
+        )
+        with patch("murmly.daemon.SoundDeviceRecorder"), patch("murmly.daemon.FasterWhisperTranscriber"):
+            return SpeechSession(config, focus_observer=NullFocusObserver("unsupported"))
+
+    def test_delivered_transcript_ignores_partials_entirely(self) -> None:
+        transcripts = []
+        for live in (False, True):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                session = self._session(temp_dir, live_transcribe=live)
+                session._paster = TranscriptDeliveryTests.RecordingPaster()
+                session._recorder.sample_rate_hz = 16_000
+                session._transcriber.transcribe_pcm16.return_value = "the delivered transcript"
+                session._transcriber.transcribe_partial.return_value = "a partial guess"
+
+                result = session.process_recording(b"pcm", None)
+                transcripts.append(result.text)
+
+                # Delivery reads the complete recording, never a partial.
+                session._transcriber.transcribe_pcm16.assert_called_once_with(b"pcm", 16_000)
+                session._transcriber.transcribe_partial.assert_not_called()
+
+        self.assertEqual(["the delivered transcript", "the delivered transcript"], transcripts)
+
+    def test_no_live_worker_starts_when_both_features_are_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir)
+            session.start_recording()
+            self.addCleanup(session.stop_recording)
+
+        self.assertIsNone(session._live_thread)
+        self.assertIsNone(session._silence)
+
+    def test_live_worker_starts_for_partials_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, live_transcribe=True, live_interval_ms=250)
+            session._recorder.sample_rate_hz = 16_000
+            session._recorder.snapshot.return_value = b"\x01\x00" * 8_000
+            session._transcriber.transcribe_partial.return_value = "partial words"
+            published: list[str] = []
+            session._partial_sink = published.append
+
+            session.start_recording()
+            deadline = time.time() + 3
+            while time.time() < deadline and not published:
+                time.sleep(0.01)
+            session.stop_recording()
+
+        self.assertEqual(["partial words"], published[:1])
+        self.assertIsNone(session._silence)
+
+    def test_stop_recording_stops_partials_before_returning_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, live_transcribe=True)
+            session.start_recording()
+            session.stop_recording()
+
+        session._transcriber.stop_partials.assert_called_once()
+        self.assertTrue(session._live_stop.is_set())
