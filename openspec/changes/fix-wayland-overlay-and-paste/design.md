@@ -209,7 +209,11 @@ them.
 
 ## Open Questions
 
-- Which exact `ydotool` setup commands to print for Fedora — package install plus unit
-  name — pending verification of the shipped unit's socket path and whether the client
-  needs `YDOTOOL_SOCKET`. This changes only the text of a diagnostic message, not the
-  specs, the approach, or the task breakdown.
+Resolved during apply. The `ydotool` remedy text was written only after reading the
+packaged binaries (task 5.1): Fedora ships `ydotool.service`, a system unit running
+`/usr/bin/ydotoold` with no arguments; the client resolves its socket as
+`YDOTOOL_SOCKET`, else `$XDG_RUNTIME_DIR/.ydotool_socket`, else
+`/tmp/.ydotool_socket`; and the daemon's default socket permission is `0600`. A root
+daemon therefore writes a socket the user's client neither reads nor could open, so
+the printed remedy is a drop-in that sets both the path and the owner. Murmly prints
+it filled in for the live session and runs none of it.
