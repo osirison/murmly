@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_BYTES = 1_024
 MIN_ERROR_DURATION_MS = 100
 MAX_ERROR_DURATION_MS = 10_000
+MAX_PARTIAL_CHARS = 200
+PARTIAL_MESSAGE_PREFIX = b'{"type":"partial"'
 SYSTEM_PYTHON = Path("/usr/bin/python3")
 COMMON_RENDERER_ENVIRONMENT_KEYS = {
     "DBUS_SESSION_BUS_ADDRESS",
@@ -67,14 +69,53 @@ class OverlayLifecycle(Protocol):
 
     def publish_level(self, level: float) -> None: ...
 
+    def publish_partial(self, text: str) -> None: ...
+
     def publish_error(self, duration_ms: int = 2_000) -> None: ...
 
     def close(self) -> None: ...
 
 
+def bound_partial_text(text: str) -> str:
+    """Collapse a partial transcript to something the overlay protocol can carry.
+
+    The tail is kept rather than the head: the newest speech is what the user is
+    checking against what they just said.
+    """
+    collapsed = " ".join(text.split())
+    if len(collapsed) > MAX_PARTIAL_CHARS:
+        collapsed = collapsed[-MAX_PARTIAL_CHARS:]
+    if not collapsed or _partial_message_bytes(collapsed) <= MAX_MESSAGE_BYTES:
+        return collapsed
+    # Binary search the longest tail that fits, rather than re-encoding the whole
+    # message once per stripped character on the live worker's thread.
+    low, high = 0, len(collapsed)
+    while low < high:
+        middle = (low + high) // 2
+        if _partial_message_bytes(collapsed[middle:]) <= MAX_MESSAGE_BYTES:
+            high = middle
+        else:
+            low = middle + 1
+    return collapsed[low:]
+
+
+def _partial_message_bytes(text: str) -> int:
+    encoded = json.dumps(
+        {"type": "partial", "value": text},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return len(encoded) + 1
+
+
 def encode_overlay_message(message: dict[str, object]) -> bytes:
     message_type = message.get("type")
-    if message_type == "state":
+    if message_type == "partial":
+        value = message.get("value")
+        if set(message) != {"type", "value"} or not isinstance(value, str):
+            raise ValueError("Invalid overlay partial message.")
+        message = {"type": "partial", "value": bound_partial_text(value)}
+    elif message_type == "state":
         if set(message) != {"type", "value"} or message.get("value") not in OverlayState:
             raise ValueError("Invalid overlay state message.")
     elif message_type == "level":
@@ -152,6 +193,8 @@ class OverlayController:
         *,
         bottom_margin_px: int,
         reduced_motion: bool,
+        text_size_px: int = 13,
+        transcript_panel: bool = False,
         backend: OverlayBackend | None = None,
         helper_path: Path | None = None,
         popen_factory: Callable[..., object] = subprocess.Popen,
@@ -162,6 +205,8 @@ class OverlayController:
     ) -> None:
         self._bottom_margin_px = bottom_margin_px
         self._reduced_motion = reduced_motion
+        self._text_size_px = text_size_px
+        self._transcript_panel = transcript_panel
         self._backend = backend or detect_overlay_backend()
         self._helper_path = (helper_path or Path(__file__).with_name("overlay_renderer.py")).resolve()
         self._popen_factory = popen_factory
@@ -214,6 +259,29 @@ class OverlayController:
                 self._condition.notify()
         except Exception as error:
             self._set_health(False, f"Unable to queue overlay level: {error}")
+
+    def publish_partial(self, text: str) -> None:
+        try:
+            encoded = encode_overlay_message({"type": "partial", "value": text})
+            with self._condition:
+                if self._closed:
+                    return
+                # Latest-wins, but still in the queue: only the newest partial is
+                # worth showing, and appending every one lets a stalled renderer
+                # build an unbounded backlog and then replay stale speech. Dropping
+                # superseded partials in place keeps ordering against the state
+                # changes that clear them, which a separate slot would lose.
+                superseded = [
+                    message
+                    for message in self._control_messages
+                    if message.startswith(PARTIAL_MESSAGE_PREFIX)
+                ]
+                for message in superseded:
+                    self._control_messages.remove(message)
+                self._control_messages.append(encoded)
+                self._condition.notify()
+        except Exception as error:
+            self._set_health(False, f"Unable to queue overlay partial: {error}")
 
     def publish_error(self, duration_ms: int = 2_000) -> None:
         try:
@@ -303,11 +371,15 @@ class OverlayController:
                 str(child_transport.fileno()),
                 "--bottom-margin-px",
                 str(self._bottom_margin_px),
+                "--text-size-px",
+                str(self._text_size_px),
                 "--backend",
                 self._backend.value,
             ]
             if self._reduced_motion:
                 command.append("--reduced-motion")
+            if self._transcript_panel:
+                command.append("--transcript-panel")
             process = self._popen_factory(
                 command,
                 close_fds=True,
@@ -426,6 +498,9 @@ class NullOverlayController:
 
     def publish_level(self, level: float) -> None:
         del level
+
+    def publish_partial(self, text: str) -> None:
+        del text
 
     def publish_error(self, duration_ms: int = 2_000) -> None:
         del duration_ms

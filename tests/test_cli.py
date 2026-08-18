@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -13,7 +14,14 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from murmly.cli import _run_doctor, delivery_diagnostics, overlay_diagnostics
+from murmly.cli import (
+    _measurement_clip,
+    _run_doctor,
+    delivery_diagnostics,
+    live_transcription_diagnostics,
+    measure_partial_pass_ms,
+    overlay_diagnostics,
+)
 from murmly.config import MurmlyConfig
 from murmly.stt import FasterWhisperTranscriber
 
@@ -616,3 +624,114 @@ class InstallationDiagnosticsTests(unittest.TestCase):
         report = json.loads(output.getvalue())
         self.assertIn("installation", report)
         self.assertFalse(report["installation"]["installed"])
+
+
+class LiveTranscriptionDiagnosticsTests(unittest.TestCase):
+    def _config(self, **overrides: object) -> MurmlyConfig:
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        return MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            **overrides,
+        )
+
+    def test_defaults_report_both_features_off_without_loading_anything(self) -> None:
+        with patch("murmly.cli.SilenceDetector") as detector, patch(
+            "murmly.cli.FasterWhisperTranscriber"
+        ) as transcriber:
+            report = live_transcription_diagnostics(self._config())
+
+        self.assertFalse(report["live_transcribe"])
+        self.assertEqual("off", report["auto_transcribe"])
+        self.assertIsNone(report["partial_pass_ceiling_ms"])
+        self.assertEqual("Auto-transcribe is disabled.", report["silence_detection_detail"])
+        # Neither the VAD nor the model may be loaded for a disabled feature.
+        detector.assert_not_called()
+        transcriber.assert_not_called()
+
+    def test_a_rejected_mode_is_surfaced(self) -> None:
+        config = self._config(auto_transcribe="off", auto_transcribe_rejected_value="whenever")
+
+        with patch("murmly.cli.SilenceDetector"):
+            report = live_transcription_diagnostics(config)
+
+        self.assertEqual("whenever", report["auto_transcribe_rejected_value"])
+
+    def test_silence_is_checked_against_the_negotiated_rate(self) -> None:
+        config = self._config(auto_transcribe="stop", sample_rate_hz=16_000)
+
+        with (
+            patch("murmly.cli.negotiated_capture_rate", return_value=(44_100, None)),
+            patch("murmly.cli.SilenceDetector") as detector,
+        ):
+            detector.return_value.available = False
+            detector.return_value.unavailable_reason = "capture rate 44100 Hz is not supported"
+            report = live_transcription_diagnostics(config)
+
+        self.assertEqual(44_100, report["negotiated_sample_rate_hz"])
+        self.assertFalse(report["silence_detection_available"])
+        self.assertEqual(44_100, detector.call_args.args[0])
+
+    def test_keeps_pace_compares_the_ceiling_against_the_interval(self) -> None:
+        config = self._config(live_transcribe=True, live_interval_ms=1_000)
+
+        for measured, expected in ((300, True), (12_000, False)):
+            with self.subTest(measured=measured):
+                with (
+                    patch("murmly.cli.SilenceDetector"),
+                    patch("murmly.cli.measure_partial_pass_ms", return_value=(measured, None)),
+                ):
+                    report = live_transcription_diagnostics(config)
+
+                self.assertEqual(measured, report["partial_pass_ceiling_ms"])
+                self.assertEqual(expected, report["partial_pass_keeps_pace"])
+
+    def test_a_failed_measurement_reports_detail_and_no_verdict(self) -> None:
+        config = self._config(live_transcribe=True)
+
+        with (
+            patch("murmly.cli.SilenceDetector"),
+            patch("murmly.cli.measure_partial_pass_ms", return_value=(None, "model exploded")),
+        ):
+            report = live_transcription_diagnostics(config)
+
+        self.assertIsNone(report["partial_pass_ceiling_ms"])
+        self.assertEqual("model exploded", report["partial_pass_detail"])
+        self.assertNotIn("partial_pass_keeps_pace", report)
+
+    def test_measurement_clip_is_never_digital_silence(self) -> None:
+        """A silent clip short-circuits before the model runs.
+
+        The measurement would then report None forever without anything failing.
+        """
+        clip = _measurement_clip(16_000, 15)
+
+        self.assertTrue(any(clip))
+        self.assertEqual(16_000 * 15 * 2, len(clip))
+
+    def test_measurement_refuses_a_transcriber_with_the_vad_filter_on(self) -> None:
+        """With the filter on, the synthetic clip is discarded as non-speech.
+
+        The pass would then time no decoding and report a fast ceiling on a
+        machine that cannot keep pace at all.
+        """
+        config = self._config(live_transcribe=True, vad_filter=True)
+        transcriber = FasterWhisperTranscriber(config)
+
+        measured, detail = measure_partial_pass_ms(config, transcriber)
+
+        self.assertIsNone(measured)
+        self.assertIn("voice activity filter", detail)
+
+    def test_measurement_uses_a_vad_free_config_when_it_builds_its_own(self) -> None:
+        config = self._config(live_transcribe=True, vad_filter=True)
+
+        with patch("murmly.cli.FasterWhisperTranscriber") as factory:
+            factory.return_value.partials_available = True
+            factory.return_value.transcribe_partial.return_value = "text"
+            measured, detail = measure_partial_pass_ms(config)
+
+        self.assertIsNone(detail)
+        self.assertIsInstance(measured, int)
+        self.assertFalse(factory.call_args.args[0].vad_filter)

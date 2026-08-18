@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+from collections import deque
 import math
 import sys
 import threading
@@ -63,7 +64,9 @@ class SoundDeviceRecorder:
         self._meter_stop: threading.Event | None = None
         self._meter_thread: threading.Thread | None = None
         self._stream = None
-        self._buffer = bytearray()
+        self._blocks: deque[bytes] = deque()
+        self._pending = bytearray()
+        self._pending_lock = threading.Lock()
         self._level_smoother.reset()
         self._latest_level_frame = None
         self._sample_rate_hz = config.sample_rate_hz
@@ -71,6 +74,10 @@ class SoundDeviceRecorder:
     @property
     def sample_rate_hz(self) -> int:
         return self._sample_rate_hz
+
+    @property
+    def bytes_per_second(self) -> int:
+        return self._sample_rate_hz * self._config.channels * 2
 
     def start(self) -> None:
         try:
@@ -80,14 +87,16 @@ class SoundDeviceRecorder:
                 "sounddevice is required for microphone capture. Install it before starting murmly."
             ) from error
 
-        self._buffer = bytearray()
+        self._blocks.clear()
+        with self._pending_lock:
+            self._pending = bytearray()
 
         def callback(indata: bytes, frames: int, time_info: object, status: object) -> None:
             del frames, time_info
             if status:
                 raise RuntimeError(f"Audio capture error: {status}")
             pcm_audio = bytes(indata)
-            self._buffer.extend(pcm_audio)
+            self._blocks.append(pcm_audio)
             if self._level_sink is not None:
                 self._latest_level_frame = pcm_audio
 
@@ -144,7 +153,56 @@ class SoundDeviceRecorder:
                 self._stop_meter()
                 self._level_smoother.reset()
                 self._latest_level_frame = None
-        return bytes(self._buffer)
+        return self.take_segment()
+
+    def snapshot(self, window_seconds: float | None = None) -> bytes:
+        """Return the audio captured since the last segment without stopping capture.
+
+        A window bounds the copy to the trailing `window_seconds`, so a long
+        recording does not cost more to inspect than a short one.
+        """
+        with self._pending_lock:
+            self._drain_locked()
+            if window_seconds is None:
+                return bytes(self._pending)
+            window_bytes = self._window_bytes(window_seconds)
+            if window_bytes <= 0 or len(self._pending) <= window_bytes:
+                return bytes(self._pending)
+            return bytes(self._pending[-window_bytes:])
+
+    def take_segment(self) -> bytes:
+        """Return everything captured since the last call and reset the accumulator.
+
+        More than one consumer can reach this: the live worker closes segments
+        while the toggle path stops the recording. Draining and resetting under
+        one lock is what stops those two losing a block into an orphaned buffer,
+        or handing the same audio to two transcripts.
+        """
+        with self._pending_lock:
+            self._drain_locked()
+            segment = bytes(self._pending)
+            self._pending = bytearray()
+            return segment
+
+    def _drain_locked(self) -> None:
+        """Move blocks the capture callback produced into the consumer's accumulator.
+
+        Callers must hold `_pending_lock`. `deque.append` in the callback and
+        `popleft` here are the thread-safe pair, so the real-time audio path
+        still takes no lock.
+        """
+        blocks = self._blocks
+        pending = self._pending
+        while True:
+            try:
+                pending.extend(blocks.popleft())
+            except IndexError:
+                return
+
+    def _window_bytes(self, window_seconds: float) -> int:
+        frame_bytes = self._config.channels * 2
+        window = int(self.bytes_per_second * max(window_seconds, 0.0))
+        return window - (window % frame_bytes)
 
     def record_for_seconds(self, seconds: float) -> bytes:
         self.start()

@@ -32,6 +32,29 @@ MODEL_PROFILES = {
 VALID_DEVICES = {"auto", "cpu", "cuda"}
 DEFAULT_RESTORE_DELAY_MS = 500
 MAX_RESTORE_DELAY_MS = 5_000
+
+VALID_AUTO_TRANSCRIBE_MODES = {"off", "stop", "continuous"}
+DEFAULT_AUTO_TRANSCRIBE_MODE = "off"
+
+DEFAULT_LIVE_INTERVAL_MS = 1_000
+MIN_LIVE_INTERVAL_MS = 250
+MAX_LIVE_INTERVAL_MS = 10_000
+
+DEFAULT_LIVE_WINDOW_SECONDS = 15
+MIN_LIVE_WINDOW_SECONDS = 5
+MAX_LIVE_WINDOW_SECONDS = 60
+
+DEFAULT_SILENCE_MS = 2_000
+MIN_SILENCE_MS = 250
+MAX_SILENCE_MS = 30_000
+
+DEFAULT_MIN_SPEECH_MS = 300
+MIN_MIN_SPEECH_MS = 0
+MAX_MIN_SPEECH_MS = 10_000
+
+DEFAULT_OVERLAY_TEXT_SIZE_PX = 13
+MIN_OVERLAY_TEXT_SIZE_PX = 8
+MAX_OVERLAY_TEXT_SIZE_PX = 48
 VALID_COMPUTE_TYPES = {
     "auto",
     "bfloat16",
@@ -77,12 +100,20 @@ class MurmlyConfig:
     beam_size: int = 5
     vad_filter: bool = True
     lazy_load_model: bool = True
+    live_transcribe: bool = False
+    live_interval_ms: int = DEFAULT_LIVE_INTERVAL_MS
+    live_window_seconds: int = DEFAULT_LIVE_WINDOW_SECONDS
+    auto_transcribe: str = DEFAULT_AUTO_TRANSCRIBE_MODE
+    auto_transcribe_rejected_value: str | None = None
+    auto_transcribe_silence_ms: int = DEFAULT_SILENCE_MS
+    auto_transcribe_min_speech_ms: int = DEFAULT_MIN_SPEECH_MS
     restore_clipboard: bool = True
     restore_clipboard_delay_ms: int = DEFAULT_RESTORE_DELAY_MS
     verify_target: bool = True
     overlay_enabled: bool = True
     overlay_bottom_margin_px: int = 32
     overlay_reduced_motion: bool = False
+    overlay_text_size_px: int = DEFAULT_OVERLAY_TEXT_SIZE_PX
 
     @property
     def model_name(self) -> str:
@@ -122,6 +153,12 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         compute_type = "auto"
     beam_size = _bounded_int(stt.get("beam_size"), model.beam_size, minimum=1, maximum=10)
 
+    auto_transcribe = str(stt.get("auto_transcribe", DEFAULT_AUTO_TRANSCRIBE_MODE))
+    auto_transcribe_rejected_value: str | None = None
+    if auto_transcribe not in VALID_AUTO_TRANSCRIBE_MODES:
+        auto_transcribe_rejected_value = auto_transcribe
+        auto_transcribe = DEFAULT_AUTO_TRANSCRIBE_MODE
+
     return MurmlyConfig(
         socket_path=socket_path,
         config_path=config_path,
@@ -133,6 +170,33 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         beam_size=beam_size,
         vad_filter=bool(stt.get("vad_filter", model.vad_filter)),
         lazy_load_model=bool(stt.get("lazy_load_model", True)),
+        live_transcribe=_boolean(stt.get("live_transcribe"), False),
+        live_interval_ms=_bounded_int(
+            stt.get("live_interval_ms"),
+            DEFAULT_LIVE_INTERVAL_MS,
+            minimum=MIN_LIVE_INTERVAL_MS,
+            maximum=MAX_LIVE_INTERVAL_MS,
+        ),
+        live_window_seconds=_bounded_int(
+            stt.get("live_window_seconds"),
+            DEFAULT_LIVE_WINDOW_SECONDS,
+            minimum=MIN_LIVE_WINDOW_SECONDS,
+            maximum=MAX_LIVE_WINDOW_SECONDS,
+        ),
+        auto_transcribe=auto_transcribe,
+        auto_transcribe_rejected_value=auto_transcribe_rejected_value,
+        auto_transcribe_silence_ms=_bounded_int(
+            stt.get("auto_transcribe_silence_ms"),
+            DEFAULT_SILENCE_MS,
+            minimum=MIN_SILENCE_MS,
+            maximum=MAX_SILENCE_MS,
+        ),
+        auto_transcribe_min_speech_ms=_bounded_int(
+            stt.get("auto_transcribe_min_speech_ms"),
+            DEFAULT_MIN_SPEECH_MS,
+            minimum=MIN_MIN_SPEECH_MS,
+            maximum=MAX_MIN_SPEECH_MS,
+        ),
         restore_clipboard=bool(clipboard.get("restore", True)),
         restore_clipboard_delay_ms=_bounded_int(
             clipboard.get("restore_delay_ms"),
@@ -149,6 +213,12 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
             maximum=512,
         ),
         overlay_reduced_motion=_boolean(overlay.get("reduced_motion"), False),
+        overlay_text_size_px=_bounded_int(
+            overlay.get("text_size_px"),
+            DEFAULT_OVERLAY_TEXT_SIZE_PX,
+            minimum=MIN_OVERLAY_TEXT_SIZE_PX,
+            maximum=MAX_OVERLAY_TEXT_SIZE_PX,
+        ),
     )
 
 

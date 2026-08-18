@@ -6,40 +6,150 @@ import logging
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import wave
 
 from murmly.config import MurmlyConfig
 
 
 logger = logging.getLogger(__name__)
+WHISPER_SAMPLE_RATE_HZ = 16_000
 
 
 class FasterWhisperTranscriber:
     def __init__(self, config: MurmlyConfig) -> None:
         self._config = config
         self._model = None
+        self._model_lock = threading.Lock()
+        self._load_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._stopping = threading.Event()
+        self._partials_disabled = False
+        self._capture_generation = 0
         if not self._config.lazy_load_model:
             self._load_model()
+
+    @property
+    def partials_available(self) -> bool:
+        return not self._partials_disabled
+
+    @property
+    def vad_filter(self) -> bool:
+        return self._config.vad_filter
+
+    def begin_capture(self) -> None:
+        """Allow partial passes again for a new recording."""
+        with self._state_lock:
+            self._stopping.clear()
+            self._partials_disabled = False
+            self._capture_generation += 1
+
+    def stop_partials(self) -> None:
+        """Refuse to start further partial passes.
+
+        A pass already inside the engine cannot be interrupted, so it runs to
+        completion and its result is discarded instead.
+        """
+        self._stopping.set()
 
     def transcribe_pcm16(self, pcm_audio: bytes, sample_rate_hz: int | None = None) -> str:
         if not pcm_audio or not any(pcm_audio):
             return ""
+        return self._transcribe(pcm_audio, sample_rate_hz)
+
+    def transcribe_partial(self, pcm_audio: bytes, sample_rate_hz: int | None = None) -> str | None:
+        """Transcribe captured audio for display only.
+
+        Returns None when the result must not be shown: partials are disabled,
+        capture has stopped, or the pass failed. A failure never reaches the
+        caller, because a partial is feedback and must not disturb the recording.
+        """
+        with self._state_lock:
+            if self._partials_disabled or self._stopping.is_set():
+                return None
+            generation = self._capture_generation
+        if not pcm_audio or not any(pcm_audio):
+            return None
+        try:
+            text = self._transcribe(pcm_audio, sample_rate_hz, allow_array=True)
+        except Exception as error:
+            with self._state_lock:
+                if generation == self._capture_generation:
+                    self._partials_disabled = True
+            logger.warning("Live transcription disabled after a failed pass: %s", error)
+            return None
+        with self._state_lock:
+            # Compare the generation, not just the stopping flag: a pass that
+            # outlived its recording would otherwise see the flag cleared by the
+            # next begin_capture and publish the previous recording's speech.
+            if self._stopping.is_set() or generation != self._capture_generation:
+                return None
+        return text
+
+    def _transcribe(
+        self,
+        pcm_audio: bytes,
+        sample_rate_hz: int | None,
+        *,
+        allow_array: bool = False,
+    ) -> str:
         model = self._load_model()
+        rate = sample_rate_hz or self._config.sample_rate_hz
+        # Mono 16 kHz only: the array path has no de-interleaving, and handing
+        # Whisper interleaved stereo would show nonsense in the panel while the
+        # delivered transcript (written as a correct WAV) said something else.
+        fast_path = (
+            allow_array
+            and rate == WHISPER_SAMPLE_RATE_HZ
+            and self._config.channels == 1
+        )
+        audio = self._as_array(pcm_audio) if fast_path else None
+        if audio is not None:
+            with self._model_lock:
+                return self._decode(model, audio)
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
             wav_path = Path(handle.name)
         try:
-            self._write_wav(wav_path, pcm_audio, sample_rate_hz or self._config.sample_rate_hz)
-            segments, _info = model.transcribe(
-                str(wav_path),
-                language="en",
-                beam_size=self._config.beam_size,
-                vad_filter=self._config.vad_filter,
-            )
-            return " ".join(segment.text.strip() for segment in segments).strip()
+            self._write_wav(wav_path, pcm_audio, rate)
+            with self._model_lock:
+                return self._decode(model, str(wav_path))
         finally:
             wav_path.unlink(missing_ok=True)
 
+    def _decode(self, model, audio) -> str:
+        segments, _info = model.transcribe(
+            audio,
+            language="en",
+            beam_size=self._config.beam_size,
+            vad_filter=self._config.vad_filter,
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
+
+    @staticmethod
+    def _as_array(pcm_audio: bytes):
+        """Hand 16 kHz partials straight to the model instead of via a temp WAV.
+
+        Only the partial path uses this. The delivered transcript keeps the file
+        route unchanged, so it cannot drift from what a non-live session produces.
+        """
+        try:
+            import numpy as np
+        except ModuleNotFoundError:
+            return None
+        usable = len(pcm_audio) - (len(pcm_audio) % 2)
+        if usable == 0:
+            return None
+        samples = np.frombuffer(pcm_audio[:usable], dtype=np.int16).astype(np.float32)
+        return samples / 32_768.0
+
     def _load_model(self):
+        # Serialized: two threads that both saw `self._model is None` would each
+        # construct a model, allocating two copies of the weights at once.
+        with self._load_lock:
+            return self._load_model_locked()
+
+    def _load_model_locked(self):
         if self._model is None:
             try:
                 from faster_whisper import WhisperModel

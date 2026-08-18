@@ -6,8 +6,20 @@ import unittest
 from pathlib import Path
 
 from murmly.config import (
+    DEFAULT_LIVE_INTERVAL_MS,
+    DEFAULT_LIVE_WINDOW_SECONDS,
+    DEFAULT_MIN_SPEECH_MS,
+    DEFAULT_OVERLAY_TEXT_SIZE_PX,
     DEFAULT_RESTORE_DELAY_MS,
+    DEFAULT_SILENCE_MS,
+    MAX_LIVE_INTERVAL_MS,
+    MAX_LIVE_WINDOW_SECONDS,
+    MAX_OVERLAY_TEXT_SIZE_PX,
     MAX_RESTORE_DELAY_MS,
+    MAX_SILENCE_MS,
+    MIN_LIVE_INTERVAL_MS,
+    MIN_OVERLAY_TEXT_SIZE_PX,
+    MIN_SILENCE_MS,
     default_socket_path,
     load_config,
 )
@@ -199,6 +211,112 @@ class ConfigTests(unittest.TestCase):
 
             self.assertGreaterEqual(config.restore_clipboard_delay_ms, 0)
             self.assertLessEqual(config.restore_clipboard_delay_ms, MAX_RESTORE_DELAY_MS)
+
+    def test_live_and_auto_transcribe_default_to_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(Path(temp_dir) / "missing.toml")
+
+        self.assertFalse(config.live_transcribe)
+        self.assertEqual("off", config.auto_transcribe)
+        self.assertIsNone(config.auto_transcribe_rejected_value)
+        self.assertEqual(DEFAULT_LIVE_INTERVAL_MS, config.live_interval_ms)
+        self.assertEqual(DEFAULT_LIVE_WINDOW_SECONDS, config.live_window_seconds)
+        self.assertEqual(2_000, config.auto_transcribe_silence_ms)
+        self.assertEqual(DEFAULT_SILENCE_MS, config.auto_transcribe_silence_ms)
+        self.assertEqual(DEFAULT_MIN_SPEECH_MS, config.auto_transcribe_min_speech_ms)
+
+    def test_live_and_auto_transcribe_read_valid_values(self) -> None:
+        for mode in ("off", "stop", "continuous"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [stt]
+                        live_transcribe = true
+                        live_interval_ms = 750
+                        live_window_seconds = 20
+                        auto_transcribe = "{mode}"
+                        auto_transcribe_silence_ms = 1500
+                        auto_transcribe_min_speech_ms = 500
+                        """
+                    ).strip()
+                )
+
+                config = load_config(config_path)
+
+            self.assertTrue(config.live_transcribe)
+            self.assertEqual(750, config.live_interval_ms)
+            self.assertEqual(20, config.live_window_seconds)
+            self.assertEqual(mode, config.auto_transcribe)
+            self.assertIsNone(config.auto_transcribe_rejected_value)
+            self.assertEqual(1_500, config.auto_transcribe_silence_ms)
+            self.assertEqual(500, config.auto_transcribe_min_speech_ms)
+
+    def test_unrecognized_auto_transcribe_mode_falls_back_and_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('[stt]\nauto_transcribe = "whenever"')
+
+            config = load_config(config_path)
+
+        self.assertEqual("off", config.auto_transcribe)
+        self.assertEqual("whenever", config.auto_transcribe_rejected_value)
+
+    def test_out_of_range_live_and_silence_values_fall_back_to_defaults(self) -> None:
+        for interval, silence in (
+            (MIN_LIVE_INTERVAL_MS - 1, MIN_SILENCE_MS - 1),
+            (MAX_LIVE_INTERVAL_MS + 1, MAX_SILENCE_MS + 1),
+        ):
+            with self.subTest(interval=interval), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [stt]
+                        live_interval_ms = {interval}
+                        live_window_seconds = {MAX_LIVE_WINDOW_SECONDS + 1}
+                        auto_transcribe_silence_ms = {silence}
+                        auto_transcribe_min_speech_ms = -5
+                        """
+                    ).strip()
+                )
+
+                config = load_config(config_path)
+
+            self.assertEqual(DEFAULT_LIVE_INTERVAL_MS, config.live_interval_ms)
+            self.assertEqual(DEFAULT_LIVE_WINDOW_SECONDS, config.live_window_seconds)
+            self.assertEqual(DEFAULT_SILENCE_MS, config.auto_transcribe_silence_ms)
+            self.assertEqual(DEFAULT_MIN_SPEECH_MS, config.auto_transcribe_min_speech_ms)
+
+    def test_overlay_text_size_defaults_and_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(Path(temp_dir) / "missing.toml")
+        self.assertEqual(DEFAULT_OVERLAY_TEXT_SIZE_PX, config.overlay_text_size_px)
+
+        for value, expected in (
+            (24, 24),
+            (MIN_OVERLAY_TEXT_SIZE_PX - 1, DEFAULT_OVERLAY_TEXT_SIZE_PX),
+            (MAX_OVERLAY_TEXT_SIZE_PX + 1, DEFAULT_OVERLAY_TEXT_SIZE_PX),
+            ('"large"', DEFAULT_OVERLAY_TEXT_SIZE_PX),
+        ):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(f"[overlay]\ntext_size_px = {value}")
+
+                config = load_config(config_path)
+
+            self.assertEqual(expected, config.overlay_text_size_px)
+
+    def test_invalid_live_transcribe_value_uses_the_default(self) -> None:
+        for value in ('"yes"', "1", "[]"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(f"[stt]\nlive_transcribe = {value}")
+
+                config = load_config(config_path)
+
+            self.assertFalse(config.live_transcribe)
 
     def test_invalid_stt_settings_fall_back_to_profile_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

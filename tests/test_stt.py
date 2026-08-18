@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
+import threading
+import time
 import unittest
 import wave
 from importlib.metadata import PackageNotFoundError
@@ -234,6 +237,137 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
         self.assertEqual("", text)
         load_model.assert_not_called()
 
+    def test_partial_transcription_returns_text_while_capture_runs(self) -> None:
+        transcriber, model = self._transcriber_with_model(" partial text ")
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+            text = transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+
+        self.assertEqual("partial text", text)
+
+    def test_partial_result_is_dropped_once_capture_stops(self) -> None:
+        transcriber, model = self._transcriber_with_model(" too late ")
+
+        def transcribe(*_args, **_kwargs):
+            transcriber.stop_partials()
+            return ([SimpleNamespace(text=" too late ")], object())
+
+        model.transcribe.side_effect = transcribe
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+            text = transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+
+        self.assertIsNone(text)
+
+    def test_no_partial_pass_starts_after_capture_stops(self) -> None:
+        transcriber, model = self._transcriber_with_model(" never ")
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+            transcriber.stop_partials()
+            text = transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+
+        self.assertIsNone(text)
+        model.transcribe.assert_not_called()
+
+    def test_partial_failure_does_not_propagate_and_disables_partials(self) -> None:
+        transcriber, model = self._transcriber_with_model(" unused ")
+        model.transcribe.side_effect = RuntimeError("decode exploded")
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+            self.assertTrue(transcriber.partials_available)
+            text = transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+
+        self.assertIsNone(text)
+        self.assertFalse(transcriber.partials_available)
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            self.assertIsNone(transcriber.transcribe_partial(b"\x01\x00" * 16_000))
+        self.assertEqual(1, model.transcribe.call_count)
+
+    def test_a_failed_partial_does_not_stop_the_final_transcription(self) -> None:
+        transcriber, model = self._transcriber_with_model(" unused ")
+        model.transcribe.side_effect = RuntimeError("decode exploded")
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+            transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+            model.transcribe.side_effect = None
+            model.transcribe.return_value = ([SimpleNamespace(text=" delivered ")], object())
+            text = transcriber.transcribe_pcm16(b"\x01\x00" * 16_000)
+
+        self.assertEqual("delivered", text)
+
+    def test_partial_and_final_passes_never_run_concurrently(self) -> None:
+        transcriber, model = self._transcriber_with_model(" text ")
+        concurrent = []
+        active = []
+        barrier = threading.Event()
+
+        def transcribe(*_args, **_kwargs):
+            active.append(1)
+            concurrent.append(len(active))
+            barrier.wait(timeout=1)
+            active.pop()
+            return ([SimpleNamespace(text=" text ")], object())
+
+        model.transcribe.side_effect = transcribe
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+            partial = threading.Thread(
+                target=transcriber.transcribe_partial,
+                args=(b"\x01\x00" * 16_000,),
+            )
+            partial.start()
+            final = threading.Thread(
+                target=transcriber.transcribe_pcm16,
+                args=(b"\x01\x00" * 16_000,),
+            )
+            final.start()
+            barrier.set()
+            partial.join(timeout=3)
+            final.join(timeout=3)
+
+        self.assertEqual(2, len(concurrent))
+        self.assertEqual([1, 1], concurrent)
+
+    def test_begin_capture_re_enables_partials_for_the_next_session(self) -> None:
+        transcriber, model = self._transcriber_with_model(" text ")
+        model.transcribe.side_effect = RuntimeError("decode exploded")
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+            transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+            self.assertFalse(transcriber.partials_available)
+
+            transcriber.begin_capture()
+            self.assertTrue(transcriber.partials_available)
+
+    def test_partial_transcription_skips_digital_silence(self) -> None:
+        transcriber, model = self._transcriber_with_model(" text ")
+
+        with patch.object(transcriber, "_load_model", return_value=model) as load_model:
+            transcriber.begin_capture()
+            self.assertIsNone(transcriber.transcribe_partial(b"\x00\x00" * 16_000))
+
+        load_model.assert_not_called()
+
+    def _transcriber_with_model(self, text: str):
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+        transcriber = FasterWhisperTranscriber(config)
+        model = Mock()
+        model.transcribe.return_value = ([SimpleNamespace(text=text)], object())
+        return transcriber, model
+
     def test_write_wav_uses_supplied_capture_rate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             wav_path = Path(temp_dir) / "clip.wav"
@@ -248,3 +382,80 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 self.assertEqual(48_000, wav_handle.getframerate())
                 self.assertEqual(1, wav_handle.getnchannels())
                 self.assertEqual(2, wav_handle.getsampwidth())
+
+class TranscriberConcurrencyTests(unittest.TestCase):
+    def _transcriber(self) -> FasterWhisperTranscriber:
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+        return FasterWhisperTranscriber(config)
+
+    def test_only_one_model_is_ever_constructed(self) -> None:
+        """Two threads that both see `_model is None` must not each build one.
+
+        Each model is ~1.6 GB, so a second concurrent construction can exhaust
+        VRAM and abort the transcription the user is actually waiting on.
+        """
+        transcriber = self._transcriber()
+        constructed = []
+        start = threading.Barrier(4)
+
+        def slow_model(*_args, **_kwargs):
+            constructed.append(1)
+            time.sleep(0.2)
+            return Mock()
+
+        with (
+            patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
+            patch("faster_whisper.WhisperModel", side_effect=slow_model),
+        ):
+            def load() -> None:
+                start.wait(timeout=5)
+                transcriber._load_model()
+
+            threads = [threading.Thread(target=load) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertEqual(1, len(constructed))
+
+    def test_a_partial_from_a_finished_recording_is_never_published(self) -> None:
+        """A pass can outlive the recording that started it.
+
+        `stop_partials` is only advisory once a pass is inside the engine, so the
+        result must be matched to its own recording rather than to a flag the
+        next `begin_capture` clears.
+        """
+        transcriber = self._transcriber()
+        model = Mock()
+        released = threading.Event()
+
+        def slow_transcribe(*_args, **_kwargs):
+            released.wait(timeout=5)
+            return ([SimpleNamespace(text=" speech from recording A ")], object())
+
+        model.transcribe.side_effect = slow_transcribe
+        results: list[str | None] = []
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+
+            def stale_pass() -> None:
+                results.append(transcriber.transcribe_partial(b"\x01\x00" * 16_000))
+
+            worker = threading.Thread(target=stale_pass)
+            worker.start()
+            time.sleep(0.1)
+
+            # Recording A ends and recording B begins while the pass is in flight.
+            transcriber.stop_partials()
+            transcriber.begin_capture()
+            released.set()
+            worker.join(timeout=5)
+
+        self.assertEqual([None], results)

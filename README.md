@@ -121,6 +121,11 @@ it; `murmly doctor` shows the path currently recorded.
   transcription model in memory — roughly 1.6 GB for the balanced profile, in
   VRAM when running on CUDA — until you log out. Set a smaller
   `stt.model_profile` if that matters on your machine.
+- **Live transcription puts what you say on screen.** With `stt.live_transcribe`
+  enabled, partial transcripts are visible in the overlay while you speak, which
+  means they are visible to anyone watching a shared screen. It is disabled by
+  default, the text is discarded the moment capture stops, and it is never
+  written to a log or a file.
 
 ## Configuration
 
@@ -142,6 +147,12 @@ compute_type = "auto"
 beam_size = 5
 vad_filter = true
 lazy_load_model = true
+live_transcribe = false        # Show partial transcripts while you speak
+live_interval_ms = 1000        # How often a partial is produced, 250-10000
+live_window_seconds = 15       # Trailing audio each partial re-reads, 5-60
+auto_transcribe = "off"        # off | stop | continuous
+auto_transcribe_silence_ms = 2000     # Silence that triggers auto-transcribe, 250-30000
+auto_transcribe_min_speech_ms = 300   # Speech required before silence counts, 0-10000
 
 [clipboard]
 restore = true
@@ -152,6 +163,7 @@ verify_target = true # Refuse to paste if focus left the window you dictated int
 enabled = true
 bottom_margin_px = 32 # Logical pixels from the display's bottom edge, 0-512
 reduced_motion = false
+text_size_px = 13 # Transcript panel text size, 8-48
 ```
 
 Profile mapping:
@@ -166,6 +178,64 @@ of a profile downloads its model; later sessions reuse the local cache. The
 tested CUDA runtime wheels are about 1.4 GB and the cached `large-v3-turbo`
 model about 1.6 GB. The balanced model revision is pinned for reproducible
 downloads.
+
+### Live transcription
+
+`stt.live_transcribe` shows partial transcripts in a panel below the recording
+indicator while you speak. Partials are feedback only: they never reach the
+clipboard or your application, and the transcript Murmly delivers is always
+produced by a fresh pass over the complete recording. Enabling live transcription
+cannot change what gets typed.
+
+Whether partials keep pace depends on the profile and device. `murmly doctor`
+reports `partial_pass_ceiling_ms`, measured on your machine as the worst case
+where a whole window is speech. Measured here with the default 15-second window:
+
+| Device | Profile | Ceiling | Verdict |
+| --- | --- | --- | --- |
+| CUDA `float16` | `fast` | 244 ms | keeps pace |
+| CUDA `float16` | `balanced` | 319 ms | keeps pace |
+| CPU `int8` | `fast` | 641 ms | keeps pace |
+| CPU `int8` | `balanced` | 12364 ms | **falls behind** |
+
+`large-v3-turbo` on CPU is roughly twelve times over the default 1000 ms
+interval. Murmly skips ticks rather than queuing them, so the partial display
+simply updates rarely. Silence detection is unaffected: it runs on its own
+thread, so a slow partial pass cannot delay auto-transcribe.
+
+One cost does remain. A partial pass already inside the model cannot be
+cancelled, and the model decodes one request at a time, so stopping a recording
+can wait for an in-flight pass to finish before the final transcription starts —
+bounded by one pass, which is the ceiling in the table above. On CPU, pair live
+transcription with the `fast` profile.
+
+### Auto-transcribe
+
+`stt.auto_transcribe` lets a run of silence act for you. It is independent of
+live transcription; either works without the other.
+
+- `off` (default) — silence never ends a recording.
+- `stop` — silence ends the recording exactly as pressing the hotkey would:
+  capture stops, the transcript is produced and delivered, and Murmly returns to
+  idle.
+- `continuous` — silence closes a segment, which is transcribed and delivered
+  while capture keeps running for your next sentence. The session ends when you
+  toggle, when a delivery is refused, or on error.
+
+Silence only counts once speech has been detected in the current recording or
+segment, so a muted microphone keeps Murmly listening instead of ending the
+recording on an empty transcript. Detection uses the voice activity model bundled
+with faster-whisper and needs a capture rate that is an integer multiple of
+16 kHz; on other rates Murmly disables auto-transcribe for that session and says
+so in `murmly doctor`.
+
+**An auto-stopped recording delivers without printing.** The toggle that started
+the recording already returned, so `murmly toggle` shows only the acknowledgement
+that capture began. The transcript is still pasted and still lands on your
+clipboard — it just never appears in command output.
+
+In `continuous` mode a refused delivery ends the session rather than continuing to
+record speech Murmly has just shown it cannot deliver.
 
 Restart the service after changing configuration:
 
