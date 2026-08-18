@@ -172,13 +172,25 @@ class OverlayRendererTests(unittest.TestCase):
         self.assertEqual((1_920 - WINDOW_WIDTH) // 2, indicator_x)
         self.assertEqual(1_080 - WINDOW_HEIGHT - 96, indicator_y)
 
-    def test_panel_is_clamped_to_stay_on_the_display(self) -> None:
+    def test_panel_moves_above_the_indicator_when_the_margin_cannot_hold_it(self) -> None:
+        """It must never overlap the indicator, and never leave the display."""
         monitor = MonitorGeometry(connector="DP-1", x=0, y=0, width=1_920, height=1_080)
         height = panel_height(40)
 
         _x, y = panel_position(monitor, 0, 400, height)
 
-        self.assertEqual(1_080 - height, y)
+        indicator_top = 1_080 - WINDOW_HEIGHT
+        self.assertLessEqual(y + height, indicator_top)
+        self.assertGreaterEqual(y, 0)
+        self.assertLessEqual(y + height, 1_080)
+
+    def test_panel_sits_below_the_indicator_when_the_margin_has_room(self) -> None:
+        monitor = MonitorGeometry(connector="DP-1", x=0, y=0, width=1_920, height=1_080)
+        height = panel_height(13)
+
+        _x, y = panel_position(monitor, 120, 400, height)
+
+        self.assertGreaterEqual(y, 1_080 - 120)
         self.assertLessEqual(y + height, 1_080)
 
     def test_truncation_keeps_the_tail_behind_an_ellipsis(self) -> None:

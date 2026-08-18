@@ -36,6 +36,7 @@ COMMAND_TIMEOUT_SECONDS = 2.0
 LIVE_WORKER_JOIN_SECONDS = 0.5
 MIN_LIVE_TICK_SECONDS = 0.05
 SILENCE_TICK_SECONDS = 0.25
+MAX_SILENCE_TICK_SECONDS = 1.0
 MAX_TICK_FAILURES = 5
 
 
@@ -69,7 +70,6 @@ class SpeechSession:
         self._live_stop = threading.Event()
         self._live_threads: list[threading.Thread] = []
         self._delivery_lock = threading.Lock()
-        self._tick_failures = 0
 
     @property
     def focus_observer(self) -> FocusObserver:
@@ -77,14 +77,26 @@ class SpeechSession:
 
     def start_recording(self) -> None:
         self._recorder.start()
-        self._transcriber.begin_capture()
-        self._silence = self._create_silence_detector()
-        self._tick_failures = 0
-        self._start_live_worker()
+        try:
+            self._transcriber.begin_capture()
+            self._silence = self._create_silence_detector()
+            self._start_live_worker()
+        except Exception:
+            # The stream is already open. Without this the daemon reports failure
+            # and stays IDLE while the microphone stays live, and the next toggle
+            # orphans it by overwriting the handle.
+            try:
+                self._recorder.stop()
+            except Exception as stop_error:
+                logger.warning("Unable to close capture after a failed start: %s", stop_error)
+            raise
 
     def stop_recording(self) -> bytes:
-        self._stop_live_worker()
+        # Refuse new passes first: a tick already past its wait would otherwise
+        # start a full decode during the join and hold the model lock, delaying
+        # the final transcription by a whole pass whose result is discarded.
         self._transcriber.stop_partials()
+        self._stop_live_worker()
         return self._recorder.stop()
 
     def take_segment(self) -> bytes:
@@ -148,7 +160,7 @@ class SpeechSession:
             self._spawn_live_thread(
                 self._run_silence_loop,
                 "murmly-silence",
-                SILENCE_TICK_SECONDS,
+                self._silence_interval(),
             )
         if wants_partials:
             self._spawn_live_thread(
@@ -156,6 +168,17 @@ class SpeechSession:
                 "murmly-partial",
                 max(self._config.live_interval_ms / 1_000, MIN_LIVE_TICK_SECONDS),
             )
+
+    def _silence_interval(self) -> float:
+        """How often to re-measure the trailing window.
+
+        Each tick re-runs the voice activity model over the whole window, so a
+        fixed rate would recompute a 30 s window four times a second. Scaling with
+        the window keeps the cost flat while staying far below the threshold the
+        reading has to detect.
+        """
+        window = self._silence.window_seconds if self._silence is not None else 0.0
+        return min(max(SILENCE_TICK_SECONDS, window / 40), MAX_SILENCE_TICK_SECONDS)
 
     def _spawn_live_thread(self, loop, name: str, interval: float) -> None:
         thread = threading.Thread(
@@ -194,40 +217,33 @@ class SpeechSession:
         self._run_tick_loop(stop_event, interval, self._partial_tick, "partial")
 
     def _run_tick_loop(self, stop_event: threading.Event, interval: float, tick, label: str) -> None:
+        # Per loop, not shared: a healthy loop resetting the counter would hide a
+        # neighbour failing every tick, and a broken one could kill a healthy one.
+        failures = 0
         next_tick = self._clock() + interval
         while True:
             delay = next_tick - self._clock()
             if stop_event.wait(delay if delay > 0 else MIN_LIVE_TICK_SECONDS):
                 return
-            if not self._guarded_tick(tick, label):
-                return
+            try:
+                tick()
+                failures = 0
+            except Exception as error:
+                failures += 1
+                logger.warning(
+                    "Live worker %s tick failed (%d/%d): %s",
+                    label,
+                    failures,
+                    MAX_TICK_FAILURES,
+                    error,
+                )
+                if failures >= MAX_TICK_FAILURES:
+                    return
             # Advance against the time the tick finished: a slow tick would
             # otherwise leave the schedule in the past and fire a catch-up burst.
             after = self._clock()
             while next_tick <= after:
                 next_tick += interval
-
-    def _guarded_tick(self, tick, label: str) -> bool:
-        """Run one tick, surviving transient failures.
-
-        A single bad tick must not end silence polling: in stop mode that would
-        leave the microphone open for the rest of the session with no way to end
-        it but the hotkey. The loop only gives up once failures are persistent.
-        """
-        try:
-            tick()
-        except Exception as error:
-            self._tick_failures += 1
-            logger.warning(
-                "Live worker %s tick failed (%d/%d): %s",
-                label,
-                self._tick_failures,
-                MAX_TICK_FAILURES,
-                error,
-            )
-            return self._tick_failures < MAX_TICK_FAILURES
-        self._tick_failures = 0
-        return True
 
     def _silence_tick(self) -> None:
         if self._silence is None or not self._silence.available:
@@ -274,6 +290,8 @@ class MurmlyDaemon:
         # live worker and the toggle path. Mutual exclusion here is what keeps
         # segment order, `_segments`, and `_session_delivered` consistent.
         self._unit_lock = threading.Lock()
+        self._segment_thread: threading.Thread | None = None
+        self._partial_sink_owner = self._publish_partial
         self._state = "IDLE"
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
@@ -511,9 +529,12 @@ class MurmlyDaemon:
         self._start_transition(self._finish_auto_stop, "murmly-auto-stop")
 
     def _finish_auto_stop(self) -> None:
-        self._publish_state(OverlayState.THINKING)
         try:
             pcm_audio = self._session.stop_recording()
+            # Published only once capture has stopped, matching the toggle path:
+            # the processing presentation must never be shown while the waveform
+            # still represents live input.
+            self._publish_state(OverlayState.THINKING)
             target = self._session.capture_delivery_target()
             result = self._session.process_recording(pcm_audio, target)
             if result.detail is None:
@@ -528,8 +549,29 @@ class MurmlyDaemon:
                 self._state = "IDLE"
 
     def _deliver_segment(self) -> None:
-        # Non-blocking: a toggle already holding this is ending the recording, and
-        # it joins this very worker, so waiting here would stall it.
+        """Hand the segment to its own thread and return to polling.
+
+        Decode plus paste plus the clipboard restore delay runs for seconds; on
+        the silence thread that would black out detection for the whole time and
+        swallow the next pause -- the defect the separate thread exists to avoid.
+        """
+        if self._segment_thread is not None and self._segment_thread.is_alive():
+            return
+        try:
+            thread = threading.Thread(
+                target=self._run_segment,
+                name="murmly-segment",
+                daemon=True,
+            )
+            thread.start()
+        except RuntimeError as error:
+            logger.warning("Unable to start segment delivery: %s", error)
+            return
+        self._segment_thread = thread
+
+    def _run_segment(self) -> None:
+        # Non-blocking: a toggle already holding this is ending the recording, so
+        # it should win rather than queue behind another segment.
         if not self._unit_lock.acquire(blocking=False):
             return
         try:
@@ -549,11 +591,17 @@ class MurmlyDaemon:
                 self._segments.append(result.text)
                 if not result.delivered:
                     self._session_delivered = False
-            refused = not result.delivered
+            # This text has been pasted; leaving it under the indicator would show
+            # the user speech that is no longer pending.
+            if self._partial_sink_owner is not None:
+                self._partial_sink_owner("")
+            if not result.delivered:
+                # Claimed under the unit lock: releasing first lets a toggle take
+                # the session over and deliver normally, leaving the user a
+                # success overlay and a failure response for the same session.
+                self._end_continuous_session()
         finally:
             self._unit_lock.release()
-        if refused:
-            self._end_continuous_session()
 
     def _end_continuous_session(self) -> None:
         if not self._claim_listening(advance=True):

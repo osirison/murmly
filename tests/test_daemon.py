@@ -690,6 +690,16 @@ class AutoTranscribeTests(unittest.TestCase):
         )
         return MurmlyDaemon(config, session=session)
 
+    def _settle(self, daemon: MurmlyDaemon) -> None:
+        """Wait for an off-thread segment delivery to finish.
+
+        Segment delivery runs on its own thread so it cannot stall silence
+        polling, so the tests have to join it rather than assume it is done.
+        """
+        thread = daemon._segment_thread
+        if thread is not None:
+            thread.join(timeout=5)
+
     def _wait_for_state(self, daemon: MurmlyDaemon, state: str) -> None:
         deadline = time.time() + 3
         while time.time() < deadline:
@@ -706,6 +716,8 @@ class AutoTranscribeTests(unittest.TestCase):
             self.assertEqual("LISTENING", daemon.state)
 
             daemon._on_silence()
+
+            self._settle(daemon)
             self._wait_for_state(daemon, "IDLE")
 
         self.assertEqual(1, session.stopped)
@@ -719,6 +731,8 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon.handle_command("toggle")
 
             daemon._on_silence()
+
+            self._settle(daemon)
 
             self.assertEqual("LISTENING", daemon.state)
             self.assertEqual(0, session.stopped)
@@ -734,6 +748,8 @@ class AutoTranscribeTests(unittest.TestCase):
 
             daemon._on_silence()
 
+            self._settle(daemon)
+
             self.assertEqual(1, session.stopped)
             self.assertEqual(1, session.processed)
 
@@ -744,6 +760,8 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon.handle_command("toggle")
 
             daemon._on_silence()
+
+            self._settle(daemon)
             self.assertTrue(session.processing.wait(timeout=3))
 
             response = daemon.handle_command("toggle")
@@ -762,8 +780,11 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon.handle_command("toggle")
 
             daemon._on_silence()
+
+            self._settle(daemon)
             self.assertEqual("LISTENING", daemon.state)
             daemon._on_silence()
+            self._settle(daemon)
             self.assertEqual("LISTENING", daemon.state)
 
             response = daemon.handle_command("toggle")
@@ -783,6 +804,8 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon.handle_command("toggle")
 
             daemon._on_silence()
+
+            self._settle(daemon)
             daemon.handle_command("toggle")
 
         self.assertEqual(2, session.targets_captured)
@@ -795,6 +818,8 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon.handle_command("toggle")
 
             daemon._on_silence()
+
+            self._settle(daemon)
             self._wait_for_state(daemon, "IDLE")
 
         self.assertEqual(1, session.segments_taken)
@@ -809,6 +834,8 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon.handle_command("toggle")
 
             daemon._on_silence()
+
+            self._settle(daemon)
             response = daemon.handle_command("toggle")
 
         self.assertEqual("only segment", response["text"])
@@ -838,6 +865,7 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon.handle_command("toggle")
             self.assertEqual("LISTENING", daemon.state)
             daemon._on_silence()
+            self._settle(daemon)
             self.assertEqual("LISTENING", daemon.state)
             daemon.handle_command("toggle")
             self.assertEqual("IDLE", daemon.state)
@@ -971,6 +999,91 @@ class LiveWorkerCadenceTests(unittest.TestCase):
         # The observation window sits entirely inside one 1.5 s partial pass. A
         # shared thread would record zero ticks here; separate loops give ~4.
         self.assertGreaterEqual(silence_ticks, 3)
+
+    def test_a_blocking_segment_delivery_does_not_stall_silence_polling(self) -> None:
+        """Drives the real silence loop against a delivery that blocks.
+
+        Every other auto-transcribe test calls `_on_silence()` from the test
+        thread, so none of them can see a delivery running on the polling thread.
+        """
+        class BlockingSegmentSession(SegmentSession):
+            def __init__(self) -> None:
+                super().__init__(texts=["one", "two"])
+                self.delivering = threading.Event()
+                self.release = threading.Event()
+
+            def process_recording(self, pcm_audio, target=None):
+                self.delivering.set()
+                self.release.wait(timeout=5)
+                return super().process_recording(pcm_audio, target)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = BlockingSegmentSession()
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+                auto_transcribe="continuous",
+            )
+            daemon = MurmlyDaemon(config, session=session)
+            daemon.handle_command("toggle")
+
+            ticks = 0
+            triggered = threading.Event()
+
+            def tick() -> None:
+                nonlocal ticks
+                if not triggered.is_set():
+                    triggered.set()
+                    daemon._on_silence()
+                    return
+                if session.delivering.is_set():
+                    ticks += 1
+
+            loop_session = SpeechSession.__new__(SpeechSession)
+            loop_session._clock = time.monotonic
+            loop_session._silence_tick = tick
+
+            stop = threading.Event()
+            worker = threading.Thread(
+                target=SpeechSession._run_tick_loop,
+                args=(loop_session, stop, 0.25, tick, "silence"),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(session.delivering.wait(timeout=3))
+            time.sleep(1.0)
+            session.release.set()
+            stop.set()
+            worker.join(timeout=3)
+            if daemon._segment_thread is not None:
+                daemon._segment_thread.join(timeout=5)
+            daemon.handle_command("toggle")
+
+        # The delivery blocks on its own thread, so the loop keeps ticking.
+        self.assertGreaterEqual(ticks, 3)
+
+    def test_segment_delivery_runs_off_the_polling_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["one"])
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+                auto_transcribe="continuous",
+            )
+            daemon = MurmlyDaemon(config, session=session)
+            daemon.handle_command("toggle")
+            caller = threading.current_thread()
+
+            daemon._on_silence()
+            thread = daemon._segment_thread
+            self.assertIsNotNone(thread)
+            self.assertIsNot(thread, caller)
+            thread.join(timeout=5)
+
+            self.assertEqual(1, session.segments_taken)
+            daemon.handle_command("toggle")
 
     def test_only_the_configured_loops_start(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

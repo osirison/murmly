@@ -121,11 +121,19 @@ def panel_position(
     the indicator's bottom edge and the display edge, clamped so it never leaves
     the screen.
     """
-    top = monitor.y + monitor.height - bottom_margin_px + PANEL_GAP_PX
-    lowest_top = monitor.y + monitor.height - height
+    indicator_top = monitor.y + monitor.height - WINDOW_HEIGHT - bottom_margin_px
+    indicator_bottom = indicator_top + WINDOW_HEIGHT
+    below_top = indicator_bottom + PANEL_GAP_PX
+    if below_top + height <= monitor.y + monitor.height:
+        top = below_top
+    else:
+        # No room in the margin. Sitting above the indicator keeps the panel
+        # visible and adjacent; clamping it downward instead would draw it on top
+        # of the indicator, and leaving it below would push it off the display.
+        top = max(indicator_top - PANEL_GAP_PX - height, monitor.y)
     return (
         (monitor.x + (monitor.width - width) // 2) * monitor.scale,
-        min(top, lowest_top) * monitor.scale,
+        top * monitor.scale,
     )
 
 
@@ -732,7 +740,10 @@ class OverlayApplication:
         self._sync_visibility()
         if self._drawing_area is not None:
             self._drawing_area.queue_draw()
-        self._sync_panel()
+        # Levels arrive at 30 Hz and never change the panel's content, so
+        # redrawing on them would re-run the truncation search 30 times a second.
+        if message["type"] != "level":
+            self._sync_panel()
         return False
 
     def _sync_panel(self) -> None:
@@ -809,6 +820,7 @@ class OverlayApplication:
             # Forget the panel geometry too: the next recording may select a
             # different monitor, and a width-only check would skip re-placing it.
             self._panel_width = 0
+            self._panel_geometry = None
             self._selected_monitor = None
             self._selected_geometry = None
 

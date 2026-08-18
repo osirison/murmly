@@ -350,7 +350,16 @@ def live_transcription_diagnostics(
 
     report["partial_pass_ceiling_ms"] = None
     if config.live_transcribe:
-        measured, detail = measure_partial_pass_ms(config, transcriber)
+        # At the negotiated rate, not the configured one: a session that lands on
+        # 48 kHz takes the slower temp-WAV route, and measuring at 16 kHz would
+        # report the in-memory path's ceiling for a setup that never uses it.
+        measured_rate = report.get("negotiated_sample_rate_hz")
+        if measured_rate is None:
+            measured_rate, _detail = negotiated_capture_rate(config)
+        measurement_config = (
+            config if measured_rate is None else replace(config, sample_rate_hz=measured_rate)
+        )
+        measured, detail = measure_partial_pass_ms(measurement_config, transcriber)
         report["partial_pass_ceiling_ms"] = measured
         if detail is not None:
             report["partial_pass_detail"] = detail
