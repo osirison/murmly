@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from importlib.metadata import PackageNotFoundError
@@ -381,3 +382,80 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 self.assertEqual(48_000, wav_handle.getframerate())
                 self.assertEqual(1, wav_handle.getnchannels())
                 self.assertEqual(2, wav_handle.getsampwidth())
+
+class TranscriberConcurrencyTests(unittest.TestCase):
+    def _transcriber(self) -> FasterWhisperTranscriber:
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+        return FasterWhisperTranscriber(config)
+
+    def test_only_one_model_is_ever_constructed(self) -> None:
+        """Two threads that both see `_model is None` must not each build one.
+
+        Each model is ~1.6 GB, so a second concurrent construction can exhaust
+        VRAM and abort the transcription the user is actually waiting on.
+        """
+        transcriber = self._transcriber()
+        constructed = []
+        start = threading.Barrier(4)
+
+        def slow_model(*_args, **_kwargs):
+            constructed.append(1)
+            time.sleep(0.2)
+            return Mock()
+
+        with (
+            patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
+            patch("faster_whisper.WhisperModel", side_effect=slow_model),
+        ):
+            def load() -> None:
+                start.wait(timeout=5)
+                transcriber._load_model()
+
+            threads = [threading.Thread(target=load) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertEqual(1, len(constructed))
+
+    def test_a_partial_from_a_finished_recording_is_never_published(self) -> None:
+        """A pass can outlive the recording that started it.
+
+        `stop_partials` is only advisory once a pass is inside the engine, so the
+        result must be matched to its own recording rather than to a flag the
+        next `begin_capture` clears.
+        """
+        transcriber = self._transcriber()
+        model = Mock()
+        released = threading.Event()
+
+        def slow_transcribe(*_args, **_kwargs):
+            released.wait(timeout=5)
+            return ([SimpleNamespace(text=" speech from recording A ")], object())
+
+        model.transcribe.side_effect = slow_transcribe
+        results: list[str | None] = []
+
+        with patch.object(transcriber, "_load_model", return_value=model):
+            transcriber.begin_capture()
+
+            def stale_pass() -> None:
+                results.append(transcriber.transcribe_partial(b"\x01\x00" * 16_000))
+
+            worker = threading.Thread(target=stale_pass)
+            worker.start()
+            time.sleep(0.1)
+
+            # Recording A ends and recording B begins while the pass is in flight.
+            transcriber.stop_partials()
+            transcriber.begin_capture()
+            released.set()
+            worker.join(timeout=5)
+
+        self.assertEqual([None], results)

@@ -190,14 +190,24 @@ the configured text size and is clamped to the configured bottom margin, which
 means a user who wants noticeably larger text also raises
 `overlay.bottom_margin_px` to make room.
 
-### Segment delivery runs on one queue
+### One unit of audio is produced and delivered at a time
 
-Continuous mode delivers through a single-threaded queue, so a segment's paste
-cannot begin while the previous segment's clipboard restoration is still pending.
-`ClipboardPaster` restores after a delay of up to 5000 ms; two overlapping
-deliveries would let a restore overwrite a transcript that has not been pasted
-yet. One queue makes the spec's serialization requirement structural instead of
-timing-dependent.
+Continuous mode and the toggle path both turn captured audio into a delivered
+transcript, on different threads. They take a single session-wide lock for that
+whole operation — close the audio, record the target, transcribe, deliver — so
+only one is ever in flight.
+
+That is what makes ordering structural rather than timing-dependent. A queue was
+the first design, but it only serializes the *delivery* step; transcription still
+ran concurrently, so two segments could finish in the opposite order to capture
+and `ClipboardPaster`'s restore (up to 5000 ms) could overwrite a transcript that
+had not been pasted yet. Serializing the whole unit removes the interleaving
+instead of ordering its tail.
+
+The live worker takes the lock without blocking: a toggle holding it is ending
+this recording and also joins the worker, so waiting there would stall the toggle
+for the join timeout. An in-flight segment therefore always completes, and a
+toggle arriving mid-segment waits for it rather than racing it.
 
 ## Risks / Trade-offs
 

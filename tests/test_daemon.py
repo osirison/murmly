@@ -979,3 +979,121 @@ class LiveWorkerCadenceTests(unittest.TestCase):
             worker.join(timeout=2)
 
         self.assertGreaterEqual(silence_ticks, 2)
+
+
+class SegmentToggleConcurrencyTests(unittest.TestCase):
+    """A toggle can arrive while a segment is mid-flight on the live worker.
+
+    Every other continuous-mode test calls `_on_silence()` synchronously on the
+    test thread, so none of them can observe the two paths overlapping.
+    """
+
+    def _daemon(self, temp_dir: str, session, **overrides: object) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+            **overrides,
+        )
+        return MurmlyDaemon(config, session=session)
+
+    def test_a_toggle_waits_for_an_in_flight_segment(self) -> None:
+        class SlowSegmentSession(SegmentSession):
+            def __init__(self) -> None:
+                super().__init__(texts=["segment one", "final text"])
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.order: list[str] = []
+
+            def process_recording(self, pcm_audio, target=None):
+                self.order.append("enter")
+                if not self.entered.is_set():
+                    self.entered.set()
+                    self.release.wait(timeout=5)
+                result = super().process_recording(pcm_audio, target)
+                self.order.append("exit")
+                return result
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SlowSegmentSession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            worker = threading.Thread(target=daemon._on_silence, daemon=True)
+            worker.start()
+            self.assertTrue(session.entered.wait(timeout=3))
+
+            response: dict[str, object] = {}
+
+            def toggle_off() -> None:
+                response.update(daemon.handle_command("toggle"))
+
+            toggler = threading.Thread(target=toggle_off, daemon=True)
+            toggler.start()
+            # The toggle must not begin its own stop-and-deliver yet.
+            time.sleep(0.3)
+            self.assertEqual(["enter"], session.order)
+
+            session.release.set()
+            worker.join(timeout=5)
+            toggler.join(timeout=5)
+
+        # Never interleaved: each delivery completed before the next began.
+        self.assertEqual(["enter", "exit", "enter", "exit"], session.order)
+        self.assertEqual("segment one final text", response["text"])
+        self.assertEqual(2, response["segments"])
+        self.assertTrue(response["delivered"])
+
+    def test_a_refused_segment_is_reported_even_if_a_toggle_races_it(self) -> None:
+        class RefusingSlowSession(SegmentSession):
+            def __init__(self) -> None:
+                super().__init__(texts=["refused text", "trailing"], delivered=[False, True])
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def process_recording(self, pcm_audio, target=None):
+                if not self.entered.is_set():
+                    self.entered.set()
+                    self.release.wait(timeout=5)
+                return super().process_recording(pcm_audio, target)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = RefusingSlowSession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            worker = threading.Thread(target=daemon._on_silence, daemon=True)
+            worker.start()
+            self.assertTrue(session.entered.wait(timeout=3))
+
+            response: dict[str, object] = {}
+            toggler = threading.Thread(
+                target=lambda: response.update(daemon.handle_command("toggle")),
+                daemon=True,
+            )
+            toggler.start()
+            session.release.set()
+            worker.join(timeout=5)
+            toggler.join(timeout=5)
+
+        # The refusal must not be lost by the racing toggle's response.
+        if response.get("ok"):
+            self.assertFalse(response["delivered"])
+            self.assertIn("refused text", response["text"])
+
+    def test_a_failed_transition_thread_does_not_wedge_the_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="stop")
+            daemon.handle_command("toggle")
+            self.assertEqual("LISTENING", daemon.state)
+
+            with patch("murmly.daemon.threading.Thread.start", side_effect=RuntimeError("no thread")):
+                daemon._on_silence()
+
+            # Without the guard the state stays THINKING and every later toggle
+            # is answered "busy" until the daemon is restarted.
+            self.assertEqual("IDLE", daemon.state)
+            self.assertEqual(1, session.stopped)
+            self.assertEqual({"ok": True, "state": "LISTENING"}, daemon.handle_command("toggle"))
+            daemon.handle_command("toggle")

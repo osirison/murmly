@@ -54,7 +54,7 @@ description: Track implementation and validation of partial transcription during
 - [x] 6.6 Implement `continuous` mode: close a segment, record its delivery target, transcribe and deliver it while capture continues, and reset speech tracking for the next segment
 - [x] 6.7 End a continuous session on a refused segment delivery, stopping capture and returning to idle with the transcript on the clipboard
 - [x] 6.8 Transcribe and deliver the trailing audio as a final segment when a toggle ends a continuous session, and deliver nothing when no speech was captured since the last segment
-- [x] 6.9 Deliver segments through a single-threaded queue so a segment's paste never begins while a previous clipboard restoration is pending
+- [x] 6.9 Serialize the whole produce-and-deliver of one unit of audio across the live worker and the toggle path, so a segment's paste never begins while a previous clipboard restoration is pending
 - [x] 6.10 Report the session outcome on the toggle that ends a multi-segment session: combined transcript text in capture order and delivered only when every segment was delivered, leaving single-transcript responses unchanged
 
 ## 7. Diagnostics and documentation

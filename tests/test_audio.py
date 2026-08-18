@@ -451,3 +451,129 @@ class AudioTests(unittest.TestCase):
         if device is None:
             return devices
         return devices[device]
+
+class CaptureAccumulatorConcurrencyTests(unittest.TestCase):
+    """The accumulator has two consumers: the live worker and the toggle path.
+
+    The rest of the suite never runs them together, which is how a lost-update
+    race on `_pending` survived a green suite.
+    """
+
+    def _recorder(self):
+        callback_holder: dict[str, object] = {}
+        stream = FakeStream()
+        sounddevice = ModuleType("sounddevice")
+        sounddevice.PortAudioError = FakePortAudioError
+        sounddevice.query_devices = AudioTests._fake_query_devices
+        sounddevice.check_input_settings = lambda **_kwargs: None
+
+        def raw_input_stream(**kwargs: object) -> FakeStream:
+            callback_holder["callback"] = kwargs["callback"]
+            return stream
+
+        sounddevice.RawInputStream = raw_input_stream
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+        patcher = patch.dict(sys.modules, {"sounddevice": sounddevice})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        recorder = SoundDeviceRecorder(config)
+        recorder.start()
+        return recorder, callback_holder["callback"]
+
+    def test_every_accumulator_consumer_holds_the_lock(self) -> None:
+        """Pins the fix directly: a consumer that skips the lock fails here.
+
+        A stress test cannot do this job -- the GIL makes the losing interleaving
+        rare enough to pass by luck.
+        """
+        recorder, callback = self._recorder()
+        callback(b"\x01\x00" * 8, 8, object(), None)
+
+        real_lock = recorder._pending_lock
+        acquisitions: list[str] = []
+
+        class TrackingLock:
+            def __enter__(self) -> object:
+                acquisitions.append("acquired")
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc: object) -> object:
+                return real_lock.__exit__(*exc)
+
+        recorder._pending_lock = TrackingLock()
+
+        acquisitions.clear()
+        recorder.snapshot()
+        self.assertEqual(1, len(acquisitions), "snapshot must serialize on the accumulator lock")
+
+        acquisitions.clear()
+        recorder.take_segment()
+        self.assertEqual(1, len(acquisitions), "take_segment must serialize on the accumulator lock")
+
+        acquisitions.clear()
+        recorder._pending_lock = real_lock
+        recorder.stop()
+
+    def test_take_segment_blocks_while_another_consumer_holds_the_lock(self) -> None:
+        recorder, callback = self._recorder()
+        callback(b"\x03\x00" * 8, 8, object(), None)
+        released = threading.Event()
+        finished = threading.Event()
+
+        def hold_then_release() -> None:
+            with recorder._pending_lock:
+                released.wait(timeout=5)
+
+        holder = threading.Thread(target=hold_then_release)
+        holder.start()
+        time.sleep(0.05)
+
+        def take() -> None:
+            recorder.take_segment()
+            finished.set()
+
+        taker = threading.Thread(target=take)
+        taker.start()
+
+        self.assertFalse(finished.wait(timeout=0.3), "take_segment ran while the lock was held")
+        released.set()
+        holder.join(timeout=5)
+        taker.join(timeout=5)
+        self.assertTrue(finished.is_set())
+        recorder.stop()
+
+    def test_concurrent_consumers_preserve_every_captured_byte(self) -> None:
+        recorder, callback = self._recorder()
+        total_blocks = 200
+        block = b"\x01\x00" * 4
+        collected: list[bytes] = []
+        collected_lock = threading.Lock()
+        stop = threading.Event()
+
+        def producer() -> None:
+            for _ in range(total_blocks):
+                callback(block, 4, object(), None)
+                time.sleep(0.0005)
+            stop.set()
+
+        def consumer() -> None:
+            while not stop.is_set():
+                segment = recorder.take_segment()
+                if segment:
+                    with collected_lock:
+                        collected.append(segment)
+
+        threads = [threading.Thread(target=producer)]
+        threads += [threading.Thread(target=consumer) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        collected.append(recorder.stop())
+
+        self.assertEqual(block * total_blocks, b"".join(collected))

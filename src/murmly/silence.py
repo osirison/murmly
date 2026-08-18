@@ -67,7 +67,22 @@ class SilenceDetector:
 
     @property
     def window_seconds(self) -> float:
-        return max(self._silence_ms + WINDOW_MARGIN_MS, MIN_WINDOW_MS) / 1_000
+        """How much trailing audio each reading examines.
+
+        The window must also cover `min_speech_ms`: a reading can only ever
+        observe as much speech as the window holds, so a shorter window would
+        make the speech-armed condition unsatisfiable and auto-transcribe would
+        silently never fire.
+        """
+        # A trigger needs the speech total and the trailing silence run to be
+        # visible in the same reading, so the window has to hold both at once
+        # plus a margin. Sizing it for either alone leaves the condition
+        # unsatisfiable and auto-transcribe silently never fires.
+        required = max(
+            self._silence_ms + self._min_speech_ms + WINDOW_MARGIN_MS,
+            MIN_WINDOW_MS,
+        )
+        return required / 1_000
 
     def reset(self) -> None:
         """Forget the current segment, so the next one must observe speech again."""

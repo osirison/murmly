@@ -163,6 +163,39 @@ class SilenceDetectorTests(unittest.TestCase):
         self.assertFalse(reading.speech_detected)
         self.assertEqual(100 * VAD_FRAME_MS, reading.silence_ms)
 
+    def test_window_always_covers_the_configured_minimum_speech(self) -> None:
+        """A window shorter than min_speech_ms can never arm the trigger.
+
+        `observe` only ever sees the trailing window, so the speech total is
+        capped by it; auto-transcribe would then silently never fire.
+        """
+        for min_speech_ms in (300, 3_000, 10_000):
+            with self.subTest(min_speech_ms=min_speech_ms):
+                detector = SilenceDetector(
+                    VAD_SAMPLE_RATE_HZ,
+                    1,
+                    silence_ms=2_000,
+                    min_speech_ms=min_speech_ms,
+                    vad_model=FakeVadModel(lambda _index, _total: 0.9),
+                )
+                frames = int(VAD_SAMPLE_RATE_HZ * detector.window_seconds) // VAD_FRAME_SAMPLES
+                self.assertGreaterEqual(frames * VAD_FRAME_MS, min_speech_ms)
+
+    def test_a_long_minimum_speech_still_arms_the_trigger(self) -> None:
+        model = FakeVadModel(lambda index, total: 0.9 if index < total - 40 else 0.0)
+        detector = SilenceDetector(
+            VAD_SAMPLE_RATE_HZ,
+            1,
+            silence_ms=1_000,
+            min_speech_ms=3_000,
+            vad_model=model,
+        )
+        frames = int(VAD_SAMPLE_RATE_HZ * detector.window_seconds) // VAD_FRAME_SAMPLES
+
+        reading = detector.observe(pcm16(frames * VAD_FRAME_SAMPLES))
+
+        self.assertTrue(reading.speech_detected)
+        self.assertTrue(reading.triggered)
 
 if __name__ == "__main__":
     unittest.main()

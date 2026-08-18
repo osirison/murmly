@@ -324,19 +324,29 @@ def live_transcription_diagnostics(
     if config.auto_transcribe_rejected_value is not None:
         report["auto_transcribe_rejected_value"] = config.auto_transcribe_rejected_value
 
-    try:
-        detector = SilenceDetector(
-            config.sample_rate_hz,
-            config.channels,
-            silence_ms=config.auto_transcribe_silence_ms,
-            min_speech_ms=config.auto_transcribe_min_speech_ms,
-        )
-        report["silence_detection_available"] = detector.available
-        if not detector.available:
-            report["silence_detection_detail"] = detector.unavailable_reason
-    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
-        report["silence_detection_available"] = False
-        report["silence_detection_detail"] = f"Unable to check silence detection: {error}"
+    if config.auto_transcribe == "off":
+        report["silence_detection_detail"] = "Auto-transcribe is disabled."
+    else:
+        # Checked against the rate a session actually negotiates, not the
+        # configured one: a device that refuses 16 kHz silently disables
+        # auto-transcribe, and reporting the configured rate would hide that.
+        rate, rate_detail = negotiated_capture_rate(config)
+        report["negotiated_sample_rate_hz"] = rate
+        try:
+            detector = SilenceDetector(
+                rate if rate is not None else config.sample_rate_hz,
+                config.channels,
+                silence_ms=config.auto_transcribe_silence_ms,
+                min_speech_ms=config.auto_transcribe_min_speech_ms,
+            )
+            report["silence_detection_available"] = detector.available
+            if not detector.available:
+                report["silence_detection_detail"] = detector.unavailable_reason
+            elif rate_detail is not None:
+                report["silence_detection_detail"] = rate_detail
+        except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+            report["silence_detection_available"] = False
+            report["silence_detection_detail"] = f"Unable to check silence detection: {error}"
 
     report["partial_pass_ceiling_ms"] = None
     if config.live_transcribe:
@@ -355,6 +365,27 @@ def live_transcription_diagnostics(
     return report
 
 
+def negotiated_capture_rate(config: MurmlyConfig) -> tuple[int | None, str | None]:
+    """Open the capture device briefly to learn the rate a session would get.
+
+    `murmly doctor` must not report on the configured rate alone: the recorder
+    falls back to a device's native rate when 16 kHz is refused, and that is
+    exactly the case that disables auto-transcribe.
+    """
+    recorder = SoundDeviceRecorder(config)
+    try:
+        recorder.start()
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return None, f"Unable to open the capture device: {error}"
+    try:
+        return recorder.sample_rate_hz, None
+    finally:
+        try:
+            recorder.stop()
+        except Exception:  # noqa: BLE001 - diagnostics must not raise
+            pass
+
+
 def measure_partial_pass_ms(
     config: MurmlyConfig,
     transcriber: FasterWhisperTranscriber | None = None,
@@ -369,8 +400,16 @@ def measure_partial_pass_ms(
     Only runs when live transcription is enabled, because it loads the model.
     """
     try:
+        # vad_filter is disabled for the measurement whoever supplies the
+        # transcriber: with it on, the synthetic clip is discarded as non-speech
+        # and the pass would time no decoding at all.
         if transcriber is None:
             transcriber = FasterWhisperTranscriber(replace(config, vad_filter=False))
+        elif getattr(transcriber, "_config", None) is not None and transcriber._config.vad_filter:
+            return None, (
+                "Refusing to measure with the voice activity filter enabled: "
+                "it discards the synthetic clip and would time no decoding."
+            )
         transcriber.begin_capture()
         clip = _measurement_clip(config.sample_rate_hz, config.live_window_seconds)
         # Discard one pass first. The daemon holds the model in memory for the
