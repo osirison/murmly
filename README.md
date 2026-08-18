@@ -129,12 +129,25 @@ it; `murmly doctor` shows the path currently recorded.
 
 ## Configuration
 
-Configuration lives at `~/.config/murmly/config.toml` (or
-`$XDG_CONFIG_HOME/murmly/config.toml`).
+Murmly runs on its defaults, so configuration is optional. When you want to
+change something, start from the annotated defaults in
+[config.example.toml](config.example.toml):
+
+```bash
+mkdir -p ~/.config/murmly
+cp config.example.toml ~/.config/murmly/config.toml
+```
+
+Murmly reads `~/.config/murmly/config.toml`, or
+`$XDG_CONFIG_HOME/murmly/config.toml` when that variable is set. Every option in
+the example is shown at its default, so copying it in changes nothing until you
+edit it. A value outside its documented range falls back to the default rather
+than refusing to start, and `murmly doctor` reports the path actually in use.
 
 ```toml
 [daemon]
-socket_path = "/run/user/1000/murmly.sock"
+# Defaults to $XDG_RUNTIME_DIR/murmly.sock
+# socket_path = "/run/user/1000/murmly.sock"
 
 [audio]
 sample_rate_hz = 16000 # Preferred capture rate
@@ -144,9 +157,10 @@ channels = 1
 model_profile = "balanced" # fast | balanced | accurate
 device = "auto" # auto | cpu | cuda
 compute_type = "auto"
-beam_size = 5
-vad_filter = true
 lazy_load_model = true
+# beam_size and vad_filter follow the profile unless you pin them here
+# beam_size = 5
+# vad_filter = true
 live_transcribe = false        # Show partial transcripts while you speak
 live_interval_ms = 1000        # How often a partial is produced, 250-10000
 live_window_seconds = 15       # Trailing audio each partial re-reads, 5-60
