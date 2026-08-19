@@ -905,8 +905,31 @@ class UnhandledFailureTests(unittest.TestCase):
             ):
                 exit_code = main(["--config", str(config_path), "doctor"])
 
+        reported = errors.getvalue()
         self.assertEqual(1, exit_code)
-        self.assertIn("probe exploded", errors.getvalue())
+        self.assertIn("probe exploded", reported)
+        # One line for a person at a terminal. The frames go to the daemon only.
+        self.assertNotIn("Traceback", reported)
+
+    def test_the_daemon_guard_keeps_the_traceback_its_journal_needs(self) -> None:
+        # The daemon runs unattended, so the one line the guard prints is all
+        # that would survive of a crash nothing anticipated. Whoever reads the
+        # journal afterwards has nothing else to work from.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("", encoding="utf-8")
+
+            with (
+                patch("murmly.cli._run_daemon", side_effect=RuntimeError("worker exploded")),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "daemon"])
+
+        reported = errors.getvalue()
+        self.assertEqual(1, exit_code)
+        self.assertIn("murmly: unexpected failure: worker exploded", reported)
+        self.assertIn("Traceback (most recent call last)", reported)
 
     def test_argument_errors_still_reach_the_parser(self) -> None:
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
@@ -1021,6 +1044,22 @@ class DoctorCompletenessTests(unittest.TestCase):
         self.assertIn(str(directory), report["command_socket"]["detail"])
         for section in self.SECTIONS:
             self.assertIn(section, report)
+
+    def test_diagnostics_explain_a_platform_that_cannot_report_peer_identity(self) -> None:
+        # The section exists to say what is protecting the socket. Where the
+        # identity check is unavailable, file permissions are the whole answer
+        # and the report has to say so.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+            with patch("murmly.cli.peer_identity_supported", return_value=False):
+                report = command_socket_diagnostics(config)
+
+        self.assertFalse(report["peer_identity_supported"])
+        self.assertIn("file permissions alone", report["peer_identity_detail"])
 
     def test_a_private_socket_path_is_reported_as_private(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

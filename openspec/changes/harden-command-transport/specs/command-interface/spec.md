@@ -103,11 +103,17 @@ Codes MUST distinguish at least these categories: Murmly is busy with another co
 
 Every Murmly command SHALL report the failures it encounters through its own output and exit status, and MUST NOT terminate with an unhandled error. Commands are invoked from a desktop hotkey and from scripts, neither of which surfaces an unhandled error usefully, so such a failure is indistinguishable from the command doing nothing.
 
-A command that reaches Murmly and receives no response, a command run against an unreadable configuration file, and a daemon that refuses to start MUST each be reported as a message and a non-zero exit.
+A command that reaches Murmly and receives no response, a command run against an unreadable configuration file, and a daemon that refuses to start MUST each be reported as a message and a non-zero exit. A command MUST NOT wait without bound for a response: a connection Murmly accepts and then holds open without answering is the same outcome for the caller as one it closes, and MUST be reported the same way.
 
 #### Scenario: Murmly closes the connection without responding
 
 - **WHEN** a command is sent and the connection closes before any response arrives
+- **THEN** the command reports that Murmly did not respond
+- **AND** exits non-zero without an unhandled error
+
+#### Scenario: Murmly accepts the command and never answers
+
+- **WHEN** a command is sent, Murmly accepts it, and no response arrives within the supported wait
 - **THEN** the command reports that Murmly did not respond
 - **AND** exits non-zero without an unhandled error
 
@@ -122,6 +128,7 @@ A command that reaches Murmly and receives no response, a command run against an
 - **WHEN** the daemon refuses to start for any reason it detects itself
 - **THEN** the reason is reported as a message and a non-zero exit
 - **AND** no unhandled error is raised
+- **AND** anything the daemon started before it refused is stopped
 
 ### Requirement: Diagnostics report every section they can determine
 
@@ -145,7 +152,9 @@ Murmly SHALL restrict its command socket to the user account the daemon runs as.
 
 Directories Murmly creates for the socket, and the socket itself, MUST be created accessible only to that account. A peer whose reported identity differs from the daemon's MUST be refused. When the platform cannot report a peer's identity, Murmly MUST report that it cannot and continue serving on file permissions alone, rather than treating an unknown identity as permitted.
 
-A configured socket path whose containing directory is writable by another account MUST be refused at daemon startup, reporting the path and how to correct it. Such a directory allows another account to create or replace the socket node, so the owner's own commands would reach a socket Murmly does not serve. A directory that other accounts can only read or traverse MUST NOT be refused, because the socket node itself is owner-only.
+A configured socket path another account could take control of MUST be refused at daemon startup, naming the directory at fault and how to correct it. Control is not limited to the directory holding the socket: renaming a directory replaces everything under it, and an owner can grant itself write access whenever it likes, so every directory from the socket up to the root counts, and a directory another account can write or owns is an exposure wherever it sits on that path. Such a directory allows another account to create or replace the socket node, so the owner's own commands would reach a socket Murmly does not serve.
+
+A directory that other accounts can only read or traverse MUST NOT be refused, because the socket node itself is owner-only. Above the nearest existing directory on the path, a shared directory that stops one account removing or renaming another's entries MUST NOT be refused either, or the standard shared temporary directory would disqualify every path beneath it. That exemption MUST NOT extend to the nearest existing directory, because the components below it do not exist yet and such a directory does not stop another account creating them.
 
 #### Scenario: Permissions at creation
 
@@ -170,6 +179,23 @@ A configured socket path whose containing directory is writable by another accou
 - **WHEN** the configured socket path lies in a directory writable by group or other
 - **THEN** the daemon refuses to start, reporting the configured path and how to correct it
 - **AND** no socket is created at that path
+
+#### Scenario: Configured socket path is below a directory another account can write
+
+- **WHEN** the directory holding the configured socket path is private but a directory above it is writable by group or other
+- **THEN** the daemon refuses to start, naming the directory above it as the one at fault
+- **AND** no socket is created at that path
+
+#### Scenario: Configured socket path is under a directory another account owns
+
+- **WHEN** a directory on the configured socket path is owned by an account other than the one the daemon runs as
+- **THEN** the daemon refuses to start, naming that directory
+- **AND** no socket is created at that path
+
+#### Scenario: Shared ancestor that protects the entries in it
+
+- **WHEN** a directory above the one holding the configured socket path is writable by other accounts but stops them removing or renaming entries they do not own
+- **THEN** the daemon serves at that path
 
 #### Scenario: Configured socket path is readable but not writable by others
 

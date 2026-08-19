@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 MAX_COMMAND_BYTES = 4_096
 MAX_COMMAND_WORKERS = 8
 COMMAND_TIMEOUT_SECONDS = 2.0
+CLIENT_CONNECT_TIMEOUT_SECONDS = 2.0
+CLIENT_RESPONSE_TIMEOUT_SECONDS = 600.0
 REFUSAL_SEND_TIMEOUT_SECONDS = 0.5
 SHUTDOWN_DRAIN_SECONDS = 0.5
 SHUTDOWN_DRAIN_POLL_SECONDS = 0.01
@@ -76,7 +78,11 @@ class DaemonStartupError(RuntimeError):
 
 
 class DaemonNotRespondingError(RuntimeError):
-    """The daemon accepted the connection and closed it without responding.
+    """The daemon accepted the connection and then neither answered nor stayed.
+
+    Covers both shapes of the same outcome: a connection closed without a
+    response, and one held open past the point where an answer could still be
+    called an answer.
 
     Subclasses RuntimeError so a caller that already guards a bare RuntimeError
     keeps working, while the CLI names this type rather than catching bare
@@ -101,29 +107,77 @@ def failure_response(code: CommandCode, message: str, **fields: object) -> dict[
 def socket_path_detail(socket_path: Path) -> str | None:
     """Why the configured socket path is not private, or None when it is.
 
-    The predicate is write permission, not reachability. Connecting to a UNIX
-    socket requires write permission on the node and the node is owner-only, so a
-    directory other accounts can merely read or traverse is not an exposure --
-    refusing on that would reject a 0755 home directory. What a writable
-    directory permits is creating or replacing the node, so that the owner's own
-    commands reach a socket Murmly does not serve.
+    The predicate is control over the path, not reachability. Connecting to a
+    UNIX socket requires write permission on the node and the node is owner-only,
+    so a directory other accounts can merely read or traverse is not an exposure
+    -- refusing on that would reject a 0755 home directory. What another account
+    needs is the ability to put its own node at this path, and three things grant
+    it: write permission on the directory that holds the node, write permission
+    on any directory above that one -- renaming a directory replaces everything
+    under it -- and ownership of any of them, because an owner can grant itself
+    the write permission whenever it likes.
 
-    A directory Murmly has yet to create is judged by the nearest existing
-    ancestor, which is where another account would pre-create it.
+    So every directory from the socket up to the root is judged. Above the
+    nearest existing one the sticky bit is accepted in place of the write bits:
+    it is exactly the permission that stops one account renaming or removing
+    another's entry, which is what /tmp relies on. The nearest existing directory
+    gets no such exemption, because the components below it do not exist yet and
+    the sticky bit does not stop anyone creating them.
+
+    The parent is resolved first, so a symlink cannot hide the directories the
+    node really lands in.
     """
-    directory = socket_path.parent
-    existing = directory
+    try:
+        existing = socket_path.parent.resolve()
+    except OSError as error:
+        return f"The path {socket_path.parent} could not be resolved: {error}."
     while not existing.exists() and existing.parent != existing:
         existing = existing.parent
-    try:
-        mode = existing.stat().st_mode
-    except OSError as error:
-        return f"The permissions of {existing} could not be read: {error}."
-    if not mode & (stat.S_IWGRP | stat.S_IWOTH):
+    directory = existing
+    while True:
+        try:
+            info = directory.stat()
+        except OSError as error:
+            return f"The permissions of {directory} could not be read: {error}."
+        detail = _directory_exposure(
+            directory, info, socket_path, sticky_accepted=directory != existing
+        )
+        if detail is not None:
+            return detail
+        if directory.parent == directory:
+            return None
+        directory = directory.parent
+
+
+def _directory_exposure(
+    directory: Path,
+    info: os.stat_result,
+    socket_path: Path,
+    *,
+    sticky_accepted: bool,
+) -> str | None:
+    """How this one directory would let another account take over the socket path.
+
+    Each detail carries its own remedy, because they differ: a directory this
+    account does not own cannot be corrected with chmod.
+    """
+    if info.st_uid not in (0, os.getuid()):
+        return (
+            f"{directory} is owned by uid {info.st_uid}, which can grant itself write "
+            f"access to it at any time and replace {socket_path}, so the commands meant "
+            "for Murmly would reach a socket it does not serve. Either move the socket "
+            "under your per-user runtime directory ($XDG_RUNTIME_DIR), or serve it from "
+            "a directory this account owns."
+        )
+    if not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return None
+    if sticky_accepted and info.st_mode & stat.S_ISVTX:
         return None
     return (
-        f"{existing} is writable by other accounts, so another account could "
-        f"create or replace {socket_path} and receive the commands meant for Murmly."
+        f"{directory} is writable by other accounts, so another account could create "
+        f"or replace {socket_path} and receive the commands meant for Murmly. Either "
+        "move the socket under your per-user runtime directory ($XDG_RUNTIME_DIR), or "
+        f"remove write access for group and other from {directory}."
     )
 
 
@@ -455,64 +509,76 @@ class MurmlyDaemon:
             return self._state
 
     def serve_forever(self) -> None:
-        # Re-checked here, before the unlink below deletes whatever sits at the
-        # configured path: that unlink must never run against a path Murmly
-        # would refuse.
-        self._require_private_socket_path()
-        if not peer_identity_supported():
-            logger.warning(
-                "This platform cannot report the account behind a connection. The "
-                "command socket is protected by its file permissions alone."
-            )
-        create_socket_directory(self._config.socket_path.parent)
-        self._config.socket_path.unlink(missing_ok=True)
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-                self._server = server
-                server.bind(str(self._config.socket_path))
-                # The window between bind and chmod is accepted: the containing
-                # directory is the barrier and is already restricted.
-                self._config.socket_path.chmod(SOCKET_MODE)
-                server.listen()
-                server.settimeout(0.2)
-                while not self._shutdown.is_set():
-                    try:
-                        connection, _address = server.accept()
-                    except socket.timeout:
-                        continue
-                    except OSError:
-                        if self._shutdown.is_set():
-                            break
-                        raise
-                    # Checked before a worker slot is taken: inside a worker, a
-                    # foreign account could occupy every slot and deny service to
-                    # the owner -- the pool this change is otherwise hardening.
-                    if not self._peer_permitted(connection):
-                        self._refuse(
-                            connection,
-                            failure_response(
-                                CommandCode.NOT_PERMITTED,
-                                "Murmly serves only the account it runs as.",
-                            ),
-                        )
-                        connection.close()
-                        continue
-                    self._dispatch_connection(connection)
-        finally:
-            self._server = None
+            # Re-checked here, before the unlink below deletes whatever sits at
+            # the configured path: that unlink must never run against a path
+            # Murmly would refuse.
+            self._require_private_socket_path()
+            if not peer_identity_supported():
+                logger.warning(
+                    "This platform cannot report the account behind a connection. The "
+                    "command socket is protected by its file permissions alone."
+                )
+            try:
+                create_socket_directory(self._config.socket_path.parent)
+            except OSError as error:
+                # Named as the startup refusal it is. Left as an OSError it would
+                # reach the caller's backstop and be reported as an unexpected
+                # failure, which is the one thing it is not.
+                raise DaemonStartupError(
+                    f"Refusing to serve at {self._config.socket_path}. Its directory "
+                    f"could not be created: {error}."
+                ) from error
             self._config.socket_path.unlink(missing_ok=True)
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                    self._server = server
+                    server.bind(str(self._config.socket_path))
+                    # The window between bind and chmod is accepted: the containing
+                    # directory is the barrier and is already restricted.
+                    self._config.socket_path.chmod(SOCKET_MODE)
+                    server.listen()
+                    server.settimeout(0.2)
+                    while not self._shutdown.is_set():
+                        try:
+                            connection, _address = server.accept()
+                        except socket.timeout:
+                            continue
+                        except OSError:
+                            if self._shutdown.is_set():
+                                break
+                            raise
+                        # Checked before a worker slot is taken: inside a worker, a
+                        # foreign account could occupy every slot and deny service to
+                        # the owner -- the pool this change is otherwise hardening.
+                        if not self._peer_permitted(connection):
+                            self._refuse(
+                                connection,
+                                failure_response(
+                                    CommandCode.NOT_PERMITTED,
+                                    "Murmly serves only the account it runs as.",
+                                ),
+                            )
+                            connection.close()
+                            continue
+                        self._dispatch_connection(connection)
+            finally:
+                self._server = None
+                self._config.socket_path.unlink(missing_ok=True)
+        finally:
+            # Outside the socket's own unwinding, because a refusal that happens
+            # before the socket exists still has an overlay to close: the
+            # constructor started one.
             self._close_overlay()
 
     def _require_private_socket_path(self) -> None:
         detail = socket_path_detail(self._config.socket_path)
         if detail is None:
             return
-        raise DaemonStartupError(
-            f"Refusing to serve at {self._config.socket_path}. {detail} "
-            "Either move the socket under your per-user runtime directory "
-            "($XDG_RUNTIME_DIR), or remove write access for group and other from "
-            f"{self._config.socket_path.parent}."
-        )
+        # The remedy belongs to the detail rather than to this message: the
+        # directory at fault is not always the socket's own parent, and an
+        # ownership fault is not corrected the way a mode fault is.
+        raise DaemonStartupError(f"Refusing to serve at {self._config.socket_path}. {detail}")
 
     def _peer_permitted(self, connection: socket.socket) -> bool:
         """Whether the account behind this connection is the one Murmly serves.
@@ -539,6 +605,10 @@ class MurmlyDaemon:
                 pass
         self._drain_answering()
         self._answer_the_rest()
+        # A worker that took the claim before the drain expired is writing its
+        # own response right now. It stays owed until that write returns, so this
+        # second wait is what keeps the close below from truncating it.
+        self._drain_answering()
         with self._connections_lock:
             connections = tuple(self._connections)
         for connection in connections:
@@ -576,29 +646,44 @@ class MurmlyDaemon:
 
         A transcription runs for seconds, far longer than the drain will wait, so
         the drain alone would still leave an empty read on the one case this
-        exists for: the service restarting mid-transcription. Claiming the
-        response first is what makes this safe -- the worker finds the connection
-        already answered and writes nothing, so the connection still carries
-        exactly one response.
+        exists for: the service restarting mid-transcription. The claim is what
+        makes this safe -- the worker finds the connection already answered and
+        writes nothing, so the connection still carries exactly one response. A
+        connection whose claim is already taken is left alone: a worker holds it
+        and is writing its own response, which the second drain waits for.
         """
         with self._connections_lock:
             answering = tuple(self._answering)
         for connection in answering:
             if not self._claim_response(connection):
                 continue
-            self._refuse(
-                connection,
-                failure_response(CommandCode.SHUTTING_DOWN, "Murmly is shutting down."),
-            )
+            try:
+                self._refuse(
+                    connection,
+                    failure_response(CommandCode.SHUTTING_DOWN, "Murmly is shutting down."),
+                )
+            finally:
+                self._finish_response(connection)
 
     def _claim_response(self, connection: socket.socket) -> bool:
-        """Take the exclusive right to write this connection's one response."""
+        """Take the exclusive right to write this connection's one response.
+
+        Taking the claim does not discharge what the connection is owed: the
+        response is still unwritten here. Shutdown waits on what is owed, so the
+        connection stays in `_answering` until `_finish_response`. Discarding it
+        here instead would let the drain find nothing to wait for and close on a
+        response already on its way.
+        """
         with self._connections_lock:
             if connection in self._claimed:
                 return False
             self._claimed.add(connection)
-            self._answering.discard(connection)
             return True
+
+    def _finish_response(self, connection: socket.socket) -> None:
+        """Record that this connection's one response has been written, or cannot be."""
+        with self._connections_lock:
+            self._answering.discard(connection)
 
     def _serve_connection(self, connection: socket.socket) -> None:
         try:
@@ -635,6 +720,10 @@ class MurmlyDaemon:
             # the response is discarded rather than retried.
             if not self._shutdown.is_set():
                 raise
+        finally:
+            # Discharged whether or not the bytes landed. Nothing further will be
+            # written on this connection, so shutdown must stop waiting for it.
+            self._finish_response(connection)
 
     def _unexpected_failure(self, error: Exception) -> dict[str, object]:
         """Answer a command that failed in a way Murmly does not anticipate.
@@ -1051,16 +1140,41 @@ class MurmlyDaemon:
             logger.warning("Overlay shutdown failed: %s", error)
 
 
-def send_command(socket_path: str, command: str) -> dict[str, object]:
+def send_command(
+    socket_path: str,
+    command: str,
+    connect_timeout: float = CLIENT_CONNECT_TIMEOUT_SECONDS,
+    response_timeout: float = CLIENT_RESPONSE_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Send one command over the command socket and return the one response.
+
+    The two bounds differ because the two waits do. Reaching a UNIX socket either
+    happens at once or is not going to, so a short bound is right for it. Waiting
+    for the answer is not that: a toggle that stops a recording answers only once
+    the transcription is done, which takes as long as the audio deserves. Both
+    are bounded, because a hotkey press has nowhere to show a caller that never
+    returns.
+
+    A response that never arrives is reported as the daemon not responding rather
+    than as a timeout, which is what it is from here: the daemon took the request,
+    so restarting the service would answer a question the caller did not ask.
+    """
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(connect_timeout)
         client.connect(socket_path)
         client.sendall((json.dumps({"command": command}) + "\n").encode("utf-8"))
+        client.settimeout(response_timeout)
         payload = b""
-        while not payload.endswith(b"\n"):
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            payload += chunk
+        try:
+            while not payload.endswith(b"\n"):
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                payload += chunk
+        except socket.timeout as error:
+            raise DaemonNotRespondingError(
+                f"Murmly daemon did not respond within {response_timeout:g} seconds."
+            ) from error
     if not payload:
         raise DaemonNotRespondingError("Murmly daemon closed the connection before responding.")
     return json.loads(payload.decode("utf-8"))

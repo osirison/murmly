@@ -122,6 +122,18 @@ exactly one response. **Widening the drain to cover a transcription** would make
 shutdown latency depend on decode time -- up to twelve seconds on CPU -- and
 systemd would kill the process before the response was written anyway.
 
+**Taking the claim does not discharge the debt.** Claiming and being answered are
+two different points in time, and between them the response is still unwritten. A
+drain that stops waiting at the claim finds nothing left to wait for and closes on
+a response already on its way -- reproduced by delaying the interval between the
+claim and the send, which produced a `0.000s` drain and an empty read at the
+client. So a connection stays owed until its write returns or definitively cannot,
+and `shutdown()` drains a second time after answering: the first drain lets
+workers finish on their own, the answer covers whatever outlived it, and the
+second lets an in-flight write land before the force-close. A write blocked on a
+peer that is not reading is bounded by the same drain and is the case the spec
+already excepts.
+
 A connection is registered as owed an answer the moment its first request byte
 arrives, before the request is decoded. Registering after the decode leaves a
 window in which the request has arrived, shutdown does not yet know the connection
@@ -198,12 +210,28 @@ Validation of a configured `socket_path` runs at daemon startup, before the
 existing `mkdir`/`unlink` — which currently deletes whatever is at the configured
 path, so it must not run against a path Murmly is about to refuse.
 
-The predicate is **writable by group or other**, not "reachable". Because
-connecting requires write permission on the node and the node is `0600`, a
-directory others can merely read or traverse is not an exposure; refusing on it
-would reject a `0755` `$HOME`, which is common outside Fedora's defaults. What a
-writable directory permits is replacing the node, so that the owner's own commands
-reach a socket Murmly does not serve.
+The predicate is **control of the path**, not "reachable". Because connecting
+requires write permission on the node and the node is `0600`, a directory others
+can merely read or traverse is not an exposure; refusing on it would reject a
+`0755` `$HOME`, which is common outside Fedora's defaults. What matters is whether
+another account can put its own node at this path, and three things grant that:
+write permission on the directory holding the node, write permission on any
+directory above it -- renaming a directory replaces everything under it -- and
+ownership of any of them, since an owner can grant itself the write permission at
+any time.
+
+So every directory from the socket up to the root is judged, and the parent is
+resolved first so a symlink cannot hide where the node really lands. Checking the
+holder alone was the original mistake: `/srv/shared` at `0777` with a `0700`
+directory inside it passed, and renaming that directory away substituted the
+socket while `murmly doctor` still reported the path private.
+
+Above the nearest existing directory the sticky bit is accepted in place of the
+write bits. It is exactly the permission that stops one account renaming or
+removing another's entry, which is what `/tmp` relies on; without the exemption
+every path under `/tmp` would be refused. The nearest existing directory gets no
+exemption, because the components below it do not exist yet and the sticky bit
+does not stop anyone creating them.
 
 Validation lives in the daemon, not in `load_config`. Every command loads
 configuration, including `murmly doctor`, and a configuration that refuses to load
@@ -249,7 +277,18 @@ distinguish a device name from an error message.
   task rather than discovered during implementation.
 - **The shutdown test tolerates both outcomes** (`tests/test_daemon.py:308-312`,
   `except RuntimeError: pass`) → a new assertion is required; the existing test
-  cannot verify the fix.
+  cannot verify the fix. The tolerant clause is removed rather than left beside
+  the new tests, since it would hide a regression of exactly this change.
+- **A startup refusal leaves the overlay running** → the constructor starts the
+  renderer before `serve_forever` runs, so the unwinding that closes it sits
+  outside the socket's own, and a directory that cannot be created is reported as
+  the startup refusal it is rather than as an unexpected failure.
+- **The client waits without bound** → reaching the socket and waiting for the
+  answer are bounded separately, because a toggle answers only once the
+  transcription is done while a connect either happens at once or not at all. A
+  response that never arrives is reported as the daemon not responding, so it
+  takes the path that already exists for that outcome rather than restarting a
+  service that is running.
 - **The refusal write can delay the accept loop** → send timeout before the write,
   failed writes discarded, never retried.
 - **Semaphore accounting in `_dispatch_connection`** → a refusal write placed on

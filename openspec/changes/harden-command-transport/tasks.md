@@ -73,3 +73,16 @@ description: Track implementation and validation of answered connections, coded 
 - [x] 8.4 Send `[1,2]` and `not json` to the live socket and confirm both are answered and the daemon keeps serving
 - [x] 8.5 Run `murmly doctor` and confirm the report is complete and reports the socket path privacy
 - [x] 8.6 Run `openspec validate harden-command-transport --strict`
+
+## 9. Review fixes
+
+- [x] 9.1 Judge every directory from the socket up to the root, not the holder alone, refusing one another account can write or owns, and resolving the parent first so a symlink cannot hide it
+- [x] 9.2 Accept the sticky bit in place of the write bits above the nearest existing directory, and not on that directory itself
+- [x] 9.3 Move the remedy into the detail so the directory named is the one at fault rather than always the socket's parent
+- [x] 9.4 Keep a connection owed its response until the write returns, and drain a second time after `shutdown()` answers, so a claimed-but-unwritten response is not truncated
+- [x] 9.5 Close the overlay on a startup refusal, and report a socket directory that cannot be created as a startup refusal rather than an unexpected failure
+- [x] 9.6 Bound the client's connect and its wait for the response separately, reporting a response that never arrives as the daemon not responding
+- [x] 9.7 Print the traceback for an unanticipated daemon failure, which runs unattended, while other commands keep the single line
+- [x] 9.8 Add tests for each of the above, and confirm each fails against the code before its fix
+- [x] 9.9 Cover the paths the specs describe and the suite did not reach: a platform that cannot report peer identity, a peer that closes before its response, and the bound on a peer that never reads
+- [x] 9.10 Remove `except RuntimeError: pass` from `tests/test_daemon.py:308-312` and assert the shutting-down response instead

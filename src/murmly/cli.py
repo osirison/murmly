@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 from collections.abc import Callable
 
 from murmly.audio import SoundDeviceRecorder
@@ -97,6 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         # daemon's startup refusal, an unreadable configuration, a daemon that
         # did not respond -- reports it itself, because a generic message names
         # the wrong thing.
+        if args.command == "daemon":
+            # The daemon runs unattended under the service manager, where this
+            # one line would be all that survived of a crash nothing anticipated.
+            # A person reading the journal needs the frames.
+            traceback.print_exc(file=sys.stderr)
         print(f"murmly: unexpected failure: {error}", file=sys.stderr)
         return 1
 

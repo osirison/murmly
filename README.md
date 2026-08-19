@@ -195,8 +195,8 @@ than refusing to start, and `murmly doctor` reports the path actually in use.
 
 ```toml
 [daemon]
-# Defaults to $XDG_RUNTIME_DIR/murmly.sock. Its directory must not be writable
-# by group or other; see "The command socket" below.
+# Defaults to $XDG_RUNTIME_DIR/murmly.sock. No directory on the path may be
+# writable by group or other; see "The command socket" below.
 # socket_path = "/run/user/1000/murmly.sock"
 
 [audio]
@@ -239,23 +239,27 @@ directory Murmly creates for it is `0700`, and a connection whose reported
 account differs from the daemon's is refused.
 
 The default path is under `$XDG_RUNTIME_DIR`, which is already private, and
-needs no action. If you set `daemon.socket_path` yourself, its containing
-directory must not be writable by group or other. The daemon refuses to start
-otherwise, because a directory another account can write lets that account
-create or replace the socket node, and your own `murmly toggle` would then reach
-a socket Murmly does not serve. Either move the socket back under
-`$XDG_RUNTIME_DIR`, or remove write access for group and other from its
-directory:
+needs no action. If you set `daemon.socket_path` yourself, no directory on it may
+be writable by group or other, and every one of them must be owned by you or by
+root. That covers the whole path, not just the directory holding the socket:
+renaming a directory replaces everything under it, and an owner can grant itself
+write access at any time. The daemon refuses to start otherwise, because such a
+directory lets another account create or replace the socket node, and your own
+`murmly toggle` would then reach a socket Murmly does not serve. The refusal
+names the directory at fault. Either move the socket back under
+`$XDG_RUNTIME_DIR`, or remove write access for group and other from it:
 
 ```bash
-chmod go-w /path/to/its/directory
+chmod go-w /path/to/the/directory/it/named
 ```
 
 A directory other accounts can only read or traverse is fine, because the socket
 node itself is owner-only and connecting to a UNIX socket requires write
-permission on it. `murmly doctor` reports the condition under `command_socket`
-without refusing to run, so you can check the state before restarting the
-service.
+permission on it. A shared directory with the sticky bit set — `/tmp` and the
+like, where one account cannot remove another's entries — is fine above the
+directory holding the socket, though not as that directory itself. `murmly
+doctor` reports the condition under `command_socket` without refusing to run, so
+you can check the state before restarting the service.
 
 Profile mapping:
 
