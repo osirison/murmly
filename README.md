@@ -195,7 +195,8 @@ than refusing to start, and `murmly doctor` reports the path actually in use.
 
 ```toml
 [daemon]
-# Defaults to $XDG_RUNTIME_DIR/murmly.sock
+# Defaults to $XDG_RUNTIME_DIR/murmly.sock. Its directory must not be writable
+# by group or other; see "The command socket" below.
 # socket_path = "/run/user/1000/murmly.sock"
 
 [audio]
@@ -228,6 +229,33 @@ bottom_margin_px = 32 # Logical pixels from the display's bottom edge, 0-512
 reduced_motion = false
 text_size_px = 13 # Transcript panel text size, 8-48
 ```
+
+### The command socket
+
+`murmly toggle` and `murmly status` reach the daemon over a UNIX socket at
+`daemon.socket_path`. That socket starts and stops the microphone, so it is
+restricted to the account the daemon runs as: the socket is created `0600`, any
+directory Murmly creates for it is `0700`, and a connection whose reported
+account differs from the daemon's is refused.
+
+The default path is under `$XDG_RUNTIME_DIR`, which is already private, and
+needs no action. If you set `daemon.socket_path` yourself, its containing
+directory must not be writable by group or other. The daemon refuses to start
+otherwise, because a directory another account can write lets that account
+create or replace the socket node, and your own `murmly toggle` would then reach
+a socket Murmly does not serve. Either move the socket back under
+`$XDG_RUNTIME_DIR`, or remove write access for group and other from its
+directory:
+
+```bash
+chmod go-w /path/to/its/directory
+```
+
+A directory other accounts can only read or traverse is fine, because the socket
+node itself is owner-only and connecting to a UNIX socket requires write
+permission on it. `murmly doctor` reports the condition under `command_socket`
+without refusing to run, so you can check the state before restarting the
+service.
 
 Profile mapping:
 

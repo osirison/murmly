@@ -19,6 +19,13 @@
 [daemon]
 # Where the daemon listens. Defaults to $XDG_RUNTIME_DIR/murmly.sock, which is
 # /run/user/<your uid>/murmly.sock. Uncomment only to move it.
+#
+# The socket starts and stops the microphone, so it is restricted to the account
+# the daemon runs as. If you move it, its containing directory must not be
+# writable by group or other, or the daemon refuses to start: such a directory
+# lets another account replace the socket node and receive your commands. A
+# directory others can only read or traverse is fine. `murmly doctor` reports
+# the condition under `command_socket`.
 # socket_path = "/run/user/1000/murmly.sock"
 
 [audio]

@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 import json
 import logging
+import os
+from pathlib import Path
 import socket
+import stat
+import struct
 import threading
 import time
 
@@ -33,11 +38,137 @@ logger = logging.getLogger(__name__)
 MAX_COMMAND_BYTES = 4_096
 MAX_COMMAND_WORKERS = 8
 COMMAND_TIMEOUT_SECONDS = 2.0
+REFUSAL_SEND_TIMEOUT_SECONDS = 0.5
+SHUTDOWN_DRAIN_SECONDS = 0.5
+SHUTDOWN_DRAIN_POLL_SECONDS = 0.01
+SOCKET_MODE = 0o600
+SOCKET_DIRECTORY_MODE = 0o700
 LIVE_WORKER_JOIN_SECONDS = 0.5
 MIN_LIVE_TICK_SECONDS = 0.05
 SILENCE_TICK_SECONDS = 0.25
 MAX_SILENCE_TICK_SECONDS = 1.0
 MAX_TICK_FAILURES = 5
+
+
+class CommandCode(StrEnum):
+    """The closed set of failure categories an unsuccessful response reports.
+
+    A caller that has to decide what to do next cannot branch on prose, which is
+    free to be reworded. SHUTTING_DOWN is separate from COMMAND_FAILED because a
+    caller should retry it and must not retry the other.
+    """
+
+    BUSY = "busy"
+    UNSUPPORTED_COMMAND = "unsupported_command"
+    MALFORMED_REQUEST = "malformed_request"
+    OVER_CAPACITY = "over_capacity"
+    NOT_PERMITTED = "not_permitted"
+    SHUTTING_DOWN = "shutting_down"
+    COMMAND_FAILED = "command_failed"
+
+
+class RequestError(ValueError):
+    """A request Murmly could not read, carrying the wording to report for it."""
+
+
+class DaemonStartupError(RuntimeError):
+    """The daemon refuses to start for a reason it detected itself."""
+
+
+class DaemonNotRespondingError(RuntimeError):
+    """The daemon accepted the connection and closed it without responding.
+
+    Subclasses RuntimeError so a caller that already guards a bare RuntimeError
+    keeps working, while the CLI names this type rather than catching bare
+    RuntimeError and swallowing genuine programming errors with it.
+    """
+
+
+def failure_response(code: CommandCode, message: str, **fields: object) -> dict[str, object]:
+    """Build an unsuccessful response.
+
+    Takes the extra fields rather than the code and message alone: several
+    failures carry `state`, and an existing reader of one of those responses must
+    keep finding every field it reads today.
+    """
+    response: dict[str, object] = {"ok": False}
+    response.update(fields)
+    response["error"] = message
+    response["code"] = code
+    return response
+
+
+def socket_path_detail(socket_path: Path) -> str | None:
+    """Why the configured socket path is not private, or None when it is.
+
+    The predicate is write permission, not reachability. Connecting to a UNIX
+    socket requires write permission on the node and the node is owner-only, so a
+    directory other accounts can merely read or traverse is not an exposure --
+    refusing on that would reject a 0755 home directory. What a writable
+    directory permits is creating or replacing the node, so that the owner's own
+    commands reach a socket Murmly does not serve.
+
+    A directory Murmly has yet to create is judged by the nearest existing
+    ancestor, which is where another account would pre-create it.
+    """
+    directory = socket_path.parent
+    existing = directory
+    while not existing.exists() and existing.parent != existing:
+        existing = existing.parent
+    try:
+        mode = existing.stat().st_mode
+    except OSError as error:
+        return f"The permissions of {existing} could not be read: {error}."
+    if not mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return None
+    return (
+        f"{existing} is writable by other accounts, so another account could "
+        f"create or replace {socket_path} and receive the commands meant for Murmly."
+    )
+
+
+def peer_identity_supported() -> bool:
+    """Whether this platform can report the account behind an accepted connection."""
+    return hasattr(socket, "SO_PEERCRED")
+
+
+def read_peer_identity(connection: socket.socket) -> int | None:
+    """The user id on the other end of the connection, or None where unreadable."""
+    if not peer_identity_supported():
+        return None
+    try:
+        credentials = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+    except OSError as error:
+        logger.warning("Unable to read the peer identity of a connection: %s", error)
+        return None
+    _pid, uid, _gid = struct.unpack("3i", credentials)
+    return uid
+
+
+def create_socket_directory(directory: Path) -> None:
+    """Create the socket's directory, and any missing ancestor, owner-only.
+
+    `Path.mkdir(mode=...)` cannot be relied on here: it applies the mode to the
+    final directory only, leaving intermediates at the umask, and skips a
+    directory that already exists. So each missing directory is created and moded
+    on its own, and one Murmly did not create is left alone -- an existing
+    XDG_RUNTIME_DIR is the session's, not Murmly's, and is already private.
+    """
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for path in reversed(missing):
+        try:
+            path.mkdir()
+        except FileExistsError:
+            continue
+        path.chmod(SOCKET_DIRECTORY_MODE)
 
 
 @dataclass(slots=True)
@@ -280,8 +411,13 @@ class MurmlyDaemon:
         config: MurmlyConfig,
         session: SpeechSession | None = None,
         overlay: OverlayLifecycle | None = None,
+        peer_identity: Callable[[socket.socket], int | None] = read_peer_identity,
     ) -> None:
         self._config = config
+        self._peer_identity = peer_identity
+        # Before the overlay, which spawns a renderer from its constructor: a
+        # daemon that refuses to run must not start anything first.
+        self._require_private_socket_path()
         self._overlay = overlay or self._create_overlay(config)
         self._session = session or SpeechSession(
             config,
@@ -304,6 +440,9 @@ class MurmlyDaemon:
         self._worker_slots = threading.BoundedSemaphore(MAX_COMMAND_WORKERS)
         self._connections_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
+        # The subset whose request has already been read. Shutdown waits for these
+        # and for no others: a peer that has not spoken has nothing to be told.
+        self._answering: set[socket.socket] = set()
 
     @property
     def state(self) -> str:
@@ -311,12 +450,24 @@ class MurmlyDaemon:
             return self._state
 
     def serve_forever(self) -> None:
-        self._config.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        # Re-checked here, before the unlink below deletes whatever sits at the
+        # configured path: that unlink must never run against a path Murmly
+        # would refuse.
+        self._require_private_socket_path()
+        if not peer_identity_supported():
+            logger.warning(
+                "This platform cannot report the account behind a connection. The "
+                "command socket is protected by its file permissions alone."
+            )
+        create_socket_directory(self._config.socket_path.parent)
         self._config.socket_path.unlink(missing_ok=True)
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
                 self._server = server
                 server.bind(str(self._config.socket_path))
+                # The window between bind and chmod is accepted: the containing
+                # directory is the barrier and is already restricted.
+                self._config.socket_path.chmod(SOCKET_MODE)
                 server.listen()
                 server.settimeout(0.2)
                 while not self._shutdown.is_set():
@@ -328,11 +479,50 @@ class MurmlyDaemon:
                         if self._shutdown.is_set():
                             break
                         raise
+                    # Checked before a worker slot is taken: inside a worker, a
+                    # foreign account could occupy every slot and deny service to
+                    # the owner -- the pool this change is otherwise hardening.
+                    if not self._peer_permitted(connection):
+                        self._refuse(
+                            connection,
+                            failure_response(
+                                CommandCode.NOT_PERMITTED,
+                                "Murmly serves only the account it runs as.",
+                            ),
+                        )
+                        connection.close()
+                        continue
                     self._dispatch_connection(connection)
         finally:
             self._server = None
             self._config.socket_path.unlink(missing_ok=True)
             self._close_overlay()
+
+    def _require_private_socket_path(self) -> None:
+        detail = socket_path_detail(self._config.socket_path)
+        if detail is None:
+            return
+        raise DaemonStartupError(
+            f"Refusing to serve at {self._config.socket_path}. {detail} "
+            "Either move the socket under your per-user runtime directory "
+            "($XDG_RUNTIME_DIR), or remove write access for group and other from "
+            f"{self._config.socket_path.parent}."
+        )
+
+    def _peer_permitted(self, connection: socket.socket) -> bool:
+        """Whether the account behind this connection is the one Murmly serves.
+
+        An identity this platform cannot report is served rather than refused,
+        which is reported at startup and in diagnostics: refusing would make the
+        daemon unusable on a platform whose only fault is not offering the check.
+        """
+        uid = self._peer_identity(connection)
+        if uid is None:
+            return True
+        if uid == os.getuid():
+            return True
+        logger.warning("Refused a command from uid %d.", uid)
+        return False
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -342,6 +532,7 @@ class MurmlyDaemon:
                 server.close()
             except OSError:
                 pass
+        self._drain_answering()
         with self._connections_lock:
             connections = tuple(self._connections)
         for connection in connections:
@@ -356,34 +547,102 @@ class MurmlyDaemon:
         self._config.socket_path.unlink(missing_ok=True)
         self._close_overlay()
 
+    def _drain_answering(self) -> None:
+        """Let a worker whose request was read write its response before the close.
+
+        Waits only for connections that carry a request. Waiting for a peer that
+        connected and never spoke would make shutdown latency depend on an idle
+        client, and there is nothing to tell it.
+        """
+        deadline = time.monotonic() + SHUTDOWN_DRAIN_SECONDS
+        while True:
+            with self._connections_lock:
+                answering = len(self._answering)
+            if answering == 0:
+                return
+            if time.monotonic() >= deadline:
+                logger.warning("Shutting down with %d command(s) still answering.", answering)
+                return
+            time.sleep(SHUTDOWN_DRAIN_POLL_SECONDS)
+
     def _serve_connection(self, connection: socket.socket) -> None:
         try:
             with connection:
                 connection.settimeout(COMMAND_TIMEOUT_SECONDS)
-                response = self._handle_connection(connection)
                 try:
-                    connection.sendall((json.dumps(response) + "\n").encode("utf-8"))
-                except (BrokenPipeError, OSError):
-                    if not self._shutdown.is_set():
-                        raise
-        except (json.JSONDecodeError, socket.timeout, UnicodeDecodeError, ValueError):
-            pass
+                    response = self._answer(connection)
+                except OSError:
+                    # The connection itself failed. There is nothing left to
+                    # answer on, so this is reported rather than replied to.
+                    raise
+                except Exception as error:  # noqa: BLE001 - an accepted connection is answered
+                    response = self._unexpected_failure(error)
+                self._write_response(connection, response)
         except OSError as error:
             if not self._shutdown.is_set():
                 logger.warning("Command connection failed: %s", error)
         finally:
             with self._connections_lock:
                 self._connections.discard(connection)
+                self._answering.discard(connection)
             self._worker_slots.release()
+
+    def _write_response(self, connection: socket.socket, response: dict[str, object]) -> None:
+        try:
+            connection.sendall((json.dumps(response) + "\n").encode("utf-8"))
+        except OSError:
+            # A peer that closed first, or a connection shutdown force-closed:
+            # the response is discarded rather than retried.
+            if not self._shutdown.is_set():
+                raise
+
+    def _unexpected_failure(self, error: Exception) -> dict[str, object]:
+        """Answer a command that failed in a way Murmly does not anticipate.
+
+        A worker thread that dies takes its response with it, and the caller
+        cannot tell that empty read from a daemon that crashed. The shape checks
+        answer the failures Murmly expects; this answers the rest.
+        """
+        if self._shutdown.is_set():
+            return failure_response(CommandCode.SHUTTING_DOWN, "Murmly is shutting down.")
+        logger.warning("Command handling failed: %s", error, exc_info=error)
+        return failure_response(CommandCode.COMMAND_FAILED, f"Command failed: {error}")
+
+    def _refuse(self, connection: socket.socket, response: dict[str, object]) -> None:
+        """Answer a connection that never reaches a worker.
+
+        Written on the accept loop, so the send timeout comes first and a failed
+        write is discarded rather than retried: a peer that connects and never
+        reads must not hold up the next command.
+        """
+        try:
+            connection.settimeout(REFUSAL_SEND_TIMEOUT_SECONDS)
+            connection.sendall((json.dumps(response) + "\n").encode("utf-8"))
+        except OSError as error:
+            logger.debug("A refusal could not be delivered: %s", error)
 
     def _dispatch_connection(self, connection: socket.socket) -> bool:
         if not self._worker_slots.acquire(blocking=False):
+            # Written here rather than from a worker: the bound exists to stop
+            # this connection from taking one, and a reserved permit would only
+            # move the refusal to the next connection.
+            self._refuse(
+                connection,
+                failure_response(
+                    CommandCode.OVER_CAPACITY,
+                    f"Murmly is already handling {MAX_COMMAND_WORKERS} commands.",
+                ),
+            )
             connection.close()
             return False
         started = False
+        refusal: dict[str, object] | None = None
         try:
             with self._connections_lock:
                 if self._shutdown.is_set():
+                    refusal = failure_response(
+                        CommandCode.SHUTTING_DOWN, "Murmly is shutting down."
+                    )
                     return False
                 self._connections.add(connection)
                 thread = threading.Thread(
@@ -401,29 +660,82 @@ class MurmlyDaemon:
             return True
         except RuntimeError as error:
             logger.warning("Unable to start command worker: %s", error)
+            refusal = failure_response(
+                CommandCode.COMMAND_FAILED, "Murmly could not start a command worker."
+            )
             return False
         finally:
+            # Both refusals are written after the connections lock is released:
+            # a send must never run under it. Neither release site moves, because
+            # a second release on a BoundedSemaphore raises.
             if not started:
+                if refusal is not None:
+                    self._refuse(connection, refusal)
                 connection.close()
                 self._worker_slots.release()
 
-    def _handle_connection(self, connection: socket.socket) -> dict[str, object]:
+    def _answer(self, connection: socket.socket) -> dict[str, object]:
+        """Produce the one response this connection is owed."""
+        try:
+            request = self._read_request(connection)
+        except RequestError as error:
+            return failure_response(CommandCode.MALFORMED_REQUEST, str(error))
+        except socket.timeout:
+            return failure_response(
+                CommandCode.MALFORMED_REQUEST,
+                f"No request arrived within {COMMAND_TIMEOUT_SECONDS:g} seconds.",
+            )
+        except UnicodeDecodeError:
+            return failure_response(
+                CommandCode.MALFORMED_REQUEST, "Request is not valid UTF-8 text."
+            )
+        except json.JSONDecodeError as error:
+            return failure_response(
+                CommandCode.MALFORMED_REQUEST, f"Request is not valid JSON: {error}"
+            )
+        # The request is in hand from here, so shutdown owes this connection an
+        # answer and must not force-close it until the response is written.
+        with self._connections_lock:
+            self._answering.add(connection)
+        if self._shutdown.is_set():
+            return failure_response(CommandCode.SHUTTING_DOWN, "Murmly is shutting down.")
+        return self._dispatch_request(request)
+
+    def _read_request(self, connection: socket.socket) -> object:
         payload = bytearray()
         while not payload.endswith(b"\n"):
             chunk = connection.recv(4096)
             if not chunk:
                 break
             if len(payload) + len(chunk) > MAX_COMMAND_BYTES:
-                return {"ok": False, "error": "Command exceeds the 4096-byte limit."}
+                raise RequestError("Command exceeds the 4096-byte limit.")
             payload.extend(chunk)
-        command = json.loads(payload.decode("utf-8") or "{}")
-        return self.handle_command(str(command.get("command", "")))
+        return json.loads(payload.decode("utf-8") or "{}")
+
+    def _dispatch_request(self, request: object) -> dict[str, object]:
+        """Check the request's shape, then run the command it names.
+
+        Checked rather than caught: a caught AttributeError would report a
+        request problem for a class of bugs that are not request problems.
+        """
+        if not isinstance(request, dict):
+            return failure_response(
+                CommandCode.MALFORMED_REQUEST, "Request is not a JSON object."
+            )
+        command = request.get("command", "")
+        if not isinstance(command, str):
+            return failure_response(
+                CommandCode.UNSUPPORTED_COMMAND, f"Unsupported command: {command!r}"
+            )
+        return self.handle_command(command)
 
     def handle_command(self, command: str) -> dict[str, object]:
         if command == "status":
             return {"ok": True, "state": self.state}
         if command != "toggle":
-            return {"ok": False, "error": f"Unsupported command: {command}"}
+            return failure_response(
+                CommandCode.UNSUPPORTED_COMMAND, f"Unsupported command: {command}"
+            )
 
         with self._lock:
             if self._state == "IDLE":
@@ -433,13 +745,15 @@ class MurmlyDaemon:
                     self._session.start_recording()
                 except Exception as error:
                     self._publish_error()
-                    return {"ok": False, "state": "IDLE", "error": str(error)}
+                    return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
                 self._state = "LISTENING"
                 state = self._state
                 self._publish_state(OverlayState.LISTENING)
                 return {"ok": True, "state": state}
             if self._state != "LISTENING":
-                return {"ok": False, "state": self._state, "error": "Daemon is busy."}
+                return failure_response(
+                    CommandCode.BUSY, "Daemon is busy.", state=self._state
+                )
             self._state = "THINKING"
         # Claimed before stopping capture so an in-flight segment finishes first;
         # otherwise its transcript could paste after this one, out of order.
@@ -450,7 +764,7 @@ class MurmlyDaemon:
                 with self._lock:
                     self._state = "IDLE"
                 self._publish_error()
-                return {"ok": False, "state": "IDLE", "error": str(error)}
+                return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
             # Published only once capture has stopped: the processing presentation
             # must never be shown while the waveform still represents live input.
             self._publish_state(OverlayState.THINKING)
@@ -468,7 +782,7 @@ class MurmlyDaemon:
             return self._session_response(result)
         except Exception as error:
             self._publish_error()
-            return {"ok": False, "state": "IDLE", "error": str(error)}
+            return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
         finally:
             with self._lock:
                 self._state = "IDLE"
@@ -704,5 +1018,5 @@ def send_command(socket_path: str, command: str) -> dict[str, object]:
                 break
             payload += chunk
     if not payload:
-        raise RuntimeError("Murmly daemon closed the connection before responding.")
+        raise DaemonNotRespondingError("Murmly daemon closed the connection before responding.")
     return json.loads(payload.decode("utf-8"))
