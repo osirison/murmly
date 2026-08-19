@@ -476,6 +476,24 @@ class ToggleRecoveryTests(unittest.TestCase):
         self.assertEqual(1, service.starts)
         self.assertEqual(2, sender.attempts, "exactly one retry after the initial attempt")
 
+    def test_a_daemon_that_answers_nothing_is_reported_without_a_restart(self) -> None:
+        # Something is listening, so starting the service would answer a question
+        # the caller did not ask.
+        from murmly.cli import DaemonUnavailableError, send_command_with_recovery
+        from murmly.daemon import DaemonNotRespondingError
+
+        service = StubService(installed=True)
+        sender = CountingSender([DaemonNotRespondingError("nothing came back")])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir) / "murmly.sock")
+            with patch("murmly.cli.send_command", sender):
+                with self.assertRaises(DaemonUnavailableError) as raised:
+                    send_command_with_recovery(config, "toggle", service=service)
+
+        self.assertIn("nothing came back", str(raised.exception))
+        self.assertEqual(0, service.starts, "a daemon that answered must not be restarted")
+        self.assertEqual(1, sender.attempts, "no retry when the connection was accepted")
+
     def test_not_installed_names_the_install_command(self) -> None:
         from murmly.cli import DaemonUnavailableError, send_command_with_recovery
 

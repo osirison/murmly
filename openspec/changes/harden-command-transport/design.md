@@ -220,18 +220,29 @@ directory above it -- renaming a directory replaces everything under it -- and
 ownership of any of them, since an owner can grant itself the write permission at
 any time.
 
-So every directory from the socket up to the root is judged, and the parent is
-resolved first so a symlink cannot hide where the node really lands. Checking the
-holder alone was the original mistake: `/srv/shared` at `0777` with a `0700`
-directory inside it passed, and renaming that directory away substituted the
-socket while `murmly doctor` still reported the path private.
+So every directory the lookup passes through is judged. Checking the holder
+alone was the first mistake: `/srv/shared` at `0777` with a `0700` directory
+inside it passed, and renaming that directory away substituted the socket while
+`murmly doctor` still reported the path private.
 
-Above the nearest existing directory the sticky bit is accepted in place of the
+Resolving the whole path first and walking what came back was the second. It
+judges where the node lands, not how it is reached, and a caller opens the
+configured path every time -- so `/srv/shared/link` pointing at a private
+directory passed, and whoever could write `/srv/shared` replaced the link and
+took the commands without touching what it pointed at. Each component is
+resolved at the point it is reached instead, and the directory holding it is
+judged before the step is taken, which covers both the link and its target and
+holds for links that chain. The hop count is bounded, so a loop is reported
+rather than followed.
+
+Above the deepest existing directory the sticky bit is accepted in place of the
 write bits. It is exactly the permission that stops one account renaming or
 removing another's entry, which is what `/tmp` relies on; without the exemption
 every path under `/tmp` would be refused. The nearest existing directory gets no
 exemption, because the components below it do not exist yet and the sticky bit
-does not stop anyone creating them.
+does not stop anyone creating them. So a path whose own directory has yet to be
+created is refused under a shared directory, and served once that directory
+exists and is private.
 
 Validation lives in the daemon, not in `load_config`. Every command loads
 configuration, including `murmly doctor`, and a configuration that refuses to load
@@ -289,6 +300,15 @@ distinguish a device name from an error message.
   response that never arrives is reported as the daemon not responding, so it
   takes the path that already exists for that outcome rather than restarting a
   service that is running.
+- **A test that passes with and without its fix proves nothing** → each fix is
+  mutated in a scratch copy and the test that covers it is required to fail. Two
+  fixes reached review with no test that pinned them -- the second drain, and the
+  refusal to restart a service for a daemon that answered nothing -- and were
+  found this way rather than by reading.
+- **A path component that is not a directory** → the walk stops there and the
+  bind reports it. `unlink`, `bind`, `chmod` and `listen` are startup refusals
+  like the directory check, so `ENOTDIR` and `EISDIR` name the path rather than
+  reaching the caller's backstop as unexpected failures.
 - **The refusal write can delay the accept loop** → send timeout before the write,
   failed writes discarded, never retried.
 - **Semaphore accounting in `_dispatch_connection`** → a refusal write placed on

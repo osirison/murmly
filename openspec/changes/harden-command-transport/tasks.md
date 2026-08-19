@@ -86,3 +86,13 @@ description: Track implementation and validation of answered connections, coded 
 - [x] 9.8 Add tests for each of the above, and confirm each fails against the code before its fix
 - [x] 9.9 Cover the paths the specs describe and the suite did not reach: a platform that cannot report peer identity, a peer that closes before its response, and the bound on a peer that never reads
 - [x] 9.10 Remove `except RuntimeError: pass` from `tests/test_daemon.py:308-312` and assert the shutting-down response instead
+
+## 10. Review fixes, round two
+
+- [x] 10.1 Resolve each component of the socket path at the point it is reached rather than resolving the whole path first, so the directory holding a symbolic link is judged as well as the one the link points at, with a bounded hop count
+- [x] 10.2 Report `unlink`, `bind`, `chmod` and `listen` failures as startup refusals, so a path component that is not a directory names itself instead of reaching the caller's backstop
+- [x] 10.3 Guard the socket unlink in the unwinding, so a failure to clean up cannot replace the reason the daemon is unwinding
+- [x] 10.4 Correct the bind-to-chmod window comment: the umask keeps it closed, not the containing directory, which is deliberately allowed to be traversable
+- [x] 10.5 Pin the second shutdown drain and the refusal to restart a service for a daemon that answered nothing, both of which survived mutation with the suite green
+- [x] 10.6 Correct `README.md` and `config.example.toml`, which described the sticky exemption against the directory holding the socket rather than the deepest existing one, and offered `chmod` as the remedy for a directory another account owns
+- [x] 10.7 State the administrative-account exemption in the spec, which read literally refused every path

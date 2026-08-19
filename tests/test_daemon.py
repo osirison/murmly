@@ -1762,6 +1762,55 @@ class AnsweredConnectionTests(ServedDaemonTests):
         self.assertEqual(1, received.count(b"\n"), f"expected one response, got {received!r}")
         self.assertEqual({"ok": True, "state": "IDLE"}, json.loads(received))
 
+    def test_shutdown_waits_for_a_write_that_outlives_the_drain(self) -> None:
+        # The drain expires while the worker holds the claim. Shutdown cannot
+        # answer for that connection -- the worker is about to -- and must not
+        # close on it either, so the wait after the answer is the only thing
+        # keeping the response whole.
+        daemon, socket_path = self.serve()
+        claimed = threading.Event()
+        answered = threading.Event()
+        release = threading.Event()
+        take_claim = daemon._claim_response
+        answer_the_rest = daemon._answer_the_rest
+
+        def stall_after_claiming(connection: socket.socket) -> bool:
+            taken = take_claim(connection)
+            if taken:
+                claimed.set()
+                release.wait(timeout=5)
+            return taken
+
+        def note_the_answer() -> None:
+            answer_the_rest()
+            answered.set()
+
+        daemon._claim_response = stall_after_claiming
+        daemon._answer_the_rest = note_the_answer
+        frames: list[bytes] = []
+        caller = threading.Thread(
+            target=lambda: frames.append(
+                send_and_read_to_close(socket_path, b'{"command": "status"}\n')
+            ),
+            daemon=True,
+        )
+        caller.start()
+        self.assertTrue(claimed.wait(timeout=3))
+
+        shutting_down = threading.Thread(target=daemon.shutdown, daemon=True)
+        shutting_down.start()
+        # Released only once shutdown has answered everything it could, so the
+        # write lands after that point -- the whole window the second wait is for.
+        self.assertTrue(answered.wait(timeout=5))
+        release.set()
+        shutting_down.join(timeout=5)
+        caller.join(timeout=5)
+
+        self.assertEqual(1, len(frames))
+        received = frames[0]
+        self.assertEqual(1, received.count(b"\n"), f"expected one response, got {received!r}")
+        self.assertEqual({"ok": True, "state": "IDLE"}, json.loads(received))
+
     def test_a_peer_that_closes_before_the_response_does_not_stop_the_daemon(self) -> None:
         # One of the two connections that cannot be answered. Murmly discards the
         # response it produced and goes on serving.
@@ -2077,6 +2126,51 @@ class SocketAccessTests(ServedDaemonTests):
 
         self.assertIn(str(socket_path), str(refusal.exception))
         self.assertTrue(overlay.closed)
+
+    def test_a_symlink_does_not_hide_the_directory_it_is_reached_through(self) -> None:
+        # A caller opens the configured path, so the link is what it reaches
+        # through. Judging only what the path resolves to leaves the directory
+        # holding the link unexamined, and an account that can write there
+        # replaces the link and takes the commands, whatever it pointed at.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wide = Path(temp_dir) / "wide"
+            wide.mkdir()
+            private = Path(temp_dir) / "private"
+            private.mkdir(mode=0o700)
+            link = wide / "link"
+            link.symlink_to(private)
+            wide.chmod(0o777)
+            hop = Path(temp_dir) / "hop"
+            hop.symlink_to(link)
+
+            detail = socket_path_detail(link / "murmly.sock")
+            chained = socket_path_detail(hop / "murmly.sock")
+
+        self.assertIsNotNone(detail)
+        self.assertIn(str(wide), detail)
+        # The second link reaches the first, so the exposure is two hops away and
+        # is still found.
+        self.assertIsNotNone(chained)
+        self.assertIn(str(wide), chained)
+
+    def test_a_socket_path_that_cannot_be_created_is_reported_as_a_refusal(self) -> None:
+        # The daemon detected this itself, so it is a refusal rather than the
+        # unexpected failure the caller's backstop would otherwise report.
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        occupant = Path(temp_dir.name) / "notadir"
+        occupant.write_text("", encoding="utf-8")
+        config = MurmlyConfig(
+            socket_path=occupant / "murmly.sock",
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+        daemon = MurmlyDaemon(config, session=DummySession())
+
+        with self.assertRaises(DaemonStartupError) as refusal:
+            daemon.serve_forever()
+
+        self.assertIn(str(config.socket_path), str(refusal.exception))
 
     def test_a_platform_without_peer_identity_is_reported_and_keeps_serving(self) -> None:
         # Refusing here would make the daemon unusable on a platform whose only

@@ -44,6 +44,7 @@ REFUSAL_SEND_TIMEOUT_SECONDS = 0.5
 SHUTDOWN_DRAIN_SECONDS = 0.5
 SHUTDOWN_DRAIN_POLL_SECONDS = 0.01
 SOCKET_MODE = 0o600
+MAX_SOCKET_PATH_LINKS = 40
 SOCKET_DIRECTORY_MODE = 0o700
 LIVE_WORKER_JOIN_SECONDS = 0.5
 MIN_LIVE_TICK_SECONDS = 0.05
@@ -117,36 +118,87 @@ def socket_path_detail(socket_path: Path) -> str | None:
     under it -- and ownership of any of them, because an owner can grant itself
     the write permission whenever it likes.
 
-    So every directory from the socket up to the root is judged. Above the
-    nearest existing one the sticky bit is accepted in place of the write bits:
-    it is exactly the permission that stops one account renaming or removing
-    another's entry, which is what /tmp relies on. The nearest existing directory
-    gets no such exemption, because the components below it do not exist yet and
-    the sticky bit does not stop anyone creating them.
-
-    The parent is resolved first, so a symlink cannot hide the directories the
-    node really lands in.
+    So every directory the lookup passes through is judged, symlinks resolved as
+    they are reached rather than all at once: a caller opens the configured path,
+    so the directories it is reached *through* matter as much as the one the node
+    lands in. Above the deepest existing one the sticky bit is accepted in place
+    of the write bits -- it is exactly the permission that stops one account
+    renaming or removing another's entry, which is what /tmp relies on. The
+    deepest existing directory gets no such exemption, because the components
+    below it do not exist yet and the sticky bit does not stop anyone creating
+    them.
     """
-    try:
-        existing = socket_path.parent.resolve()
-    except OSError as error:
-        return f"The path {socket_path.parent} could not be resolved: {error}."
-    while not existing.exists() and existing.parent != existing:
-        existing = existing.parent
-    directory = existing
-    while True:
+    traversed = _traversed_directories(socket_path.parent)
+    if isinstance(traversed, str):
+        return traversed
+    deepest = traversed[-1]
+    for directory in traversed:
         try:
             info = directory.stat()
         except OSError as error:
             return f"The permissions of {directory} could not be read: {error}."
         detail = _directory_exposure(
-            directory, info, socket_path, sticky_accepted=directory != existing
+            directory, info, socket_path, sticky_accepted=directory != deepest
         )
         if detail is not None:
             return detail
-        if directory.parent == directory:
-            return None
-        directory = directory.parent
+    return None
+
+
+def _traversed_directories(directory: Path) -> list[Path] | str:
+    """Every directory a lookup of this path passes through, or why it cannot be walked.
+
+    Resolving the whole path first and walking what comes back judges where the
+    node lands but not how it is reached, and a symlink on the configured path is
+    reached every time a caller opens it. An account that can replace that link
+    substitutes the socket without touching the directory the link points at. So
+    each component is resolved at the point it is reached, and the directory
+    holding it is judged before the step is taken.
+
+    The walk stops at the first component that is not an existing directory.
+    Below that there is nothing to judge: either Murmly creates the rest, under a
+    directory already judged here, or the path runs through something that is not
+    a directory at all, which the bind reports.
+    """
+    if not directory.is_absolute():
+        directory = Path.cwd() / directory
+    root = Path(directory.anchor)
+    current = root
+    traversed = [root]
+    pending = list(reversed(directory.parts[1:]))
+    links = 0
+    while pending:
+        name = pending.pop()
+        if name == ".":
+            continue
+        if name == "..":
+            current = current.parent
+            traversed.append(current)
+            continue
+        candidate = current / name
+        try:
+            is_link = candidate.is_symlink()
+        except OSError as error:
+            return f"The path {candidate} could not be read: {error}."
+        if is_link:
+            links += 1
+            if links > MAX_SOCKET_PATH_LINKS:
+                return f"The path {directory} passes through too many symbolic links."
+            try:
+                target = Path(os.readlink(candidate))
+            except OSError as error:
+                return f"The symbolic link {candidate} could not be read: {error}."
+            if target.is_absolute():
+                current = root
+                pending.extend(reversed(target.parts[1:]))
+            else:
+                pending.extend(reversed(target.parts))
+            continue
+        if not candidate.is_dir():
+            break
+        current = candidate
+        traversed.append(current)
+    return traversed
 
 
 def _directory_exposure(
@@ -529,15 +581,30 @@ class MurmlyDaemon:
                     f"Refusing to serve at {self._config.socket_path}. Its directory "
                     f"could not be created: {error}."
                 ) from error
-            self._config.socket_path.unlink(missing_ok=True)
+            try:
+                self._config.socket_path.unlink(missing_ok=True)
+            except OSError as error:
+                raise DaemonStartupError(
+                    f"Refusing to serve at {self._config.socket_path}. What is already "
+                    f"at that path could not be removed: {error}."
+                ) from error
             try:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
                     self._server = server
-                    server.bind(str(self._config.socket_path))
-                    # The window between bind and chmod is accepted: the containing
-                    # directory is the barrier and is already restricted.
-                    self._config.socket_path.chmod(SOCKET_MODE)
-                    server.listen()
+                    try:
+                        server.bind(str(self._config.socket_path))
+                        # The window between bind and chmod is accepted. What
+                        # keeps it closed is the umask, which leaves the node
+                        # unwritable by other accounts even before the chmod; the
+                        # directory rule above does not, since it deliberately
+                        # serves a directory others can traverse.
+                        self._config.socket_path.chmod(SOCKET_MODE)
+                        server.listen()
+                    except OSError as error:
+                        raise DaemonStartupError(
+                            f"Refusing to serve at {self._config.socket_path}. Its socket "
+                            f"could not be created: {error}."
+                        ) from error
                     server.settimeout(0.2)
                     while not self._shutdown.is_set():
                         try:
@@ -564,7 +631,12 @@ class MurmlyDaemon:
                         self._dispatch_connection(connection)
             finally:
                 self._server = None
-                self._config.socket_path.unlink(missing_ok=True)
+                try:
+                    self._config.socket_path.unlink(missing_ok=True)
+                except OSError as error:
+                    # Reported rather than raised: a failure to clean up must not
+                    # replace the reason the daemon is unwinding.
+                    logger.warning("The command socket could not be removed: %s", error)
         finally:
             # Outside the socket's own unwinding, because a refusal that happens
             # before the socket exists still has an overlay to close: the

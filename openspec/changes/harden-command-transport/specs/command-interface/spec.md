@@ -152,9 +152,9 @@ Murmly SHALL restrict its command socket to the user account the daemon runs as.
 
 Directories Murmly creates for the socket, and the socket itself, MUST be created accessible only to that account. A peer whose reported identity differs from the daemon's MUST be refused. When the platform cannot report a peer's identity, Murmly MUST report that it cannot and continue serving on file permissions alone, rather than treating an unknown identity as permitted.
 
-A configured socket path another account could take control of MUST be refused at daemon startup, naming the directory at fault and how to correct it. Control is not limited to the directory holding the socket: renaming a directory replaces everything under it, and an owner can grant itself write access whenever it likes, so every directory from the socket up to the root counts, and a directory another account can write or owns is an exposure wherever it sits on that path. Such a directory allows another account to create or replace the socket node, so the owner's own commands would reach a socket Murmly does not serve.
+A configured socket path another account could take control of MUST be refused at daemon startup, naming the directory at fault and how to correct it. Control is not limited to the directory holding the socket: renaming a directory replaces everything under it, replacing a symbolic link redirects everything reached through it, and an owner can grant itself write access whenever it likes. So every directory a lookup of the configured path passes through counts, symbolic links followed as they are reached, and one another account can write, or that is owned by neither the account the daemon runs as nor the system's own administrative account, is an exposure wherever it sits on that path. Such a directory allows another account to create or replace the socket node, so the owner's own commands would reach a socket Murmly does not serve.
 
-A directory that other accounts can only read or traverse MUST NOT be refused, because the socket node itself is owner-only. Above the nearest existing directory on the path, a shared directory that stops one account removing or renaming another's entries MUST NOT be refused either, or the standard shared temporary directory would disqualify every path beneath it. That exemption MUST NOT extend to the nearest existing directory, because the components below it do not exist yet and such a directory does not stop another account creating them.
+A directory that other accounts can only read or traverse MUST NOT be refused, because the socket node itself is owner-only. Above the deepest directory on the path that already exists, a shared directory that stops one account removing or renaming another's entries MUST NOT be refused either, or the standard shared temporary directory would disqualify every path beneath it. That exemption MUST NOT extend to the deepest existing directory, because the components below it do not exist yet and such a directory does not stop another account creating them.
 
 #### Scenario: Permissions at creation
 
@@ -190,6 +190,12 @@ A directory that other accounts can only read or traverse MUST NOT be refused, b
 
 - **WHEN** a directory on the configured socket path is owned by an account other than the one the daemon runs as
 - **THEN** the daemon refuses to start, naming that directory
+- **AND** no socket is created at that path
+
+#### Scenario: Configured socket path is reached through a symbolic link
+
+- **WHEN** the configured socket path passes through a symbolic link that sits in a directory writable by group or other, whatever that link points at
+- **THEN** the daemon refuses to start, naming the directory holding the link
 - **AND** no socket is created at that path
 
 #### Scenario: Shared ancestor that protects the entries in it
