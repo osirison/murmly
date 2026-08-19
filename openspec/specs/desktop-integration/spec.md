@@ -193,7 +193,9 @@ to other applications.
 When a hotkey press reaches Murmly and the daemon is not accepting commands,
 Murmly SHALL attempt to start the installed service, wait a bounded time for it,
 and retry once. A hotkey press MUST NOT surface an unhandled error, because a
-hotkey has no visible output channel.
+hotkey has no visible output channel. A daemon that accepts the connection and
+then closes it without responding MUST be treated as not having answered, not as
+an error to raise.
 
 #### Scenario: Daemon not running but installed
 
@@ -215,6 +217,14 @@ hotkey has no visible output channel.
 - **THEN** Murmly exits non-zero with a message stating that the daemon could not
   be started
 - **AND** does not retry indefinitely
+
+#### Scenario: Daemon accepts the connection but does not respond
+
+- **WHEN** the hotkey is pressed, the connection is accepted, and it closes before
+  any response arrives
+- **THEN** Murmly exits non-zero with a message stating that the daemon did not
+  respond
+- **AND** no unhandled error is raised
 
 ### Requirement: Hotkey specification is validated strictly
 
