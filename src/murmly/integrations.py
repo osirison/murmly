@@ -30,11 +30,17 @@ class InjectorCandidate:
     The probe exists because a tool being installed says nothing about whether the
     session can run it: `wtype` needs the compositor to offer the virtual keyboard
     protocol, and `ydotool` needs a daemon this user can reach.
+
+    `requires` names an environment variable the method cannot work without, and
+    `confirms_delivery` is false for a method that reports success whether or not the
+    keystroke reached the focused window.
     """
 
     method: str
     command: tuple[str, ...]
     probe: tuple[str, ...] | None = None
+    requires: str | None = None
+    confirms_delivery: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +51,7 @@ class PasteInjection:
     command: tuple[str, ...] | None
     reason: str | None = None
     remedy: tuple[str, ...] = ()
+    confirms_delivery: bool = True
 
     @property
     def available(self) -> bool:
@@ -58,7 +65,24 @@ class DeliveryOutcome:
 
 
 WAYLAND_INJECTORS = (
+    # wtype first: on a compositor that offers the virtual keyboard protocol it is
+    # the native route and needs nothing else. Then xdotool, which reaches Wayland
+    # windows on compositors that bridge XTEST into their own input handling - KWin
+    # does, through the EIS socket it hands XWayland. ydotool last: it works
+    # anywhere but wants a daemon with access to /dev/uinput.
     InjectorCandidate("wtype", ("wtype", "-M", "ctrl", "v", "-m", "ctrl"), ("wtype", "")),
+    InjectorCandidate(
+        "xdotool",
+        ("xdotool", "key", "--clearmodifiers", "ctrl+v"),
+        # Opens an X connection without issuing an XTEST request, so probing cannot
+        # trip the compositor's input-control consent prompt as a side effect.
+        ("xdotool", "getdisplaygeometry"),
+        requires="DISPLAY",
+        # XWayland falls back to plain XTEST when the compositor refuses the EIS
+        # connection, and xdotool exits 0 either way, so success here is not proof
+        # the keystroke reached a Wayland-native window.
+        confirms_delivery=False,
+    ),
     InjectorCandidate("ydotool", ("ydotool", "key", "29:1", "47:1", "47:0", "29:0"), ("ydotool", "type", "")),
 )
 X11_INJECTORS = (InjectorCandidate("xdotool", ("xdotool", "key", "--clearmodifiers", "ctrl+v")),)
@@ -110,24 +134,22 @@ def ydotool_socket_path(env: dict[str, str] | None = None) -> str:
 
 
 def injector_remedy(env: dict[str, str] | None = None) -> tuple[str, ...]:
-    """Commands the user has to run themselves. Murmly changes no system state."""
+    """What the user has to do themselves. Murmly changes no system state.
+
+    Ordered by cost to the user, not by elegance: a compositor that bridges XTEST
+    into its own input handling - KWin does - needs nothing but xdotool and one
+    click, so that goes first and the root-owned uinput daemon goes last.
+    """
     environment = env or os.environ
     if not is_wayland_session(environment):
         return ("sudo dnf install xdotool",)
-    # ydotoold defaults to a root-owned socket under its own runtime directory, which
-    # is not the path this user's client reads, so the drop-in names both.
-    socket_path = ydotool_socket_path(environment)
     return (
-        "sudo dnf install ydotool",
-        "sudo mkdir -p /etc/systemd/system/ydotool.service.d",
-        "sudo tee /etc/systemd/system/ydotool.service.d/murmly.conf >/dev/null <<'EOF'",
-        "[Service]",
-        "ExecStart=",
-        f"ExecStart=/usr/bin/ydotoold --socket-path={socket_path} "
-        f"--socket-own={os.getuid()}:{os.getgid()}",
-        "EOF",
-        "sudo systemctl daemon-reload",
-        "sudo systemctl enable --now ydotool.service",
+        "sudo dnf install xdotool    # KDE Plasma: KWin passes it through to Wayland windows;",
+        "                            # the first paste asks once to allow input control, and",
+        "                            # ticking 'Always allow' on that dialog makes it permanent",
+        "sudo dnf install wtype      # wlroots compositors (Sway, river, Hyprland)",
+        "                            # Neither works? ydotool needs one-time root setup:",
+        "                            # see the Wayland paste section in Murmly's README",
     )
 
 
@@ -173,14 +195,18 @@ def select_paste_injection(
     remedy = injector_remedy(environment)
     skipped = set(excluded)
 
-    installed = [candidate for candidate in candidates if which(candidate.command[0])]
+    installed = [
+        candidate
+        for candidate in candidates
+        if which(candidate.command[0])
+        and (candidate.requires is None or environment.get(candidate.requires))
+    ]
     if not installed:
         session = "Wayland" if wayland else "X11"
-        tools = " or ".join(candidate.method for candidate in candidates)
         return PasteInjection(
             None,
             None,
-            reason=f"No {session} paste injector is installed; install {tools}.",
+            reason=f"No {session} paste injector is installed.",
             remedy=remedy,
         )
 
@@ -191,7 +217,11 @@ def select_paste_injection(
             continue
         detail = probe_injector(candidate, environment, run)
         if detail is None:
-            return PasteInjection(candidate.method, candidate.command)
+            return PasteInjection(
+                candidate.method,
+                candidate.command,
+                confirms_delivery=candidate.confirms_delivery,
+            )
         reasons.append(f"{candidate.method} is installed but cannot inject in this session: {detail}")
     return PasteInjection(None, None, reason="; ".join(reasons), remedy=remedy)
 
@@ -224,7 +254,10 @@ class ClipboardPaster:
         if not injection.available:
             self.copy(text)
             return DeliveryOutcome(False, injection.reason)
-        previous = self._read_clipboard() if self._restore_clipboard else None
+        # Not read at all when the method cannot confirm delivery: restoring over a
+        # transcript that may never have arrived would destroy the only copy of it.
+        restoring = self._restore_clipboard and injection.confirms_delivery
+        previous = self._read_clipboard() if restoring else None
         self.copy(text)
         try:
             self._run(list(injection.command or ()))

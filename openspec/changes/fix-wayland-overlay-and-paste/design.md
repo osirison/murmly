@@ -48,9 +48,27 @@ as **confirmed** (reproduced on the reporting machine: Fedora 44, Plasma Wayland
   assertion survives this change unchanged.
 - **Confirmed.** Fedora's `ydotool` package ships `/usr/bin/ydotool`,
   `/usr/bin/ydotoold`, and `/usr/lib/systemd/system/ydotool.service`.
-- **Inferred.** `ydotool` is the only injector that can work on this session, because
-  it drives `/dev/uinput` rather than a Wayland protocol. Its socket path, whether the
-  client needs `YDOTOOL_SOCKET`, and what the shipped unit sets are **unverified**.
+- **Confirmed, replacing an inference this change first shipped.** `xdotool` reaches
+  Wayland-native windows on this session. KWin hands XWayland an EIS socket
+  (`LIBEI_SOCKET=/proc/self/fd/122` in XWayland's environ; `ldd /usr/bin/Xwayland`
+  shows `libei.so.1`), so XTEST events are bridged into the compositor's own input
+  handling rather than confined to X11 clients. Verified end to end: a GTK4 window
+  under `GDK_BACKEND=wayland` (`display=GdkWaylandDisplay`) received the clipboard
+  contents from `xdotool key --clearmodifiers ctrl+v`, twice, and then again through
+  `ClipboardPaster.copy_and_paste` itself. Injection latency is 14 ms median over ten
+  runs. The earlier claim here — "ydotool is the only injector that can work on this
+  session" — was inferred from the absent virtual-keyboard protocol and is wrong.
+- **Confirmed.** The first attempt in a session raises KDE's input-control consent
+  dialog (`/usr/libexec/kwin_eis_prompter`, "Always allow apps claiming to be %1",
+  revocable under System Settings' "Legacy X11 App Support"). Until it is answered,
+  events queue and `xdotool` has already exited, so that first transcript reaches the
+  clipboard only. Ticking "Always allow" writes `XwaylandEisNoPromptApps` in `kwinrc`;
+  without it the grant lasts the session.
+- **Confirmed.** `xdotool` exits 0 whether or not the keystroke arrived: with consent
+  outstanding, two calls returned 0 while the target window received nothing. Exit
+  status is not evidence of delivery on this path.
+- **Confirmed.** `ydotool`'s socket path, its client's resolution order, and the
+  shipped unit were read from the packaged binaries — see Open Questions.
 
 ## Goals / Non-Goals
 
@@ -162,8 +180,17 @@ once per daemon lifetime and cached:
 
 | Session | Candidates, in order | Probe |
 | --- | --- | --- |
-| Wayland | `wtype`, `ydotool` | run the tool with an empty payload (`wtype ""`, `ydotool type ""`) |
+| Wayland | `wtype`, `xdotool` (only with `DISPLAY`), `ydotool` | `wtype ""`, `xdotool getdisplaygeometry`, `ydotool type ""` |
 | X11 | `xdotool` | none — unchanged from today |
+
+`wtype` stays first so a compositor offering the virtual keyboard protocol uses the
+native route. `xdotool` follows, because a compositor that bridges XTEST into its own
+input handling delivers it to Wayland windows, and it needs no package, no daemon and
+no root — only a single consent click the desktop itself provides. `ydotool` is last:
+it works anywhere but wants a daemon with access to `/dev/uinput`. The `xdotool` probe
+is `getdisplaygeometry` rather than a keystroke, so probing opens an X connection
+without issuing an XTEST request and cannot trip the consent prompt as a side effect;
+verified by checking the journal for `kwin_eis_prompter` after a probe run.
 
 A candidate is selected only if it is installed and its probe succeeds. If a selected
 candidate then fails during a real delivery, it is marked unusable for the rest of the
@@ -186,9 +213,41 @@ Alternatives considered:
   the protocol question rather than the "can this tool run" question.
 - *Prefer `ydotool` whenever the desktop is Plasma.* Rejected: hardcodes a
   compositor's current protocol support, and forces a root-owned daemon on Plasma
-  users whose compositor may later support `wtype`.
+  users whose compositor may later support `wtype`. It also turned out to be
+  unnecessary — `xdotool` works here.
+- *The `xdg-desktop-portal` RemoteDesktop interface with `NotifyKeyboardKeycode`.*
+  Present on this machine (frontend v2, KDE implementation v2,
+  `AvailableDeviceTypes=7`) and the sanctioned no-root input path, driven from a
+  helper under the system interpreter as the overlay renderer already is. Rejected for
+  now on cost: roughly 400 lines of session lifecycle, restore-token persistence and
+  `Session.Closed` recovery, against about ten for the `xdotool` candidate, plus a
+  reported permanent "Remote Control" tray icon for the life of the session. It stays
+  the right answer if Murmly ever wants GNOME, where no XTEST bridge exists.
+- *`zwp_input_method_v1`, committing the transcript as text.* KWin advertises it and it
+  would bypass the clipboard entirely. Rejected: XWayland clients and Electron apps
+  without `--enable-wayland-ime` receive nothing, so it would add a second injection
+  path rather than replace one, and it needs a Wayland protocol client Python does not
+  have installed.
+- *KWin's `org.kde.KWin.EIS.RemoteDesktop.connectToEIS` directly.* Rejected: it is a
+  private unversioned API that appears to lack a caller check, which is a reason not to
+  use it rather than a reason to.
 - *No probe; demote purely on failure.* Rejected: `murmly doctor` must answer before
   any delivery has happened, and that is exactly the moment the user asks.
+
+### 5a. A method that cannot confirm delivery must not restore the clipboard
+
+`xdotool` reports success either way, and XWayland silently falls back to plain XTEST
+when the compositor refuses the EIS connection — a Wayland-native target then receives
+nothing while the call still exits 0. Murmly marks such a method
+`confirms_delivery=False` and, for it, never reads the previous clipboard and never
+restores. The toggle response still reports the transcript as delivered, matching how
+the spec already treats a session whose delivery cannot be verified; what changes is
+that Murmly refuses to overwrite the only copy of the transcript on the strength of an
+exit status that does not mean what it appears to mean.
+
+Alternative considered: report such a delivery as refused. Rejected — it would mark
+every successful paste on KDE Wayland as a failure, and the user would see an error
+state for the normal case.
 
 ### 6. Copy survives an unusable injector
 

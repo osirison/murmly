@@ -18,38 +18,49 @@ and lets the desktop's own shortcut system call `murmly toggle`.
 - Python 3.12+
 - KDE Plasma, for the hotkey and the recording overlay
 - Clipboard and paste tools for your session:
-  - Wayland: `wl-clipboard`, plus a paste injector — `wtype` where the compositor
-    offers the virtual keyboard protocol (`zwp_virtual_keyboard_manager_v1`), or
-    `ydotool` where it does not. Plasma's KWin does not advertise that protocol on
-    the sessions Murmly has been tested on, so a Plasma Wayland session needs
-    `ydotool` and its daemon (see below).
   - X11: `xclip` and `xdotool`
+  - Wayland: `wl-clipboard`, plus a paste injector. Which one depends on the
+    compositor, and Murmly picks by running each tool's own no-op invocation rather
+    than by what is installed:
+    - **KDE Plasma**: `xdotool`. KWin bridges XTEST through libei into its own input
+      handling, so an X11 tool reaches Wayland-native windows. The first paste raises
+      KDE's input-control dialog; tick **Always allow** and click Allow, and it is
+      done permanently. That permission is revocable under System Settings →
+      *Legacy X11 App Support*.
+    - **wlroots compositors** (Sway, river, Hyprland): `wtype`, which uses the
+      virtual keyboard protocol directly and needs no permission.
+    - **Anything offering neither**: `ydotool`, which injects through `/dev/uinput`
+      and is the only option here that needs one-time root setup (see below).
 
-Murmly picks an injector by running the tool's own no-op invocation, so a tool
-that is installed but cannot run in your session is never chosen. When none can
-run, every transcript is still copied to the clipboard and `murmly doctor` reports
-the reason under `paste_injection` along with the commands that fix it.
+Until the KDE dialog is answered, the first transcript of a session reaches the
+clipboard only: the events queue while the dialog is open, and `xdotool` has already
+exited by the time it is answered. Murmly never restores the previous clipboard over a
+transcript delivered this way, because `xdotool` exits 0 whether or not the keystroke
+arrived, so a transcript is never lost to a paste that silently did not happen.
 
-### Pasting on a Plasma Wayland session
+`murmly doctor` reports which method it would use under `paste_injection`, and prints
+what to install when it has none.
 
-`ydotool` injects through `/dev/uinput`, so its daemon runs as root while Murmly
-runs as you. The shipped unit puts its socket where the client does not look for
-it, so point it at your own socket path and give it to your user:
+### Pasting with ydotool
+
+Only needed on a Wayland compositor that offers neither the virtual keyboard protocol
+nor an XTEST bridge. `ydotoold` needs access to `/dev/uinput`, which is root-owned.
+Rather than override the packaged system unit — its `ExecStart` cannot name your
+runtime directory, because `/run/user/$UID` does not exist yet when the unit starts at
+boot — grant your own user access and run the daemon as yourself:
 
 ```bash
 sudo dnf install ydotool
-sudo mkdir -p /etc/systemd/system/ydotool.service.d
-sudo tee /etc/systemd/system/ydotool.service.d/murmly.conf >/dev/null <<EOF
-[Service]
-ExecStart=
-ExecStart=/usr/bin/ydotoold --socket-path=$XDG_RUNTIME_DIR/.ydotool_socket --socket-own=$(id -u):$(id -g)
-EOF
-sudo systemctl daemon-reload
-sudo systemctl enable --now ydotool.service
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/60-ydotool-uinput.rules
+sudo udevadm control --reload && sudo udevadm trigger
 ```
 
-`murmly doctor` prints these same commands, filled in for your session, whenever
-it cannot inject a paste.
+Log out and back in, then run `ydotoold` as a user service. As your own process it
+picks up `XDG_RUNTIME_DIR` and writes its socket exactly where the client looks for
+it, with no flags and no socket-ownership juggling. This arrangement is documented
+from the packaged binaries and udev's `uaccess` behaviour; it has not been run
+end to end on a Murmly machine, because KDE and wlroots both have cheaper routes.
 
 For the recording overlay:
 

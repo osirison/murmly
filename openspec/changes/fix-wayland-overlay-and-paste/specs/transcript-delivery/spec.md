@@ -70,3 +70,19 @@ When no usable paste injection method is available, or the selected method fails
 - **WHEN** diagnostics run in a session where an installed injection tool cannot be executed
 - **THEN** the report states that the installed tool cannot be used in this session
 - **AND** names what to install or enable instead
+
+### Requirement: An unconfirmable injection method must not overwrite the transcript
+
+Some injection methods report success whether or not the keystroke reached the focused window, so Murmly cannot tell delivery from silent failure. When delivery was attempted with such a method, Murmly SHALL leave the transcript on the clipboard and MUST NOT restore the previous contents over it, whatever the restoration setting says. Restoration remains as configured for a method whose failure Murmly can observe.
+
+#### Scenario: Delivery by a method whose success cannot be observed
+
+- **WHEN** a transcript is injected with a method that cannot confirm the keystroke arrived
+- **THEN** the transcript is still the clipboard contents after Murmly returns to idle
+- **AND** the contents present before capture are not restored
+- **AND** Murmly does not wait out the restoration interval
+
+#### Scenario: Delivery by a method whose failure is observable
+
+- **WHEN** a transcript is injected with a method that reports its failures
+- **THEN** clipboard restoration behaves as configured

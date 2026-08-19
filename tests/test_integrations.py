@@ -57,6 +57,26 @@ class IntegrationSelectionTests(unittest.TestCase):
         self.assertEqual("ydotool", injection.method)
         self.assertEqual(("ydotool", "key", "29:1", "47:1", "47:0", "29:0"), injection.command)
 
+    def test_wayland_falls_to_xdotool_where_the_compositor_passes_it_through(self) -> None:
+        # wtype installed but unusable, which is every KWin session: xdotool is next
+        # because KWin bridges XTEST into its own input handling.
+        which = fake_which_factory("wl-copy", "wtype", "xdotool", "ydotool")
+        environment = dict(self.WAYLAND, DISPLAY=":1")
+
+        injection = select_paste_injection(environment, which, probe_factory("xdotool", "ydotool"))
+
+        self.assertEqual("xdotool", injection.method)
+        self.assertEqual(("xdotool", "key", "--clearmodifiers", "ctrl+v"), injection.command)
+        # Its success says nothing about whether the keystroke arrived.
+        self.assertFalse(injection.confirms_delivery)
+
+    def test_xdotool_is_not_offered_to_a_wayland_session_without_xwayland(self) -> None:
+        which = fake_which_factory("wl-copy", "xdotool", "ydotool")
+
+        injection = select_paste_injection(self.WAYLAND, which, probe_factory("xdotool", "ydotool"))
+
+        self.assertEqual("ydotool", injection.method)
+
     def test_no_usable_injector_reports_every_reason_and_the_remedy(self) -> None:
         which = fake_which_factory("wl-copy", "wtype", "ydotool")
 
@@ -66,14 +86,15 @@ class IntegrationSelectionTests(unittest.TestCase):
         self.assertIsNone(injection.command)
         self.assertIn("wtype is installed but cannot inject", injection.reason)
         self.assertIn("ydotool is installed but cannot inject", injection.reason)
-        self.assertTrue(any("dnf install ydotool" in line for line in injection.remedy))
+        self.assertTrue(any("dnf install xdotool" in line for line in injection.remedy))
 
     def test_nothing_installed_names_what_to_install(self) -> None:
         injection = select_paste_injection(self.WAYLAND, fake_which_factory("wl-copy"), probe_factory())
 
         self.assertFalse(injection.available)
-        self.assertIn("wtype or ydotool", injection.reason)
-        self.assertTrue(injection.remedy)
+        self.assertIn("No Wayland paste injector is installed", injection.reason)
+        # The remedy carries the ranking, cheapest first.
+        self.assertTrue(injection.remedy[0].startswith("sudo dnf install xdotool"))
 
     def test_an_excluded_injector_is_not_reselected(self) -> None:
         which = fake_which_factory("wl-copy", "wtype", "ydotool")
@@ -253,3 +274,44 @@ class UnavailableInjectorTests(unittest.TestCase):
 
         self.assertEqual("ydotool", paster.injection.method)
         self.assertEqual({"wtype"}, reselect.call_args.kwargs["excluded"])
+
+
+class UnconfirmableDeliveryTests(unittest.TestCase):
+    """A method that reports success either way must not trigger a restore."""
+
+    WAYLAND = {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":1"}
+
+    def test_an_unconfirmable_injector_never_reads_or_restores_the_clipboard(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(command, **_kwargs):
+            calls.append(tuple(command))
+            return subprocess.CompletedProcess(command, 0, stdout="OLD-CLIPBOARD", stderr="")
+
+        injection = PasteInjection(
+            "xdotool",
+            ("xdotool", "key", "--clearmodifiers", "ctrl+v"),
+            confirms_delivery=False,
+        )
+        with patch("murmly.integrations.select_paste_injection", return_value=injection):
+            paster = ClipboardPaster(
+                env=dict(self.WAYLAND),
+                which=lambda name: f"/usr/bin/{name}",
+                restore_clipboard=True,
+                restore_delay_ms=500,
+            )
+        sleeps: list[float] = []
+        with patch("murmly.integrations.subprocess.run", fake_run), patch(
+            "murmly.integrations.time.sleep", sleeps.append
+        ):
+            outcome = paster.copy_and_paste("transcript")
+
+        self.assertTrue(outcome.injected)
+        # No read of the previous clipboard, no wait, no restore: the transcript is
+        # the only copy of what the user said until something proves it arrived.
+        self.assertNotIn(("wl-paste", "--no-newline"), calls)
+        self.assertEqual([], sleeps)
+        self.assertEqual(
+            [("wl-copy",), ("xdotool", "key", "--clearmodifiers", "ctrl+v")],
+            calls,
+        )

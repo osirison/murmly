@@ -54,22 +54,55 @@ wayland-info | grep -o "interface: '[a-z_0-9]*'" | sort -u | grep -i virtual
 # org_kde_plasma_virtual_desktop_management only
 ```
 
-So `ydotool` is the injector on this desktop. Facts about ydotool 1.0.4, read from
-the packaged binaries rather than assumed:
+That does **not** mean ydotool is required. `xdotool` works on this desktop, verified
+end to end: a GTK4 window under `GDK_BACKEND=wayland` received the clipboard contents
+from `xdotool key --clearmodifiers ctrl+v`. KWin hands XWayland an EIS socket and
+XWayland feeds XTEST through it, so the events go into KWin's own input redirection
+rather than only to X11 clients:
+
+```bash
+tr '\0' '\n' < /proc/$(pgrep -x Xwayland)/environ | grep LIBEI
+# LIBEI_SOCKET=/proc/self/fd/122
+ldd /usr/bin/Xwayland | grep libei
+# libei.so.1 => /lib64/libei.so.1
+```
+
+Three behaviours to know before relying on it:
+
+- **The first attempt raises a consent dialog** (`/usr/libexec/kwin_eis_prompter`).
+  Until it is answered the events queue, and a one-shot `xdotool` has already exited,
+  so that first paste never lands. Ticking "Always allow apps claiming to be X" writes
+  `XwaylandEisNoPromptApps` to `kwinrc`; without the tick the grant lasts the session.
+  Revocable under System Settings, "Legacy X11 App Support".
+- **Exit 0 does not mean delivered.** With consent outstanding, two `xdotool` calls
+  returned 0 while the target window received nothing — XWayland falls back to plain
+  XTEST when the EIS connection is refused. Murmly marks this method
+  `confirms_delivery=False` and never restores the clipboard over a transcript
+  delivered by it.
+- **Probe without a keystroke.** `xdotool getdisplaygeometry` opens an X connection and
+  issues no XTEST request, so probing cannot trip the prompt as a side effect. Checked
+  against the journal for `kwin_eis_prompter` after a probe.
+
+Injection latency: 14 ms median over ten runs.
+
+`ydotool` is only needed on a compositor with neither route. Facts about ydotool 1.0.4,
+read from the packaged binaries:
 
 - The client resolves its socket as `YDOTOOL_SOCKET`, else
   `$XDG_RUNTIME_DIR/.ydotool_socket`, else `/tmp/.ydotool_socket`.
-- Fedora's `ydotool.service` runs `/usr/bin/ydotoold` as root with no arguments.
-  Root has no `XDG_RUNTIME_DIR` under systemd, so the daemon creates
-  `/tmp/.ydotool_socket` at the default permission `0600` — a path the user's client
-  does not read, and a mode it could not open anyway.
-- A systemd drop-in for `ydotool.service` fixes both ends at once, by setting
-  `ExecStart=` empty and then
-  `ExecStart=/usr/bin/ydotoold --socket-path=$XDG_RUNTIME_DIR/.ydotool_socket
-  --socket-own=$(id -u):$(id -g)`.
+- Fedora's `ydotool.service` runs `/usr/bin/ydotoold` as root with no arguments and
+  `WantedBy=default.target`. Root has no `XDG_RUNTIME_DIR` under systemd, so the daemon
+  creates `/tmp/.ydotool_socket` at the default permission `0600` — a path the user's
+  client does not read, at a mode it could not open.
+- **Do not fix that with a drop-in pointing at `$XDG_RUNTIME_DIR`.** The unit starts at
+  boot, `/run/user/$UID` is a tmpfs logind mounts at login, so the daemon fails until
+  someone logs in and `Restart=always` spins it meanwhile. Grant `/dev/uinput` to the
+  user with a udev `uaccess` rule and run `ydotoold` as a user service instead, where
+  it picks up `XDG_RUNTIME_DIR` and needs no flags at all. Preconditions checked here:
+  `uaccess` works on this box (`getfacl /dev/dri/card1` shows `user:qp:rw-`),
+  `/dev/uinput` is `crw------- root root` with no ACL, and no packaged rule claims it.
+  The arrangement itself is **unverified** — no root available in that session.
 
-`murmly doctor` prints the exact commands, filled in for the current session, under
-`paste_injection.remedy`. Murmly never runs them: they need root.
 
 ## Probing an injector without installing it
 
