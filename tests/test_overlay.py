@@ -242,6 +242,7 @@ class OverlayTests(unittest.TestCase):
         self.assertEqual("/run/user/1000/xauth", x11_environment["XAUTHORITY"])
         self.assertNotIn("WAYLAND_DISPLAY", x11_environment)
         self.assertEqual("x11", x11_environment["GDK_BACKEND"])
+        self.assertNotIn("LD_PRELOAD", x11_environment)
 
     def test_backend_detection_requires_plasma_and_selects_display_protocol(self) -> None:
         self.assertEqual(

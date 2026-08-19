@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import ast
+from contextlib import redirect_stderr
+from io import StringIO
 import json
-import os
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
+from murmly.overlay import detect_overlay_backend, renderer_environment
 from murmly.overlay_renderer import (
+    COMPOSITOR_LACKS_LAYER_SHELL,
+    LAYER_SHELL_LIBRARY,
     MAX_MESSAGE_BYTES,
     MAX_PARTIAL_CHARS,
     PANEL_GAP_PX,
@@ -20,6 +26,8 @@ from murmly.overlay_renderer import (
     MessageParser,
     MonitorGeometry,
     RendererViewState,
+    load_layer_shell,
+    main,
     panel_height,
     panel_max_width,
     panel_position,
@@ -201,11 +209,71 @@ class OverlayRendererTests(unittest.TestCase):
         self.assertEqual("…world", truncate_to_width("hello world", measure, 60))
         self.assertEqual("", truncate_to_width("hello", measure, 0))
 
+    def test_layer_shell_load_names_its_own_failures_apart_from_the_compositor(self) -> None:
+        # A gi already imported is a bug in the renderer's own import order, and the
+        # message has to say so rather than blame the compositor for it.
+        ordering = load_layer_shell({"gi": object()})
+        self.assertIsNotNone(ordering)
+        self.assertIn("gi is already imported", ordering)
+        self.assertNotIn("compositor", ordering)
+        self.assertIn("compositor", COMPOSITOR_LACKS_LAYER_SHELL)
+
+        with patch("murmly.overlay_renderer.ctypes.CDLL", side_effect=OSError("no such file")):
+            missing = load_layer_shell({})
+        self.assertIn(LAYER_SHELL_LIBRARY, missing)
+        self.assertIn("no such file", missing)
+        self.assertNotIn("compositor", missing)
+
+        with patch("murmly.overlay_renderer.ctypes.CDLL") as load:
+            self.assertIsNone(load_layer_shell({}))
+        load.assert_called_once()
+
+    def test_the_renderer_imports_gi_lazily_so_layer_shell_can_load_first(self) -> None:
+        """The ordering that makes the ctypes load work, guarded against a future edit.
+
+        A module-scope `import gi` would pull in libwayland-client before
+        `load_layer_shell` ever runs, and layer-shell placement would then fail
+        silently - the exact bug this replaced.
+        """
+        source = Path(sys.modules["murmly.overlay_renderer"].__file__).read_text()
+        tree = ast.parse(source)
+        module_scope = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+        ]
+        imported = set()
+        for node in module_scope:
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif node.module:
+                imported.add(node.module.split(".")[0])
+
+        self.assertNotIn("gi", imported)
+        self.assertNotIn("cairo", imported)
+
+    def test_an_unplaceable_overlay_is_reported_instead_of_presented(self) -> None:
+        reason = "The active Wayland compositor does not support Layer Shell."
+
+        def refuse(*arguments: object, **keywords: object) -> None:
+            raise OSError(reason)
+
+        errors = StringIO()
+        with patch("murmly.overlay_renderer.OverlayApplication", refuse), redirect_stderr(errors):
+            status = main(["--fd", "3", "--backend", "wayland"])
+
+        self.assertEqual(1, status)
+        self.assertIn(reason, errors.getvalue())
+
     def test_runtime_integration_skips_without_supported_plasma_session(self) -> None:
-        backend = os.environ.get("XDG_SESSION_TYPE", "").casefold()
-        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").casefold()
-        if backend not in SUPPORTED_BACKENDS or "kde" not in desktop:
+        selected = detect_overlay_backend()
+        if selected is None or selected.value not in SUPPORTED_BACKENDS:
             self.skipTest("GTK4 overlay runtime on KDE Plasma is unavailable")
+        backend = selected.value
+        # The renderer's own environment, not the test runner's: on Wayland the
+        # difference is the layer-shell preload, without which this exercises a
+        # renderer that refuses to start.
+        environment = renderer_environment(selected)
 
         renderer_path = Path(sys.modules["murmly.overlay_renderer"].__file__).resolve()
         try:
@@ -214,6 +282,7 @@ class OverlayRendererTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                env=environment,
             )
         except OSError:
             self.skipTest("The system interpreter for the overlay renderer is unavailable")
@@ -239,6 +308,7 @@ class OverlayRendererTests(unittest.TestCase):
             ],
             close_fds=True,
             pass_fds=(child.fileno(),),
+            env=environment,
         )
         child.close()
         try:

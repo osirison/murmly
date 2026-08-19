@@ -123,10 +123,15 @@ class SpeechSession:
         with self._delivery_lock:
             allowed, reason = should_deliver(self._focus, target, self._config.verify_target)
             if allowed:
-                self._ensure_paster().copy_and_paste(text)
-                return ProcessingResult(text=text, state="DONE", delivered=True)
-            logger.warning("Transcript delivery refused: %s", reason)
-            self._ensure_paster().copy(text)
+                # A session that cannot inject a paste is a refusal, not an error:
+                # the transcript stays on the clipboard and the caller is told.
+                outcome = self._ensure_paster().copy_and_paste(text)
+                if outcome.injected:
+                    return ProcessingResult(text=text, state="DONE", delivered=True)
+                logger.warning("Transcript delivery could not inject a paste: %s", outcome.reason)
+            else:
+                logger.warning("Transcript delivery refused: %s", reason)
+                self._ensure_paster().copy(text)
         return ProcessingResult(
             text=text,
             state="DONE",

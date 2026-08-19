@@ -28,6 +28,7 @@ PANEL_HORIZONTAL_PADDING = 12
 PANEL_VERTICAL_PADDING = 6
 PANEL_GAP_PX = 6
 SUPPORTED_BACKENDS = {"x11", "wayland"}
+LAYER_SHELL_LIBRARY = "libgtk4-layer-shell.so.0"
 XA_ATOM = 4
 XA_CARDINAL = 6
 PROP_MODE_REPLACE = 0
@@ -273,6 +274,38 @@ class RendererViewState:
         return message_type == "shutdown"
 
 
+COMPOSITOR_LACKS_LAYER_SHELL = "The active Wayland compositor does not support Layer Shell."
+
+
+def load_layer_shell(modules: dict[str, object] | None = None) -> str | None:
+    """Put gtk4-layer-shell in the global symbol scope, before GTK loads libwayland.
+
+    The library works by interposing on libwayland-client's symbols, so it has to be
+    in the global scope first. PyGObject pulls libwayland in when it imports
+    `gi.repository.Gtk`, and once that has happened the layer-shell calls silently do
+    nothing rather than failing, so this runs before any gi import in the process.
+    Upstream's own Python example loads the library this way for the same reason.
+
+    Returns the reason it could not be done, or None. The two failures are told
+    apart because they have different remedies: a library that is not installed is
+    the user's to install, and a `gi` already imported is a bug in this file.
+    """
+    loaded = sys.modules if modules is None else modules
+    if "gi" in loaded:
+        # Conservative: it is `from gi.repository import Gtk` that pulls in
+        # libwayland-client and closes the window, not `import gi` on its own. The
+        # cheap check is the safe one, because the failure it prevents is silent.
+        return (
+            "gtk4-layer-shell has to be loaded before gi.repository imports "
+            "libwayland-client, and gi is already imported."
+        )
+    try:
+        ctypes.CDLL(LAYER_SHELL_LIBRARY, mode=ctypes.RTLD_GLOBAL)
+    except OSError as error:
+        return f"{LAYER_SHELL_LIBRARY} could not be loaded: {error}"
+    return None
+
+
 def check_visual_runtime(backend: str) -> dict[str, object]:
     result: dict[str, object] = {
         "backend": backend,
@@ -287,6 +320,12 @@ def check_visual_runtime(backend: str) -> dict[str, object]:
     if backend not in SUPPORTED_BACKENDS:
         result["error"] = f"Unsupported overlay backend: {backend}"
         return result
+    if backend == "wayland":
+        # Before the gi import below, which is what makes the ordering work.
+        unloadable = load_layer_shell()
+        if unloadable is not None:
+            result["error"] = unloadable
+            return result
     try:
         import cairo
         import gi
@@ -304,7 +343,7 @@ def check_visual_runtime(backend: str) -> dict[str, object]:
 
             Gtk.init()
             if not Gtk4LayerShell.is_supported():
-                raise OSError("The active Wayland compositor does not support Layer Shell.")
+                raise OSError(COMPOSITOR_LACKS_LAYER_SHELL)
             result["gtk4_layer_shell"] = True
         else:
             gi.require_version("GdkX11", "4.0")
@@ -587,6 +626,14 @@ class OverlayApplication:
         text_size_px: int = 13,
         transcript_panel: bool = False,
     ) -> None:
+        if backend == "wayland":
+            # Ahead of the gi import: gtk4-layer-shell has to reach the global symbol
+            # scope before PyGObject loads libwayland-client, or its placement calls
+            # quietly do nothing and the compositor puts the overlay where it likes.
+            unloadable = load_layer_shell()
+            if unloadable is not None:
+                raise OSError(unloadable)
+
         import cairo
         import gi
 
@@ -605,6 +652,12 @@ class OverlayApplication:
             gi.require_version("Gtk4LayerShell", "1.0")
             from gi.repository import Gtk4LayerShell
 
+            # Checked before any window exists: init_for_window does not raise when
+            # Layer Shell is unavailable, it quietly leaves an ordinary toplevel that
+            # the compositor places itself. Refusing here keeps a mis-placed overlay
+            # off the screen and reports through the existing unavailable path.
+            if not Gtk4LayerShell.is_supported():
+                raise OSError(COMPOSITOR_LACKS_LAYER_SHELL)
             self._layer_shell = Gtk4LayerShell
         else:
             gi.require_version("GdkX11", "4.0")

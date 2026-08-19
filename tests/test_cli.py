@@ -21,8 +21,11 @@ from murmly.cli import (
     live_transcription_diagnostics,
     measure_partial_pass_ms,
     overlay_diagnostics,
+    paste_injection_diagnostics,
 )
 from murmly.config import MurmlyConfig
+from murmly.integrations import PasteInjection
+from murmly.overlay import OverlayBackend, renderer_environment
 from murmly.stt import FasterWhisperTranscriber
 
 
@@ -77,7 +80,10 @@ class CliTests(unittest.TestCase):
                     return_value=("cuda", "float16"),
                 ),
                 patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
-                patch("murmly.cli.choose_paste_command", return_value=["xdotool"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
                 redirect_stdout(StringIO()) as output,
             ):
                 _run_doctor(config)
@@ -87,6 +93,41 @@ class CliTests(unittest.TestCase):
         self.assertEqual("auto", report["compute_type"])
         self.assertEqual("cuda", report["runtime_device"])
         self.assertEqual("float16", report["runtime_compute_type"])
+
+    def test_paste_injection_diagnostics_names_the_method_when_it_can_inject(self) -> None:
+        report = paste_injection_diagnostics(
+            PasteInjection("ydotool", ("ydotool", "key", "29:1", "47:1", "47:0", "29:0"))
+        )
+
+        self.assertTrue(report["available"])
+        self.assertEqual("ydotool", report["method"])
+        self.assertEqual(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], report["command"])
+        self.assertNotIn("remedy", report)
+
+    def test_paste_injection_diagnostics_separates_absent_from_unusable(self) -> None:
+        absent = paste_injection_diagnostics(
+            PasteInjection(
+                None,
+                None,
+                reason="No Wayland paste injector is installed; install wtype or ydotool.",
+                remedy=("sudo dnf install ydotool",),
+            )
+        )
+        unusable = paste_injection_diagnostics(
+            PasteInjection(
+                None,
+                None,
+                reason="wtype is installed but cannot inject in this session: no virtual keyboard",
+                remedy=("sudo dnf install ydotool",),
+            )
+        )
+
+        self.assertFalse(absent["available"])
+        self.assertIn("is installed", absent["reason"])
+        self.assertEqual(["sudo dnf install ydotool"], absent["remedy"])
+        self.assertFalse(unusable["available"])
+        self.assertIn("cannot inject in this session", unusable["reason"])
+        self.assertEqual(["sudo dnf install ydotool"], unusable["remedy"])
 
     def test_overlay_diagnostics_reports_available_plasma_x11_runtime(self) -> None:
         config = self._config()
@@ -117,6 +158,37 @@ class CliTests(unittest.TestCase):
         self.assertTrue(report["gdk_x11"])
         self.assertTrue(report["native_x11"])
         self.assertEqual("4.22.4", report["gtk4"])
+
+    def test_overlay_diagnostics_checks_under_the_renderer_environment(self) -> None:
+        config = self._config()
+        completed = self._helper_result({"available": True, "gtk4_layer_shell": True})
+        recorded: dict[str, object] = {}
+
+        def record(*arguments: object, **keywords: object) -> object:
+            recorded.update(keywords)
+            return completed
+
+        report = overlay_diagnostics(
+            config,
+            env={
+                "XDG_SESSION_TYPE": "wayland",
+                "WAYLAND_DISPLAY": "wayland-0",
+                "XDG_CURRENT_DESKTOP": "KDE",
+                "LD_PRELOAD": "/tmp/injected.so",
+            },
+            run_command=record,
+        )
+
+        self.assertTrue(report["available"])
+        # Whatever the renderer will be launched with, down to the preload that
+        # decides whether Layer Shell works at all.
+        self.assertEqual(
+            renderer_environment(
+                OverlayBackend.WAYLAND,
+                {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0", "XDG_CURRENT_DESKTOP": "KDE"},
+            ),
+            recorded["env"],
+        )
 
     def test_overlay_diagnostics_reports_partial_install(self) -> None:
         config = self._config()
@@ -299,7 +371,10 @@ class CliTests(unittest.TestCase):
             with (
                 patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
                 patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
-                patch("murmly.cli.choose_paste_command", return_value=["xdotool"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
                 redirect_stdout(StringIO()) as output,
             ):
                 _run_doctor(config)
@@ -612,7 +687,10 @@ class InstallationDiagnosticsTests(unittest.TestCase):
             with (
                 patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
                 patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
-                patch("murmly.cli.choose_paste_command", return_value=["xdotool"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
                 patch(
                     "murmly.cli.installation_diagnostics",
                     return_value={"installed": False, "detail": "not installed"},

@@ -18,8 +18,49 @@ and lets the desktop's own shortcut system call `murmly toggle`.
 - Python 3.12+
 - KDE Plasma, for the hotkey and the recording overlay
 - Clipboard and paste tools for your session:
-  - Wayland: `wl-clipboard` plus `wtype` or `ydotool`
   - X11: `xclip` and `xdotool`
+  - Wayland: `wl-clipboard`, plus a paste injector. Which one depends on the
+    compositor, and Murmly picks by running each tool's own no-op invocation rather
+    than by what is installed:
+    - **KDE Plasma**: `xdotool`. KWin bridges XTEST through libei into its own input
+      handling, so an X11 tool reaches Wayland-native windows. The first paste raises
+      KDE's input-control dialog; tick **Always allow** and click Allow, and it is
+      done permanently. That permission is revocable under System Settings →
+      *Legacy X11 App Support*.
+    - **wlroots compositors** (Sway, river, Hyprland): `wtype`, which uses the
+      virtual keyboard protocol directly and needs no permission.
+    - **Anything offering neither**: `ydotool`, which injects through `/dev/uinput`
+      and is the only option here that needs one-time root setup (see below).
+
+Until the KDE dialog is answered, the first transcript of a session reaches the
+clipboard only: the events queue while the dialog is open, and `xdotool` has already
+exited by the time it is answered. Murmly never restores the previous clipboard over a
+transcript delivered this way, because `xdotool` exits 0 whether or not the keystroke
+arrived, so a transcript is never lost to a paste that silently did not happen.
+
+`murmly doctor` reports which method it would use under `paste_injection`, and prints
+what to install when it has none.
+
+### Pasting with ydotool
+
+Only needed on a Wayland compositor that offers neither the virtual keyboard protocol
+nor an XTEST bridge. `ydotoold` needs access to `/dev/uinput`, which is root-owned.
+Rather than override the packaged system unit — its `ExecStart` cannot name your
+runtime directory, because `/run/user/$UID` does not exist yet when the unit starts at
+boot — grant your own user access and run the daemon as yourself:
+
+```bash
+sudo dnf install ydotool
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/60-ydotool-uinput.rules
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+Log out and back in, then run `ydotoold` as a user service. As your own process it
+picks up `XDG_RUNTIME_DIR` and writes its socket exactly where the client looks for
+it, with no flags and no socket-ownership juggling. This arrangement is documented
+from the packaged binaries and udev's `uaccess` behaviour; it has not been run
+end to end on a Murmly machine, because KDE and wlroots both have cheaper routes.
 
 For the recording overlay:
 
@@ -32,6 +73,14 @@ The overlay runs as a separate helper under `/usr/bin/python3` so it can use
 Fedora's tested PyGObject and GTK packages instead of compiling duplicates
 inside the virtual environment. Missing visual packages disable only the
 overlay; recording, transcription, clipboard, and paste handling continue.
+
+On Wayland the helper loads `libgtk4-layer-shell.so.0` itself, with
+`ctypes.CDLL(..., RTLD_GLOBAL)`, before it imports `gi`. gtk4-layer-shell works by
+interposing on libwayland-client, so it has to be in the global symbol scope first;
+PyGObject pulls libwayland in the moment it imports Gtk, and after that the
+layer-shell calls silently do nothing and the compositor places the overlay itself.
+Rather than draw an overlay it cannot place, the helper refuses to start and reports
+the reason.
 
 ## Install
 
@@ -352,10 +401,12 @@ nothing at all usually means the binding, not the daemon.
 
 ```bash
 /usr/bin/python3 src/murmly/overlay_renderer.py --check
+/usr/bin/python3 src/murmly/overlay_renderer.py --check --backend wayland
 ```
 
-Add `--backend x11` or `--backend wayland` to inspect a specific backend. Restart
-the service after installing visual packages.
+Add `--backend x11` or `--backend wayland` to inspect a specific backend. The check
+loads the layer-shell library the same way the running overlay does, so its report
+is what the overlay would do. Restart the service after installing visual packages.
 
 **Silent recordings on Intel SOF hardware.** See
 [docs/agent-notes/murmly-spike-sof-dmic.md](docs/agent-notes/murmly-spike-sof-dmic.md).

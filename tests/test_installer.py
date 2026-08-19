@@ -14,6 +14,7 @@ from murmly.installer import (
     service_unit_text,
     write_atomically,
 )
+from murmly.integrations import PasteInjection
 
 
 class FakeSystemctl:
@@ -651,16 +652,26 @@ def owner(component: str, friendly: str = "other"):
     return ShortcutOwner("_launch", friendly, component, friendly)
 
 
-def make_installer(service=None, launcher=None, shortcuts=None, session=None, entrypoint="/bin/murmly"):
+def make_installer(
+    service=None,
+    launcher=None,
+    shortcuts=None,
+    session=None,
+    entrypoint="/bin/murmly",
+    injection=None,
+):
     from murmly.installer import DESKTOP_ID, Installer
 
     hotkey_code = 268435544
+    # Pinned so the tests never depend on what this machine has installed.
+    selected = injection or PasteInjection("xdotool", ("xdotool", "key", "--clearmodifiers", "ctrl+v"))
     return Installer(
         service=service or FakeService(),
         launcher=launcher or FakeLauncher(),
         shortcuts=shortcuts or OwnerRegistry(keys={DESKTOP_ID: [hotkey_code]}, owners={hotkey_code: [owner(DESKTOP_ID, "murmly")]}),
         session=session or FakeSession(),
         entrypoint_resolver=lambda: Path(entrypoint),
+        injection_selector=lambda: selected,
     )
 
 
@@ -997,3 +1008,71 @@ class InstallerStatusTests(unittest.TestCase):
         ).status()
 
         self.assertIn("bus is down", report["detail"])
+
+
+class PasteInjectionReportTests(unittest.TestCase):
+    """Installation says whether a transcript will reach the focused window."""
+
+    def _messages(self, injection: PasteInjection) -> str:
+        from murmly.hotkey import parse_hotkey
+
+        outcome = make_installer(injection=injection).install(parse_hotkey("Meta+X"))
+        return "\n".join(outcome.messages)
+
+    def test_a_usable_injector_is_named(self) -> None:
+        report = self._messages(PasteInjection("ydotool", ("ydotool", "key", "29:1")))
+
+        self.assertIn("pasted into the focused window with ydotool", report)
+
+    def test_nothing_installed_reports_the_remedy_without_failing(self) -> None:
+        from murmly.hotkey import parse_hotkey
+
+        injection = PasteInjection(
+            None,
+            None,
+            reason="No Wayland paste injector is installed; install wtype or ydotool.",
+            remedy=("sudo dnf install ydotool", "sudo systemctl enable --now ydotool.service"),
+        )
+        service = FakeService()
+        outcome = make_installer(service=service, injection=injection).install(parse_hotkey("Meta+X"))
+        report = "\n".join(outcome.messages)
+
+        self.assertTrue(outcome.service_installed)
+        self.assertTrue(outcome.hotkey_registered)
+        self.assertIn("copied to the clipboard but not pasted", report)
+        self.assertIn("sudo dnf install ydotool", report)
+        self.assertEqual(1, len(service.installs))
+
+    def test_an_installed_but_unusable_injector_reports_that_it_cannot_run(self) -> None:
+        report = self._messages(
+            PasteInjection(
+                None,
+                None,
+                reason="wtype is installed but cannot inject in this session: no virtual keyboard",
+                remedy=("sudo dnf install ydotool",),
+            )
+        )
+
+        self.assertIn("installed but cannot inject", report)
+        self.assertIn("sudo dnf install ydotool", report)
+
+    def test_a_failing_selector_never_fails_the_install(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import Installer, DESKTOP_ID
+
+        def explode() -> PasteInjection:
+            raise OSError("selection blew up")
+
+        hotkey_code = 268435544
+        installer = Installer(
+            service=FakeService(),
+            launcher=FakeLauncher(),
+            shortcuts=OwnerRegistry(keys={DESKTOP_ID: [hotkey_code]}, owners={hotkey_code: [owner(DESKTOP_ID, "murmly")]}),
+            session=FakeSession(),
+            entrypoint_resolver=lambda: Path("/bin/murmly"),
+            injection_selector=explode,
+        )
+
+        outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertTrue(outcome.hotkey_registered)
