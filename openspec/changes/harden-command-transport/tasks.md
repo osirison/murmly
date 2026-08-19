@@ -68,8 +68,8 @@ description: Track implementation and validation of answered connections, coded 
 ## 8. Verification
 
 - [x] 8.1 Run `uv run --extra cuda python -m unittest discover -s tests` and confirm the suite is green
-- [ ] 8.2 Start the daemon, press the bound hotkey, and confirm capture still toggles normally
-- [ ] 8.3 Restart the service while a transcription is in flight and confirm the hotkey path reports a message rather than a traceback
+- [x] 8.2 Start the daemon, press the bound hotkey, and confirm capture still toggles normally
+- [ ] 8.3 Restart the service while a transcription is in flight and confirm the hotkey path reports a message rather than a traceback — not run: hitting the interleaving by hand means restarting during the seconds a transcription is decoding, and a miss is indistinguishable from a pass. The transport half is covered automatically by `test_shutdown_answers_a_command_that_outlives_the_drain`, `test_shutdown_waits_for_a_write_that_outlives_the_drain`, and `test_a_client_that_receives_nothing_raises_a_named_type`, each over a real socket; what stays unverified is that a `systemctl --user restart` produces the same interleaving as an in-process `shutdown()`
 - [x] 8.4 Send `[1,2]` and `not json` to the live socket and confirm both are answered and the daemon keeps serving
 - [x] 8.5 Run `murmly doctor` and confirm the report is complete and reports the socket path privacy
 - [x] 8.6 Run `openspec validate harden-command-transport --strict`
