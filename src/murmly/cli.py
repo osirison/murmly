@@ -12,11 +12,19 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 from collections.abc import Callable
 
 from murmly.audio import SoundDeviceRecorder
-from murmly.config import MurmlyConfig, load_config
-from murmly.daemon import MurmlyDaemon, send_command
+from murmly.config import MurmlyConfig, default_config_path, load_config
+from murmly.daemon import (
+    DaemonNotRespondingError,
+    DaemonStartupError,
+    MurmlyDaemon,
+    peer_identity_supported,
+    send_command,
+    socket_path_detail,
+)
 from murmly.hotkey import HotkeyError, parse_hotkey
 from murmly.installer import (
     HotkeyNotConfirmedError,
@@ -83,7 +91,29 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = load_config(args.config)
+    try:
+        return _dispatch(parser, args)
+    except Exception as error:  # noqa: BLE001 - no command terminates with an unhandled error
+        # A backstop only. Every failure with something specific to say -- the
+        # daemon's startup refusal, an unreadable configuration, a daemon that
+        # did not respond -- reports it itself, because a generic message names
+        # the wrong thing.
+        if args.command == "daemon":
+            # The daemon runs unattended under the service manager, where this
+            # one line would be all that survived of a crash nothing anticipated.
+            # A person reading the journal needs the frames.
+            traceback.print_exc(file=sys.stderr)
+        print(f"murmly: unexpected failure: {error}", file=sys.stderr)
+        return 1
+
+
+def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    config_path = Path(args.config) if args.config else default_config_path()
+    try:
+        config = load_config(args.config)
+    except Exception as error:  # noqa: BLE001 - the file is named rather than raised
+        print(f"Unable to read the configuration at {config_path}: {error}", file=sys.stderr)
+        return 1
 
     if args.command == "daemon":
         return _run_daemon(config)
@@ -105,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
 def _run_client_command(config: MurmlyConfig, command: str) -> int:
     try:
         response = send_command_with_recovery(config, command)
-    except DaemonUnavailableError as error:
+    except (DaemonUnavailableError, DaemonNotRespondingError) as error:
         print(str(error), file=sys.stderr)
         return 1
     print(json.dumps(response, indent=2))
@@ -129,6 +159,10 @@ def send_command_with_recovery(
     socket_path = str(config.socket_path)
     try:
         return send_command(socket_path, command)
+    except DaemonNotRespondingError as error:
+        # Something is listening, so starting the service would answer a question
+        # the caller did not ask. Reported instead.
+        raise DaemonUnavailableError(str(error)) from error
     except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, socket.timeout, OSError):
         pass
 
@@ -161,6 +195,8 @@ def send_command_with_recovery(
 
     try:
         return send_command(socket_path, command)
+    except DaemonNotRespondingError as error:
+        raise DaemonUnavailableError(str(error)) from error
     except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError, socket.timeout, OSError) as error:
         raise DaemonUnavailableError(
             f"The Murmly daemon started but did not accept the '{command}' command: {error}"
@@ -221,7 +257,11 @@ def _run_uninstall() -> int:
 
 
 def _run_daemon(config: MurmlyConfig) -> int:
-    daemon = MurmlyDaemon(config)
+    try:
+        daemon = MurmlyDaemon(config)
+    except DaemonStartupError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
     def request_shutdown(_signal_number: int, _frame: object) -> None:
         daemon.shutdown()
@@ -232,6 +272,9 @@ def _run_daemon(config: MurmlyConfig) -> int:
     }
     try:
         daemon.serve_forever()
+    except DaemonStartupError as error:
+        print(str(error), file=sys.stderr)
+        return 1
     finally:
         for signal_number, handler in previous_handlers.items():
             signal.signal(signal_number, handler)
@@ -271,35 +314,88 @@ def _run_doctor(config: MurmlyConfig) -> None:
     except MissingToolError as error:
         clipboard_command = f"unavailable: {error}"
 
-    injection = select_paste_injection()
+    try:
+        injection_report = paste_injection_diagnostics(select_paste_injection())
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        injection_report = {
+            "available": False,
+            "method": None,
+            "reason": f"Unable to choose a paste method: {error}",
+            "remedy": [],
+        }
 
-    runtime_device, runtime_compute_type = FasterWhisperTranscriber.resolve_runtime(config)
-    overlay = overlay_diagnostics(config)
+    # Guarded like every other probe: this is the exact misconfiguration the
+    # command exists to explain, and a report that stops here withholds it.
+    runtime_detail: str | None = None
+    try:
+        runtime_device, runtime_compute_type = FasterWhisperTranscriber.resolve_runtime(config)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        # Reported in its own field rather than substituted into the two runtime
+        # values, so a program reading them never has to tell a device name from
+        # an error message.
+        runtime_device, runtime_compute_type = None, None
+        runtime_detail = f"Unable to determine the transcription runtime: {error}"
 
-    print(
-        json.dumps(
-            {
-                "config_path": str(config.config_path),
-                "socket_path": str(config.socket_path),
-                "session": "wayland" if is_wayland_session() else "x11",
-                "clipboard_command": clipboard_command,
-                "paste_injection": paste_injection_diagnostics(injection),
-                "model_profile": config.model_profile,
-                "model_name": config.model_name,
-                "device": config.device,
-                "compute_type": config.compute_type,
-                "runtime_device": runtime_device,
-                "runtime_compute_type": runtime_compute_type,
-                "beam_size": config.beam_size,
-                "vad_filter": config.vad_filter,
-                "live_transcription": live_transcription_diagnostics(config),
-                "delivery": delivery_diagnostics(config),
-                "overlay": overlay,
-                "installation": installation_diagnostics(),
-            },
-            indent=2,
+    session_detail: str | None = None
+    try:
+        session: str | None = "wayland" if is_wayland_session() else "x11"
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        session = None
+        session_detail = f"Unable to determine the session type: {error}"
+
+    try:
+        overlay = overlay_diagnostics(config)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        overlay = {"available": False, "detail": f"Unable to check the overlay: {error}"}
+
+    report: dict[str, object] = {
+        "config_path": str(config.config_path),
+        "socket_path": str(config.socket_path),
+        "command_socket": command_socket_diagnostics(config),
+        "session": session,
+        "clipboard_command": clipboard_command,
+        "paste_injection": injection_report,
+        "model_profile": config.model_profile,
+        "model_name": config.model_name,
+        "device": config.device,
+        "compute_type": config.compute_type,
+        "runtime_device": runtime_device,
+        "runtime_compute_type": runtime_compute_type,
+        "beam_size": config.beam_size,
+        "vad_filter": config.vad_filter,
+        "live_transcription": live_transcription_diagnostics(config),
+        "delivery": delivery_diagnostics(config),
+        "overlay": overlay,
+        "installation": installation_diagnostics(),
+    }
+    if session_detail is not None:
+        report["session_detail"] = session_detail
+    if runtime_detail is not None:
+        report["runtime_detail"] = runtime_detail
+    print(json.dumps(report, indent=2))
+
+
+def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
+    """Who can reach the command socket, for `murmly doctor`.
+
+    Reported, never refused. Only the daemon refuses to start on a path another
+    account can write, because every command loads this configuration and the
+    command that exists to explain the condition must keep running.
+    """
+    detail = socket_path_detail(config.socket_path)
+    report: dict[str, object] = {
+        "path": str(config.socket_path),
+        "path_private": detail is None,
+        "peer_identity_supported": peer_identity_supported(),
+    }
+    if detail is not None:
+        report["detail"] = detail
+    if not report["peer_identity_supported"]:
+        report["peer_identity_detail"] = (
+            "This platform cannot report the account behind a connection. The "
+            "command socket is protected by its file permissions alone."
         )
-    )
+    return report
 
 
 def paste_injection_diagnostics(injection: PasteInjection) -> dict[str, object]:
@@ -492,7 +588,19 @@ def delivery_diagnostics(
     env: dict[str, str] | None = None,
     observer: FocusObserver | None = None,
 ) -> dict[str, object]:
-    focus = observer if observer is not None else create_focus_observer(env)
+    if observer is not None:
+        focus = observer
+    else:
+        try:
+            focus = create_focus_observer(env)
+        except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+            return {
+                "verification_supported": False,
+                "verification_enabled": config.verify_target,
+                "restore_clipboard": config.restore_clipboard,
+                "restore_delay_ms": config.restore_clipboard_delay_ms,
+                "detail": f"Unable to check delivery target verification: {error}",
+            }
     report: dict[str, object] = {
         "verification_supported": focus.supported,
         "verification_enabled": config.verify_target,

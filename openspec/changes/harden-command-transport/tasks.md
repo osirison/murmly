@@ -1,0 +1,98 @@
+---
+title: Harden Command Transport Tasks
+description: Track implementation and validation of answered connections, coded failures, shape-tolerant request parsing, and owner-only access on the command socket
+---
+
+## 1. Failure codes
+
+- [x] 1.1 Define the closed code vocabulary in `daemon.py` covering seven categories: busy, unsupported command, malformed request, over capacity, not permitted, shutting down, command failure
+- [x] 1.2 Add a response builder taking a code, a message, and any additional fields, so a response carrying `state` keeps it
+- [x] 1.3 Route every `{"ok": False, ...}` return through that builder, including the three in `handle_command`, the one in `_handle_connection`, and the one in `_finish_toggle`, keeping each `error` string byte-identical
+- [x] 1.4 Add tests asserting each existing failure keeps its current `error` text and every other field it carries today, and gains the expected `code`
+- [x] 1.5 Add a test asserting the seven categories map to seven distinct codes
+- [x] 1.6 Add a test asserting successful responses carry no `code`, and confirm the four exact-dict assertions at `tests/test_daemon.py:154`, `:854`, `:864`, `:1245` still pass unchanged
+
+## 2. Shape-tolerant request parsing
+
+- [x] 2.1 Replace the bare-string extraction in `_handle_connection` with an explicit check that the decoded payload is a mapping, returning the malformed-request code when it is not
+- [x] 2.2 Check that the command name is a string before dispatch, returning the unsupported-command code without coercing it
+- [x] 2.3 Leave `handle_command`'s signature unchanged; no parameter plumbing in this change
+- [x] 2.4 Add tests over a real socket for `[1,2]`, `"hi"`, `5`, and `{"command": 5}`, asserting a response arrives and a following `status` still answers
+
+## 3. Answered connections
+
+- [x] 3.1 Convert the caught-and-passed parse failures in `_serve_connection` into responses: invalid JSON, invalid UTF-8, and a request that does not arrive within the command timeout
+- [x] 3.2 Widen `_serve_connection`'s except clauses so any unexpected exception becomes a response rather than a dead thread, logging the exception at warning
+- [x] 3.3 Write an over-capacity response inline in `_dispatch_connection` before closing, with a send timeout set first and a failed write discarded, without moving either existing semaphore release
+- [x] 3.4 Write a response on the two remaining mute paths in `_dispatch_connection`: shutdown observed after slot acquisition, and a worker thread that fails to start
+- [x] 3.5 Add a bounded drain to `shutdown()` so a worker whose request was already read can write a shutting-down response before its connection is force-closed
+- [x] 3.6 Rewrite `tests/test_daemon.py:437`, which currently asserts `assertEqual(b"", received)` on the capacity path, to assert the over-capacity response
+- [x] 3.7 Add tests for: invalid JSON, invalid UTF-8, a connect-then-idle request timeout, and an unexpected exception raised inside command handling — each asserting a response arrives and the daemon keeps serving
+- [x] 3.8 Add a shutdown test that asserts a response with the shutting-down code, replacing reliance on `tests/test_daemon.py:308-312` which swallows the failure with `except RuntimeError: pass`
+- [x] 3.9 Add a test that a peer which never reads its response does not stop the daemon accepting the next command
+- [x] 3.10 Answer, from `shutdown()`, every connection still owed a response when the drain expires, with a single-writer claim so the worker cannot write a second frame to the same connection — found by measuring 3.5 against a transcription that outlives the drain, which is every real transcription
+- [x] 3.11 Register a connection as owed an answer when its first request byte arrives rather than after the request is decoded, closing the window in which shutdown force-closes a connection whose request had already arrived
+
+## 4. Commands that never raise
+
+- [x] 4.1 Replace the bare `RuntimeError` in `send_command` with a dedicated exception type for "connected but received no response", subclassing `RuntimeError` so `tests/test_daemon.py:311` stays honest
+- [x] 4.2 Handle that type by name in both `send_command_with_recovery` paths and in `_run_client_command`, reporting a single message and exiting non-zero
+- [x] 4.3 Add a top-level guard in `main` that reports an unexpected failure and returns non-zero, covering `load_config` on a malformed `config.toml` before any subcommand dispatches
+- [x] 4.4 Report the daemon startup refusal from `_run_daemon` as a message and a non-zero exit rather than letting it propagate
+- [x] 4.5 Add tests: a stub server that accepts and closes produces a reported message and non-zero exit with no exception escaping `main`; a malformed `config.toml` does the same for a non-daemon subcommand
+
+## 5. Socket access control
+
+- [x] 5.1 Validate the configured `socket_path` at daemon startup, before the existing `mkdir` and `unlink`, refusing to start when its containing directory is writable by group or other, and reporting the path plus both remedies
+- [x] 5.2 Create the socket's parent directory without `exist_ok` and `chmod` it to `0700` only when Murmly created it, since `mkdir(mode=...)` skips existing directories and intermediates
+- [x] 5.3 `chmod` the socket node to `0600` immediately after bind
+- [x] 5.4 Read the peer's identity on each accepted connection and refuse a mismatch with the not-permitted code, checking before the worker slot is acquired so a refused peer consumes no capacity, with the comparison injectable
+- [x] 5.5 Log once at startup and report in diagnostics when the platform cannot report peer identity, and continue serving
+- [x] 5.6 Report the configured socket path's privacy in `murmly doctor` without refusing to run
+- [x] 5.7 Add tests for created socket and directory modes, and for a refused substituted peer identity alongside an accepted matching one
+- [x] 5.8 Add tests for startup refusal on a group- or other-writable configured path, acceptance of a readable-but-not-writable directory, and normal startup on the default path
+- [x] 5.9 Add a test that diagnostics still run and report the condition for a path the daemon would refuse
+
+## 6. Diagnostics
+
+- [x] 6.1 Move the transcription runtime probe in `_run_doctor` inside a guard, reporting the failure in a separate detail field so `runtime_device` and `runtime_compute_type` keep the shape pinned at `tests/test_cli.py:88`
+- [x] 6.2 Bring the remaining unguarded probes in `_run_doctor` under the same rule: `is_wayland_session` and `create_focus_observer` as reached from `delivery_diagnostics`
+- [x] 6.3 Add a test asserting `murmly doctor` produces a complete report with `stt.device = "cuda"` and the runtime unavailable, naming the reason in the transcription section
+- [x] 6.4 Add a test asserting the success shape of every diagnostics section is unchanged
+
+## 7. Documentation
+
+- [x] 7.1 Document the socket path privacy requirement in `README.md` where `daemon.socket_path` is described
+- [x] 7.2 Document it in `config.example.toml` beside the commented `socket_path` line
+
+## 8. Verification
+
+- [x] 8.1 Run `uv run --extra cuda python -m unittest discover -s tests` and confirm the suite is green
+- [x] 8.2 Start the daemon, press the bound hotkey, and confirm capture still toggles normally
+- [x] 8.3 Restart the service while a transcription is in flight and confirm the hotkey path reports a message rather than a traceback — verified with `uv run --extra cuda python scripts/verify_restart_mid_transcription.py`, which waits for the daemon to report THINKING and restarts inside that window rather than hand-timing it. Three restarts landed inside a transcription and each caller received `{"ok": false, "error": "Murmly is shutting down.", "code": "shutting_down"}` and exited 0, with no traceback and no empty read. Four further attempts decoded before the restart landed and were not counted, which is why the check waits on the state rather than on a timer
+- [x] 8.4 Send `[1,2]` and `not json` to the live socket and confirm both are answered and the daemon keeps serving
+- [x] 8.5 Run `murmly doctor` and confirm the report is complete and reports the socket path privacy
+- [x] 8.6 Run `openspec validate harden-command-transport --strict`
+
+## 9. Review fixes
+
+- [x] 9.1 Judge every directory from the socket up to the root, not the holder alone, refusing one another account can write or owns, and resolving the parent first so a symlink cannot hide it
+- [x] 9.2 Accept the sticky bit in place of the write bits above the nearest existing directory, and not on that directory itself
+- [x] 9.3 Move the remedy into the detail so the directory named is the one at fault rather than always the socket's parent
+- [x] 9.4 Keep a connection owed its response until the write returns, and drain a second time after `shutdown()` answers, so a claimed-but-unwritten response is not truncated
+- [x] 9.5 Close the overlay on a startup refusal, and report a socket directory that cannot be created as a startup refusal rather than an unexpected failure
+- [x] 9.6 Bound the client's connect and its wait for the response separately, reporting a response that never arrives as the daemon not responding
+- [x] 9.7 Print the traceback for an unanticipated daemon failure, which runs unattended, while other commands keep the single line
+- [x] 9.8 Add tests for each of the above, and confirm each fails against the code before its fix
+- [x] 9.9 Cover the paths the specs describe and the suite did not reach: a platform that cannot report peer identity, a peer that closes before its response, and the bound on a peer that never reads
+- [x] 9.10 Remove `except RuntimeError: pass` from `tests/test_daemon.py:308-312` and assert the shutting-down response instead
+
+## 10. Review fixes, round two
+
+- [x] 10.1 Resolve each component of the socket path at the point it is reached rather than resolving the whole path first, so the directory holding a symbolic link is judged as well as the one the link points at, with a bounded hop count
+- [x] 10.2 Report `unlink`, `bind`, `chmod` and `listen` failures as startup refusals, so a path component that is not a directory names itself instead of reaching the caller's backstop
+- [x] 10.3 Guard the socket unlink in the unwinding, so a failure to clean up cannot replace the reason the daemon is unwinding
+- [x] 10.4 Correct the bind-to-chmod window comment: the umask keeps it closed, not the containing directory, which is deliberately allowed to be traversable
+- [x] 10.5 Pin the second shutdown drain and the refusal to restart a service for a daemon that answered nothing, both of which survived mutation with the suite green
+- [x] 10.6 Correct `README.md` and `config.example.toml`, which described the sticky exemption against the directory holding the socket rather than the deepest existing one, and offered `chmod` as the remedy for a directory another account owns
+- [x] 10.7 State the administrative-account exemption in the spec, which read literally refused every path

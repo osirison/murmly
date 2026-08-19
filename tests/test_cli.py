@@ -4,26 +4,31 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from murmly.cli import (
     _measurement_clip,
     _run_doctor,
+    command_socket_diagnostics,
     delivery_diagnostics,
     live_transcription_diagnostics,
+    main,
     measure_partial_pass_ms,
     overlay_diagnostics,
     paste_injection_diagnostics,
 )
 from murmly.config import MurmlyConfig
+from murmly.daemon import DaemonStartupError, MurmlyDaemon
 from murmly.integrations import PasteInjection
 from murmly.overlay import OverlayBackend, renderer_environment
 from murmly.stt import FasterWhisperTranscriber
@@ -471,6 +476,24 @@ class ToggleRecoveryTests(unittest.TestCase):
         self.assertEqual(1, service.starts)
         self.assertEqual(2, sender.attempts, "exactly one retry after the initial attempt")
 
+    def test_a_daemon_that_answers_nothing_is_reported_without_a_restart(self) -> None:
+        # Something is listening, so starting the service would answer a question
+        # the caller did not ask.
+        from murmly.cli import DaemonUnavailableError, send_command_with_recovery
+        from murmly.daemon import DaemonNotRespondingError
+
+        service = StubService(installed=True)
+        sender = CountingSender([DaemonNotRespondingError("nothing came back")])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(Path(temp_dir) / "murmly.sock")
+            with patch("murmly.cli.send_command", sender):
+                with self.assertRaises(DaemonUnavailableError) as raised:
+                    send_command_with_recovery(config, "toggle", service=service)
+
+        self.assertIn("nothing came back", str(raised.exception))
+        self.assertEqual(0, service.starts, "a daemon that answered must not be restarted")
+        self.assertEqual(1, sender.attempts, "no retry when the connection was accepted")
+
     def test_not_installed_names_the_install_command(self) -> None:
         from murmly.cli import DaemonUnavailableError, send_command_with_recovery
 
@@ -813,3 +836,274 @@ class LiveTranscriptionDiagnosticsTests(unittest.TestCase):
         self.assertIsNone(detail)
         self.assertIsInstance(measured, int)
         self.assertFalse(factory.call_args.args[0].vad_filter)
+
+
+class UnhandledFailureTests(unittest.TestCase):
+    """No Murmly command terminates with an unhandled error."""
+
+    def test_a_daemon_that_answers_nothing_is_reported_and_exits_non_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                f'[daemon]\nsocket_path = "{socket_path}"\n', encoding="utf-8"
+            )
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(server.close)
+            server.bind(str(socket_path))
+            server.listen()
+            stop = threading.Event()
+
+            def accept_and_close() -> None:
+                server.settimeout(0.2)
+                while not stop.is_set():
+                    try:
+                        connection, _address = server.accept()
+                    except socket.timeout:
+                        continue
+                    with connection:
+                        connection.settimeout(1)
+                        try:
+                            connection.recv(4_096)
+                        except OSError:
+                            pass
+
+            thread = threading.Thread(target=accept_and_close, daemon=True)
+            thread.start()
+            try:
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+                    exit_code = main(["--config", str(config_path), "status"])
+            finally:
+                stop.set()
+                thread.join(timeout=3)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("closed the connection before responding", errors.getvalue())
+
+    def test_a_configuration_that_cannot_be_read_is_reported_and_exits_non_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("[daemon\nsocket_path = \n", encoding="utf-8")
+
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+                exit_code = main(["--config", str(config_path), "doctor"])
+
+        self.assertEqual(1, exit_code)
+        self.assertIn(str(config_path), errors.getvalue())
+        self.assertIn("Unable to read the configuration", errors.getvalue())
+
+    def test_a_daemon_that_refuses_to_start_is_reported_and_exits_non_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir) / "shared"
+            directory.mkdir()
+            directory.chmod(0o777)
+            socket_path = directory / "murmly.sock"
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                f'[daemon]\nsocket_path = "{socket_path}"\n\n[overlay]\nenabled = false\n',
+                encoding="utf-8",
+            )
+
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+                exit_code = main(["--config", str(config_path), "daemon"])
+
+        self.assertEqual(1, exit_code)
+        self.assertIn(str(socket_path), errors.getvalue())
+        self.assertIn("XDG_RUNTIME_DIR", errors.getvalue())
+
+    def test_the_top_level_guard_reports_an_unexpected_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("", encoding="utf-8")
+
+            with (
+                patch("murmly.cli._run_doctor", side_effect=RuntimeError("probe exploded")),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "doctor"])
+
+        reported = errors.getvalue()
+        self.assertEqual(1, exit_code)
+        self.assertIn("probe exploded", reported)
+        # One line for a person at a terminal. The frames go to the daemon only.
+        self.assertNotIn("Traceback", reported)
+
+    def test_the_daemon_guard_keeps_the_traceback_its_journal_needs(self) -> None:
+        # The daemon runs unattended, so the one line the guard prints is all
+        # that would survive of a crash nothing anticipated. Whoever reads the
+        # journal afterwards has nothing else to work from.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("", encoding="utf-8")
+
+            with (
+                patch("murmly.cli._run_daemon", side_effect=RuntimeError("worker exploded")),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "daemon"])
+
+        reported = errors.getvalue()
+        self.assertEqual(1, exit_code)
+        self.assertIn("murmly: unexpected failure: worker exploded", reported)
+        self.assertIn("Traceback (most recent call last)", reported)
+
+    def test_argument_errors_still_reach_the_parser(self) -> None:
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            main(["not-a-command"])
+
+
+class DoctorCompletenessTests(unittest.TestCase):
+    """`murmly doctor` reports every section it can and explains the ones it cannot."""
+
+    SECTIONS = (
+        "config_path",
+        "socket_path",
+        "command_socket",
+        "session",
+        "clipboard_command",
+        "paste_injection",
+        "model_profile",
+        "model_name",
+        "device",
+        "compute_type",
+        "runtime_device",
+        "runtime_compute_type",
+        "beam_size",
+        "vad_filter",
+        "live_transcription",
+        "delivery",
+        "overlay",
+        "installation",
+    )
+
+    def _report(self, config: MurmlyConfig, resolve_runtime: object) -> dict[str, object]:
+        with (
+            patch.object(FasterWhisperTranscriber, "resolve_runtime", resolve_runtime),
+            patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+            patch(
+                "murmly.cli.select_paste_injection",
+                return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+            ),
+            redirect_stdout(StringIO()) as output,
+        ):
+            _run_doctor(config)
+        return json.loads(output.getvalue())
+
+    def test_the_report_is_complete_when_the_configured_runtime_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                device="cuda",
+            )
+            report = self._report(
+                config,
+                Mock(side_effect=RuntimeError("the cuda extra is not installed")),
+            )
+
+        self.assertEqual("cuda", report["device"])
+        self.assertIsNone(report["runtime_device"])
+        self.assertIsNone(report["runtime_compute_type"])
+        self.assertIn("the cuda extra is not installed", report["runtime_detail"])
+        for section in self.SECTIONS:
+            self.assertIn(section, report)
+
+    def test_the_success_shape_of_every_section_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            report = self._report(config, Mock(return_value=("cuda", "float16")))
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertEqual("cuda", report["runtime_device"])
+        self.assertEqual("float16", report["runtime_compute_type"])
+        self.assertIn(report["session"], {"wayland", "x11"})
+        self.assertEqual(
+            {"available", "method", "command", "confirms_delivery"},
+            set(report["paste_injection"]),
+        )
+        self.assertEqual(
+            {
+                "verification_supported",
+                "verification_enabled",
+                "restore_clipboard",
+                "restore_delay_ms",
+                "detail",
+            },
+            set(report["delivery"]),
+        )
+        self.assertEqual(
+            {"path", "path_private", "peer_identity_supported"},
+            set(report["command_socket"]),
+        )
+        self.assertTrue(report["command_socket"]["path_private"])
+
+    def test_diagnostics_report_a_socket_path_the_daemon_would_refuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir) / "shared"
+            directory.mkdir()
+            directory.chmod(0o777)
+            config = MurmlyConfig(
+                socket_path=directory / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            # The same path the daemon refuses, so the two cannot drift apart.
+            with self.assertRaises(DaemonStartupError):
+                MurmlyDaemon(config)
+
+            report = self._report(config, Mock(return_value=("cpu", "int8")))
+
+        self.assertFalse(report["command_socket"]["path_private"])
+        self.assertIn(str(directory), report["command_socket"]["detail"])
+        for section in self.SECTIONS:
+            self.assertIn(section, report)
+
+    def test_diagnostics_explain_a_platform_that_cannot_report_peer_identity(self) -> None:
+        # The section exists to say what is protecting the socket. Where the
+        # identity check is unavailable, file permissions are the whole answer
+        # and the report has to say so.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+            with patch("murmly.cli.peer_identity_supported", return_value=False):
+                report = command_socket_diagnostics(config)
+
+        self.assertFalse(report["peer_identity_supported"])
+        self.assertIn("file permissions alone", report["peer_identity_detail"])
+
+    def test_a_private_socket_path_is_reported_as_private(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+            report = command_socket_diagnostics(config)
+
+        self.assertTrue(report["path_private"])
+        self.assertNotIn("detail", report)
+        self.assertTrue(report["peer_identity_supported"])
+
+    def test_an_unreadable_focus_probe_does_not_abandon_the_delivery_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+            with patch(
+                "murmly.cli.create_focus_observer",
+                side_effect=RuntimeError("the display went away"),
+            ):
+                report = delivery_diagnostics(config)
+
+        self.assertFalse(report["verification_supported"])
+        self.assertIn("the display went away", report["detail"])

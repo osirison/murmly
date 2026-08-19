@@ -195,7 +195,8 @@ than refusing to start, and `murmly doctor` reports the path actually in use.
 
 ```toml
 [daemon]
-# Defaults to $XDG_RUNTIME_DIR/murmly.sock
+# Defaults to $XDG_RUNTIME_DIR/murmly.sock. No directory on the path may be
+# writable by group or other; see "The command socket" below.
 # socket_path = "/run/user/1000/murmly.sock"
 
 [audio]
@@ -228,6 +229,43 @@ bottom_margin_px = 32 # Logical pixels from the display's bottom edge, 0-512
 reduced_motion = false
 text_size_px = 13 # Transcript panel text size, 8-48
 ```
+
+### The command socket
+
+`murmly toggle` and `murmly status` reach the daemon over a UNIX socket at
+`daemon.socket_path`. That socket starts and stops the microphone, so it is
+restricted to the account the daemon runs as: the socket is created `0600`, any
+directory Murmly creates for it is `0700`, and a connection whose reported
+account differs from the daemon's is refused.
+
+The default path is under `$XDG_RUNTIME_DIR`, which is already private, and
+needs no action. If you set `daemon.socket_path` yourself, no directory a lookup
+of it passes through may be writable by group or other, and every one of them
+must be owned by you or by root. That covers the whole path, not just the
+directory holding the socket, and it follows any symbolic link on the way:
+renaming a directory replaces everything under it, replacing a link redirects
+everything reached through it, and an owner can grant itself write access at any
+time. The daemon refuses to start otherwise, because such a directory lets
+another account create or replace the socket node, and your own `murmly toggle`
+would then reach a socket Murmly does not serve. The refusal names the directory
+at fault. Either move the socket back under `$XDG_RUNTIME_DIR`, or correct that
+directory — `chmod go-w` for a writable one, and for one another account owns
+there is nothing to chmod, so move the socket:
+
+```bash
+chmod go-w /path/to/the/directory/it/named
+```
+
+A directory other accounts can only read or traverse is fine, because the socket
+node itself is owner-only and connecting to a UNIX socket requires write
+permission on it. A shared directory with the sticky bit set — `/tmp` and the
+like, where one account cannot remove another's entries — is fine above the
+deepest directory on the path that already exists, though not as that directory
+itself. So `/tmp/murmly-yours/murmly.sock` is served once you have created
+`murmly-yours` as `0700`, and refused while it is still missing: until it exists,
+anyone can create it first. `murmly doctor` reports the condition under
+`command_socket` without refusing to run, so you can check the state before
+restarting the service.
 
 Profile mapping:
 

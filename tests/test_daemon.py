@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -9,8 +11,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from murmly.config import MurmlyConfig
-from murmly.daemon import MAX_COMMAND_WORKERS, MurmlyDaemon, ProcessingResult, SpeechSession, send_command
+from murmly.config import MurmlyConfig, default_socket_path
+from murmly.daemon import (
+    MAX_COMMAND_BYTES,
+    MAX_COMMAND_WORKERS,
+    CommandCode,
+    DaemonNotRespondingError,
+    DaemonStartupError,
+    MurmlyDaemon,
+    ProcessingResult,
+    RequestError,
+    SpeechSession,
+    read_peer_identity,
+    send_command,
+    socket_path_detail,
+)
 from murmly.focus import NullFocusObserver, WindowIdentity
 from murmly.integrations import DeliveryOutcome
 from murmly.overlay import OverlayHealth, OverlayState
@@ -306,11 +321,12 @@ class DaemonTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual("LISTENING", send_command(str(socket_path), "toggle")["state"])
 
+            responses: list[dict[str, object]] = []
+
             def blocked_request() -> None:
-                try:
-                    send_command(str(socket_path), "toggle")
-                except RuntimeError:
-                    pass
+                # What this receives is the point of the test: a command shutdown
+                # interrupts is answered rather than closed on.
+                responses.append(send_command(str(socket_path), "toggle"))
 
             processing_thread = threading.Thread(
                 target=blocked_request,
@@ -327,6 +343,9 @@ class DaemonTests(unittest.TestCase):
             self.assertTrue(overlay.closed)
             session.release.set()
             processing_thread.join(timeout=1)
+
+            self.assertEqual(1, len(responses))
+            self.assertEqual(CommandCode.SHUTTING_DOWN, responses[0]["code"])
 
     def test_incomplete_clients_are_bounded_and_closed_on_shutdown(self) -> None:
         clients: list[socket.socket] = []
@@ -428,14 +447,16 @@ class DaemonTests(unittest.TestCase):
             try:
                 dispatched = daemon._dispatch_connection(server_side)
                 client_side.settimeout(1)
-                received = client_side.recv(1)
+                received = client_side.recv(4_096)
             finally:
                 client_side.close()
 
+        response = json.loads(received)
         self.assertFalse(dispatched)
         self.assertFalse(semaphore.assert_nonblocking)
         self.assertEqual(1, semaphore.released)
-        self.assertEqual(b"", received)
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.SHUTTING_DOWN, response["code"])
         with daemon._connections_lock:
             self.assertEqual(0, len(daemon._connections))
 
@@ -1266,3 +1287,901 @@ class SegmentToggleConcurrencyTests(unittest.TestCase):
             self.assertEqual(1, session.stopped)
             self.assertEqual({"ok": True, "state": "LISTENING"}, daemon.handle_command("toggle"))
             daemon.handle_command("toggle")
+
+
+def read_frame(client: socket.socket) -> bytes:
+    payload = b""
+    while not payload.endswith(b"\n"):
+        chunk = client.recv(4_096)
+        if not chunk:
+            break
+        payload += chunk
+    return payload
+
+
+def send_payload(socket_path: Path, payload: bytes, timeout: float = 5.0) -> bytes:
+    """Send one raw request and read the frame that answers it."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
+        client.connect(str(socket_path))
+        if payload:
+            client.sendall(payload)
+        return read_frame(client)
+
+
+def send_and_read_to_close(socket_path: Path, payload: bytes, timeout: float = 10.0) -> bytes:
+    """Send one request and read until the daemon closes, not just to the first frame.
+
+    Reading past the first newline is the point: it is what can observe a second
+    response on a connection that should carry exactly one.
+    """
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
+        client.connect(str(socket_path))
+        client.sendall(payload)
+        received = b""
+        while True:
+            try:
+                chunk = client.recv(4_096)
+            except (ConnectionResetError, socket.timeout):
+                break
+            if not chunk:
+                break
+            received += chunk
+    return received
+
+
+class ServedDaemonTests(unittest.TestCase):
+    """A daemon serving on a real socket, for behavior only the transport shows."""
+
+    def serve(self, session: object | None = None, **overrides: object) -> tuple[MurmlyDaemon, Path]:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        socket_path = Path(temp_dir.name) / "murmly.sock"
+        config = MurmlyConfig(
+            socket_path=socket_path,
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+        return self.serve_config(config, session, **overrides)
+
+    def serve_config(
+        self,
+        config: MurmlyConfig,
+        session: object | None = None,
+        **overrides: object,
+    ) -> tuple[MurmlyDaemon, Path]:
+        daemon = MurmlyDaemon(config, session=session or DummySession(), **overrides)
+        thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(daemon.shutdown)
+        deadline = time.time() + 3
+        while not config.socket_path.exists():
+            if time.time() >= deadline:
+                self.fail("daemon socket was not created")
+            time.sleep(0.01)
+        return daemon, config.socket_path
+
+    def wait_for_connections(self, daemon: MurmlyDaemon, count: int) -> int:
+        deadline = time.time() + 3
+        while True:
+            with daemon._connections_lock:
+                observed = len(daemon._connections)
+            if observed == count or time.time() >= deadline:
+                return observed
+            time.sleep(0.01)
+
+
+class FailureCodeTests(unittest.TestCase):
+    def _daemon(self, temp_dir: str, session: object | None = None) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+        )
+        return MurmlyDaemon(config, session=session or DummySession())
+
+    def test_an_unsupported_command_keeps_its_wording_and_gains_a_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response = self._daemon(temp_dir).handle_command("wobble")
+
+        self.assertEqual(
+            {"ok": False, "error": "Unsupported command: wobble", "code": "unsupported_command"},
+            response,
+        )
+
+    def test_a_busy_daemon_keeps_its_wording_state_and_gains_a_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = BlockingSession()
+            daemon = self._daemon(temp_dir, session)
+            daemon.handle_command("toggle")
+            stopper = threading.Thread(target=daemon.handle_command, args=("toggle",), daemon=True)
+            stopper.start()
+            self.assertTrue(session.processing.wait(timeout=2))
+            response = daemon.handle_command("toggle")
+            session.release.set()
+            stopper.join(timeout=3)
+
+        self.assertEqual(
+            {"ok": False, "state": "THINKING", "error": "Daemon is busy.", "code": "busy"},
+            response,
+        )
+
+    def test_a_failed_start_keeps_its_wording_state_and_gains_a_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession(start_error=RuntimeError("no microphone"))
+            response = self._daemon(temp_dir, session).handle_command("toggle")
+
+        self.assertEqual(
+            {"ok": False, "state": "IDLE", "error": "no microphone", "code": "command_failed"},
+            response,
+        )
+
+    def test_a_failed_stop_keeps_its_wording_state_and_gains_a_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession(stop_error=RuntimeError("capture died"))
+            daemon = self._daemon(temp_dir, session)
+            daemon.handle_command("toggle")
+            response = daemon.handle_command("toggle")
+
+        self.assertEqual(
+            {"ok": False, "state": "IDLE", "error": "capture died", "code": "command_failed"},
+            response,
+        )
+
+    def test_a_failed_transcription_keeps_its_wording_state_and_gains_a_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession(process_error=RuntimeError("decode exploded"))
+            daemon = self._daemon(temp_dir, session)
+            daemon.handle_command("toggle")
+            response = daemon.handle_command("toggle")
+
+        self.assertEqual(
+            {"ok": False, "state": "IDLE", "error": "decode exploded", "code": "command_failed"},
+            response,
+        )
+
+    def test_the_seven_categories_map_to_seven_distinct_codes(self) -> None:
+        codes = [code.value for code in CommandCode]
+
+        self.assertEqual(7, len(codes))
+        self.assertEqual(
+            {
+                "busy",
+                "unsupported_command",
+                "malformed_request",
+                "over_capacity",
+                "not_permitted",
+                "shutting_down",
+                "command_failed",
+            },
+            set(codes),
+        )
+
+    def test_successful_responses_carry_no_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir)
+            status = daemon.handle_command("status")
+            started = daemon.handle_command("toggle")
+            finished = daemon.handle_command("toggle")
+
+        for response in (status, started, finished):
+            self.assertTrue(response["ok"])
+            self.assertNotIn("code", response)
+
+
+class RequestShapeTests(ServedDaemonTests):
+    def test_a_payload_that_is_not_an_object_is_answered(self) -> None:
+        _daemon, socket_path = self.serve()
+
+        responses = [
+            json.loads(send_payload(socket_path, payload))
+            for payload in (b"[1, 2]\n", b'"hi"\n', b"5\n", b"true\n")
+        ]
+
+        for response in responses:
+            self.assertFalse(response["ok"])
+            self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
+            self.assertEqual("Request is not a JSON object.", response["error"])
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_command_name_that_is_not_text_is_answered(self) -> None:
+        _daemon, socket_path = self.serve()
+
+        response = json.loads(send_payload(socket_path, b'{"command": 5}\n'))
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.UNSUPPORTED_COMMAND, response["code"])
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_request_carrying_extra_fields_runs_its_command(self) -> None:
+        _daemon, socket_path = self.serve()
+
+        response = json.loads(send_payload(socket_path, b'{"command": "status", "extra": 1}\n'))
+
+        self.assertEqual({"ok": True, "state": "IDLE"}, response)
+
+
+class AnsweredConnectionTests(ServedDaemonTests):
+    def test_invalid_json_is_answered(self) -> None:
+        _daemon, socket_path = self.serve()
+
+        response = json.loads(send_payload(socket_path, b"not json\n"))
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
+        self.assertIn("not valid JSON", response["error"])
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_invalid_text_is_answered(self) -> None:
+        _daemon, socket_path = self.serve()
+
+        response = json.loads(send_payload(socket_path, b"\xff\xfe\n"))
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
+        self.assertEqual("Request is not valid UTF-8 text.", response["error"])
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_request_that_never_arrives_is_answered(self) -> None:
+        with patch("murmly.daemon.COMMAND_TIMEOUT_SECONDS", 0.2):
+            _daemon, socket_path = self.serve()
+
+            response = json.loads(send_payload(socket_path, b""))
+
+            self.assertFalse(response["ok"])
+            self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
+            self.assertIn("No request arrived within", response["error"])
+            self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_an_unexpected_failure_in_command_handling_is_answered(self) -> None:
+        daemon, socket_path = self.serve()
+
+        def explode(command: str) -> dict[str, object]:
+            raise ZeroDivisionError("nothing divides")
+
+        daemon.handle_command = explode
+        with self.assertLogs("murmly.daemon", level="WARNING"):
+            response = json.loads(send_payload(socket_path, b'{"command": "status"}\n'))
+        del daemon.handle_command
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.COMMAND_FAILED, response["code"])
+        self.assertIn("nothing divides", response["error"])
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_connection_over_capacity_is_answered(self) -> None:
+        daemon, socket_path = self.serve()
+        for _index in range(MAX_COMMAND_WORKERS):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(client.close)
+            client.connect(str(socket_path))
+        self.assertEqual(MAX_COMMAND_WORKERS, self.wait_for_connections(daemon, MAX_COMMAND_WORKERS))
+
+        response = json.loads(send_payload(socket_path, b'{"command": "status"}\n'))
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.OVER_CAPACITY, response["code"])
+        self.assertIn(str(MAX_COMMAND_WORKERS), response["error"])
+
+    def test_shutdown_answers_a_command_whose_request_was_read(self) -> None:
+        daemon, socket_path = self.serve()
+        dispatched = threading.Event()
+
+        def wait_for_shutdown(command: str) -> dict[str, object]:
+            dispatched.set()
+            daemon._shutdown.wait(timeout=5)
+            raise RuntimeError("capture interrupted")
+
+        daemon.handle_command = wait_for_shutdown
+        received: list[bytes] = []
+        caller = threading.Thread(
+            target=lambda: received.append(send_payload(socket_path, b'{"command": "toggle"}\n')),
+            daemon=True,
+        )
+        caller.start()
+        self.assertTrue(dispatched.wait(timeout=3))
+
+        daemon.shutdown()
+        caller.join(timeout=5)
+
+        self.assertEqual(1, len(received))
+        response = json.loads(received[0])
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.SHUTTING_DOWN, response["code"])
+
+    def test_shutdown_answers_a_command_that_outlives_the_drain(self) -> None:
+        # The case the drain alone cannot cover, and the one that actually
+        # happens: a transcription runs for seconds, so a service restart lands
+        # while the command is still running and the drain expires under it.
+        with patch("murmly.daemon.SHUTDOWN_DRAIN_SECONDS", 0.05):
+            daemon, socket_path = self.serve()
+            dispatched = threading.Event()
+            finish = threading.Event()
+
+            def slow_command(command: str) -> dict[str, object]:
+                dispatched.set()
+                finish.wait(timeout=5)
+                return {"ok": True, "state": "DONE", "text": "too late", "delivered": True}
+
+            daemon.handle_command = slow_command
+            frames: list[bytes] = []
+            caller = threading.Thread(
+                target=lambda: frames.append(
+                    send_and_read_to_close(socket_path, b'{"command": "toggle"}\n')
+                ),
+                daemon=True,
+            )
+            caller.start()
+            self.assertTrue(dispatched.wait(timeout=3))
+
+            daemon.shutdown()
+            caller.join(timeout=5)
+            # Released only after shutdown, so the command really did outlive the
+            # drain rather than finishing inside it.
+            finish.set()
+
+        self.assertEqual(1, len(frames))
+        received = frames[0]
+        self.assertEqual(1, received.count(b"\n"), f"expected exactly one response, got {received!r}")
+        response = json.loads(received)
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.SHUTTING_DOWN, response["code"])
+        self.assertEqual("Murmly is shutting down.", response["error"])
+
+    def test_a_command_that_finishes_inside_the_drain_keeps_its_own_response(self) -> None:
+        daemon, socket_path = self.serve()
+        dispatched = threading.Event()
+
+        def prompt_command(command: str) -> dict[str, object]:
+            dispatched.set()
+            return {"ok": True, "state": "DONE", "text": "in time", "delivered": True}
+
+        daemon.handle_command = prompt_command
+        frames: list[bytes] = []
+        caller = threading.Thread(
+            target=lambda: frames.append(
+                send_and_read_to_close(socket_path, b'{"command": "toggle"}\n')
+            ),
+            daemon=True,
+        )
+        caller.start()
+        self.assertTrue(dispatched.wait(timeout=3))
+        caller.join(timeout=5)
+
+        daemon.shutdown()
+
+        self.assertEqual(1, len(frames))
+        response = json.loads(frames[0])
+        self.assertTrue(response["ok"])
+        self.assertEqual("in time", response["text"])
+        self.assertNotIn("code", response)
+
+    def test_a_request_is_owed_an_answer_from_the_moment_its_bytes_arrive(self) -> None:
+        # Closes the window between a request arriving and its command being
+        # dispatched. Registering only after the decode would let shutdown land
+        # in that gap and close on a connection it already owes a response.
+        daemon, _socket_path = self.serve()
+        for payload, failure in (
+            (b"not json\n", json.JSONDecodeError),
+            (b"x" * (MAX_COMMAND_BYTES + 1), RequestError),
+        ):
+            with self.subTest(payload=payload[:12]):
+                server_side, client_side = socket.socketpair()
+                self.addCleanup(client_side.close)
+                self.addCleanup(server_side.close)
+                client_side.sendall(payload)
+
+                with self.assertRaises(failure):
+                    daemon._read_request(server_side)
+
+                with daemon._connections_lock:
+                    self.assertIn(server_side, daemon._answering)
+                    # Registered by hand, so discharged by hand: left owed, this
+                    # connection makes every later shutdown wait out its drain on
+                    # a socket this test has already closed.
+                    daemon._answering.discard(server_side)
+
+    def test_a_peer_that_never_reads_does_not_stop_the_daemon(self) -> None:
+        _daemon, socket_path = self.serve()
+        silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(silent.close)
+        silent.connect(str(socket_path))
+        silent.sendall(b'{"command": "status"}\n')
+
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_client_that_receives_nothing_raises_a_named_type(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(server.close)
+            server.bind(str(socket_path))
+            server.listen()
+            stop = threading.Event()
+
+            def accept_and_close() -> None:
+                server.settimeout(0.2)
+                while not stop.is_set():
+                    try:
+                        connection, _address = server.accept()
+                    except socket.timeout:
+                        continue
+                    # Read first: closing on an unread request resets the
+                    # connection, which is a different failure from the one a
+                    # daemon that dies after reading produces.
+                    with connection:
+                        connection.settimeout(1)
+                        try:
+                            connection.recv(4_096)
+                        except OSError:
+                            pass
+
+            thread = threading.Thread(target=accept_and_close, daemon=True)
+            thread.start()
+            try:
+                with self.assertRaises(DaemonNotRespondingError):
+                    send_command(str(socket_path), "status")
+            finally:
+                stop.set()
+                thread.join(timeout=3)
+
+
+    def test_shutdown_waits_for_a_response_that_is_claimed_but_not_yet_written(self) -> None:
+        # The window between taking the claim and the bytes reaching the kernel.
+        # A drain that treated the claim as the answer would find nothing left to
+        # wait for and close on a response already on its way.
+        daemon, socket_path = self.serve()
+        claimed = threading.Event()
+        take_claim = daemon._claim_response
+
+        def stall_after_claiming(connection: socket.socket) -> bool:
+            taken = take_claim(connection)
+            if taken:
+                claimed.set()
+                time.sleep(0.15)
+            return taken
+
+        daemon._claim_response = stall_after_claiming
+        frames: list[bytes] = []
+        caller = threading.Thread(
+            target=lambda: frames.append(
+                send_and_read_to_close(socket_path, b'{"command": "status"}\n')
+            ),
+            daemon=True,
+        )
+        caller.start()
+        self.assertTrue(claimed.wait(timeout=3))
+
+        daemon.shutdown()
+        caller.join(timeout=5)
+
+        self.assertEqual(1, len(frames))
+        received = frames[0]
+        self.assertEqual(1, received.count(b"\n"), f"expected one response, got {received!r}")
+        self.assertEqual({"ok": True, "state": "IDLE"}, json.loads(received))
+
+    def test_shutdown_waits_for_a_write_that_outlives_the_drain(self) -> None:
+        # The drain expires while the worker holds the claim. Shutdown cannot
+        # answer for that connection -- the worker is about to -- and must not
+        # close on it either, so the wait after the answer is the only thing
+        # keeping the response whole.
+        daemon, socket_path = self.serve()
+        claimed = threading.Event()
+        answered = threading.Event()
+        release = threading.Event()
+        take_claim = daemon._claim_response
+        answer_the_rest = daemon._answer_the_rest
+
+        def stall_after_claiming(connection: socket.socket) -> bool:
+            taken = take_claim(connection)
+            if taken:
+                claimed.set()
+                release.wait(timeout=5)
+            return taken
+
+        def note_the_answer() -> None:
+            answer_the_rest()
+            answered.set()
+
+        daemon._claim_response = stall_after_claiming
+        daemon._answer_the_rest = note_the_answer
+        frames: list[bytes] = []
+        caller = threading.Thread(
+            target=lambda: frames.append(
+                send_and_read_to_close(socket_path, b'{"command": "status"}\n')
+            ),
+            daemon=True,
+        )
+        caller.start()
+        self.assertTrue(claimed.wait(timeout=3))
+
+        shutting_down = threading.Thread(target=daemon.shutdown, daemon=True)
+        shutting_down.start()
+        # Released only once shutdown has answered everything it could, so the
+        # write lands after that point -- the whole window the second wait is for.
+        self.assertTrue(answered.wait(timeout=5))
+        release.set()
+        shutting_down.join(timeout=5)
+        caller.join(timeout=5)
+
+        self.assertEqual(1, len(frames))
+        received = frames[0]
+        self.assertEqual(1, received.count(b"\n"), f"expected one response, got {received!r}")
+        self.assertEqual({"ok": True, "state": "IDLE"}, json.loads(received))
+
+    def test_a_peer_that_closes_before_the_response_does_not_stop_the_daemon(self) -> None:
+        # One of the two connections that cannot be answered. Murmly discards the
+        # response it produced and goes on serving.
+        _daemon, socket_path = self.serve()
+        early = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        early.connect(str(socket_path))
+        early.sendall(b'{"command": "status"}\n')
+        early.close()
+
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_peer_that_never_reads_is_given_up_on_within_the_bound(self) -> None:
+        # A response small enough to fit the socket buffer never waits on anyone,
+        # so the bound is only exercised by one too large to fit.
+        with patch("murmly.daemon.COMMAND_TIMEOUT_SECONDS", 0.2):
+            daemon, socket_path = self.serve()
+            answer_command = daemon.handle_command
+
+            def oversized(command: str) -> dict[str, object]:
+                if command != "toggle":
+                    return answer_command(command)
+                return {"ok": True, "state": "IDLE", "text": "x" * (2 << 20), "delivered": True}
+
+            daemon.handle_command = oversized
+            silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(silent.close)
+            silent.connect(str(socket_path))
+            silent.sendall(b'{"command": "toggle"}\n')
+            started = time.monotonic()
+
+            self.assertEqual(0, self.wait_for_connections(daemon, 0))
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 2.0)
+            self.assertEqual(
+                {"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status")
+            )
+
+    def test_a_daemon_that_holds_the_connection_open_is_reported_not_waited_on(self) -> None:
+        # The other half of "no command terminates with an unhandled error": a
+        # daemon that answers nothing at all is as unhelpful as one that closes,
+        # and a hotkey press has nowhere to show a caller that never returns.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(server.close)
+            server.bind(str(socket_path))
+            server.listen()
+            stop = threading.Event()
+            held: list[socket.socket] = []
+
+            def accept_and_hold() -> None:
+                server.settimeout(0.2)
+                while not stop.is_set():
+                    try:
+                        connection, _address = server.accept()
+                    except socket.timeout:
+                        continue
+                    # Kept open and unanswered, which is the case a close cannot
+                    # produce: the caller has no empty read to notice.
+                    held.append(connection)
+                    connection.settimeout(1)
+                    try:
+                        connection.recv(4_096)
+                    except OSError:
+                        pass
+
+            thread = threading.Thread(target=accept_and_hold, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join, 3)
+            self.addCleanup(stop.set)
+            started = time.monotonic()
+
+            with self.assertRaises(DaemonNotRespondingError) as failure:
+                send_command(str(socket_path), "status", response_timeout=0.2)
+
+            elapsed = time.monotonic() - started
+            for connection in held:
+                connection.close()
+
+        # Bounded by the response timeout specifically, not by the connect
+        # timeout leaking into the read: those are different waits.
+        self.assertLess(elapsed, 1.0)
+        self.assertIn("did not respond", str(failure.exception))
+
+
+class SocketAccessTests(ServedDaemonTests):
+    def test_the_socket_and_every_directory_murmly_creates_are_owner_only(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        directory = Path(temp_dir.name) / "created" / "nested"
+        config = MurmlyConfig(
+            socket_path=directory / "murmly.sock",
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+
+        _daemon, socket_path = self.serve_config(config)
+
+        self.assertEqual(0o600, stat.S_IMODE(socket_path.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(directory.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(directory.parent.stat().st_mode))
+
+    def test_peer_identity_reports_the_connecting_account(self) -> None:
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+
+        self.assertEqual(os.getuid(), read_peer_identity(left))
+
+    def test_a_peer_from_the_same_account_is_served(self) -> None:
+        _daemon, socket_path = self.serve()
+
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_peer_from_another_account_is_refused_and_takes_no_capacity(self) -> None:
+        # A genuine cross-account connection needs a second account and root,
+        # which the suite does not have and must not need, so the comparison is
+        # substituted. More refusals than there are worker slots are sent: if one
+        # consumed a slot, the permitted command that follows could not be served.
+        refusals = MAX_COMMAND_WORKERS + 4
+        seen: list[socket.socket] = []
+
+        def foreign_until_permitted(connection: socket.socket) -> int:
+            seen.append(connection)
+            return os.getuid() + 1 if len(seen) <= refusals else os.getuid()
+
+        _daemon, socket_path = self.serve(peer_identity=foreign_until_permitted)
+
+        for _index in range(refusals):
+            response = json.loads(send_payload(socket_path, b'{"command": "toggle"}\n'))
+            self.assertFalse(response["ok"])
+            self.assertEqual(CommandCode.NOT_PERMITTED, response["code"])
+
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_a_refused_peer_runs_no_command(self) -> None:
+        session = DummySession()
+        _daemon, socket_path = self.serve(session, peer_identity=lambda connection: os.getuid() + 1)
+
+        json.loads(send_payload(socket_path, b'{"command": "toggle"}\n'))
+
+        self.assertEqual(0, session.started)
+
+    def test_the_daemon_refuses_a_socket_path_other_accounts_can_write(self) -> None:
+        for mode in (0o777, 0o770):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as temp_dir:
+                directory = Path(temp_dir) / "shared"
+                directory.mkdir()
+                directory.chmod(mode)
+                socket_path = directory / "murmly.sock"
+                config = MurmlyConfig(
+                    socket_path=socket_path,
+                    config_path=Path(temp_dir) / "config.toml",
+                    overlay_enabled=False,
+                )
+
+                with self.assertRaises(DaemonStartupError) as refusal:
+                    MurmlyDaemon(config, session=DummySession())
+
+                message = str(refusal.exception)
+                self.assertIn(str(socket_path), message)
+                self.assertIn("XDG_RUNTIME_DIR", message)
+                self.assertIn(str(directory), message)
+                self.assertFalse(socket_path.exists())
+
+    def test_a_refused_socket_path_is_not_unlinked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir) / "shared"
+            directory.mkdir()
+            occupant = directory / "murmly.sock"
+            occupant.write_text("not ours", encoding="utf-8")
+            directory.chmod(0o777)
+            config = MurmlyConfig(
+                socket_path=occupant,
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+
+            with self.assertRaises(DaemonStartupError):
+                MurmlyDaemon(config, session=DummySession())
+
+            self.assertEqual("not ours", occupant.read_text(encoding="utf-8"))
+
+    def test_the_daemon_serves_a_directory_others_can_read_but_not_write(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        directory = Path(temp_dir.name) / "readable"
+        directory.mkdir()
+        directory.chmod(0o755)
+        config = MurmlyConfig(
+            socket_path=directory / "murmly.sock",
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+
+        _daemon, socket_path = self.serve_config(config)
+
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+
+    def test_the_default_socket_path_is_served(self) -> None:
+        runtime_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(runtime_dir.cleanup)
+        socket_path = default_socket_path({"XDG_RUNTIME_DIR": runtime_dir.name})
+        config = MurmlyConfig(
+            socket_path=socket_path,
+            config_path=Path(runtime_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+
+        _daemon, served_path = self.serve_config(config)
+
+        self.assertEqual(Path(runtime_dir.name) / "murmly.sock", served_path)
+        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(served_path), "status"))
+
+    def test_the_daemon_refuses_a_private_directory_under_one_others_can_write(self) -> None:
+        # The exposure is above the directory that holds the socket. Renaming
+        # `wide/private` away and putting another one in its place substitutes
+        # every path under it, so checking the holder alone misses this.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wide = Path(temp_dir) / "wide"
+            wide.mkdir()
+            private = wide / "private"
+            private.mkdir()
+            private.chmod(0o700)
+            wide.chmod(0o777)
+            socket_path = private / "murmly.sock"
+            config = MurmlyConfig(
+                socket_path=socket_path,
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+
+            with self.assertRaises(DaemonStartupError) as refusal:
+                MurmlyDaemon(config, session=DummySession())
+
+            message = str(refusal.exception)
+            self.assertIn(str(wide), message)
+            self.assertIn(str(socket_path), message)
+            self.assertIn("XDG_RUNTIME_DIR", message)
+            self.assertFalse(socket_path.exists())
+
+    def test_a_directory_missing_under_one_others_can_write_is_refused(self) -> None:
+        # Nothing exists below `wide` yet, so `wide` is where another account
+        # would create the directory first and own everything under it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wide = Path(temp_dir) / "wide"
+            wide.mkdir()
+            wide.chmod(0o777)
+
+            detail = socket_path_detail(wide / "murmly" / "murmly.sock")
+
+        self.assertIsNotNone(detail)
+        self.assertIn(str(wide), detail)
+
+    @unittest.skipUnless(
+        Path(tempfile.gettempdir()).stat().st_mode & stat.S_ISVTX,
+        "the shared temporary directory is not sticky here",
+    )
+    def test_a_sticky_shared_ancestor_leaves_the_path_private(self) -> None:
+        # /tmp is world-writable and sticky, and every temporary directory in
+        # this suite sits under it. The sticky bit is exactly what stops another
+        # account renaming ours away, so it is accepted above the holder.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.assertIsNone(socket_path_detail(Path(temp_dir) / "murmly.sock"))
+
+    def test_the_sticky_bit_does_not_excuse_the_directory_holding_the_socket(self) -> None:
+        # Sticky stops another account removing our entry; it does not stop one
+        # creating the entry first, which is all it takes when the node is the
+        # thing being created.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared = Path(temp_dir) / "shared"
+            shared.mkdir()
+            shared.chmod(0o1777)
+
+            detail = socket_path_detail(shared / "murmly.sock")
+
+        self.assertIsNotNone(detail)
+        self.assertIn(str(shared), detail)
+
+    def test_a_directory_owned_by_another_account_is_not_private(self) -> None:
+        # A directory this account does not own can be opened up by its owner at
+        # any time, so its mode right now says nothing. The comparison is
+        # substituted because the suite has one account.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("murmly.daemon.os.getuid", return_value=os.getuid() + 1):
+                detail = socket_path_detail(Path(temp_dir) / "murmly.sock")
+
+        self.assertIsNotNone(detail)
+        self.assertIn(str(temp_dir), detail)
+        self.assertIn("owned by uid", detail)
+
+    @unittest.skipIf(os.getuid() == 0, "root is not bound by directory permissions")
+    def test_a_startup_failure_closes_the_overlay_the_constructor_started(self) -> None:
+        # The refusal happens before the socket exists, so the unwinding that
+        # closes the overlay has to sit outside the socket's own.
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        parent = Path(temp_dir.name) / "murmly"
+        parent.mkdir()
+        parent.chmod(0o500)
+        self.addCleanup(parent.chmod, 0o700)
+        socket_path = parent / "nested" / "murmly.sock"
+        config = MurmlyConfig(
+            socket_path=socket_path,
+            config_path=Path(temp_dir.name) / "config.toml",
+        )
+        overlay = FakeOverlay()
+        daemon = MurmlyDaemon(config, session=DummySession(), overlay=overlay)
+
+        with self.assertRaises(DaemonStartupError) as refusal:
+            daemon.serve_forever()
+
+        self.assertIn(str(socket_path), str(refusal.exception))
+        self.assertTrue(overlay.closed)
+
+    def test_a_symlink_does_not_hide_the_directory_it_is_reached_through(self) -> None:
+        # A caller opens the configured path, so the link is what it reaches
+        # through. Judging only what the path resolves to leaves the directory
+        # holding the link unexamined, and an account that can write there
+        # replaces the link and takes the commands, whatever it pointed at.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wide = Path(temp_dir) / "wide"
+            wide.mkdir()
+            private = Path(temp_dir) / "private"
+            private.mkdir(mode=0o700)
+            link = wide / "link"
+            link.symlink_to(private)
+            wide.chmod(0o777)
+            hop = Path(temp_dir) / "hop"
+            hop.symlink_to(link)
+
+            detail = socket_path_detail(link / "murmly.sock")
+            chained = socket_path_detail(hop / "murmly.sock")
+
+        self.assertIsNotNone(detail)
+        self.assertIn(str(wide), detail)
+        # The second link reaches the first, so the exposure is two hops away and
+        # is still found.
+        self.assertIsNotNone(chained)
+        self.assertIn(str(wide), chained)
+
+    def test_a_socket_path_that_cannot_be_created_is_reported_as_a_refusal(self) -> None:
+        # The daemon detected this itself, so it is a refusal rather than the
+        # unexpected failure the caller's backstop would otherwise report.
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        occupant = Path(temp_dir.name) / "notadir"
+        occupant.write_text("", encoding="utf-8")
+        config = MurmlyConfig(
+            socket_path=occupant / "murmly.sock",
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+        daemon = MurmlyDaemon(config, session=DummySession())
+
+        with self.assertRaises(DaemonStartupError) as refusal:
+            daemon.serve_forever()
+
+        self.assertIn(str(config.socket_path), str(refusal.exception))
+
+    def test_a_platform_without_peer_identity_is_reported_and_keeps_serving(self) -> None:
+        # Refusing here would make the daemon unusable on a platform whose only
+        # fault is not offering the check, so it serves and says so.
+        with patch("murmly.daemon.peer_identity_supported", return_value=False):
+            with self.assertLogs("murmly.daemon", level="WARNING") as logs:
+                _daemon, socket_path = self.serve(peer_identity=lambda _connection: None)
+                response = send_command(str(socket_path), "status")
+
+        self.assertEqual({"ok": True, "state": "IDLE"}, response)
+        self.assertTrue(
+            any("cannot report the account" in line for line in logs.output),
+            f"expected the startup warning, got {logs.output!r}",
+        )
