@@ -13,12 +13,14 @@ from unittest.mock import patch
 
 from murmly.config import MurmlyConfig, default_socket_path
 from murmly.daemon import (
+    MAX_COMMAND_BYTES,
     MAX_COMMAND_WORKERS,
     CommandCode,
     DaemonNotRespondingError,
     DaemonStartupError,
     MurmlyDaemon,
     ProcessingResult,
+    RequestError,
     SpeechSession,
     read_peer_identity,
     send_command,
@@ -1302,6 +1304,28 @@ def send_payload(socket_path: Path, payload: bytes, timeout: float = 5.0) -> byt
         return read_frame(client)
 
 
+def send_and_read_to_close(socket_path: Path, payload: bytes, timeout: float = 10.0) -> bytes:
+    """Send one request and read until the daemon closes, not just to the first frame.
+
+    Reading past the first newline is the point: it is what can observe a second
+    response on a connection that should carry exactly one.
+    """
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
+        client.connect(str(socket_path))
+        client.sendall(payload)
+        received = b""
+        while True:
+            try:
+                chunk = client.recv(4_096)
+            except (ConnectionResetError, socket.timeout):
+                break
+            if not chunk:
+                break
+            received += chunk
+    return received
+
+
 class ServedDaemonTests(unittest.TestCase):
     """A daemon serving on a real socket, for behavior only the transport shows."""
 
@@ -1561,6 +1585,94 @@ class AnsweredConnectionTests(ServedDaemonTests):
         response = json.loads(received[0])
         self.assertFalse(response["ok"])
         self.assertEqual(CommandCode.SHUTTING_DOWN, response["code"])
+
+    def test_shutdown_answers_a_command_that_outlives_the_drain(self) -> None:
+        # The case the drain alone cannot cover, and the one that actually
+        # happens: a transcription runs for seconds, so a service restart lands
+        # while the command is still running and the drain expires under it.
+        with patch("murmly.daemon.SHUTDOWN_DRAIN_SECONDS", 0.05):
+            daemon, socket_path = self.serve()
+            dispatched = threading.Event()
+            finish = threading.Event()
+
+            def slow_command(command: str) -> dict[str, object]:
+                dispatched.set()
+                finish.wait(timeout=5)
+                return {"ok": True, "state": "DONE", "text": "too late", "delivered": True}
+
+            daemon.handle_command = slow_command
+            frames: list[bytes] = []
+            caller = threading.Thread(
+                target=lambda: frames.append(
+                    send_and_read_to_close(socket_path, b'{"command": "toggle"}\n')
+                ),
+                daemon=True,
+            )
+            caller.start()
+            self.assertTrue(dispatched.wait(timeout=3))
+
+            daemon.shutdown()
+            caller.join(timeout=5)
+            # Released only after shutdown, so the command really did outlive the
+            # drain rather than finishing inside it.
+            finish.set()
+
+        self.assertEqual(1, len(frames))
+        received = frames[0]
+        self.assertEqual(1, received.count(b"\n"), f"expected exactly one response, got {received!r}")
+        response = json.loads(received)
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.SHUTTING_DOWN, response["code"])
+        self.assertEqual("Murmly is shutting down.", response["error"])
+
+    def test_a_command_that_finishes_inside_the_drain_keeps_its_own_response(self) -> None:
+        daemon, socket_path = self.serve()
+        dispatched = threading.Event()
+
+        def prompt_command(command: str) -> dict[str, object]:
+            dispatched.set()
+            return {"ok": True, "state": "DONE", "text": "in time", "delivered": True}
+
+        daemon.handle_command = prompt_command
+        frames: list[bytes] = []
+        caller = threading.Thread(
+            target=lambda: frames.append(
+                send_and_read_to_close(socket_path, b'{"command": "toggle"}\n')
+            ),
+            daemon=True,
+        )
+        caller.start()
+        self.assertTrue(dispatched.wait(timeout=3))
+        caller.join(timeout=5)
+
+        daemon.shutdown()
+
+        self.assertEqual(1, len(frames))
+        response = json.loads(frames[0])
+        self.assertTrue(response["ok"])
+        self.assertEqual("in time", response["text"])
+        self.assertNotIn("code", response)
+
+    def test_a_request_is_owed_an_answer_from_the_moment_its_bytes_arrive(self) -> None:
+        # Closes the window between a request arriving and its command being
+        # dispatched. Registering only after the decode would let shutdown land
+        # in that gap and close on a connection it already owes a response.
+        daemon, _socket_path = self.serve()
+        for payload, failure in (
+            (b"not json\n", json.JSONDecodeError),
+            (b"x" * (MAX_COMMAND_BYTES + 1), RequestError),
+        ):
+            with self.subTest(payload=payload[:12]):
+                server_side, client_side = socket.socketpair()
+                self.addCleanup(client_side.close)
+                self.addCleanup(server_side.close)
+                client_side.sendall(payload)
+
+                with self.assertRaises(failure):
+                    daemon._read_request(server_side)
+
+                with daemon._connections_lock:
+                    self.assertIn(server_side, daemon._answering)
 
     def test_a_peer_that_never_reads_does_not_stop_the_daemon(self) -> None:
         _daemon, socket_path = self.serve()

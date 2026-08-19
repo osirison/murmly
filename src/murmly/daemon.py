@@ -440,9 +440,14 @@ class MurmlyDaemon:
         self._worker_slots = threading.BoundedSemaphore(MAX_COMMAND_WORKERS)
         self._connections_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
-        # The subset whose request has already been read. Shutdown waits for these
-        # and for no others: a peer that has not spoken has nothing to be told.
+        # The subset whose request has already been read and whose one response is
+        # still owed. Shutdown waits for these and for no others: a peer that has
+        # not spoken has nothing to be told.
         self._answering: set[socket.socket] = set()
+        # Connections whose response has been claimed by whoever will write it.
+        # Shutdown answers a command that outlives the drain, so the claim is what
+        # keeps it and the worker from both writing to the same connection.
+        self._claimed: set[socket.socket] = set()
 
     @property
     def state(self) -> str:
@@ -533,6 +538,7 @@ class MurmlyDaemon:
             except OSError:
                 pass
         self._drain_answering()
+        self._answer_the_rest()
         with self._connections_lock:
             connections = tuple(self._connections)
         for connection in connections:
@@ -565,6 +571,35 @@ class MurmlyDaemon:
                 return
             time.sleep(SHUTDOWN_DRAIN_POLL_SECONDS)
 
+    def _answer_the_rest(self) -> None:
+        """Answer the commands that outlived the drain instead of closing on them.
+
+        A transcription runs for seconds, far longer than the drain will wait, so
+        the drain alone would still leave an empty read on the one case this
+        exists for: the service restarting mid-transcription. Claiming the
+        response first is what makes this safe -- the worker finds the connection
+        already answered and writes nothing, so the connection still carries
+        exactly one response.
+        """
+        with self._connections_lock:
+            answering = tuple(self._answering)
+        for connection in answering:
+            if not self._claim_response(connection):
+                continue
+            self._refuse(
+                connection,
+                failure_response(CommandCode.SHUTTING_DOWN, "Murmly is shutting down."),
+            )
+
+    def _claim_response(self, connection: socket.socket) -> bool:
+        """Take the exclusive right to write this connection's one response."""
+        with self._connections_lock:
+            if connection in self._claimed:
+                return False
+            self._claimed.add(connection)
+            self._answering.discard(connection)
+            return True
+
     def _serve_connection(self, connection: socket.socket) -> None:
         try:
             with connection:
@@ -585,9 +620,14 @@ class MurmlyDaemon:
             with self._connections_lock:
                 self._connections.discard(connection)
                 self._answering.discard(connection)
+                self._claimed.discard(connection)
             self._worker_slots.release()
 
     def _write_response(self, connection: socket.socket, response: dict[str, object]) -> None:
+        if not self._claim_response(connection):
+            # Shutdown answered this connection while the command was still
+            # running. A second frame would break the one-response rule.
+            return
         try:
             connection.sendall((json.dumps(response) + "\n").encode("utf-8"))
         except OSError:
@@ -693,10 +733,6 @@ class MurmlyDaemon:
             return failure_response(
                 CommandCode.MALFORMED_REQUEST, f"Request is not valid JSON: {error}"
             )
-        # The request is in hand from here, so shutdown owes this connection an
-        # answer and must not force-close it until the response is written.
-        with self._connections_lock:
-            self._answering.add(connection)
         if self._shutdown.is_set():
             return failure_response(CommandCode.SHUTTING_DOWN, "Murmly is shutting down.")
         return self._dispatch_request(request)
@@ -707,6 +743,14 @@ class MurmlyDaemon:
             chunk = connection.recv(4096)
             if not chunk:
                 break
+            if not payload:
+                # The peer has spoken, so an answer is owed from here -- including
+                # one that reports the request could not be read. Registered
+                # before the request is decoded, because a registration after the
+                # decode leaves a window where shutdown closes on a connection it
+                # already owes a response.
+                with self._connections_lock:
+                    self._answering.add(connection)
             if len(payload) + len(chunk) > MAX_COMMAND_BYTES:
                 raise RequestError("Command exceeds the 4096-byte limit.")
             payload.extend(chunk)

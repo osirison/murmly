@@ -30,6 +30,8 @@ description: Track implementation and validation of answered connections, coded 
 - [x] 3.7 Add tests for: invalid JSON, invalid UTF-8, a connect-then-idle request timeout, and an unexpected exception raised inside command handling — each asserting a response arrives and the daemon keeps serving
 - [x] 3.8 Add a shutdown test that asserts a response with the shutting-down code, replacing reliance on `tests/test_daemon.py:308-312` which swallows the failure with `except RuntimeError: pass`
 - [x] 3.9 Add a test that a peer which never reads its response does not stop the daemon accepting the next command
+- [x] 3.10 Answer, from `shutdown()`, every connection still owed a response when the drain expires, with a single-writer claim so the worker cannot write a second frame to the same connection — found by measuring 3.5 against a transcription that outlives the drain, which is every real transcription
+- [x] 3.11 Register a connection as owed an answer when its first request byte arrives rather than after the request is decoded, closing the window in which shutdown force-closes a connection whose request had already arrived
 
 ## 4. Commands that never raise
 

@@ -93,20 +93,45 @@ thread that fails to start. Both already sit inside `_dispatch_connection`'s
 release in that `finally` and another in the worker, and a double release raises
 `ValueError`. The refusal write must not move either release.
 
-### Shutdown drains before it force-closes
+### Shutdown drains, then answers whatever the drain did not
 
 `shutdown()` sets its event, then waits a bounded interval for tracked connections
 to be released by their workers, and only then force-closes whatever remains. A
 worker that has read a request and observes the shutdown answers with the
 shutting-down code before releasing.
 
-*Alternative considered.* **Having `shutdown()` write the response itself** races
-the worker for the same socket. **Leaving the force-close and accepting the empty
-read** is the current behavior and is what the change exists to remove.
+**A drain alone is not enough, and measuring it is what showed why.** A
+transcription runs for seconds and the drain waits half of one, so on the single
+case this exists for -- the service restarting mid-transcription -- the drain
+expires under the command and the caller still gets an empty read. Measured
+end to end: an eight-second transcription plus a SIGTERM produced zero bytes at
+the client and `Murmly daemon closed the connection before responding.` on its
+stderr. That satisfies the desktop-integration rule, which asks only for a message
+rather than a traceback, and violates *An accepted connection is answered*, which
+asks for a response rather than an empty read.
 
-A connection on which no request had been read is closed unanswered. There is
-nothing to answer, and holding shutdown open for a peer that has not spoken would
-make shutdown latency depend on an idle client.
+So after the drain expires, `shutdown()` writes the shutting-down response itself
+to every connection still owed one.
+
+*Alternative considered, and why it was reconsidered.* **Having `shutdown()`
+write the response itself** was rejected first because it races the worker for the
+same socket. It only races while both are free to write. A single-writer claim
+removes the race: whoever takes the claim writes, and the other finds the
+connection already answered and writes nothing, so the connection still carries
+exactly one response. **Widening the drain to cover a transcription** would make
+shutdown latency depend on decode time -- up to twelve seconds on CPU -- and
+systemd would kill the process before the response was written anyway.
+
+A connection is registered as owed an answer the moment its first request byte
+arrives, before the request is decoded. Registering after the decode leaves a
+window in which the request has arrived, shutdown does not yet know the connection
+is owed anything, and the force-close lands in the gap. A request that turns out
+to be unreadable is owed an answer too, so the earlier point is also the correct
+one.
+
+A connection on which no request had been read is still closed unanswered. There
+is nothing to answer, and holding shutdown open for a peer that has not spoken
+would make shutdown latency depend on an idle client.
 
 ### Shape is checked, not caught
 
@@ -233,6 +258,16 @@ distinguish a device name from an error message.
 - **Bounded shutdown drain adds shutdown latency** → the bound is short and
   applies only to connections whose request was read; idle connections close
   immediately.
+- **`shutdown()` and a worker could both write to one connection** → a
+  single-writer claim, taken under the connections lock, decides which of them
+  writes; the other returns without writing. Asserted by reading a connection to
+  close rather than to its first newline, so a second frame would be observed.
+- **`shutdown()` runs in signal-handler context on the accept-loop thread**, so
+  the refusal writes it now performs run there too. Each has a send timeout and a
+  discarded failure, bounding it at the worker count times that timeout. Stated
+  rather than solved: the pre-existing hazard underneath it is that `shutdown()`
+  can deadlock against `_connections_lock` held across `thread.start()` on the
+  same thread, which predates this change and is unchanged by it.
 - **Refusing to start on a group- or other-writable configured `socket_path` is a
   behavior change** → the default path is unaffected; the refusal names the path
   and both remedies; `doctor` reports it without refusing; `README.md` and
