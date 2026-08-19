@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import logging
 import os
+from pathlib import Path
 from shutil import which as shutil_which
 import subprocess
 import time
@@ -52,6 +53,7 @@ class PasteInjection:
     reason: str | None = None
     remedy: tuple[str, ...] = ()
     confirms_delivery: bool = True
+    advisory: str | None = None
 
     @property
     def available(self) -> bool:
@@ -153,6 +155,38 @@ def injector_remedy(env: dict[str, str] | None = None) -> tuple[str, ...]:
     )
 
 
+def input_consent_advisory(method: str, env: dict[str, str] | None = None) -> str | None:
+    """Warn when KDE will gate this method behind its input-control dialog.
+
+    KWin re-asks each time XWayland opens a fresh EIS connection, which it does
+    again after roughly ten minutes idle. The paste that raises the dialog is lost -
+    the tool has exited by the time anyone clicks - so it reaches the clipboard and
+    no further. Ticking "Always allow" writes the app into kwinrc and ends it.
+    """
+    environment = env or os.environ
+    if method != "xdotool" or not is_wayland_session(environment):
+        return None
+    config_home = environment.get("XDG_CONFIG_HOME") or f"{environment.get('HOME', '')}/.config"
+    kwinrc = Path(config_home) / "kwinrc"
+    try:
+        settings = kwinrc.read_text()
+    except OSError:
+        # No kwinrc: not a KWin session, so this dialog is not in the way.
+        return None
+    for line in settings.splitlines():
+        if not line.startswith("XwaylandEisNoPromptApps"):
+            continue
+        granted = [entry.strip() for entry in line.partition("=")[2].split(",")]
+        if method in granted:
+            return None
+        break
+    return (
+        f"KDE asks once per connection before letting {method} control input, and the "
+        "paste that raises that dialog reaches the clipboard only. Tick "
+        f"\"Always allow apps claiming to be {method}\" on it to stop it recurring."
+    )
+
+
 def probe_injector(
     candidate: InjectorCandidate,
     env: dict[str, str] | None = None,
@@ -221,6 +255,7 @@ def select_paste_injection(
                 candidate.method,
                 candidate.command,
                 confirms_delivery=candidate.confirms_delivery,
+                advisory=input_consent_advisory(candidate.method, environment),
             )
         reasons.append(f"{candidate.method} is installed but cannot inject in this session: {detail}")
     return PasteInjection(None, None, reason="; ".join(reasons), remedy=remedy)

@@ -310,6 +310,9 @@ def paste_injection_diagnostics(injection: PasteInjection) -> dict[str, object]:
     }
     if injection.available:
         report["command"] = list(injection.command or ())
+        report["confirms_delivery"] = injection.confirms_delivery
+        if injection.advisory:
+            report["advisory"] = injection.advisory
         return report
     report["reason"] = injection.reason
     report["remedy"] = list(injection.remedy)

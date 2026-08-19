@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -8,6 +10,7 @@ from murmly.integrations import (
     ClipboardPaster,
     MissingToolError,
     PasteInjection,
+    input_consent_advisory,
     choose_clipboard_copy_command,
     select_paste_injection,
 )
@@ -315,3 +318,40 @@ class UnconfirmableDeliveryTests(unittest.TestCase):
             [("wl-copy",), ("xdotool", "key", "--clearmodifiers", "ctrl+v")],
             calls,
         )
+
+
+class InputConsentAdvisoryTests(unittest.TestCase):
+    """KDE gates xdotool behind a dialog that costs one paste every time it appears."""
+
+    WAYLAND = {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"}
+
+    def _env(self, temp_dir: str, kwinrc: str | None) -> dict[str, str]:
+        if kwinrc is not None:
+            (Path(temp_dir) / "kwinrc").write_text(kwinrc)
+        return dict(self.WAYLAND, XDG_CONFIG_HOME=temp_dir)
+
+    def test_advises_while_the_grant_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            advisory = input_consent_advisory("xdotool", self._env(temp_dir, "[Xwayland]\nScale=1\n"))
+
+        self.assertIsNotNone(advisory)
+        self.assertIn("Always allow apps claiming to be xdotool", advisory)
+
+    def test_advises_when_another_app_holds_the_grant(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._env(temp_dir, "XwaylandEisNoPromptApps=someotherapp\n")
+            self.assertIsNotNone(input_consent_advisory("xdotool", env))
+
+    def test_silent_once_the_grant_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._env(temp_dir, "XwaylandEisNoPromptApps=someotherapp,xdotool\n")
+            self.assertIsNone(input_consent_advisory("xdotool", env))
+
+    def test_silent_where_the_dialog_does_not_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # No kwinrc at all: not a KWin session, so nothing gates the injection.
+            self.assertIsNone(input_consent_advisory("xdotool", self._env(temp_dir, None)))
+            # Nor does it apply to another method, or to an X11 session.
+            granted = self._env(temp_dir, "XwaylandEisNoPromptApps=\n")
+            self.assertIsNone(input_consent_advisory("wtype", granted))
+            self.assertIsNone(input_consent_advisory("xdotool", {"XDG_SESSION_TYPE": "x11", "XDG_CONFIG_HOME": temp_dir}))
