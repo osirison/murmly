@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from array import array
 from collections import deque
+import logging
 import math
 import sys
 import threading
@@ -12,8 +13,15 @@ from murmly.config import MurmlyConfig
 from murmly.overlay import LevelSink
 
 
+logger = logging.getLogger(__name__)
+
 MIN_LEVEL_DBFS = -60.0
 MAX_LEVEL_DBFS = -6.0
+
+# What the synthesis model produces. The device is preflighted at this rate
+# first, so the common case costs no resampling at all.
+DEFAULT_PLAYBACK_RATE_HZ = 24_000
+MAX_PLAYBACK_CHANNELS = 2
 
 
 def pcm16_rms(pcm_audio: bytes) -> float:
@@ -297,3 +305,311 @@ class SoundDeviceRecorder:
         except Exception:
             self._level_sink = None
         return frame
+
+
+def pcm16_from_float32(samples, channels: int = 1) -> bytes:
+    """Little-endian int16 for the device, from the float32 a synthesizer yields.
+
+    The inverse of the idiom `FasterWhisperTranscriber._as_array` uses on the way
+    in. Clipped rather than scaled to fit: a sample past full scale is the
+    model's fault and quieting the whole utterance to hide it would be worse.
+    """
+    import numpy as np
+
+    audio = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    if channels > 1:
+        audio = np.repeat(audio, channels)
+    return np.round(audio * 32_767.0).astype("<i2").tobytes()
+
+
+def resample_float32(samples, from_rate_hz: int, to_rate_hz: int):
+    """Linear interpolation between two rates.
+
+    The only other rate adaptation in the repository is integer decimation that
+    refuses a non-integer ratio, because it feeds a voice activity model that
+    aliased energy misleads. This one feeds a loudspeaker at whatever ratio the
+    device negotiated, so it has to accept every ratio, and interpolation error
+    at 24 kHz against 44.1 or 48 kHz is not audible.
+    """
+    import numpy as np
+
+    audio = np.asarray(samples, dtype=np.float32)
+    if from_rate_hz == to_rate_hz or audio.size == 0:
+        return audio
+    count = max(int(round(audio.size * to_rate_hz / from_rate_hz)), 1)
+    source = np.arange(audio.size, dtype=np.float64)
+    target = np.linspace(0.0, audio.size - 1, count, dtype=np.float64)
+    return np.interp(target, source, audio).astype(np.float32)
+
+
+class SoundDevicePlayer:
+    """Plays synthesized audio, and stops playing it on demand.
+
+    Selects a device the way `SoundDeviceRecorder` does -- preflight every
+    candidate, open the first that takes the settings, and report one combined
+    failure only once they are all exhausted -- and keeps the same lock-free
+    discipline in the callback: the producer appends under a lock, the callback
+    only ever calls `popleft`.
+    """
+
+    def __init__(
+        self,
+        config: MurmlyConfig,
+        sample_rate_hz: int = DEFAULT_PLAYBACK_RATE_HZ,
+    ) -> None:
+        self._config = config
+        self._preferred_sample_rate_hz = sample_rate_hz
+        self._sample_rate_hz = sample_rate_hz
+        self._channels = 1
+        self._stream = None
+        self._blocks: deque[bytes] = deque()
+        self._carry = b""
+        self._write_lock = threading.Lock()
+        self._frames_written = 0
+        self._frames_played = 0
+        self._underruns = 0
+        self._device_detail: str | None = None
+
+    @property
+    def sample_rate_hz(self) -> int:
+        """The rate the device negotiated, which is not always the one asked for."""
+        return self._sample_rate_hz
+
+    @property
+    def channels(self) -> int:
+        return self._channels
+
+    @property
+    def frames_played(self) -> int:
+        """Frames handed to the device, which is what the person has heard.
+
+        Never what has been produced. Producing runs ahead of playing by whole
+        sentences, and reporting the production frontier would tell a sender the
+        person heard something they did not.
+        """
+        return self._frames_played
+
+    @property
+    def frames_written(self) -> int:
+        return self._frames_written
+
+    @property
+    def pending_frames(self) -> int:
+        return max(self._frames_written - self._frames_played, 0)
+
+    @property
+    def underruns(self) -> int:
+        return self._underruns
+
+    @property
+    def device_detail(self) -> str | None:
+        """Why the device in use is not the one configured, when it is not."""
+        return self._device_detail
+
+    @property
+    def active(self) -> bool:
+        return self._stream is not None
+
+    def start(self) -> None:
+        try:
+            import sounddevice as sd
+        except ModuleNotFoundError as error:
+            raise RuntimeError(
+                "sounddevice is required for speech output. Install it before enabling it."
+            ) from error
+
+        if self._stream is not None:
+            return
+        with self._write_lock:
+            self._blocks.clear()
+        self._carry = b""
+        self._frames_written = 0
+        self._frames_played = 0
+        self._underruns = 0
+        self._device_detail = None
+
+        configured = self._configured_device()
+        failures: list[str] = []
+        for device in self._candidate_devices(sd, configured):
+            for channels in self._candidate_channels(sd, device):
+                for sample_rate_hz in self._candidate_sample_rates(sd, device):
+                    stream = self._open(sd, device, channels, sample_rate_hz, failures)
+                    if stream is None:
+                        continue
+                    self._stream = stream
+                    self._sample_rate_hz = int(round(stream.samplerate))
+                    self._channels = channels
+                    if configured is not None and device != configured:
+                        self._device_detail = (
+                            f"The configured output device {configured!r} could not be "
+                            f"opened; using {device if device is not None else 'the system default'} "
+                            f"instead."
+                        )
+                    return
+
+        details = "; ".join(failures) or "No output devices were available."
+        raise RuntimeError(f"Unable to open an audio output. {details}")
+
+    def _open(self, sd, device, channels: int, sample_rate_hz: int, failures: list[str]):
+        try:
+            sd.check_output_settings(
+                device=device,
+                channels=channels,
+                dtype="int16",
+                samplerate=sample_rate_hz,
+            )
+        except (sd.PortAudioError, ValueError) as error:
+            failures.append(f"device={device!r}, channels={channels}, rate={sample_rate_hz}: {error}")
+            return None
+
+        stream = None
+        try:
+            stream = sd.RawOutputStream(
+                device=device,
+                samplerate=sample_rate_hz,
+                channels=channels,
+                dtype="int16",
+                callback=self._callback,
+            )
+            stream.start()
+        except (sd.PortAudioError, ValueError) as error:
+            if stream is not None:
+                stream.close()
+            failures.append(f"device={device!r}, channels={channels}, rate={sample_rate_hz}: {error}")
+            return None
+        return stream
+
+    def _callback(self, outdata, frames: int, time_info: object, status: object) -> None:
+        """Fill one device period from the queue, taking no lock.
+
+        Never raises. The capture callback does, because a capture fault has to
+        stop the recording; a playback fault must not tear down the stream in
+        the middle of a sentence, so an underrun is counted and reported.
+        """
+        del time_info
+        if status:
+            self._underruns += 1
+        wanted = frames * self._channels * 2
+        view = memoryview(outdata).cast("B")
+        filled = 0
+        while filled < wanted:
+            if not self._carry:
+                try:
+                    self._carry = self._blocks.popleft()
+                except IndexError:
+                    break
+            take = min(len(self._carry), wanted - filled)
+            view[filled : filled + take] = self._carry[:take]
+            self._carry = self._carry[take:]
+            filled += take
+        if filled < wanted:
+            # Silence rather than stale audio, and not counted as played: a
+            # position that advanced through an underrun would report speech
+            # nobody heard.
+            view[filled:wanted] = bytes(wanted - filled)
+        self._frames_played += filled // (self._channels * 2)
+
+    def write(self, samples, sample_rate_hz: int) -> int:
+        """Queue one synthesized chunk, and report how many frames it became."""
+        audio = resample_float32(samples, sample_rate_hz, self._sample_rate_hz)
+        pcm_audio = pcm16_from_float32(audio, self._channels)
+        frames = len(pcm_audio) // (self._channels * 2)
+        if frames == 0:
+            return 0
+        with self._write_lock:
+            self._blocks.append(pcm_audio)
+            self._frames_written += frames
+        return frames
+
+    def abort(self) -> int:
+        """Stop audio already handed to the device, and report what was played.
+
+        Draining instead would keep speaking for as long as the device buffer
+        holds, which is the one thing a person reaching for the hotkey is asking
+        it not to do.
+        """
+        with self._write_lock:
+            self._blocks.clear()
+            self._frames_written = self._frames_played
+        stream = self._stream
+        if stream is not None:
+            try:
+                stream.abort()
+            except Exception as error:  # noqa: BLE001 - the caller is stopping, not starting
+                logger.warning("Audio output did not abort cleanly: %s", error)
+        self._carry = b""
+        return self._frames_played
+
+    def stop(self) -> None:
+        """Close the output, leaving nothing open if the stop itself fails."""
+        stream = self._stream
+        self._stream = None
+        with self._write_lock:
+            self._blocks.clear()
+        self._carry = b""
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        finally:
+            stream.close()
+
+    def _configured_device(self) -> int | str | None:
+        configured = self._config.tts_output_device.strip()
+        if not configured:
+            return None
+        return int(configured) if configured.isdigit() else configured
+
+    def _candidate_devices(self, sounddevice, configured) -> list[object]:
+        """The configured device first, then the system default, then the rest.
+
+        The configured one is not the only candidate: the spec says a device
+        that cannot be opened is reported alongside what was used instead, which
+        means there has to be something used instead.
+        """
+        candidates: list[object] = [] if configured is None else [configured]
+        try:
+            default_device = sounddevice.query_devices(kind="output")
+        except (sounddevice.PortAudioError, TypeError, ValueError):
+            default_device = None
+        if default_device is not None:
+            candidates.append(None)
+
+        virtual_device_names = {"default", "pipewire", "pulse", "sysdefault"}
+        try:
+            devices = list(enumerate(sounddevice.query_devices()))
+        except (sounddevice.PortAudioError, TypeError, ValueError):
+            devices = []
+        for index, device in devices:
+            if int(device.get("max_output_channels", 0)) < 1:
+                continue
+            if str(device["name"]).casefold() in virtual_device_names:
+                continue
+            candidates.append(index)
+        return candidates
+
+    def _candidate_channels(self, sounddevice, device) -> list[int]:
+        """Mono first. A device that will not take it gets the mono signal twice."""
+        channels = [1]
+        maximum = self._device_property(sounddevice, device, "max_output_channels")
+        if maximum is not None and maximum >= 2:
+            channels.append(MAX_PLAYBACK_CHANNELS)
+        return channels
+
+    def _candidate_sample_rates(self, sounddevice, device) -> list[int]:
+        sample_rates = [self._preferred_sample_rate_hz]
+        native = self._device_property(sounddevice, device, "default_samplerate")
+        if native is not None and int(native) > 0 and int(native) not in sample_rates:
+            sample_rates.append(int(native))
+        return sample_rates
+
+    @staticmethod
+    def _device_property(sounddevice, device, key: str):
+        try:
+            if device is None:
+                properties = sounddevice.query_devices(kind="output")
+            else:
+                properties = sounddevice.query_devices(device)
+            return properties[key]
+        except (sounddevice.PortAudioError, KeyError, TypeError, ValueError):
+            return None

@@ -30,13 +30,13 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 4. Audio output path
 
-- [ ] 4.1 Add an output stream to `audio.py` using the same preflight-then-negotiate device selection as `_open_stream`, accumulating every failure and raising one combined `RuntimeError` only after all candidates are exhausted (`audio.py:104-140`)
-- [ ] 4.2 Read the negotiated output rate back off the opened stream and expose it as a property, following `audio.py:134`; do not trust the configured value
-- [ ] 4.3 Convert float32 synthesis output to the device format using the existing idiom at `stt.py:136-144`, and resample only when the device cannot take the synthesis rate directly
-- [ ] 4.4 Keep the playback callback lock-free using the `deque.append` / `deque.popleft` pair with the lock on the producer side, mirroring `audio.py:94-101` and `audio.py:187-200`
-- [ ] 4.5 Add an abort that stops audio already handed to the device and reports how much of it was played, since the reported position must be what was heard
-- [ ] 4.6 Nest teardown so a failing stop still closes the stream, clearing the handle before the close, following `audio.py:141-156`
-- [ ] 4.7 Add tests for device negotiation, underrun, abort mid-buffer, and a device that fails to open
+- [x] 4.1 Add an output stream to `audio.py` using the same preflight-then-negotiate device selection as `_open_stream`, accumulating every failure and raising one combined `RuntimeError` only after all candidates are exhausted (`audio.py:104-140`)
+- [x] 4.2 Read the negotiated output rate back off the opened stream and expose it as a property, following `audio.py:134`; do not trust the configured value
+- [x] 4.3 Convert float32 synthesis output to the device format using the existing idiom at `stt.py:136-144`, and resample only when the device cannot take the synthesis rate directly
+- [x] 4.4 Keep the playback callback lock-free using the `deque.append` / `deque.popleft` pair with the lock on the producer side, mirroring `audio.py:94-101` and `audio.py:187-200`
+- [x] 4.5 Add an abort that stops audio already handed to the device and reports how much of it was played, since the reported position must be what was heard
+- [x] 4.6 Nest teardown so a failing stop still closes the stream, clearing the handle before the close, following `audio.py:141-156`
+- [x] 4.7 Add tests for device negotiation, underrun, abort mid-buffer, and a device that fails to open
 
 ## 5. Speech queue and playback lifecycle
 

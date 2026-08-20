@@ -10,7 +10,15 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
-from murmly.audio import LevelSmoother, SoundDeviceRecorder, pcm16_rms, rms_to_level
+from murmly.audio import (
+    LevelSmoother,
+    SoundDeviceRecorder,
+    SoundDevicePlayer,
+    pcm16_from_float32,
+    pcm16_rms,
+    resample_float32,
+    rms_to_level,
+)
 from murmly.config import MurmlyConfig
 
 
@@ -666,3 +674,280 @@ class CaptureAccumulatorConcurrencyTests(unittest.TestCase):
         collected.append(recorder.stop())
 
         self.assertEqual(block * total_blocks, b"".join(collected))
+
+
+class PlaybackTests(unittest.TestCase):
+    """The output path, driven without hardware through the output fakes."""
+
+    def _player(self, **kwargs) -> tuple[SoundDevicePlayer, list[FakeOutputStream], object]:
+        streams: list[FakeOutputStream] = []
+        sounddevice = fake_sounddevice(output_streams=streams, **kwargs)
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            tts_enabled=True,
+        )
+        patcher = patch.dict(sys.modules, {"sounddevice": sounddevice})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return SoundDevicePlayer(config), streams, sounddevice
+
+    @staticmethod
+    def _tone(count: int, value: float = 0.5) -> list[float]:
+        return [value] * count
+
+    def test_the_preferred_rate_is_preflighted_before_the_device_native_one(self) -> None:
+        attempts: list[tuple[object, int, int]] = []
+
+        def check_output_settings(**kwargs: object) -> None:
+            attempts.append((kwargs["device"], kwargs["channels"], kwargs["samplerate"]))
+
+        player, streams, _sd = self._player(check_output_settings=check_output_settings)
+        player.start()
+
+        self.assertEqual((None, 1, 24_000), attempts[0])
+        self.assertEqual(24_000, player.sample_rate_hz)
+        self.assertTrue(streams[0].started)
+
+    def test_the_negotiated_rate_is_read_off_the_stream_not_the_request(self) -> None:
+        """A device that refuses 24 kHz lands on its own rate, and that is what counts."""
+
+        def check_output_settings(**kwargs: object) -> None:
+            if kwargs["samplerate"] == 24_000:
+                raise FakePortAudioError("24 kHz not supported")
+
+        player, streams, _sd = self._player(check_output_settings=check_output_settings)
+        player.start()
+
+        self.assertEqual(44_100, player.sample_rate_hz)
+        self.assertEqual(44_100, int(streams[0].samplerate))
+
+    def test_a_device_that_takes_no_settings_at_all_reports_every_failure(self) -> None:
+        def check_output_settings(**kwargs: object) -> None:
+            raise FakePortAudioError(f"nothing at {kwargs['samplerate']}")
+
+        player, streams, _sd = self._player(check_output_settings=check_output_settings)
+
+        with self.assertRaises(RuntimeError) as raised:
+            player.start()
+
+        message = str(raised.exception)
+        self.assertIn("Unable to open an audio output", message)
+        self.assertIn("nothing at 24000", message)
+        self.assertIn("nothing at 44100", message)
+        self.assertEqual([], streams)
+
+    def test_a_stream_that_fails_to_open_is_closed_before_the_next_candidate(self) -> None:
+        opened: list[FakeStream] = []
+
+        def raw_output_stream(**kwargs: object) -> FakeStream:
+            stream = FakeOutputStream(kwargs["callback"], kwargs["samplerate"], kwargs["channels"])
+            opened.append(stream)
+            if kwargs["samplerate"] == 24_000:
+                raise FakePortAudioError("device busy")
+            return stream
+
+        player, _streams, sounddevice = self._player()
+        sounddevice.RawOutputStream = raw_output_stream
+        player.start()
+
+        self.assertEqual(44_100, player.sample_rate_hz)
+
+    def test_written_audio_reaches_the_device_unchanged_at_the_negotiated_rate(self) -> None:
+        player, streams, _sd = self._player()
+        player.start()
+
+        frames = player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+
+        self.assertEqual(480, frames)
+        self.assertEqual(480, player.frames_played)
+        self.assertEqual(pcm16_from_float32(self._tone(480)), bytes(streams[0].written))
+
+    def test_a_period_larger_than_the_queue_is_padded_and_counted_as_an_underrun(self) -> None:
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(100), 24_000)
+
+        produced = streams[0].pump(480, status="output underflow")
+
+        self.assertEqual(100, player.frames_played, "silence must not count as played")
+        self.assertEqual(bytes(2 * 380), produced[200:])
+        self.assertEqual(1, player.underruns)
+
+    def test_a_chunk_is_played_across_as_many_periods_as_it_takes(self) -> None:
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(1_000), 24_000)
+
+        for _ in range(2):
+            streams[0].pump(480)
+
+        self.assertEqual(960, player.frames_played)
+        self.assertEqual(40, player.pending_frames)
+
+    def test_abort_stops_audio_already_queued_and_reports_what_was_played(self) -> None:
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(4_800), 24_000)
+        streams[0].pump(480)
+
+        played = player.abort()
+
+        self.assertEqual(480, played)
+        self.assertEqual(0, player.pending_frames)
+        self.assertTrue(streams[0].aborted)
+
+    def test_nothing_queued_before_an_abort_plays_after_it(self) -> None:
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(4_800), 24_000)
+        streams[0].pump(480)
+        before = bytes(streams[0].written)
+
+        player.abort()
+        streams[0].pump(480)
+
+        self.assertEqual(bytes(2 * 480), bytes(streams[0].written)[len(before) :])
+
+    def test_a_failing_stop_still_closes_the_stream(self) -> None:
+        player, streams, _sd = self._player()
+        player.start()
+        streams[0].stop = lambda: (_ for _ in ()).throw(RuntimeError("stop failed"))
+
+        with self.assertRaises(RuntimeError):
+            player.stop()
+
+        self.assertTrue(streams[0].closed)
+        self.assertFalse(player.active)
+
+    def test_stopping_a_player_that_never_started_is_not_an_error(self) -> None:
+        player, _streams, _sd = self._player()
+
+        player.stop()
+
+        self.assertFalse(player.active)
+
+    def test_a_device_that_refuses_mono_gets_the_signal_twice(self) -> None:
+        def check_output_settings(**kwargs: object) -> None:
+            if kwargs["channels"] == 1:
+                raise FakePortAudioError("mono not supported")
+
+        player, streams, _sd = self._player(check_output_settings=check_output_settings)
+        player.start()
+        player.write(self._tone(4), 24_000)
+        streams[0].pump(4)
+
+        self.assertEqual(2, player.channels)
+        self.assertEqual(pcm16_from_float32(self._tone(4), channels=2), bytes(streams[0].written))
+
+    def test_the_configured_device_is_tried_first(self) -> None:
+        attempts: list[object] = []
+
+        def check_output_settings(**kwargs: object) -> None:
+            attempts.append(kwargs["device"])
+
+        streams: list[FakeOutputStream] = []
+        sounddevice = fake_sounddevice(
+            output_streams=streams, check_output_settings=check_output_settings
+        )
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            tts_output_device="Built-in Audio",
+        )
+        with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            player = SoundDevicePlayer(config)
+            player.start()
+
+        self.assertEqual("Built-in Audio", attempts[0])
+        self.assertIsNone(player.device_detail)
+
+    def test_a_configured_device_that_cannot_be_opened_names_what_was_used_instead(self) -> None:
+        def check_output_settings(**kwargs: object) -> None:
+            if kwargs["device"] == "Missing Headset":
+                raise FakePortAudioError("no such device")
+
+        streams: list[FakeOutputStream] = []
+        sounddevice = fake_sounddevice(
+            output_streams=streams, check_output_settings=check_output_settings
+        )
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            tts_output_device="Missing Headset",
+        )
+        with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            player = SoundDevicePlayer(config)
+            player.start()
+
+        self.assertIsNotNone(player.device_detail)
+        self.assertIn("Missing Headset", player.device_detail)
+        self.assertIn("instead", player.device_detail)
+
+    def test_the_callback_takes_no_lock(self) -> None:
+        """Pins the discipline the capture path already keeps.
+
+        A callback that waits on the producer's lock stutters whenever a
+        sentence is queued, and a stress test would pass by luck.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(480), 24_000)
+
+        acquisitions: list[str] = []
+        real_lock = player._write_lock
+
+        class TrackingLock:
+            def __enter__(self) -> object:
+                acquisitions.append("acquired")
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc: object) -> object:
+                return real_lock.__exit__(*exc)
+
+        player._write_lock = TrackingLock()
+        streams[0].pump(480)
+        self.assertEqual([], acquisitions, "the playback callback must take no lock")
+
+        player._write_lock = real_lock
+
+
+class SampleConversionTests(unittest.TestCase):
+    def test_float32_becomes_little_endian_int16(self) -> None:
+        self.assertEqual(b"\x00\x00\xff\x7f\x01\x80", pcm16_from_float32([0.0, 1.0, -1.0]))
+
+    def test_samples_past_full_scale_are_clipped_not_scaled(self) -> None:
+        self.assertEqual(b"\xff\x7f\x01\x80", pcm16_from_float32([4.0, -4.0]))
+
+    def test_a_stereo_device_gets_each_sample_twice(self) -> None:
+        self.assertEqual(
+            pcm16_from_float32([0.5, 0.5, -0.5, -0.5]),
+            pcm16_from_float32([0.5, -0.5], channels=2),
+        )
+
+    def test_a_matching_rate_is_not_resampled(self) -> None:
+        samples = [0.1, 0.2, 0.3]
+        self.assertEqual(samples, list(resample_float32(samples, 24_000, 24_000)))
+
+    def test_resampling_up_keeps_the_duration(self) -> None:
+        resampled = resample_float32([0.0] * 24_000, 24_000, 48_000)
+        self.assertEqual(48_000, len(resampled))
+
+    def test_resampling_down_keeps_the_duration(self) -> None:
+        resampled = resample_float32([0.0] * 48_000, 48_000, 24_000)
+        self.assertEqual(24_000, len(resampled))
+
+    def test_resampling_a_non_integer_ratio_is_accepted(self) -> None:
+        """Unlike the decimator, which refuses one: this feeds a loudspeaker."""
+        resampled = resample_float32([0.0] * 24_000, 24_000, 44_100)
+        self.assertEqual(44_100, len(resampled))
+
+    def test_an_empty_chunk_resamples_to_nothing(self) -> None:
+        self.assertEqual(0, len(resample_float32([], 24_000, 48_000)))
