@@ -74,8 +74,16 @@ text_size_px = 13       # Live transcript panel text size, 8-48
 #
 # Needs the synthesis extra and espeak-ng from your distribution:
 #
-#     uv sync --extra tts        # add --extra cuda to run it on the GPU
+#     uv sync --extra tts
 #     sudo dnf install espeak-ng
+#
+# That runs synthesis on the CPU, at roughly five times real time. The GPU build
+# of ONNX Runtime replaces the CPU one rather than joining it, because both
+# install into the same package namespace:
+#
+#     uv sync --extra cuda
+#     uv pip uninstall onnxruntime
+#     uv pip install "onnxruntime-gpu==1.24.4"
 #
 # `murmly doctor` reports what is missing under `speech_output`.
 enabled = false

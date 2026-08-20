@@ -89,7 +89,7 @@ description: Track implementation and validation of local synthesis, the speech 
 - [ ] 10.3 Guard the speech probe individually with `except Exception  # noqa: BLE001 - diagnostics must not raise` and report its failure in a dedicated detail field, following the existing probes
 - [ ] 10.4 Report both hotkeys with their purposes and whether each is held by Murmly
 - [ ] 10.5 Document speech output, the two hotkeys, and the session protocol in `README.md`
-- [ ] 10.6 Move `docs/agent-notes/onnxruntime-gpu-cuda-version.md` and `docs/agent-notes/espeakng-loader-data-path.md` into the tree with this change; both are currently untracked
+- [x] 10.6 Move `docs/agent-notes/onnxruntime-gpu-cuda-version.md` and `docs/agent-notes/espeakng-loader-data-path.md` into the tree with this change; both are currently untracked
 
 ## 11. Validation
 

@@ -285,6 +285,18 @@ class RuntimeResolutionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             return make_config(temp_dir, device=device)
 
+    @staticmethod
+    def _gpu_build():
+        """Stand in for a runtime build that carries the CUDA provider.
+
+        The suite has to pass on either build, so which one is installed must
+        not decide what these assert.
+        """
+        return patch(
+            "onnxruntime.get_available_providers",
+            return_value=["TensorrtExecutionProvider", CUDA_PROVIDER, CPU_PROVIDER],
+        )
+
     def test_cpu_is_honoured_without_probing_cuda(self) -> None:
         with patch("murmly.tts.load_cuda_libraries") as loader:
             self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("cpu")))
@@ -292,30 +304,51 @@ class RuntimeResolutionTests(unittest.TestCase):
         loader.assert_not_called()
 
     def test_cuda_is_preferred_when_its_libraries_are_present(self) -> None:
-        with patch("murmly.tts.load_cuda_libraries", return_value=True):
+        with self._gpu_build(), patch("murmly.tts.load_cuda_libraries", return_value=True):
             providers = resolve_providers(self._config("auto"))
 
         self.assertEqual([CUDA_PROVIDER, CPU_PROVIDER], providers)
 
     def test_tensorrt_is_never_requested(self) -> None:
-        with patch("murmly.tts.load_cuda_libraries", return_value=True):
+        """It heads the runtime's own list and fails on a missing libnvinfer."""
+        with self._gpu_build(), patch("murmly.tts.load_cuda_libraries", return_value=True):
             providers = resolve_providers(self._config("auto"))
 
         self.assertNotIn("TensorrtExecutionProvider", providers)
 
     def test_auto_falls_back_to_the_cpu_when_the_libraries_are_absent(self) -> None:
-        with patch("murmly.tts.load_cuda_libraries", return_value=False):
+        with self._gpu_build(), patch("murmly.tts.load_cuda_libraries", return_value=False):
             self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
 
     def test_cuda_requested_explicitly_and_unavailable_names_the_remedy(self) -> None:
-        with patch("murmly.tts.load_cuda_libraries", return_value=False):
+        with (
+            patch("murmly.tts.load_cuda_libraries", return_value=False),
+            patch("onnxruntime.get_available_providers", return_value=[CUDA_PROVIDER]),
+        ):
             with self.assertRaises(RuntimeError) as raised:
                 resolve_providers(self._config("cuda"))
 
         self.assertIn("--extra cuda", str(raised.exception))
 
+    def test_a_cpu_only_runtime_build_is_named_as_the_swap_it_needs(self) -> None:
+        """The CPU and GPU builds share one package namespace.
+
+        An environment holding both leaves the survivor of any later uninstall
+        broken, so the remedy has to say replace, not add.
+        """
+        with patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_providers(self._config("cuda"))
+
+        self.assertIn("onnxruntime-gpu==1.24.4", str(raised.exception))
+        self.assertIn("uninstall onnxruntime", str(raised.exception))
+
+    def test_a_cpu_only_runtime_build_falls_back_rather_than_raising_on_auto(self) -> None:
+        with patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]):
+            self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
+
     def test_a_library_that_will_not_load_falls_back_rather_than_raising(self) -> None:
-        with patch(
+        with self._gpu_build(), patch(
             "murmly.tts.load_cuda_libraries",
             side_effect=RuntimeError("Refusing writable CUDA runtime library"),
         ):

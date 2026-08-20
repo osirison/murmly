@@ -44,15 +44,6 @@ ONNX_CUDA_LIBRARIES = CTRANSLATE2_CUDA_LIBRARIES + (
 CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
 
-# A swap rather than an addition: onnxruntime-gpu installs into the same package
-# namespace as the CPU build faster-whisper and kokoro-onnx depend on, and an
-# environment holding both leaves the survivor of any later uninstall broken.
-GPU_RUNTIME_REMEDY = (
-    "Speech output on CUDA needs the GPU build of ONNX Runtime, which replaces "
-    "the CPU one rather than joining it. Run `uv pip uninstall onnxruntime` "
-    "then `uv pip install \"onnxruntime-gpu==1.24.4\"`."
-)
-
 # Anything below this counts as silence when the pause between sentences is
 # measured, and a run shorter than the floor is not a pause at all.
 SILENCE_FLOOR = 0.005
@@ -152,17 +143,6 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
     """
     if config.device == "cpu":
         return [CPU_PROVIDER]
-
-    # Whether this runtime build carries the provider at all, which is what the
-    # module-level list is for. What it must never be used for is proof that a
-    # session ran on it -- that comes off the session.
-    import onnxruntime
-
-    if CUDA_PROVIDER not in onnxruntime.get_available_providers():
-        if config.device == "cuda":
-            raise RuntimeError(GPU_RUNTIME_REMEDY)
-        return [CPU_PROVIDER]
-
     try:
         cuda_ready = load_cuda_libraries(ONNX_CUDA_LIBRARIES)
     except RuntimeError as error:
@@ -171,8 +151,8 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
     if not cuda_ready:
         if config.device == "cuda":
             raise RuntimeError(
-                "Speech output on CUDA needs the Murmly CUDA extra. Run "
-                "`uv sync --extra cuda`."
+                "Speech output on CUDA requires the Murmly CUDA extra. Run "
+                "`uv sync --extra cuda --extra tts`."
             )
         return [CPU_PROVIDER]
     return [CUDA_PROVIDER, CPU_PROVIDER]
@@ -346,11 +326,6 @@ class KokoroSynthesizer:
 
         try:
             resolve_espeak()
-            # Checked here rather than at the first speak: a configuration that
-            # names a runtime it cannot have must refuse sessions with a reason,
-            # not accept one and fail once someone is listening. Costs only
-            # distribution metadata and a dlopen.
-            resolve_providers(self._config)
         except RuntimeError as error:
             return str(error)
         return None

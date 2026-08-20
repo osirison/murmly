@@ -26,14 +26,24 @@ cuda = [
     "nvidia-curand-cu12>=10,<11",
     "nvidia-nvjitlink-cu12>=12,<13",
 ]
-# Speech output. Also needs espeak-ng from the distribution, and the model files
-# in $XDG_DATA_HOME/murmly; `murmly doctor` names whichever is missing.
+# Speech output on the CPU. Also needs espeak-ng from the distribution, and the
+# model files in $XDG_DATA_HOME/murmly; `murmly doctor` names whichever is
+# missing.
+#
+# onnxruntime-gpu is deliberately not listed. It installs into the same
+# `onnxruntime` package namespace as the CPU build that faster-whisper and
+# kokoro-onnx both depend on, so listing it here would resolve both
+# distributions into one environment and leave the survivor of any later
+# uninstall broken. Running synthesis on the GPU is a swap, not an addition:
+#
+#     uv pip uninstall onnxruntime
+#     uv pip install "onnxruntime-gpu==1.24.4"
+#
+# The version is pinned by docs/agent-notes/onnxruntime-gpu-cuda-version.md:
+# 1.25+ moved to CUDA 13, whose wheels are not on PyPI yet, while the `cuda`
+# extra above pins the CUDA 12 line for CTranslate2.
 tts = [
     "kokoro-onnx>=0.6.1",
-    # Pinned so ONNX Runtime and CTranslate2 share one CUDA stack: 1.25+ moved to
-    # CUDA 13, whose wheels are not on PyPI yet. See
-    # docs/agent-notes/onnxruntime-gpu-cuda-version.md.
-    "onnxruntime-gpu==1.24.4",
 ]
 
 [project.scripts]
