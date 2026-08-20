@@ -98,3 +98,71 @@ def expected_pcm16(text: str) -> bytes:
 def to_pcm16(samples: np.ndarray) -> bytes:
     scaled = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0) * 32_767.0
     return np.round(scaled).astype("<i2").tobytes()
+
+
+class FakeSession:
+    """The ONNX session stand-in, whose provider list is what gets read back."""
+
+    def __init__(self, providers: tuple[str, ...] = ("CPUExecutionProvider",)) -> None:
+        self._providers = list(providers)
+
+    def get_providers(self) -> list[str]:
+        return list(self._providers)
+
+
+class FakeKokoroModel:
+    """A synthesis model with the behaviour the real one was measured to have.
+
+    One sentence in gives leading silence, speech and trailing silence. A whole
+    passage in gives the same, with `boundary_pause` of silence between one
+    sentence's speech and the next -- which is the silence that independent
+    production drops and that the synthesizer has to put back.
+    """
+
+    def __init__(
+        self,
+        *,
+        boundary_pause: float = 0.30,
+        lead: float = 0.0,
+        tail: float = 0.10,
+        sample_rate_hz: int = FAKE_SAMPLE_RATE_HZ,
+        voices: tuple[str, ...] = ("af_heart", "bf_emma"),
+        providers: tuple[str, ...] = ("CPUExecutionProvider",),
+        error: Exception | None = None,
+    ) -> None:
+        self.boundary_pause = boundary_pause
+        self.lead = lead
+        self.tail = tail
+        self.sample_rate_hz = sample_rate_hz
+        self.voices = voices
+        self.sess = FakeSession(providers)
+        self.calls: list[tuple[str, str, float]] = []
+        self._error = error
+
+    def create(self, text, voice="af_heart", speed=1.0, lang="en-us"):
+        from murmly.tts import split_sentences
+
+        self.calls.append((text, voice, speed))
+        if self._error is not None:
+            raise self._error
+        if voice not in self.voices:
+            raise ValueError(f"Voice {voice} not found in available voices")
+
+        parts: list[np.ndarray] = []
+        for index, sentence in enumerate(split_sentences(text)):
+            if index:
+                # What the whole-passage rendering puts between two sentences,
+                # less the silence the two chunks carry at their own edges.
+                parts.append(self._silence(self.boundary_pause - self.tail - self.lead))
+            parts.append(self._silence(self.lead))
+            parts.append(np.full(self._speech_samples(sentence, speed), 0.5, dtype=np.float32))
+            parts.append(self._silence(self.tail))
+        if not parts:
+            return np.zeros(0, dtype=np.float32), self.sample_rate_hz
+        return np.concatenate(parts), self.sample_rate_hz
+
+    def _speech_samples(self, sentence: str, speed: float) -> int:
+        return max(int(len(sentence) * SAMPLES_PER_CHARACTER / speed), 1)
+
+    def _silence(self, seconds: float) -> np.ndarray:
+        return np.zeros(max(int(seconds * self.sample_rate_hz), 0), dtype=np.float32)

@@ -385,7 +385,7 @@ class ExampleConfigTests(unittest.TestCase):
         source = Path(murmly.config.__file__).read_text()
         read_keys = set(
             re.findall(
-                r"\b(daemon|audio|stt|clipboard|overlay)\.get\(\s*\"(\w+)\"",
+                r"\b(daemon|audio|stt|clipboard|overlay|tts)\.get\(\s*\"(\w+)\"",
                 source,
             )
         )

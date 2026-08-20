@@ -18,15 +18,15 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 3. Synthesis and configuration
 
-- [ ] 3.1 Add `src/murmly/tts.py` with a synthesizer that yields `(audio_chunk, sample_rate)` per unit rather than one buffer, so a chunked one-pass model and a natively streaming model stay interchangeable
-- [ ] 3.2 Split input text into units no larger than a sentence, and reinsert the inter-sentence silence that independent production drops; derive the duration rather than hardcoding the measured 0.28 s, and pin it with a test asserting the chunked total matches the whole-passage total within a small tolerance
-- [ ] 3.3 Resolve the synthesis runtime independently of `resolve_runtime` (`stt.py:169`), which validates against CTranslate2 compute types (`config.py:58`)
-- [ ] 3.4 Report availability as an `available` flag plus `unavailable_reason` logged once, following `silence.py:56-62`, rather than raising
-- [ ] 3.5 Import the synthesis package lazily inside the function that needs it and convert `ModuleNotFoundError` into a `RuntimeError` naming the package and the remedy, following `audio.py:83-88`
-- [ ] 3.6 Register a `[tts]` table in `load_config` (`config.py:137-141`); a table absent from that list is silently ignored (`config.py:225`)
-- [ ] 3.7 Add voice, rate, output device, and enabled keys to `MurmlyConfig`, validated through `_bounded_int` / `_boolean` (`config.py:232-241`) so an out-of-range or unrecognized value falls back to a named default
-- [ ] 3.8 Add an annotated `[tts]` section to `config.example.toml`, stating the default for every key
-- [ ] 3.9 Add tests for an unrecognized voice, an out-of-range rate, and an absent runtime, asserting each falls back or reports rather than refusing to start
+- [x] 3.1 Add `src/murmly/tts.py` with a synthesizer that yields `(audio_chunk, sample_rate)` per unit rather than one buffer, so a chunked one-pass model and a natively streaming model stay interchangeable
+- [x] 3.2 Split input text into units no larger than a sentence, and reinsert the inter-sentence silence that independent production drops; derive the duration rather than hardcoding the measured 0.28 s, and pin it with a test asserting the chunked total matches the whole-passage total within a small tolerance
+- [x] 3.3 Resolve the synthesis runtime independently of `resolve_runtime` (`stt.py:169`), which validates against CTranslate2 compute types (`config.py:58`)
+- [x] 3.4 Report availability as an `available` flag plus `unavailable_reason` logged once, following `silence.py:56-62`, rather than raising
+- [x] 3.5 Import the synthesis package lazily inside the function that needs it and convert `ModuleNotFoundError` into a `RuntimeError` naming the package and the remedy, following `audio.py:83-88`
+- [x] 3.6 Register a `[tts]` table in `load_config` (`config.py:137-141`); a table absent from that list is silently ignored (`config.py:225`)
+- [x] 3.7 Add voice, rate, output device, and enabled keys to `MurmlyConfig`, validated through `_bounded_int` / `_boolean` (`config.py:232-241`) so an out-of-range or unrecognized value falls back to a named default
+- [x] 3.8 Add an annotated `[tts]` section to `config.example.toml`, stating the default for every key
+- [x] 3.9 Add tests for an unrecognized voice, an out-of-range rate, and an absent runtime, asserting each falls back or reports rather than refusing to start
 
 ## 4. Audio output path
 

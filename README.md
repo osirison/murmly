@@ -228,6 +228,13 @@ enabled = true
 bottom_margin_px = 32 # Logical pixels from the display's bottom edge, 0-512
 reduced_motion = false
 text_size_px = 13 # Transcript panel text size, 8-48
+
+[tts]
+enabled = false        # Speech output; see "Speech output" below
+voice = "af_heart"     # An English voice the model carries
+rate = 100             # Percentage of the model's own speaking rate, 50-200
+output_device = ""     # Empty lets the system choose
+# model_dir = "~/.local/share/murmly"   # Where the model and voices are
 ```
 
 ### The command socket

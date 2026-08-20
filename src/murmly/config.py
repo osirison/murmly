@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 import tomllib
@@ -67,6 +67,48 @@ VALID_COMPUTE_TYPES = {
     "int16",
 }
 
+# The English voices the synthesis model carries. The rest of its voices speak
+# other languages, and transcription is fixed to English (`stt.py`
+# `language="en"`), so offering them would let speech and transcription disagree
+# about what language a conversation is in.
+VALID_TTS_VOICES = {
+    "af_alloy",
+    "af_aoede",
+    "af_bella",
+    "af_heart",
+    "af_jessica",
+    "af_kore",
+    "af_nicole",
+    "af_nova",
+    "af_river",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_eric",
+    "am_fenrir",
+    "am_liam",
+    "am_michael",
+    "am_onyx",
+    "am_puck",
+    "am_santa",
+    "bf_alice",
+    "bf_emma",
+    "bf_isabella",
+    "bf_lily",
+    "bm_daniel",
+    "bm_fable",
+    "bm_george",
+    "bm_lewis",
+}
+DEFAULT_TTS_VOICE = "af_heart"
+
+# A percentage of the model's own speaking rate, so 100 is unmodified. Bounded
+# rather than free: the model distorts badly outside roughly half to double.
+DEFAULT_TTS_RATE_PERCENT = 100
+MIN_TTS_RATE_PERCENT = 50
+MAX_TTS_RATE_PERCENT = 200
+
 
 def default_runtime_dir(env: dict[str, str] | None = None) -> Path:
     environment = env or os.environ
@@ -78,6 +120,15 @@ def default_runtime_dir(env: dict[str, str] | None = None) -> Path:
 
 def default_socket_path(env: dict[str, str] | None = None) -> Path:
     return default_runtime_dir(env) / "murmly.sock"
+
+
+def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
+    """Where the synthesis model and its voices are looked for by default."""
+    environment = env or os.environ
+    xdg_data_home = environment.get("XDG_DATA_HOME")
+    if xdg_data_home:
+        return Path(xdg_data_home) / "murmly"
+    return Path.home() / ".local" / "share" / "murmly"
 
 
 def default_config_path(env: dict[str, str] | None = None) -> Path:
@@ -114,6 +165,12 @@ class MurmlyConfig:
     overlay_bottom_margin_px: int = 32
     overlay_reduced_motion: bool = False
     overlay_text_size_px: int = DEFAULT_OVERLAY_TEXT_SIZE_PX
+    tts_enabled: bool = False
+    tts_voice: str = DEFAULT_TTS_VOICE
+    tts_voice_rejected_value: str | None = None
+    tts_rate_percent: int = DEFAULT_TTS_RATE_PERCENT
+    tts_output_device: str = ""
+    tts_model_dir: Path = field(default_factory=default_tts_model_dir)
 
     @property
     def model_name(self) -> str:
@@ -139,6 +196,7 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
     stt = _get_table(data, "stt")
     clipboard = _get_table(data, "clipboard")
     overlay = _get_table(data, "overlay")
+    tts = _get_table(data, "tts")
 
     socket_path = Path(str(daemon.get("socket_path", default_socket_path(env))))
     model_profile = str(stt.get("model_profile", "balanced"))
@@ -158,6 +216,16 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
     if auto_transcribe not in VALID_AUTO_TRANSCRIBE_MODES:
         auto_transcribe_rejected_value = auto_transcribe
         auto_transcribe = DEFAULT_AUTO_TRANSCRIBE_MODE
+
+    tts_voice = str(tts.get("voice", DEFAULT_TTS_VOICE))
+    tts_voice_rejected_value: str | None = None
+    if tts_voice not in VALID_TTS_VOICES:
+        tts_voice_rejected_value = tts_voice
+        tts_voice = DEFAULT_TTS_VOICE
+    model_dir = tts.get("model_dir")
+    tts_model_dir = (
+        Path(str(model_dir)).expanduser() if model_dir else default_tts_model_dir(env)
+    )
 
     return MurmlyConfig(
         socket_path=socket_path,
@@ -219,6 +287,17 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
             minimum=MIN_OVERLAY_TEXT_SIZE_PX,
             maximum=MAX_OVERLAY_TEXT_SIZE_PX,
         ),
+        tts_enabled=_boolean(tts.get("enabled"), False),
+        tts_voice=tts_voice,
+        tts_voice_rejected_value=tts_voice_rejected_value,
+        tts_rate_percent=_bounded_int(
+            tts.get("rate"),
+            DEFAULT_TTS_RATE_PERCENT,
+            minimum=MIN_TTS_RATE_PERCENT,
+            maximum=MAX_TTS_RATE_PERCENT,
+        ),
+        tts_output_device=str(tts.get("output_device", "")),
+        tts_model_dir=tts_model_dir,
     )
 
 

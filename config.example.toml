@@ -66,3 +66,32 @@ enabled = true
 bottom_margin_px = 32   # Logical pixels from the display's bottom edge, 0-512
 reduced_motion = false  # Stepped level feedback instead of continuous animation
 text_size_px = 13       # Live transcript panel text size, 8-48
+
+[tts]
+# Speech output. Off by default: a machine that starts talking after an upgrade
+# is producing sound its owner did not ask for. An agent opens a speech session
+# on the command socket and sends text; nothing here starts playback on its own.
+#
+# Needs the synthesis extra and espeak-ng from your distribution:
+#
+#     uv sync --extra tts        # add --extra cuda to run it on the GPU
+#     sudo dnf install espeak-ng
+#
+# `murmly doctor` reports what is missing under `speech_output`.
+enabled = false
+
+# One of the model's English voices, such as af_heart, af_bella, bf_emma or
+# am_michael. An unrecognized name falls back to af_heart and doctor reports
+# both the configured value and the one in use.
+voice = "af_heart"
+
+# Speaking rate as a percentage of the model's own, 50-200. 100 is unmodified.
+rate = 100
+
+# Output device name or index, as `python -m sounddevice` prints it. Empty means
+# let the system choose, which is what the capture side does too.
+output_device = ""
+
+# Where kokoro-v1.0.onnx and voices-v1.0.bin are. Defaults to
+# $XDG_DATA_HOME/murmly, which is ~/.local/share/murmly.
+# model_dir = "~/.local/share/murmly"
