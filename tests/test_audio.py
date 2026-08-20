@@ -22,7 +22,9 @@ class FakeStream:
     def __init__(self, sample_rate_hz: float = 48_000) -> None:
         self.started = False
         self.closed = False
+        self.aborted = False
         self.samplerate = sample_rate_hz
+        self.written = bytearray()
 
     def start(self) -> None:
         self.started = True
@@ -30,13 +32,98 @@ class FakeStream:
     def stop(self) -> None:
         pass
 
+    def abort(self) -> None:
+        self.aborted = True
+
     def close(self) -> None:
         self.closed = True
+
+    def write(self, data: bytes) -> None:
+        """Record audio that reached the device.
+
+        The output stream is callback driven, so nothing calls this on the real
+        object. It is what `pump` hands the bytes the callback produced, which is
+        how a test asserts playback without hardware.
+        """
+        self.written.extend(bytes(data))
+
+
+class FakeOutputStream(FakeStream):
+    """A `sd.RawOutputStream` stand-in whose periods the test drives itself.
+
+    PortAudio would call the callback from its own thread. Driving it from the
+    test instead makes underrun, abort mid-buffer and exact frame counts
+    reproducible rather than timing dependent.
+    """
+
+    def __init__(
+        self,
+        callback,
+        sample_rate_hz: float = 48_000,
+        channels: int = 1,
+        sample_width: int = 2,
+    ) -> None:
+        super().__init__(sample_rate_hz)
+        self.callback = callback
+        self.channels = channels
+        self.frame_bytes = channels * sample_width
+
+    def pump(self, frames: int, status: object = None) -> bytes:
+        """Run one callback period and record what it produced."""
+        block = bytearray(frames * self.frame_bytes)
+        buffer = memoryview(block)
+        self.callback(buffer, frames, object(), status)
+        produced = bytes(block)
+        self.write(produced)
+        return produced
 
 
 class FailingStopStream(FakeStream):
     def stop(self) -> None:
         raise RuntimeError("stop failed")
+
+
+def fake_sounddevice(
+    *,
+    output_streams: list[FakeOutputStream] | None = None,
+    input_streams: list[FakeStream] | None = None,
+    check_output_settings=None,
+    check_input_settings=None,
+    query_devices=None,
+) -> ModuleType:
+    """A fake sounddevice module carrying the output surface beside the input one.
+
+    The input fakes the rest of this suite builds inline are unchanged and keep
+    building them; this exists for the tests that need playback, and for the
+    barge-in tests that need both directions in one module.
+    """
+    module = ModuleType("sounddevice")
+    module.PortAudioError = FakePortAudioError
+    module.query_devices = query_devices or AudioTests._fake_query_devices
+    module.check_input_settings = check_input_settings or (lambda **_kwargs: None)
+    module.check_output_settings = check_output_settings or (lambda **_kwargs: None)
+
+    def raw_input_stream(**kwargs: object) -> FakeStream:
+        stream = FakeStream(sample_rate_hz=kwargs["samplerate"])
+        stream.kwargs = kwargs
+        if input_streams is not None:
+            input_streams.append(stream)
+        return stream
+
+    def raw_output_stream(**kwargs: object) -> FakeOutputStream:
+        stream = FakeOutputStream(
+            kwargs["callback"],
+            sample_rate_hz=kwargs["samplerate"],
+            channels=kwargs["channels"],
+        )
+        stream.kwargs = kwargs
+        if output_streams is not None:
+            output_streams.append(stream)
+        return stream
+
+    module.RawInputStream = raw_input_stream
+    module.RawOutputStream = raw_output_stream
+    return module
 
 
 class AudioTests(unittest.TestCase):
@@ -438,15 +525,17 @@ class AudioTests(unittest.TestCase):
             {
                 "name": "Built-in Audio",
                 "max_input_channels": 2,
+                "max_output_channels": 2,
                 "default_samplerate": 48_000,
             },
             {
                 "name": "default",
                 "max_input_channels": 2,
+                "max_output_channels": 2,
                 "default_samplerate": 44_100,
             },
         ]
-        if kind == "input":
+        if kind in {"input", "output"}:
             return devices[1]
         if device is None:
             return devices

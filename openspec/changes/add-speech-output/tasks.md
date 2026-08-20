@@ -11,10 +11,10 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 2. Test scaffolding for audio output
 
-- [ ] 2.1 Extend the fake sounddevice module (`tests/test_audio.py:69-78`) with `check_output_settings` and a raw output stream, leaving every existing input fake untouched
-- [ ] 2.2 Extend `FakeStream` (`tests/test_audio.py:21-35`) with a `write` that records what was written, so playback can be asserted without hardware
-- [ ] 2.3 Add a fake synthesizer returning known audio for known text, so daemon and session tests never load a model
-- [ ] 2.4 Confirm the full existing suite passes unchanged with the new fakes present
+- [x] 2.1 Extend the fake sounddevice module (`tests/test_audio.py:69-78`) with `check_output_settings` and a raw output stream, leaving every existing input fake untouched
+- [x] 2.2 Extend `FakeStream` (`tests/test_audio.py:21-35`) with a `write` that records what was written, so playback can be asserted without hardware
+- [x] 2.3 Add a fake synthesizer returning known audio for known text, so daemon and session tests never load a model
+- [x] 2.4 Confirm the full existing suite passes unchanged with the new fakes present
 
 ## 3. Synthesis and configuration
 
