@@ -137,6 +137,25 @@ are preserved* rather than as *produce sentence by sentence*. The mitigation is 
 reinsert that silence between units; with it reinserted the two are within 10 ms of
 each other in total duration and were judged indistinguishable by ear.
 
+That 0.28 s is one voice at one speed, and measuring the rest showed it must not be
+written into the code. Across four voices at three speeds the boundary gap the model
+produces ranges from 0.159 s to 0.435 s, falling as the speaking rate rises, and one
+voice (`bf_emma`) produces *longer* audio sentence by sentence than it does in one
+pass, so a fixed insertion would stretch it further. The pause is therefore derived
+per voice and speaking rate: one calibration passage is produced whole at
+synthesizer start, and the silent run the model leaves between its sentences is
+measured out of that audio. What is inserted at a boundary is that gap less the
+silence the two units already carry — `max(0, gap - trailing(previous) -
+leading(next))` — because independently produced units keep their own leading and
+trailing silence and inserting the whole gap on top would double it.
+
+Restoring the gap does not close the whole difference, and the requirement is
+written about the silence between sentences rather than about total duration for
+that reason. Producing a passage sentence by sentence also speaks it slightly
+faster, which no amount of inserted silence corrects; on a six-sentence passage
+calibration removes roughly a quarter to a half of a naive concatenation's deficit
+and the remainder is speech rate, not pause.
+
 The interface between the daemon and the synthesizer therefore yields
 `(audio_chunk, sample_rate)` rather than a whole buffer, so a one-pass model driven
 in chunks and a model that streams natively remain interchangeable.
@@ -212,10 +231,37 @@ sentences that use "session" in the old sense are reproduced unchanged.
   than a general streaming mechanism.
 - **Two ML runtimes in one process.** Transcription runs on CTranslate2 and
   synthesis on ONNX Runtime. They must share one CUDA stack; the pinning constraint
-  is recorded in `docs/agent-notes/onnxruntime-gpu-cuda-version.md`. Measured VRAM
-  for synthesis is 684 MiB against a 16 GB card, so co-residency is comfortable, but
-  it has not been measured with a transcription model loaded at the same time and
-  that measurement belongs in the first task.
+  is recorded in `docs/agent-notes/onnxruntime-gpu-cuda-version.md`. Co-residency is
+  now measured rather than assumed, in one process holding `large-v3-turbo` on
+  CTranslate2/CUDA at `float16` and `kokoro-v1.0.onnx` on `onnxruntime-gpu` 1.24.4,
+  on the target machine:
+
+  | State | Resident VRAM | Host RSS |
+  |---|---|---|
+  | Transcription model loaded, after one decode | 2290 MiB | 774 MiB |
+  | Both models resident, after one synthesis | 2822 MiB | 1566 MiB |
+
+  Synthesis adds 532 MiB of VRAM alongside a loaded transcription model, against a
+  16 GB card, so co-residency is comfortable. Load costs are 2.0–3.7 s for the
+  transcription model, 539 ms to construct the synthesis session, and 340 ms for the
+  first synthesis that follows it.
+
+  Two provider faults were found doing this, and both are silent:
+
+  - **The ONNX CUDA provider needs four cu12 libraries CTranslate2 does not.**
+    `libonnxruntime_providers_cuda.so` links `libcudart.so.12`, `libcufft.so.11`,
+    `libcurand.so.10` and `libnvJitLink.so.12` on top of the cuBLAS and cuDNN pair
+    the `cuda` extra installs today. Without them the provider fails to load, and
+    ONNX Runtime reports that as a warning and runs on the CPU. The extra therefore
+    gains those four wheels, and they are preloaded through distribution metadata by
+    the same provenance check `stt.py:_load_cuda_runtime` applies.
+  - **The TensorRT provider must not be requested.** It heads ONNX Runtime's default
+    provider list, fails on a missing `libnvinfer.so.10`, and only then falls back.
+    Synthesis asks for `CUDAExecutionProvider` by name.
+
+  Availability is confirmed by reading `session.get_providers()` back off the
+  constructed session, never `onnxruntime.get_available_providers()`, which
+  advertises CUDA on a session that is running on the CPU.
 - **A GPL-3.0 phoneme dependency enters the process.** The synthesis stack imports
   `phonemizer` and loads `espeak-ng`, both GPL-3.0, into an Apache-2.0 project. For
   a source-distributed project this is the user assembling the combination at

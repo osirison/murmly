@@ -5,9 +5,9 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 1. Measurement before commitment
 
-- [ ] 1.1 Measure resident VRAM and host RSS with a transcription model and the synthesis model loaded at the same time, and record the figures in `design.md` under Risks; the 684 MiB synthesis figure was measured alone
-- [ ] 1.2 Confirm both runtimes initialise in one process against a single CUDA stack, following `docs/agent-notes/onnxruntime-gpu-cuda-version.md`, and confirm the session actually reports the GPU provider rather than silently falling back
-- [ ] 1.3 Confirm the phoneme library resolves without hardcoding a distribution path, following `docs/agent-notes/espeakng-loader-data-path.md`, and that a failure to resolve it is reported rather than producing silent empty audio
+- [x] 1.1 Measure resident VRAM and host RSS with a transcription model and the synthesis model loaded at the same time, and record the figures in `design.md` under Risks; the 684 MiB synthesis figure was measured alone
+- [x] 1.2 Confirm both runtimes initialise in one process against a single CUDA stack, following `docs/agent-notes/onnxruntime-gpu-cuda-version.md`, and confirm the session actually reports the GPU provider rather than silently falling back
+- [x] 1.3 Confirm the phoneme library resolves without hardcoding a distribution path, following `docs/agent-notes/espeakng-loader-data-path.md`, and that a failure to resolve it is reported rather than producing silent empty audio
 
 ## 2. Test scaffolding for audio output
 
