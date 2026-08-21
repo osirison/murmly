@@ -51,6 +51,9 @@ RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 DAEMON_START_TIMEOUT_SECONDS = 10.0
 DAEMON_POLL_INTERVAL_SECONDS = 0.1
 
+#: Subcommands whose daemon-side name differs from the one argparse takes.
+DAEMON_COMMANDS = {"toggle-session": "toggle_session"}
+
 
 class DaemonUnavailableError(RuntimeError):
     """The daemon is not accepting commands and could not be brought up.
@@ -68,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("daemon", help="Run the UNIX socket daemon.")
     subparsers.add_parser("toggle", help="Toggle capture via the running daemon.")
+    subparsers.add_parser(
+        "toggle-session",
+        help="Toggle capture, delivering the transcript to the open speech session.",
+    )
     subparsers.add_parser("status", help="Query the daemon state.")
 
     install = subparsers.add_parser(
@@ -78,7 +85,17 @@ def build_parser() -> argparse.ArgumentParser:
         "hotkey",
         help="Hotkey to bind, such as Meta+X. Requires at least one modifier.",
     )
-    subparsers.add_parser("uninstall", help="Remove the session service and release the hotkey.")
+    install.add_argument(
+        "session_hotkey",
+        nargs="?",
+        default=None,
+        help=(
+            "Optional second hotkey, such as Meta+A, that dictates into the open "
+            "speech session instead of the focused window. Omitting it binds the "
+            "focused-window hotkey alone."
+        ),
+    )
+    subparsers.add_parser("uninstall", help="Remove the session service and release the hotkeys.")
 
     spike = subparsers.add_parser("spike", help="Record a short clip, transcribe it, print it, and copy it.")
     spike.add_argument("--seconds", type=float, default=5.0, help="How long to record before transcribing.")
@@ -117,10 +134,12 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
 
     if args.command == "daemon":
         return _run_daemon(config)
-    if args.command in {"toggle", "status"}:
-        return _run_client_command(config, args.command)
+    if args.command in {"toggle", "status", "toggle-session"}:
+        # The daemon's command vocabulary is not the CLI's: argparse spells a
+        # subcommand with a hyphen and the wire protocol does not.
+        return _run_client_command(config, DAEMON_COMMANDS.get(args.command, args.command))
     if args.command == "install":
-        return _run_install(args.hotkey)
+        return _run_install(args.hotkey, args.session_hotkey)
     if args.command == "uninstall":
         return _run_uninstall()
     if args.command == "spike":
@@ -218,19 +237,23 @@ def _wait_for_socket(
         sleep(DAEMON_POLL_INTERVAL_SECONDS)
 
 
-def _run_install(hotkey_text: str) -> int:
+def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> int:
     try:
         hotkey = parse_hotkey(hotkey_text)
+        session_hotkey = parse_hotkey(session_hotkey_text) if session_hotkey_text else None
     except HotkeyError as error:
         print(str(error), file=sys.stderr)
         return 2
 
     try:
-        outcome = Installer().install(hotkey)
+        outcome = Installer().install(hotkey, session_hotkey)
     except HotkeyNotConfirmedError as error:
         print(str(error), file=sys.stderr)
+        unconfirmed = ", ".join(
+            key.portable for key in (hotkey, session_hotkey) if key is not None
+        )
         print(
-            f"{hotkey.portable} is not active in this session. The binding is saved and will "
+            f"{unconfirmed} is not active in this session. The binding is saved and will "
             "take effect at your next login.",
             file=sys.stderr,
         )

@@ -77,10 +77,10 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 9. Second hotkey and installer
 
-- [ ] 9.1 Extend the launcher and shortcut writing (`installer.py:176`) to bind two hotkeys, each verified independently
-- [ ] 9.2 Add a second hotkey argument to `murmly install` (`cli.py:75-79`), and refuse an installation requesting the same key for both, naming the collision
-- [ ] 9.3 Release every bound hotkey on uninstall, succeeding when only one is present
-- [ ] 9.4 Add tests for both bound, one colliding with another application, the same key requested twice, and partial uninstall
+- [x] 9.1 Extend the launcher and shortcut writing (`installer.py:176`) to bind two hotkeys, each verified independently
+- [x] 9.2 Add a second hotkey argument to `murmly install` (`cli.py:75-79`), and refuse an installation requesting the same key for both, naming the collision
+- [x] 9.3 Release every bound hotkey on uninstall, succeeding when only one is present
+- [x] 9.4 Add tests for both bound, one colliding with another application, the same key requested twice, and partial uninstall
 
 ## 10. Diagnostics and documentation
 

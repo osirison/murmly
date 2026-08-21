@@ -1107,3 +1107,132 @@ class DoctorCompletenessTests(unittest.TestCase):
 
         self.assertFalse(report["verification_supported"])
         self.assertIn("the display went away", report["detail"])
+
+
+class SecondHotkeyCommandTests(unittest.TestCase):
+    """The CLI surface the second hotkey needs."""
+
+    @staticmethod
+    def _outcome_type():
+        from murmly.installer import InstallOutcome
+
+        return InstallOutcome
+
+    def test_install_accepts_a_second_hotkey_and_passes_it_on(self) -> None:
+        from murmly.cli import _run_install
+
+        captured: list[tuple[str, str | None]] = []
+
+        outcome_type = self._outcome_type()
+
+        class FakeInstaller:
+            def install(self, hotkey, session_hotkey=None):
+                captured.append(
+                    (hotkey.portable, session_hotkey.portable if session_hotkey else None)
+                )
+                return outcome_type(
+                    entrypoint=Path("/bin/murmly"),
+                    hotkey=hotkey,
+                    service_installed=True,
+                    hotkey_registered=True,
+                    already_bound=False,
+                    session_supported=True,
+                    session_verified=True,
+                    user_override=None,
+                    messages=("Registered both.",),
+                    session_hotkey=session_hotkey,
+                    session_hotkey_registered=session_hotkey is not None,
+                )
+
+        with patch("murmly.cli.Installer", FakeInstaller), redirect_stdout(StringIO()):
+            self.assertEqual(0, _run_install("Meta+X", "Meta+A"))
+
+        self.assertEqual([("Meta+X", "Meta+A")], captured)
+
+    def test_install_without_a_second_hotkey_passes_none(self) -> None:
+        from murmly.cli import _run_install
+
+        captured: list[tuple[str, str | None]] = []
+
+        outcome_type = self._outcome_type()
+
+        class FakeInstaller:
+            def install(self, hotkey, session_hotkey=None):
+                captured.append(
+                    (hotkey.portable, session_hotkey.portable if session_hotkey else None)
+                )
+                return outcome_type(
+                    entrypoint=Path("/bin/murmly"),
+                    hotkey=hotkey,
+                    service_installed=True,
+                    hotkey_registered=True,
+                    already_bound=False,
+                    session_supported=True,
+                    session_verified=True,
+                    user_override=None,
+                    messages=(),
+                )
+
+        with patch("murmly.cli.Installer", FakeInstaller), redirect_stdout(StringIO()):
+            self.assertEqual(0, _run_install("Meta+X"))
+
+        self.assertEqual([("Meta+X", None)], captured)
+
+    def test_an_unreadable_second_hotkey_is_refused_before_anything_is_installed(self) -> None:
+        from murmly.cli import _run_install
+
+        class RefusingInstaller:
+            def install(self, hotkey, session_hotkey=None):
+                raise AssertionError("install must not run on an unreadable hotkey")
+
+        with patch("murmly.cli.Installer", RefusingInstaller), redirect_stderr(StringIO()):
+            self.assertEqual(2, _run_install("Meta+X", "notakey"))
+
+    def test_the_parser_accepts_the_session_toggle(self) -> None:
+        from murmly.cli import build_parser
+
+        arguments = build_parser().parse_args(["toggle-session"])
+
+        self.assertEqual("toggle-session", arguments.command)
+
+    def test_the_session_toggle_reaches_the_daemon_under_its_wire_name(self) -> None:
+        """argparse spells it with a hyphen; the wire protocol does not."""
+        from murmly.cli import DAEMON_COMMANDS, main
+
+        sent: list[str] = []
+
+        def fake_send(config, command):
+            sent.append(command)
+            return {"ok": True, "state": "LISTENING"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("")
+            with (
+                patch("murmly.cli.send_command_with_recovery", fake_send),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "toggle-session"])
+
+        self.assertEqual(["toggle_session"], sent)
+        self.assertEqual("toggle_session", DAEMON_COMMANDS["toggle-session"])
+
+    def test_the_existing_toggle_is_sent_unchanged(self) -> None:
+        from murmly.cli import main
+
+        sent: list[str] = []
+
+        def fake_send(config, command):
+            sent.append(command)
+            return {"ok": True, "state": "LISTENING"}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("")
+            with (
+                patch("murmly.cli.send_command_with_recovery", fake_send),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "toggle"])
+
+        self.assertEqual(["toggle"], sent)
