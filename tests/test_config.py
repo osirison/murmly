@@ -385,7 +385,7 @@ class ExampleConfigTests(unittest.TestCase):
         source = Path(murmly.config.__file__).read_text()
         read_keys = set(
             re.findall(
-                r"\b(daemon|audio|stt|clipboard|overlay)\.get\(\s*\"(\w+)\"",
+                r"\b(daemon|audio|stt|clipboard|overlay|tts)\.get\(\s*\"(\w+)\"",
                 source,
             )
         )
@@ -405,3 +405,47 @@ class ExampleConfigTests(unittest.TestCase):
             option_keys(EXAMPLE_CONFIG_PATH.read_text()),
             option_keys(block.group(1)),
         )
+
+    def test_the_speech_instructions_never_sync_the_speech_extra_away(self) -> None:
+        """`uv sync` is exact: an extra left off a line is an extra removed.
+
+        The GPU recipe once began `uv sync --extra cuda`, which uninstalls
+        kokoro-onnx, so following the speech instructions literally produced an
+        environment with no synthesizer. Nothing else in the suite reads prose,
+        and the same recipe is mirrored in three files.
+
+        Scoped to where a reader is installing speech. The transcription section
+        names `--extra cuda` alone on purpose: someone who has not enabled
+        speech should not be made to install it.
+        """
+        project_root = Path(murmly.config.__file__).parent.parent.parent
+        sections = {
+            "README.md": re.search(
+                r"^## Speech output\b(.*?)(?=^## )", README_PATH.read_text(), re.DOTALL | re.MULTILINE
+            ),
+            "config.example.toml": re.search(
+                r"^\[tts\]\n(.*)", EXAMPLE_CONFIG_PATH.read_text(), re.DOTALL | re.MULTILINE
+            ),
+            "pyproject.toml": re.search(
+                r"^tts = \[|^# Speech output(.*?)^tts = \[",
+                (project_root / "pyproject.toml").read_text(),
+                re.DOTALL | re.MULTILINE,
+            ),
+        }
+        for name, section in sections.items():
+            self.assertIsNotNone(section, f"no speech section found in {name}")
+            body = section.group(0)
+            for line in re.findall(r"^[#\s]*(uv sync [^\n]*)$", body, re.MULTILINE):
+                if "--extra cuda" in line and "--extra tts" not in line:
+                    self.fail(
+                        f"{name}: {line.strip()!r} syncs the speech extra away. "
+                        "Name --extra tts alongside --extra cuda."
+                    )
+            # And the rule itself, not only the commands that obey it. Someone
+            # adapting an example needs to know why every extra is named, or the
+            # next command they write is the destructive one.
+            self.assertIn(
+                "match exactly the extras",
+                body,
+                f"{name}: the speech section never states that `uv sync` is exact",
+            )

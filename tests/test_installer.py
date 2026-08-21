@@ -596,15 +596,35 @@ class FakeService:
 
 
 class FakeLauncher:
-    def __init__(self, declared: str | None = None, override: str | None = None, fail=None) -> None:
+    def __init__(
+        self,
+        declared: str | None = None,
+        override: str | None = None,
+        fail=None,
+        purpose=None,
+        entrypoint: str | None = None,
+        shortcuts=None,
+    ) -> None:
+        from murmly.installer import WINDOW_HOTKEY
+
+        # Optional: a test that only reads declared_hotkey does not need it, but
+        # anything exercising release-then-claim does.
+        self._shortcuts = shortcuts
         self._declared = declared
         self._override = override
         self._fail = fail
+        self.purpose = purpose or WINDOW_HOTKEY
+        # The whole Exec line, as the real launcher reports it, so a test can
+        # place a launcher whose key is current and whose command has moved.
+        self._entrypoint = entrypoint
         self.registrations: list[tuple[Path, str]] = []
         self.unregistrations = 0
 
     def declared_hotkey(self):
         return self._declared
+
+    def declared_entrypoint(self):
+        return self._entrypoint
 
     def user_override(self):
         return self._override
@@ -614,10 +634,16 @@ class FakeLauncher:
             raise self._fail
         self.registrations.append((entrypoint, hotkey.portable))
         self._declared = hotkey.portable
+        self._entrypoint = f"{entrypoint} {self.purpose.command}"
+        if self._shortcuts is not None:
+            self._shortcuts.claim(self.purpose.desktop_id, hotkey.keycode, self.purpose.name)
 
     def unregister(self) -> bool:
         self.unregistrations += 1
         existed, self._declared = self._declared is not None, None
+        self._entrypoint = None
+        if self._shortcuts is not None:
+            self._shortcuts.release(self.purpose.desktop_id)
         return existed
 
 
@@ -630,11 +656,17 @@ class FakeSession:
 
 
 class OwnerRegistry:
-    """A shortcuts stand-in driven by explicit owner and key tables."""
+    """A shortcuts stand-in driven by explicit owner and key tables.
+
+    `release` models what the desktop does when a launcher is removed: the
+    component stops existing and its claims go with it. Without that a test
+    cannot exercise anything that releases one key to claim another, because the
+    stale claim answers every later question.
+    """
 
     def __init__(self, owners=None, keys=None) -> None:
-        self._owners = owners or {}
-        self._keys = keys or {}
+        self._owners = {code: list(entries) for code, entries in (owners or {}).items()}
+        self._keys = {component: list(codes) for component, codes in (keys or {}).items()}
 
     def owners_of(self, keycode: int):
         return list(self._owners.get(keycode, []))
@@ -644,6 +676,19 @@ class OwnerRegistry:
 
     def is_available(self, keycode: int) -> bool:
         return not self._owners.get(keycode)
+
+    def release(self, component: str) -> None:
+        self._keys.pop(component, None)
+        for code, entries in list(self._owners.items()):
+            remaining = [e for e in entries if e.component_unique != component]
+            if remaining:
+                self._owners[code] = remaining
+            else:
+                self._owners.pop(code)
+
+    def claim(self, component: str, keycode: int, friendly: str = "murmly") -> None:
+        self._keys[component] = [keycode]
+        self._owners.setdefault(keycode, []).append(owner(component, friendly))
 
 
 def owner(component: str, friendly: str = "other"):
@@ -659,8 +704,9 @@ def make_installer(
     session=None,
     entrypoint="/bin/murmly",
     injection=None,
+    session_launcher=None,
 ):
-    from murmly.installer import DESKTOP_ID, Installer
+    from murmly.installer import DESKTOP_ID, SESSION_HOTKEY, Installer
 
     hotkey_code = 268435544
     # Pinned so the tests never depend on what this machine has installed.
@@ -668,6 +714,9 @@ def make_installer(
     return Installer(
         service=service or FakeService(),
         launcher=launcher or FakeLauncher(),
+        # Always a fake: a real one would reach the developer's own launcher
+        # directory and could release a binding they actually use.
+        session_launcher=session_launcher or FakeLauncher(purpose=SESSION_HOTKEY),
         shortcuts=shortcuts or OwnerRegistry(keys={DESKTOP_ID: [hotkey_code]}, owners={hotkey_code: [owner(DESKTOP_ID, "murmly")]}),
         session=session or FakeSession(),
         entrypoint_resolver=lambda: Path(entrypoint),
@@ -710,7 +759,7 @@ class IdempotenceTests(unittest.TestCase):
         from murmly.hotkey import parse_hotkey
         from murmly.installer import DESKTOP_ID
 
-        launcher = FakeLauncher(declared="Meta+X")
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/bin/murmly toggle")
         shortcuts = OwnerRegistry(
             owners={268435544: [owner(DESKTOP_ID, "murmly")]},
             keys={DESKTOP_ID: [268435544]},
@@ -723,11 +772,17 @@ class IdempotenceTests(unittest.TestCase):
         self.assertEqual([], launcher.registrations, "must not rebind an identical hotkey")
 
     def test_reinstall_repairs_a_stale_entrypoint(self) -> None:
+        """The launcher is rewritten too, not only the service unit.
+
+        Asserting the service alone passed while the launcher kept running a
+        command that no longer exists, which is the whole failure a person
+        reinstalls to repair.
+        """
         from murmly.hotkey import parse_hotkey
         from murmly.installer import DESKTOP_ID
 
         service = FakeService(installed=True, entrypoint="/old/murmly")
-        launcher = FakeLauncher(declared="Meta+X")
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/old/murmly toggle")
         shortcuts = OwnerRegistry(
             owners={268435544: [owner(DESKTOP_ID, "murmly")]},
             keys={DESKTOP_ID: [268435544]},
@@ -739,6 +794,75 @@ class IdempotenceTests(unittest.TestCase):
         installer.install(parse_hotkey("Meta+X"))
 
         self.assertEqual([Path("/new/murmly")], service.installs)
+        self.assertEqual([(Path("/new/murmly"), "Meta+X")], launcher.registrations)
+        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+
+    def test_reinstalling_one_hotkey_repairs_a_launcher_it_did_not_request(self) -> None:
+        """The session hotkey goes stale whether or not the command names it.
+
+        Reinstalling one hotkey is how a moved checkout is repaired. Repairing
+        only the requested launcher leaves the other running a path that no
+        longer exists, and nothing reports a launcher's command, so the person
+        sees a healthy installation and a hotkey that does nothing.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/old/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/old/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher,
+            session_launcher=session_launcher,
+            shortcuts=shortcuts,
+            entrypoint="/new/murmly",
+        )
+
+        installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+        self.assertEqual(
+            "/new/murmly toggle-session",
+            session_launcher.declared_entrypoint(),
+            "a hotkey the command did not name was left running a path that is gone",
+        )
+        self.assertEqual("Meta+A", session_launcher.declared_hotkey(), "its key changed")
+
+    def test_reinstalling_one_hotkey_repairs_the_other_launcher_too(self) -> None:
+        """Both launchers run the entrypoint, so both go stale when it moves."""
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/old/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/old/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher,
+            session_launcher=session_launcher,
+            shortcuts=shortcuts,
+            entrypoint="/new/murmly",
+        )
+
+        installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+        self.assertEqual("/new/murmly toggle-session", session_launcher.declared_entrypoint())
 
 
 class VerificationTests(unittest.TestCase):
@@ -758,6 +882,212 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("268435545", str(raised.exception))
         self.assertEqual(1, launcher.unregistrations)
         self.assertEqual(1, service.removes)
+
+    def test_a_first_hotkey_that_is_not_confirmed_still_writes_the_second(self) -> None:
+        """A key the desktop was slow to confirm is persisted, not abandoned.
+
+        Raising on the first left the second never written at all: not bound
+        now, and not bound at the next login either, while the message named
+        only the first. Both are attempted and both unconfirmed keys reported.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import (
+            DESKTOP_ID,
+            SESSION_DESKTOP_ID,
+            SESSION_HOTKEY,
+            HotkeyNotConfirmedError,
+        )
+
+        launcher = FakeLauncher(fail=HotkeyNotConfirmedError("slow", parse_hotkey("Meta+X")))
+        session_launcher = FakeLauncher(purpose=SESSION_HOTKEY)
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(HotkeyNotConfirmedError) as raised:
+            installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertEqual(
+            [(Path("/bin/murmly"), "Meta+A")],
+            session_launcher.registrations,
+            "the second hotkey was never written",
+        )
+        self.assertEqual(("Meta+X",), tuple(k.portable for k in raised.exception.hotkeys))
+
+    def test_the_two_murmly_hotkeys_can_be_swapped(self) -> None:
+        """Murmly's own launcher is not a foreign claimant on a key it is
+        about to release. Treating it as one refused the install with a message
+        naming Murmly as the other application, and the swap was impossible
+        without uninstalling first.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/bin/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/bin/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly speech session")],
+            },
+            keys={DESKTOP_ID: [268435521], SESSION_DESKTOP_ID: [268435544]},
+        )
+        launcher._shortcuts = shortcuts
+        session_launcher._shortcuts = shortcuts
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        # The two keys change places.
+        installer.install(parse_hotkey("Meta+A"), parse_hotkey("Meta+X"))
+
+        self.assertEqual("Meta+A", launcher.declared_hotkey())
+        self.assertEqual("Meta+X", session_launcher.declared_hotkey())
+
+    def test_taking_the_other_murmly_hotkey_says_how_to_move_it(self) -> None:
+        """Still refused -- naming one key must not silently unbind the other.
+
+        But the generic message sends the person to their desktop settings to
+        release a binding Murmly wrote and Murmly can move, and names Murmly as
+        the conflicting application, which reads as a bug rather than a choice.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY, HotkeyConflictError
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/bin/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/bin/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly speech session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(HotkeyConflictError) as raised:
+            installer.install(parse_hotkey("Meta+A"))
+
+        message = str(raised.exception)
+        self.assertIn("Murmly's own hotkey", message)
+        self.assertIn("murmly install", message)
+        self.assertNotIn("desktop shortcut settings", message)
+        self.assertEqual([], launcher.registrations, "the refusal wrote a launcher")
+
+    def test_a_key_moving_between_purposes_is_released_before_it_is_claimed(self) -> None:
+        """The desktop delivers a key to whichever component claimed it first.
+
+        Writing the new claim while the old one still holds it binds nothing, so
+        the release has to come first.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/bin/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/bin/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly speech session")],
+            },
+            keys={DESKTOP_ID: [268435521], SESSION_DESKTOP_ID: [268435544]},
+        )
+        launcher._shortcuts = shortcuts
+        session_launcher._shortcuts = shortcuts
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        installer.install(parse_hotkey("Meta+A"), parse_hotkey("Meta+X"))
+
+        self.assertGreaterEqual(
+            launcher.unregistrations, 1, "the window launcher never released Meta+X"
+        )
+        self.assertGreaterEqual(
+            session_launcher.unregistrations, 1, "the session launcher never released Meta+A"
+        )
+
+    def test_an_unconfirmed_launcher_survives_a_later_failure(self) -> None:
+        """Its binding is persisted for the next login, which is the one thing
+        it still has going for it. A rollback that removes it takes that away
+        and the error names only the other key.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import (
+            DESKTOP_ID,
+            SESSION_DESKTOP_ID,
+            SESSION_HOTKEY,
+            HotkeyNotConfirmedError,
+            InstallError,
+        )
+
+        launcher = FakeLauncher(fail=HotkeyNotConfirmedError("slow", parse_hotkey("Meta+X")))
+        session_launcher = FakeLauncher(purpose=SESSION_HOTKEY)
+        # The session key verifies as a different keycode, so the second
+        # registration fails for a reason that does roll back.
+        shortcuts = OwnerRegistry(
+            owners={268435544: [owner(DESKTOP_ID, "murmly")]},
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [999]},
+        )
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(InstallError) as raised:
+            installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertEqual(
+            0, launcher.unregistrations, "a binding kept for the next login was rolled back"
+        )
+        self.assertIn("Meta+X", str(raised.exception))
+
+    def test_a_failed_install_leaves_a_hotkey_it_never_touched_bound(self) -> None:
+        """Rollback undoes this run, not the installation.
+
+        Rebinding the window hotkey on a two-hotkey installation must not
+        release the session hotkey. It was bound and working before the command
+        was typed, this run never mentioned it, and its loss would be reported
+        nowhere -- the error names the key that failed.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_HOTKEY, InstallError
+
+        launcher = FakeLauncher()
+        session_launcher = FakeLauncher(
+            declared="Meta+A",
+            purpose=SESSION_HOTKEY,
+            entrypoint="/bin/murmly toggle-session",
+        )
+        # The desktop resolves the window launcher to a different key, so this
+        # install fails after writing it.
+        shortcuts = OwnerRegistry(keys={DESKTOP_ID: [268435545]})
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(InstallError):
+            installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual(1, launcher.unregistrations, "this run's launcher was left behind")
+        self.assertEqual(
+            0, session_launcher.unregistrations, "a hotkey this run never touched was released"
+        )
+        self.assertEqual("Meta+A", session_launcher.declared_hotkey())
 
     def test_conflict_introduced_after_the_preflight_check_fails_and_cleans_up(self) -> None:
         """The pre-flight saw a free key, but a second claimant appeared before
@@ -869,6 +1199,37 @@ class SessionScopeTests(unittest.TestCase):
         joined = " ".join(outcome.messages)
         self.assertIn("/bin/murmly toggle", joined)
         self.assertIn("KDE Plasma", joined)
+
+    def test_an_unsupported_desktop_names_the_session_command_too(self) -> None:
+        """A requested key that is silently dropped is worse than a refused one.
+
+        The install reports success, nothing mentions the second hotkey, and the
+        person has no way to tell it was never bound -- so the manual-binding
+        instructions have to cover every purpose that was asked for.
+        """
+        from murmly.hotkey import parse_hotkey
+
+        installer = make_installer(
+            session=FakeSession(supported=False, detail="Hotkey registration requires KDE Plasma."),
+        )
+
+        outcome = installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        joined = " ".join(outcome.messages)
+        self.assertIn("/bin/murmly toggle", joined)
+        self.assertIn("/bin/murmly toggle-session", joined)
+
+    def test_a_one_key_install_is_not_told_to_bind_a_second(self) -> None:
+        """Binding one hotkey is a deliberate path, not an incomplete install."""
+        from murmly.hotkey import parse_hotkey
+
+        installer = make_installer(
+            session=FakeSession(supported=False, detail="Hotkey registration requires KDE Plasma."),
+        )
+
+        outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertNotIn("toggle-session", " ".join(outcome.messages))
 
     def test_unverified_session_proceeds_and_says_so(self) -> None:
         from murmly.hotkey import parse_hotkey
@@ -1076,3 +1437,245 @@ class PasteInjectionReportTests(unittest.TestCase):
         outcome = installer.install(parse_hotkey("Meta+X"))
 
         self.assertTrue(outcome.hotkey_registered)
+
+
+class TwoHotkeyTests(unittest.TestCase):
+    """Each binding is claimed, verified, released and reported on its own."""
+
+    @staticmethod
+    def _shortcuts(window_code: int = 268435544, session_code: int = 268435521):
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID
+
+        return OwnerRegistry(
+            keys={DESKTOP_ID: [window_code], SESSION_DESKTOP_ID: [session_code]},
+            owners={
+                window_code: [owner(DESKTOP_ID, "murmly")],
+                session_code: [owner(SESSION_DESKTOP_ID, "murmly speech session")],
+            },
+        )
+
+    def test_both_hotkeys_are_bound_and_verified_independently(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import SESSION_HOTKEY
+
+        window, session = FakeLauncher(), FakeLauncher(purpose=SESSION_HOTKEY)
+        installer = make_installer(
+            launcher=window, session_launcher=session, shortcuts=self._shortcuts()
+        )
+
+        outcome = installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertEqual([(Path("/bin/murmly"), "Meta+X")], window.registrations)
+        self.assertEqual([(Path("/bin/murmly"), "Meta+A")], session.registrations)
+        self.assertTrue(outcome.hotkey_registered)
+        self.assertTrue(outcome.session_hotkey_registered)
+
+    def test_a_registered_launcher_runs_its_own_purpose_command(self) -> None:
+        """Through the real launcher, not the template it is built from.
+
+        Asserting `launcher_text` output proves the template takes a command,
+        not that each launcher passes its own -- a session launcher writing
+        `toggle` would produce a second hotkey that dictates into the focused
+        window, and that assertion would not notice.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import SESSION_HOTKEY
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = make_launcher(temp_dir, FakeShortcuts(present=True))
+            session = make_launcher(
+                temp_dir, FakeShortcuts(present=True), purpose=SESSION_HOTKEY
+            )
+
+            window.register(Path("/bin/murmly"), parse_hotkey("Meta+X"))
+            session.register(Path("/bin/murmly"), parse_hotkey("Meta+A"))
+
+            self.assertEqual("/bin/murmly toggle", window.declared_entrypoint())
+            self.assertEqual("/bin/murmly toggle-session", session.declared_entrypoint())
+            self.assertNotEqual(window.launcher_path, session.launcher_path)
+
+    def test_each_launcher_carries_its_own_command(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import SESSION_HOTKEY, WINDOW_HOTKEY, launcher_text
+
+        window = launcher_text(
+            Path("/bin/murmly"),
+            parse_hotkey("Meta+X"),
+            name=WINDOW_HOTKEY.name,
+            command=WINDOW_HOTKEY.command,
+        )
+        session = launcher_text(
+            Path("/bin/murmly"),
+            parse_hotkey("Meta+A"),
+            name=SESSION_HOTKEY.name,
+            command=SESSION_HOTKEY.command,
+        )
+
+        self.assertIn("Exec=/bin/murmly toggle\n", window)
+        self.assertIn("Exec=/bin/murmly toggle-session\n", session)
+        self.assertIn("X-KDE-Shortcuts=Meta+A", session)
+
+    def test_the_two_launchers_are_separate_desktop_entries(self) -> None:
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = make_launcher(temp_dir, OwnerRegistry())
+            session = make_launcher(temp_dir, OwnerRegistry(), purpose=SESSION_HOTKEY)
+
+            self.assertEqual(DESKTOP_ID, window.launcher_path.name)
+            self.assertEqual(SESSION_DESKTOP_ID, session.launcher_path.name)
+            self.assertNotEqual(window.launcher_path, session.launcher_path)
+
+    def test_one_hotkey_owned_by_another_application_binds_neither(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, HotkeyConflictError, SESSION_HOTKEY
+
+        window, session = FakeLauncher(), FakeLauncher(purpose=SESSION_HOTKEY)
+        shortcuts = OwnerRegistry(
+            keys={DESKTOP_ID: [268435544]},
+            owners={268435521: [owner("plasmashell", "Klipper")]},
+        )
+        installer = make_installer(
+            launcher=window, session_launcher=session, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(HotkeyConflictError) as raised:
+            installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertIn("Meta+A", str(raised.exception))
+        self.assertIn("Klipper", str(raised.exception))
+        self.assertEqual([], window.registrations, "the other hotkey was bound anyway")
+        self.assertEqual([], session.registrations)
+
+    def test_the_same_key_for_both_purposes_is_refused_naming_the_collision(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import HotkeyConflictError, SESSION_HOTKEY
+
+        window, session = FakeLauncher(), FakeLauncher(purpose=SESSION_HOTKEY)
+        installer = make_installer(
+            launcher=window, session_launcher=session, shortcuts=self._shortcuts()
+        )
+
+        with self.assertRaises(HotkeyConflictError) as raised:
+            installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+X"))
+
+        self.assertIn("Meta+X", str(raised.exception))
+        self.assertIn("both", str(raised.exception))
+        self.assertEqual([], window.registrations)
+        self.assertEqual([], session.registrations)
+
+    def test_installing_without_a_second_hotkey_binds_the_first_alone(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import SESSION_HOTKEY
+
+        window, session = FakeLauncher(), FakeLauncher(purpose=SESSION_HOTKEY)
+        installer = make_installer(
+            launcher=window, session_launcher=session, shortcuts=self._shortcuts()
+        )
+
+        outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertTrue(outcome.hotkey_registered)
+        self.assertFalse(outcome.session_hotkey_registered)
+        self.assertEqual([], session.registrations)
+
+    def test_uninstall_releases_both_bindings(self) -> None:
+        from murmly.installer import SESSION_HOTKEY
+
+        window = FakeLauncher(declared="Meta+X")
+        session = FakeLauncher(declared="Meta+A", purpose=SESSION_HOTKEY)
+        installer = make_installer(launcher=window, session_launcher=session)
+
+        outcome = installer.uninstall()
+
+        self.assertEqual(1, window.unregistrations)
+        self.assertEqual(1, session.unregistrations)
+        self.assertIn("Released the Murmly hotkey.", outcome.messages)
+
+    def test_uninstall_succeeds_when_only_one_binding_is_present(self) -> None:
+        from murmly.installer import SESSION_HOTKEY
+
+        window = FakeLauncher(declared="Meta+X")
+        session = FakeLauncher(purpose=SESSION_HOTKEY)
+        installer = make_installer(launcher=window, session_launcher=session)
+
+        outcome = installer.uninstall()
+
+        self.assertIn("Released the Murmly hotkey.", outcome.messages)
+        self.assertNotIn(
+            "Murmly was not installed; there was nothing to remove.", outcome.messages
+        )
+
+    def test_uninstall_with_nothing_bound_still_reports_nothing_to_remove(self) -> None:
+        from murmly.installer import SESSION_HOTKEY
+
+        installer = make_installer(
+            service=FakeService(installed=False),
+            launcher=FakeLauncher(),
+            session_launcher=FakeLauncher(purpose=SESSION_HOTKEY),
+        )
+
+        outcome = installer.uninstall()
+
+        self.assertIn("Murmly was not installed; there was nothing to remove.", outcome.messages)
+
+    def test_diagnostics_name_each_binding_with_its_purpose(self) -> None:
+        from murmly.installer import SESSION_HOTKEY
+
+        window = FakeLauncher(declared="Meta+X")
+        session = FakeLauncher(declared="Meta+A", purpose=SESSION_HOTKEY)
+        installer = make_installer(
+            launcher=window, session_launcher=session, shortcuts=self._shortcuts()
+        )
+
+        report = installer.status()
+
+        purposes = {entry["purpose"]: entry for entry in report["hotkeys"]}
+        self.assertEqual("Meta+X", purposes["window"]["hotkey"])
+        self.assertEqual("Meta+A", purposes["session"]["hotkey"])
+        self.assertTrue(purposes["window"]["held"])
+        self.assertTrue(purposes["session"]["held"])
+        self.assertIn("focused window", purposes["window"]["description"])
+        self.assertIn("speech session", purposes["session"]["description"])
+
+    def test_diagnostics_report_an_unbound_second_hotkey_without_calling_it_a_failure(
+        self,
+    ) -> None:
+        from murmly.installer import SESSION_HOTKEY
+
+        window = FakeLauncher(declared="Meta+X")
+        session = FakeLauncher(purpose=SESSION_HOTKEY)
+        installer = make_installer(
+            launcher=window, session_launcher=session, shortcuts=self._shortcuts()
+        )
+
+        report = installer.status()
+
+        purposes = {entry["purpose"]: entry for entry in report["hotkeys"]}
+        self.assertIsNone(purposes["session"]["hotkey"])
+        self.assertFalse(purposes["session"]["held"])
+        self.assertIn("No hotkey is bound", purposes["session"]["detail"])
+        self.assertTrue(report["hotkey_held"], "the bound hotkey was reported as a failure")
+
+    def test_a_binding_lost_to_another_application_is_reported_alone(self) -> None:
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        window = FakeLauncher(declared="Meta+X")
+        session = FakeLauncher(declared="Meta+A", purpose=SESSION_HOTKEY)
+        shortcuts = OwnerRegistry(
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner("plasmashell", "Klipper")],
+            },
+        )
+        installer = make_installer(
+            launcher=window, session_launcher=session, shortcuts=shortcuts
+        )
+
+        report = installer.status()
+
+        purposes = {entry["purpose"]: entry for entry in report["hotkeys"]}
+        self.assertTrue(purposes["window"]["held"])
+        self.assertFalse(purposes["session"]["held"])
+        self.assertEqual("Klipper", purposes["session"]["holder"])

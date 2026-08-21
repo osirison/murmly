@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -31,6 +32,14 @@ from murmly.overlay import (
     OverlayState,
 )
 from murmly.silence import SilenceDetector
+from murmly.speech import (
+    EVENT_INTERRUPTED,
+    EVENT_SHUTTING_DOWN,
+    EVENT_TRANSCRIPT,
+    Interruption,
+    SpeechEngine,
+    SpeechSuspendError,
+)
 from murmly.stt import FasterWhisperTranscriber
 
 
@@ -52,6 +61,32 @@ SILENCE_TICK_SECONDS = 0.25
 MAX_SILENCE_TICK_SECONDS = 1.0
 MAX_TICK_FAILURES = 5
 
+COMMAND_SPEECH_SESSION = "speech_session"
+COMMAND_TOGGLE = "toggle"
+COMMAND_TOGGLE_SESSION = "toggle_session"
+COMMAND_STATUS = "status"
+# A speech session's own bound. `MAX_COMMAND_BYTES` stays 4096 for every
+# existing command: a sender streaming a reply carries paragraphs, and a state
+# query does not.
+MAX_SPEECH_FRAME_BYTES = 65_536
+SESSION_POLL_SECONDS = 0.2
+SESSION_SEND_TIMEOUT_SECONDS = 2.0
+# Enough backlog that an ordinary consumer never trips it, few enough that a
+# session which has stopped reading is disconnected rather than accumulating.
+SESSION_EVENT_BACKLOG = 64
+SESSION_WRITER_JOIN_SECONDS = 1.0
+
+STATE_IDLE = "IDLE"
+STATE_LISTENING = "LISTENING"
+STATE_THINKING = "THINKING"
+# The fourth state. `OverlayState` deliberately keeps its three: speech has no
+# visual indicator in this change, and `recording-overlay` forbids one outside
+# the capture lifecycle.
+STATE_SPEAKING = "SPEAKING"
+
+DESTINATION_WINDOW = "window"
+DESTINATION_SESSION = "session"
+
 
 class CommandCode(StrEnum):
     """The closed set of failure categories an unsuccessful response reports.
@@ -68,6 +103,12 @@ class CommandCode(StrEnum):
     NOT_PERMITTED = "not_permitted"
     SHUTTING_DOWN = "shutting_down"
     COMMAND_FAILED = "command_failed"
+    SPEECH_DISABLED = "speech_disabled"
+    SPEECH_UNAVAILABLE = "speech_unavailable"
+    SPEECH_SESSION_IN_USE = "speech_session_in_use"
+    # Not a refusal: it is the category the interruption event reports itself
+    # under, because a sender branching on what happened cannot branch on prose.
+    SPEECH_INTERRUPTED = "speech_interrupted"
 
 
 class RequestError(ValueError):
@@ -376,6 +417,33 @@ class SpeechSession:
             detail="Transcript copied to the clipboard but not pasted.",
         )
 
+    def process_for_session(
+        self,
+        pcm_audio: bytes,
+        deliver: Callable[[str], bool],
+    ) -> ProcessingResult:
+        """Transcribe, and hand the text to the speech session that asked for it.
+
+        No window is recorded and none is verified. When the session has gone,
+        the text goes to the clipboard and is reported as undelivered: the
+        person still said the words, but the destination they chose no longer
+        exists and Murmly must not substitute one for it.
+        """
+        text = self._transcriber.transcribe_pcm16(pcm_audio, self._recorder.sample_rate_hz)
+        if not text:
+            return ProcessingResult(text=text, state="DONE")
+        if deliver(text):
+            return ProcessingResult(text=text, state="DONE", delivered=True)
+        with self._delivery_lock:
+            self._ensure_paster().copy(text)
+        logger.warning("A transcript had no speech session to be delivered to.")
+        return ProcessingResult(
+            text=text,
+            state="DONE",
+            delivered=False,
+            detail="No speech session to deliver to. Transcript copied to the clipboard.",
+        )
+
     def _create_silence_detector(self) -> SilenceDetector | None:
         if self._config.auto_transcribe == "off":
             return None
@@ -511,6 +579,270 @@ class SpeechSession:
         return self._paster
 
 
+class _Adopted:
+    """Sentinel: this connection became a speech session and owes no response."""
+
+
+ADOPT_SESSION = _Adopted()
+
+
+@dataclass(slots=True)
+class _Confirmed:
+    """A queued frame whose sender is waiting to learn whether it went out.
+
+    The event alone cannot carry the answer: a discard has to wake the waiter
+    too, and a waiter woken by a discard must not read that as success.
+    """
+
+    frame: dict[str, object]
+    written: threading.Event
+    delivered: bool = False
+
+
+class SpeechSessionConnection:
+    """A connection a caller declared a speech session.
+
+    Not the same thing as `SpeechSession` above, which is a *capture* session:
+    the microphone, the transcriber and the delivery path for one recording. The
+    word is overloaded because it is overloaded in the specs; this one is the
+    socket a sender holds open while it streams text and reads what was heard.
+
+    Reads many frames and writes many, which is the exception
+    `command-interface` carves for exactly this. Every other connection is still
+    read by `_read_request` and answered once by `_write_response`.
+    """
+
+    def __init__(
+        self,
+        connection: socket.socket,
+        on_frame: Callable[[dict[str, object]], None],
+        on_closed: Callable[[SpeechSessionConnection], None],
+        shutdown: threading.Event,
+    ) -> None:
+        self._connection = connection
+        self._on_frame = on_frame
+        self._on_closed = on_closed
+        self._shutdown = shutdown
+        self._outbox: deque[dict[str, object] | _Confirmed | None] = deque()
+        self._outbox_ready = threading.Event()
+        self._outbox_lock = threading.Lock()
+        self._closing = threading.Event()
+        self._reader: threading.Thread | None = None
+        self._writer: threading.Thread | None = None
+        # Its own handle on the same connection, with its own timeout. One
+        # socket object cannot carry a short read timeout and a longer write one
+        # at the same time, and two threads changing one timeout would race.
+        self._write_handle = connection.dup()
+        self._write_handle.settimeout(SESSION_SEND_TIMEOUT_SECONDS)
+
+    @property
+    def connection(self) -> socket.socket:
+        return self._connection
+
+    def dispose(self) -> None:
+        """Release the duplicated handle of a session that never started.
+
+        Only that handle: the original is still owed the refusal that is about
+        to be written on it, and shutting the connection down would close the
+        socket the refusal has to go out on.
+
+        A writer thread that did start is stopped first. `start` can fail
+        between the two threads, and a writer left running would spin against a
+        handle that has gone.
+        """
+        self._closing.set()
+        with self._outbox_lock:
+            self._wake_waiters_locked()
+            self._outbox.clear()
+            self._outbox.append(None)
+            self._outbox_ready.set()
+        writer = self._writer
+        if writer is not None and writer is not threading.current_thread():
+            writer.join(timeout=SESSION_WRITER_JOIN_SECONDS)
+        try:
+            self._write_handle.close()
+        except OSError:
+            pass
+
+    def start(self) -> None:
+        self._connection.settimeout(SESSION_POLL_SECONDS)
+        writer = threading.Thread(
+            target=self._write_loop, name="murmly-speech-writer", daemon=True
+        )
+        writer.start()
+        # Assigned only once it is running. A thread that failed to start is one
+        # close() would join and one shutdown() would raise on.
+        self._writer = writer
+        reader = threading.Thread(
+            target=self._read_loop, name="murmly-speech-session", daemon=True
+        )
+        reader.start()
+        self._reader = reader
+
+    def send(self, frame: dict[str, object], *, confirm: bool = False) -> bool:
+        """Queue one frame for this session, never waiting on it.
+
+        A session that will not read what it is sent is disconnected rather than
+        allowed to hold up the playback thread, which is the posture the level
+        meter takes with a sink that raises.
+
+        Reports whether the frame was queued. Both refusals drop it silently
+        otherwise, and a transcript dropped without the caller knowing is the
+        person's words lost with nothing on the clipboard either.
+        """
+        with self._outbox_lock:
+            # Checked while holding the lock, not before taking it. `close` and
+            # `dispose` both set the flag and then queue the sentinel under this
+            # lock, so a send that wins the lock afterwards must see the flag --
+            # and a send that checked outside it would append behind a sentinel
+            # the writer has already stopped at, report the frame as queued, and
+            # leave the transcript on neither the socket nor the clipboard.
+            if self._closing.is_set():
+                return False
+            if len(self._outbox) >= SESSION_EVENT_BACKLOG:
+                logger.warning("Disconnecting a speech session that is not reading its events.")
+                self._closing.set()
+                self._wake_waiters_locked()
+                self._outbox.clear()
+                self._outbox.append(None)
+                self._outbox_ready.set()
+                self._shutdown_socket()
+                return False
+            pending = _Confirmed(frame, threading.Event()) if confirm else None
+            self._outbox.append(pending if pending is not None else frame)
+            self._outbox_ready.set()
+        if pending is None:
+            return True
+        # Only the transcript waits. Every other event is a report about audio
+        # and is worth nothing late, but a transcript is the person's words: a
+        # sender that dies between the queue and the write leaves them on
+        # neither the socket nor the clipboard, because the clipboard fallback
+        # was skipped on the strength of the queueing alone.
+        pending.written.wait(SESSION_SEND_TIMEOUT_SECONDS + SESSION_WRITER_JOIN_SECONDS)
+        return pending.delivered
+
+    def _wake_waiters_locked(self) -> None:
+        """Release anything waiting on a frame that is about to be dropped.
+
+        Woken rather than left to time out, and left undelivered rather than
+        marked written: a discard is the answer, not the absence of one.
+        """
+        for queued in self._outbox:
+            if isinstance(queued, _Confirmed):
+                queued.written.set()
+
+    def close(self, *, drain: bool = False) -> None:
+        """Stop this session, optionally letting queued frames reach the peer."""
+        if not self._closing.is_set():
+            self._closing.set()
+            with self._outbox_lock:
+                if not drain:
+                    # Dropped, so the waiters are woken undelivered. Draining
+                    # instead means the writer is about to send them and will
+                    # resolve each one itself -- waking them here would report a
+                    # transcript undelivered and then put it on the wire, which
+                    # is the clipboard copy and the socket both.
+                    self._wake_waiters_locked()
+                    self._outbox.clear()
+                self._outbox.append(None)
+                self._outbox_ready.set()
+        writer = self._writer
+        if drain and writer is not None and writer is not threading.current_thread():
+            writer.join(timeout=SESSION_WRITER_JOIN_SECONDS)
+        self._shutdown_socket()
+
+    def _shutdown_socket(self) -> None:
+        for handle in (self._connection, self._write_handle):
+            try:
+                handle.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+    def _write_loop(self) -> None:
+        while True:
+            if not self._outbox_ready.wait(SESSION_POLL_SECONDS):
+                continue
+            with self._outbox_lock:
+                if not self._outbox:
+                    self._outbox_ready.clear()
+                    continue
+                queued = self._outbox.popleft()
+                if not self._outbox:
+                    self._outbox_ready.clear()
+            if queued is None:
+                return
+            pending = queued if isinstance(queued, _Confirmed) else None
+            frame = pending.frame if pending is not None else queued
+            try:
+                self._write_handle.sendall((json.dumps(frame) + "\n").encode("utf-8"))
+            except OSError as error:
+                if not self._shutdown.is_set():
+                    logger.debug("A speech session event could not be written: %s", error)
+                self._closing.set()
+                if pending is not None:
+                    pending.written.set()
+                return
+            if pending is not None:
+                # Marked only once sendall has returned, so a waiter learns the
+                # difference between queued and gone out.
+                pending.delivered = True
+                pending.written.set()
+
+    def _read_loop(self) -> None:
+        payload = bytearray()
+        try:
+            while not self._closing.is_set() and not self._shutdown.is_set():
+                try:
+                    chunk = self._connection.recv(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                payload.extend(chunk)
+                while b"\n" in payload:
+                    line, _, rest = payload.partition(b"\n")
+                    payload = bytearray(rest)
+                    self._deliver(bytes(line))
+                if len(payload) > MAX_SPEECH_FRAME_BYTES:
+                    self.send(
+                        failure_response(
+                            CommandCode.MALFORMED_REQUEST,
+                            f"A speech session frame exceeds the "
+                            f"{MAX_SPEECH_FRAME_BYTES}-byte limit.",
+                        )
+                    )
+                    return
+        finally:
+            self._on_closed(self)
+
+    def _deliver(self, line: bytes) -> None:
+        if not line.strip():
+            return
+        try:
+            frame = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            # Reported rather than fatal: one unreadable frame in a long
+            # exchange must not silently end it.
+            self.send(
+                failure_response(
+                    CommandCode.MALFORMED_REQUEST, f"Frame could not be read: {error}"
+                )
+            )
+            return
+        if not isinstance(frame, dict):
+            self.send(
+                failure_response(CommandCode.MALFORMED_REQUEST, "Frame is not a JSON object.")
+            )
+            return
+        self._on_frame(frame)
+
+
 class MurmlyDaemon:
     def __init__(
         self,
@@ -518,6 +850,7 @@ class MurmlyDaemon:
         session: SpeechSession | None = None,
         overlay: OverlayLifecycle | None = None,
         peer_identity: Callable[[socket.socket], int | None] = read_peer_identity,
+        speech: SpeechEngine | None = None,
     ) -> None:
         self._config = config
         self._peer_identity = peer_identity
@@ -531,6 +864,18 @@ class MurmlyDaemon:
             partial_sink=self._publish_partial,
             on_silence=self._on_silence,
         )
+        self._speech = speech if speech is not None else SpeechEngine(config)
+        # The connection a sender holds open, at most one at a time. With two
+        # open, "deliver the transcript to that session" and "tell the session it
+        # was interrupted" would both have to guess which one was meant.
+        self._speech_session: SpeechSessionConnection | None = None
+        self._speech_session_lock = threading.Lock()
+        self._capture_destination = DESTINATION_WINDOW
+        # The session this capture is for, fixed when it starts. The one that
+        # happens to be open when the transcript is ready is a different
+        # question, and answering with it delivers a person's words to a
+        # sender that was not there when they spoke them.
+        self._capture_session: SpeechSessionConnection | None = None
         self._segments: list[str] = []
         self._session_delivered = True
         # Held for the whole produce-and-deliver of one unit of audio, by both the
@@ -557,8 +902,21 @@ class MurmlyDaemon:
 
     @property
     def state(self) -> str:
+        """The daemon state, including the one that means output is active.
+
+        Derived rather than stored, so every existing transition is untouched:
+        speech only ever runs while capture is not, so it can only be seen in
+        place of IDLE.
+        """
         with self._lock:
-            return self._state
+            state = self._state
+        if state == STATE_IDLE and self._speech.speaking:
+            return STATE_SPEAKING
+        return state
+
+    @property
+    def speech(self) -> SpeechEngine:
+        return self._speech
 
     def serve_forever(self) -> None:
         try:
@@ -675,6 +1033,9 @@ class MurmlyDaemon:
                 server.close()
             except OSError:
                 pass
+        # Before the drain, and before the blanket close below: a session has to
+        # be told what happened while its connection is still open.
+        self._close_speech_session()
         self._drain_answering()
         self._answer_the_rest()
         # A worker that took the claim before the drain expired is writing its
@@ -694,6 +1055,27 @@ class MurmlyDaemon:
                 pass
         self._config.socket_path.unlink(missing_ok=True)
         self._close_overlay()
+
+    def _close_speech_session(self) -> None:
+        """Stop speech, tell the session, and close it."""
+        with self._speech_session_lock:
+            session = self._speech_session
+            self._speech_session = None
+            # Under the lock, as in `_session_closed`. Released first, a session
+            # declaring itself in the window is accepted and given the engine,
+            # and then has it closed underneath it by this call. Shutdown is
+            # racing incoming connections by definition, so this is the path
+            # where that window is most likely to be hit.
+            try:
+                self._speech.end()
+            except Exception as error:  # noqa: BLE001 - shutdown continues regardless
+                logger.warning("Speech output did not stop cleanly: %s", error)
+        if session is None:
+            return
+        session.send({"event": EVENT_SHUTTING_DOWN, "code": CommandCode.SHUTTING_DOWN})
+        session.close(drain=True)
+        with self._connections_lock:
+            self._connections.discard(session.connection)
 
     def _drain_answering(self) -> None:
         """Let a worker whose request was read write its response before the close.
@@ -758,26 +1140,39 @@ class MurmlyDaemon:
             self._answering.discard(connection)
 
     def _serve_connection(self, connection: socket.socket) -> None:
+        adopted = False
         try:
-            with connection:
-                connection.settimeout(COMMAND_TIMEOUT_SECONDS)
-                try:
-                    response = self._answer(connection)
-                except OSError:
-                    # The connection itself failed. There is nothing left to
-                    # answer on, so this is reported rather than replied to.
-                    raise
-                except Exception as error:  # noqa: BLE001 - an accepted connection is answered
-                    response = self._unexpected_failure(error)
-                self._write_response(connection, response)
+            connection.settimeout(COMMAND_TIMEOUT_SECONDS)
+            try:
+                response = self._answer(connection)
+            except OSError:
+                # The connection itself failed. There is nothing left to
+                # answer on, so this is reported rather than replied to.
+                raise
+            except Exception as error:  # noqa: BLE001 - an accepted connection is answered
+                response = self._unexpected_failure(error)
+            if isinstance(response, _Adopted):
+                # A speech session now. It owes no single response, it must not
+                # be closed here, and it must not hold a worker slot for the
+                # length of an exchange -- eight open sessions would otherwise
+                # deny the state query and the capture toggle.
+                adopted = True
+                return
+            self._write_response(connection, response)
         except OSError as error:
             if not self._shutdown.is_set():
                 logger.warning("Command connection failed: %s", error)
         finally:
             with self._connections_lock:
-                self._connections.discard(connection)
                 self._answering.discard(connection)
                 self._claimed.discard(connection)
+                if not adopted:
+                    self._connections.discard(connection)
+            if not adopted:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
             self._worker_slots.release()
 
     def _write_response(self, connection: socket.socket, response: dict[str, object]) -> None:
@@ -875,8 +1270,13 @@ class MurmlyDaemon:
                 connection.close()
                 self._worker_slots.release()
 
-    def _answer(self, connection: socket.socket) -> dict[str, object]:
-        """Produce the one response this connection is owed."""
+    def _answer(self, connection: socket.socket) -> dict[str, object] | _Adopted:
+        """Produce the one response this connection is owed.
+
+        Or `ADOPT_SESSION`, for the one connection type that is owed none: a
+        caller that declared itself a speech session and exchanges frames until
+        it goes away.
+        """
         try:
             request = self._read_request(connection)
         except RequestError as error:
@@ -896,6 +1296,8 @@ class MurmlyDaemon:
             )
         if self._shutdown.is_set():
             return failure_response(CommandCode.SHUTTING_DOWN, "Murmly is shutting down.")
+        if isinstance(request, dict) and request.get("command") == COMMAND_SPEECH_SESSION:
+            return self._declare_session(connection)
         return self._dispatch_request(request)
 
     def _read_request(self, connection: socket.socket) -> object:
@@ -934,52 +1336,309 @@ class MurmlyDaemon:
             )
         return self.handle_command(command)
 
+    def _declare_session(self, connection: socket.socket) -> dict[str, object] | _Adopted:
+        """Accept a speech session, or refuse it with one response saying why."""
+        if not self._config.tts_enabled:
+            return failure_response(
+                CommandCode.SPEECH_DISABLED,
+                "Speech output is not enabled. Set enabled = true under [tts].",
+            )
+        if not self._speech.available:
+            return failure_response(
+                CommandCode.SPEECH_UNAVAILABLE,
+                f"Speech output is unavailable: {self._speech.unavailable_reason}",
+            )
+
+        # The state lock first, and held across `begin`. Declaring a session
+        # opens the output device and clears the barge-in hold, so one arriving
+        # while the microphone is open put speech and capture back into the room
+        # together -- which is the arrangement the whole design rules out, and
+        # the reason there is no echo cancellation to fall back on. The raw
+        # state, not the derived property: SPEAKING is IDLE with speech running
+        # and must still accept a session.
+        #
+        # The order matters. A toggle holds this lock and then reaches
+        # `_speech_session_lock` through `_barge_in`, so taking them the other
+        # way round here would deadlock.
+        with self._lock:
+            if self._state != STATE_IDLE:
+                return failure_response(
+                    CommandCode.BUSY, "Daemon is busy.", state=self._state
+                )
+            with self._speech_session_lock:
+                if self._speech_session is not None:
+                    return failure_response(
+                        CommandCode.SPEECH_SESSION_IN_USE,
+                        "A speech session is already open.",
+                    )
+                session = SpeechSessionConnection(
+                    connection,
+                    self._handle_session_frame,
+                    self._session_closed,
+                    self._shutdown,
+                )
+                try:
+                    # Opens the output device, so a session that cannot be given
+                    # one is refused now rather than accepted and failed once
+                    # somebody is listening.
+                    self._speech.begin(session.send)
+                except Exception as error:  # noqa: BLE001 - a refusal, not a crash
+                    session.dispose()
+                    return failure_response(
+                        CommandCode.SPEECH_UNAVAILABLE,
+                        f"Speech output could not be started: {error}",
+                    )
+                self._speech_session = session
+
+        try:
+            session.start()
+        except Exception as error:  # noqa: BLE001 - a refusal, not a crash
+            # The device is open and the session is registered by this point, so
+            # a half-started session left in place would refuse every later
+            # declaration for the life of the daemon.
+            with self._speech_session_lock:
+                if self._speech_session is session:
+                    self._speech_session = None
+                    try:
+                        self._speech.end()
+                    except Exception as stop_error:  # noqa: BLE001 - the handle still goes
+                        # A device that will not close must not also cost the
+                        # duplicated handle and the writer thread below.
+                        logger.warning(
+                            "Speech output did not stop cleanly: %s", stop_error
+                        )
+            session.dispose()
+            return failure_response(
+                CommandCode.COMMAND_FAILED, f"The speech session could not be started: {error}"
+            )
+
+        # Nothing further is owed on this connection as a one-shot command, so
+        # shutdown must stop waiting to answer it.
+        with self._connections_lock:
+            self._answering.discard(connection)
+            self._claimed.discard(connection)
+        session.send({"ok": True, "session": "speech"})
+        return ADOPT_SESSION
+
+    def _handle_session_frame(self, frame: dict[str, object]) -> None:
+        """Act on one frame a speech session sent."""
+        command = frame.get("command")
+        if command == "speak":
+            name = frame.get("name")
+            text = frame.get("text")
+            if not isinstance(name, str) or not name or not isinstance(text, str):
+                self._send_to_session(
+                    failure_response(
+                        CommandCode.MALFORMED_REQUEST,
+                        "A speak frame needs a name and text.",
+                    )
+                )
+                return
+            self._speech.speak(name, text)
+            return
+        if command == "end":
+            self._speech.end_input()
+            return
+        if command == "cancel":
+            self._report_interruption(self._speech.interrupt())
+            return
+        self._send_to_session(
+            failure_response(
+                CommandCode.UNSUPPORTED_COMMAND, f"Unsupported command: {command!r}"
+            )
+        )
+
+    def _session_closed(self, session: SpeechSessionConnection) -> None:
+        """A session's connection ended, for any reason.
+
+        Speech that outlives its sender is speech nobody can stop through the
+        interface that produced it, so it stops here and the queue goes with it.
+        """
+        with self._speech_session_lock:
+            if self._speech_session is not session:
+                return
+            self._speech_session = None
+            # Torn down while still holding the lock. Released first, a session
+            # declared in the window would be accepted, given the engine, and
+            # then have it closed underneath it by this call.
+            try:
+                self._speech.end()
+            except Exception as error:  # noqa: BLE001 - the session still has to be closed
+                # An output device that will not close would otherwise take this
+                # thread out through the reader's `finally`, leaving the writer
+                # thread and both socket handles alive for the life of the
+                # daemon -- and the session still registered as connected.
+                logger.warning("Speech output did not stop cleanly: %s", error)
+        # Drained, and outside the lock. A session is sometimes closed by Murmly
+        # having just written it a refusal -- a frame that could not be read, or
+        # one past the size bound -- and shutting the socket down without
+        # waiting for the writer loses the very explanation for the
+        # disconnection it explains. A peer that has already gone makes the
+        # write fail at once, so this waits only when there is something to
+        # wait for.
+        session.close(drain=True)
+        with self._connections_lock:
+            self._connections.discard(session.connection)
+
+    def _send_to_session(self, frame: dict[str, object]) -> bool:
+        """Send one frame to the open session, reporting whether it was taken."""
+        with self._speech_session_lock:
+            session = self._speech_session
+        if session is None:
+            return False
+        # Not merely that a session object exists: a session already closing
+        # drops what it is handed, and a transcript reported as delivered on
+        # that basis reaches neither the socket nor the clipboard.
+        return session.send(frame)
+
+    def _report_interruption(self, interruption: Interruption | None) -> None:
+        if interruption is None:
+            return
+        self._send_to_session(
+            {
+                "event": EVENT_INTERRUPTED,
+                "code": CommandCode.SPEECH_INTERRUPTED,
+                "playing": interruption.playing,
+                "pending": list(interruption.pending),
+            }
+        )
+
+    def _barge_in(self) -> None:
+        """Stop speech and close the output before the microphone opens.
+
+        Both hotkeys do this, because a sender has to stop generating whoever
+        the person was talking to. Playback and capture never overlap, which is
+        what makes echo cancellation unnecessary.
+        """
+        try:
+            interruption = self._speech.suspend()
+        except SpeechSuspendError as error:
+            # Speech stopped; the device did not close. The session is still
+            # owed the report, and the caller still has to refuse the capture.
+            self._report_interruption(error.interruption)
+            raise
+        self._report_interruption(interruption)
+
     def handle_command(self, command: str) -> dict[str, object]:
-        if command == "status":
+        if command == COMMAND_STATUS:
             return {"ok": True, "state": self.state}
-        if command != "toggle":
+        if command not in (COMMAND_TOGGLE, COMMAND_TOGGLE_SESSION):
             return failure_response(
                 CommandCode.UNSUPPORTED_COMMAND, f"Unsupported command: {command}"
             )
+        # Which hotkey was pressed decides where the transcript goes, and it is
+        # fixed here rather than inferred when the transcript is ready.
+        destination = (
+            DESTINATION_SESSION if command == COMMAND_TOGGLE_SESSION else DESTINATION_WINDOW
+        )
 
         with self._lock:
-            if self._state == "IDLE":
+            if self._state == STATE_IDLE:
                 self._segments = []
                 self._session_delivered = True
+                self._capture_destination = destination
+                with self._speech_session_lock:
+                    self._capture_session = (
+                        self._speech_session
+                        if destination == DESTINATION_SESSION
+                        else None
+                    )
+                # Before the microphone opens, never after. The silence
+                # detector, live partials and the final transcript all read the
+                # live stream, and each would hear Murmly.
+                try:
+                    self._barge_in()
+                except Exception as error:  # noqa: BLE001 - the microphone stays shut
+                    # Capture must not begin: speech is not known to have
+                    # stopped, and the two running at once is the one thing the
+                    # barge-in exists to prevent. The hold is released so the
+                    # session is not left silent until some later capture.
+                    self._publish_error()
+                    self._speech.resume()
+                    return failure_response(
+                        CommandCode.COMMAND_FAILED,
+                        f"Speech could not be stopped before capture: {error}",
+                        state="IDLE",
+                    )
                 try:
                     self._session.start_recording()
                 except Exception as error:
                     self._publish_error()
+                    self._speech.resume()
                     return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
-                self._state = "LISTENING"
+                self._state = STATE_LISTENING
                 state = self._state
                 self._publish_state(OverlayState.LISTENING)
                 return {"ok": True, "state": state}
-            if self._state != "LISTENING":
+            if self._state != STATE_LISTENING:
                 return failure_response(
                     CommandCode.BUSY, "Daemon is busy.", state=self._state
                 )
-            self._state = "THINKING"
+            self._state = STATE_THINKING
         # Claimed before stopping capture so an in-flight segment finishes first;
         # otherwise its transcript could paste after this one, out of order.
         with self._unit_lock:
             try:
                 pcm_audio = self._session.stop_recording()
             except Exception as error:
-                with self._lock:
-                    self._state = "IDLE"
                 self._publish_error()
+                # Capture has ended, so the hold ends with it. Every other path
+                # that ends capture releases it; without this one the session
+                # stays silent and `status` keeps reporting SPEAKING until some
+                # later capture happens to finish cleanly.
+                with self._lock:
+                    try:
+                        self._speech.resume()
+                    finally:
+                        self._state = "IDLE"
                 return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
             # Published only once capture has stopped: the processing presentation
             # must never be shown while the waveform still represents live input.
             self._publish_state(OverlayState.THINKING)
-            target = self._session.capture_delivery_target()
+            target = self._delivery_target()
             return self._finish_toggle(pcm_audio, target)
+
+    def _delivery_target(self) -> WindowIdentity | None:
+        """The window this capture is for, or None when it is for a session.
+
+        A session-bound capture records no window and verifies none: its
+        recipient was known when capture started and cannot change while capture
+        runs, which is the whole point of recording a target before
+        transcription.
+        """
+        if self._capture_destination == DESTINATION_SESSION:
+            return None
+        return self._session.capture_delivery_target()
+
+    def _process_recording(
+        self,
+        pcm_audio: bytes,
+        target: WindowIdentity | None,
+    ) -> ProcessingResult:
+        if self._capture_destination == DESTINATION_SESSION:
+            return self._session.process_for_session(pcm_audio, self._deliver_to_session)
+        return self._session.process_recording(pcm_audio, target)
+
+    def _deliver_to_session(self, text: str) -> bool:
+        """Deliver to the session this capture was started for, or to nobody.
+
+        Not "whichever session is open now": one sender can disconnect and
+        another connect while a transcript is being produced, and the second
+        one would receive words spoken to the first. Undelivered is the
+        correct answer there -- the clipboard fallback then keeps them.
+        """
+        with self._speech_session_lock:
+            session = self._capture_session
+            if session is not self._speech_session:
+                session = None
+        if session is None:
+            return False
+        return session.send({"event": EVENT_TRANSCRIPT, "text": text}, confirm=True)
 
     def _finish_toggle(self, pcm_audio: bytes, target: WindowIdentity | None) -> dict[str, object]:
 
         try:
-            result = self._session.process_recording(pcm_audio, target)
+            result = self._process_recording(pcm_audio, target)
             if result.detail is None:
                 self._publish_state(OverlayState.IDLE)
             else:
@@ -989,8 +1648,21 @@ class MurmlyDaemon:
             self._publish_error()
             return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
         finally:
+            # Under the state lock, and before the state goes IDLE. `resume`
+            # reopens the output device and clears the barge-in hold, so a
+            # capture that starts between the state going IDLE and this call
+            # would have the loudspeaker opened underneath it -- speech and the
+            # microphone in the room together, which is what the design rules
+            # out and has no echo cancellation behind it. The inner finally
+            # keeps a failing resume from wedging the daemon in THINKING.
+            # Delivery has already happened in the body above, so a session
+            # that was interrupted still receives its transcript before whatever
+            # the sender says next.
             with self._lock:
-                self._state = "IDLE"
+                try:
+                    self._speech.resume()
+                finally:
+                    self._state = STATE_IDLE
 
     def _session_response(self, result: ProcessingResult) -> dict[str, object]:
         """Report the whole session, keeping single-transcript responses identical."""
@@ -1006,9 +1678,16 @@ class MurmlyDaemon:
         response: dict[str, object] = {
             "ok": True,
             "state": result.state,
-            "text": " ".join(texts),
             "delivered": delivered,
         }
+        if self._capture_destination == DESTINATION_SESSION:
+            # A transcript produced inside a speech session goes to that session
+            # and nowhere else. The hotkey process is not the recipient the
+            # person chose, and a command response is not the one exception the
+            # spec makes for carrying it.
+            response["text"] = ""
+        else:
+            response["text"] = " ".join(texts)
         if len(texts) > 1:
             response["segments"] = len(texts)
         detail = result.detail
@@ -1059,8 +1738,8 @@ class MurmlyDaemon:
             # the processing presentation must never be shown while the waveform
             # still represents live input.
             self._publish_state(OverlayState.THINKING)
-            target = self._session.capture_delivery_target()
-            result = self._session.process_recording(pcm_audio, target)
+            target = self._delivery_target()
+            result = self._process_recording(pcm_audio, target)
             if result.detail is None:
                 self._publish_state(OverlayState.IDLE)
             else:
@@ -1070,7 +1749,10 @@ class MurmlyDaemon:
             self._publish_error()
         finally:
             with self._lock:
-                self._state = "IDLE"
+                try:
+                    self._speech.resume()
+                finally:
+                    self._state = STATE_IDLE
 
     def _deliver_segment(self) -> None:
         """Hand the segment to its own thread and return to polling.
@@ -1102,9 +1784,9 @@ class MurmlyDaemon:
             if not self._claim_listening(advance=False):
                 return
             segment = self._session.take_segment()
-            target = self._session.capture_delivery_target()
+            target = self._delivery_target()
             try:
-                result = self._session.process_recording(segment, target)
+                result = self._process_recording(segment, target)
             except Exception as error:
                 logger.warning("Segment transcription failed: %s", error)
                 self._end_continuous_session()
@@ -1150,7 +1832,10 @@ class MurmlyDaemon:
                 logger.warning("Unable to stop capture after a failed transition: %s", stop_error)
             self._publish_error()
             with self._lock:
-                self._state = "IDLE"
+                try:
+                    self._speech.resume()
+                finally:
+                    self._state = "IDLE"
 
     def _finish_continuous_session(self) -> None:
         try:
@@ -1162,8 +1847,14 @@ class MurmlyDaemon:
             logger.warning("Ending a continuous session failed: %s", error)
         finally:
             self._publish_error()
+            # Every path that ends capture releases the hold, this one included:
+            # text a sender queued while the person was speaking is owed its turn
+            # as soon as the microphone closes, however the recording ended.
             with self._lock:
-                self._state = "IDLE"
+                try:
+                    self._speech.resume()
+                finally:
+                    self._state = "IDLE"
 
     @staticmethod
     def _create_overlay(config: MurmlyConfig) -> OverlayLifecycle:

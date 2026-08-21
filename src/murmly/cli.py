@@ -15,7 +15,7 @@ import time
 import traceback
 from collections.abc import Callable
 
-from murmly.audio import SoundDeviceRecorder
+from murmly.audio import SoundDeviceRecorder, SoundDevicePlayer
 from murmly.config import MurmlyConfig, default_config_path, load_config
 from murmly.daemon import (
     DaemonNotRespondingError,
@@ -44,12 +44,16 @@ from murmly.focus import FocusObserver, create_focus_observer, record_target, sh
 from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend, renderer_environment
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
+from murmly.tts import KokoroSynthesizer, resolve_providers
 
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 
 DAEMON_START_TIMEOUT_SECONDS = 10.0
 DAEMON_POLL_INTERVAL_SECONDS = 0.1
+
+#: Subcommands whose daemon-side name differs from the one argparse takes.
+DAEMON_COMMANDS = {"toggle-session": "toggle_session"}
 
 
 class DaemonUnavailableError(RuntimeError):
@@ -68,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("daemon", help="Run the UNIX socket daemon.")
     subparsers.add_parser("toggle", help="Toggle capture via the running daemon.")
+    subparsers.add_parser(
+        "toggle-session",
+        help="Toggle capture, delivering the transcript to the open speech session.",
+    )
     subparsers.add_parser("status", help="Query the daemon state.")
 
     install = subparsers.add_parser(
@@ -78,7 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
         "hotkey",
         help="Hotkey to bind, such as Meta+X. Requires at least one modifier.",
     )
-    subparsers.add_parser("uninstall", help="Remove the session service and release the hotkey.")
+    install.add_argument(
+        "session_hotkey",
+        nargs="?",
+        default=None,
+        help=(
+            "Optional second hotkey, such as Meta+A, that dictates into the open "
+            "speech session instead of the focused window. Omitting it binds the "
+            "focused-window hotkey alone."
+        ),
+    )
+    subparsers.add_parser("uninstall", help="Remove the session service and release the hotkeys.")
 
     spike = subparsers.add_parser("spike", help="Record a short clip, transcribe it, print it, and copy it.")
     spike.add_argument("--seconds", type=float, default=5.0, help="How long to record before transcribing.")
@@ -117,10 +135,12 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
 
     if args.command == "daemon":
         return _run_daemon(config)
-    if args.command in {"toggle", "status"}:
-        return _run_client_command(config, args.command)
+    if args.command in {"toggle", "status", "toggle-session"}:
+        # The daemon's command vocabulary is not the CLI's: argparse spells a
+        # subcommand with a hyphen and the wire protocol does not.
+        return _run_client_command(config, DAEMON_COMMANDS.get(args.command, args.command))
     if args.command == "install":
-        return _run_install(args.hotkey)
+        return _run_install(args.hotkey, args.session_hotkey)
     if args.command == "uninstall":
         return _run_uninstall()
     if args.command == "spike":
@@ -218,19 +238,25 @@ def _wait_for_socket(
         sleep(DAEMON_POLL_INTERVAL_SECONDS)
 
 
-def _run_install(hotkey_text: str) -> int:
+def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> int:
     try:
         hotkey = parse_hotkey(hotkey_text)
+        session_hotkey = parse_hotkey(session_hotkey_text) if session_hotkey_text else None
     except HotkeyError as error:
         print(str(error), file=sys.stderr)
         return 2
 
     try:
-        outcome = Installer().install(hotkey)
+        outcome = Installer().install(hotkey, session_hotkey)
     except HotkeyNotConfirmedError as error:
         print(str(error), file=sys.stderr)
+        # Only the keys that were not confirmed. An install of two hotkeys can
+        # fail on either, and the other one is bound and working right now.
+        unconfirmed = ", ".join(key.portable for key in error.hotkeys) or ", ".join(
+            key.portable for key in (hotkey, session_hotkey) if key is not None
+        )
         print(
-            f"{hotkey.portable} is not active in this session. The binding is saved and will "
+            f"{unconfirmed} is not active in this session. The binding is saved and will "
             "take effect at your next login.",
             file=sys.stderr,
         )
@@ -348,6 +374,17 @@ def _run_doctor(config: MurmlyConfig) -> None:
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         overlay = {"available": False, "detail": f"Unable to check the overlay: {error}"}
 
+    # Guarded on its own, like every other probe: a speech stack that cannot be
+    # inspected must not take the rest of the report with it.
+    try:
+        speech = speech_output_diagnostics(config)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        speech = {
+            "enabled": config.tts_enabled,
+            "available": False,
+            "detail": f"Unable to check speech output: {error}",
+        }
+
     report: dict[str, object] = {
         "config_path": str(config.config_path),
         "socket_path": str(config.socket_path),
@@ -366,6 +403,7 @@ def _run_doctor(config: MurmlyConfig) -> None:
         "live_transcription": live_transcription_diagnostics(config),
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
+        "speech_output": speech,
         "installation": installation_diagnostics(),
     }
     if session_detail is not None:
@@ -396,6 +434,85 @@ def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
             "command socket is protected by its file permissions alone."
         )
     return report
+
+
+def speech_output_diagnostics(
+    config: MurmlyConfig,
+    synthesizer: KokoroSynthesizer | None = None,
+) -> dict[str, object]:
+    """What `murmly doctor` says about speech output.
+
+    Reports the settings in use alongside any configured value that was not
+    honoured, because a setting that silently falls back looks to its owner like
+    one that was ignored. Never loads the model: the probe checks that every
+    part is present, which is what decides whether a session can be opened.
+    """
+    report: dict[str, object] = {
+        "enabled": config.tts_enabled,
+        "voice": config.tts_voice,
+        "rate_percent": config.tts_rate_percent,
+        "model_dir": str(config.tts_model_dir),
+        "output_device": config.tts_output_device or None,
+    }
+    if config.tts_voice_rejected_value is not None:
+        report["voice_rejected_value"] = config.tts_voice_rejected_value
+    if config.tts_rate_rejected_value is not None:
+        report["rate_rejected_value"] = config.tts_rate_rejected_value
+
+    if not config.tts_enabled:
+        report["available"] = False
+        report["detail"] = "Speech output is disabled. Set enabled = true under [tts]."
+        return report
+
+    probe = synthesizer if synthesizer is not None else KokoroSynthesizer(config)
+    report["available"] = probe.available
+    if not probe.available:
+        # The reason is written as the remedy: what to install, or what to place
+        # where, so the report is the whole answer rather than the start of one.
+        report["detail"] = probe.unavailable_reason
+        return report
+
+    try:
+        report["providers"] = resolve_providers(config)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        report["providers"] = None
+        report["provider_detail"] = str(error)
+
+    rate, device_name, device_detail, probe_detail = negotiated_output(config)
+    report["negotiated_output_rate_hz"] = rate
+    report["output_device_in_use"] = device_name
+    if device_detail is not None:
+        report["output_device_detail"] = device_detail
+    if probe_detail is not None:
+        # A device that will not open means no speech at all: the daemon refuses
+        # every session with this same reason. Reporting availability from the
+        # probe alone would say speech works while every session is refused.
+        report["available"] = False
+        report["detail"] = probe_detail
+    return report
+
+
+def negotiated_output(
+    config: MurmlyConfig,
+) -> tuple[int | None, str | None, str | None, str | None]:
+    """Open the output device briefly to learn what a session would get.
+
+    The same reason the capture side is probed rather than reported from
+    configuration: the device negotiates the rate, and the configured output
+    device may not be the one that opens.
+    """
+    player = SoundDevicePlayer(config)
+    try:
+        player.start()
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return None, None, None, f"No output device could be opened: {error}"
+    try:
+        return player.sample_rate_hz, player.output_device, player.device_detail, None
+    finally:
+        try:
+            player.stop()
+        except Exception:  # noqa: BLE001 - diagnostics must not raise
+            pass
 
 
 def paste_injection_diagnostics(injection: PasteInjection) -> dict[str, object]:

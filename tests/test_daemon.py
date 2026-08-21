@@ -336,7 +336,10 @@ class DaemonTests(unittest.TestCase):
             self.assertTrue(session.processing.wait(timeout=1))
 
             daemon.shutdown()
-            server_thread.join(timeout=0.5)
+            # Not 0.5: SHUTDOWN_DRAIN_SECONDS is itself 0.5, so a bound equal to
+            # the drain fails under load for a shutdown that is working
+            # perfectly. What is asserted is that the thread exits, not how fast.
+            server_thread.join(timeout=3.0)
 
             self.assertFalse(server_thread.is_alive())
             self.assertFalse(socket_path.exists())
@@ -1442,10 +1445,10 @@ class FailureCodeTests(unittest.TestCase):
             response,
         )
 
-    def test_the_seven_categories_map_to_seven_distinct_codes(self) -> None:
+    def test_every_category_maps_to_its_own_distinct_code(self) -> None:
         codes = [code.value for code in CommandCode]
 
-        self.assertEqual(7, len(codes))
+        self.assertEqual(11, len(codes))
         self.assertEqual(
             {
                 "busy",
@@ -1455,9 +1458,26 @@ class FailureCodeTests(unittest.TestCase):
                 "not_permitted",
                 "shutting_down",
                 "command_failed",
+                # Speech output. Three refusals a caller has to tell apart --
+                # turn it on, install what is missing, wait for the other
+                # session -- and the category an interruption reports itself as.
+                "speech_disabled",
+                "speech_unavailable",
+                "speech_session_in_use",
+                "speech_interrupted",
             },
             set(codes),
         )
+
+    def test_the_original_seven_categories_keep_their_codes(self) -> None:
+        """Every existing caller branches on these, so none of them may move."""
+        self.assertEqual("busy", CommandCode.BUSY)
+        self.assertEqual("unsupported_command", CommandCode.UNSUPPORTED_COMMAND)
+        self.assertEqual("malformed_request", CommandCode.MALFORMED_REQUEST)
+        self.assertEqual("over_capacity", CommandCode.OVER_CAPACITY)
+        self.assertEqual("not_permitted", CommandCode.NOT_PERMITTED)
+        self.assertEqual("shutting_down", CommandCode.SHUTTING_DOWN)
+        self.assertEqual("command_failed", CommandCode.COMMAND_FAILED)
 
     def test_successful_responses_carry_no_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

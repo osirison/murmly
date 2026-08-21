@@ -15,6 +15,87 @@ from murmly.config import MurmlyConfig
 logger = logging.getLogger(__name__)
 WHISPER_SAMPLE_RATE_HZ = 16_000
 
+# What CTranslate2 needs to run on CUDA. The ONNX synthesis runtime needs these
+# and four more, so `tts.py` extends this tuple rather than restating it: the
+# provenance checks below are the point, and two copies of them would drift.
+CTRANSLATE2_CUDA_LIBRARIES = (
+    ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublasLt.so.12"),
+    ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublas.so.12"),
+    ("nvidia-cudnn-cu12", "nvidia/cudnn/lib/libcudnn.so.9"),
+)
+
+
+def cuda_device_count_available() -> int | None:
+    """How many CUDA devices this machine has, or None when nothing can say.
+
+    Shared with speech output, which needs the same answer for the same reason:
+    on a machine with no NVIDIA device the CPU is the resolution rather than a
+    fault, and a remedy printed there sends someone to fix an absence.
+    """
+    try:
+        import ctranslate2
+    except ModuleNotFoundError:
+        return None
+    try:
+        return ctranslate2.get_cuda_device_count()
+    except RuntimeError as error:
+        logger.warning("CUDA device probe failed; falling back to CPU: %s", error)
+        return 0
+
+
+def trusted_library_path(distribution_name: str, relative_path: str) -> Path | None:
+    """The path of a CUDA library shipped by a wheel, or None when absent.
+
+    Refuses anything the active environment does not own outright: a symlink, a
+    path outside `sys.prefix`, or a file another account can write.
+    """
+    try:
+        package = distribution(distribution_name)
+    except PackageNotFoundError:
+        return None
+
+    package_file = next(
+        (file for file in package.files or () if str(file) == relative_path),
+        None,
+    )
+    if package_file is None:
+        return None
+
+    unresolved_path = Path(package.locate_file(package_file))
+    if unresolved_path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked CUDA runtime library: {unresolved_path}")
+
+    try:
+        library_path = unresolved_path.resolve(strict=True)
+        library_path.relative_to(Path(sys.prefix).resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"CUDA runtime library is outside the active environment: {unresolved_path}"
+        ) from error
+
+    if not library_path.is_file():
+        return None
+    if library_path.stat().st_mode & 0o022:
+        raise RuntimeError(
+            f"Refusing writable CUDA runtime library: {library_path}"
+        )
+    return library_path
+
+
+def load_cuda_libraries(libraries: tuple[tuple[str, str], ...]) -> bool:
+    """Load every named CUDA library globally, or report that one is missing."""
+    for distribution_name, relative_path in libraries:
+        library_path = trusted_library_path(distribution_name, relative_path)
+        if library_path is None:
+            return False
+        try:
+            ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
+        except OSError as error:
+            raise RuntimeError(
+                f"Unable to load trusted CUDA runtime library {library_path}: {error}"
+            ) from error
+    return True
+
 
 class FasterWhisperTranscriber:
     def __init__(self, config: MurmlyConfig) -> None:
@@ -170,16 +251,10 @@ class FasterWhisperTranscriber:
     def resolve_runtime(cls, config: MurmlyConfig) -> tuple[str, str]:
         device = config.device
         if device == "auto":
-            try:
-                import ctranslate2
-            except ModuleNotFoundError:
+            cuda_device_count = cuda_device_count_available()
+            if cuda_device_count is None:
                 device = "cpu"
             else:
-                try:
-                    cuda_device_count = ctranslate2.get_cuda_device_count()
-                except RuntimeError as error:
-                    logger.warning("CUDA device probe failed; falling back to CPU: %s", error)
-                    cuda_device_count = 0
                 cuda_available = cuda_device_count > 0 and cls._load_cuda_runtime()
                 if cuda_device_count > 0 and not cuda_available:
                     logger.warning(
@@ -188,7 +263,9 @@ class FasterWhisperTranscriber:
                 device = "cuda" if cuda_available else "cpu"
         elif device == "cuda" and not cls._load_cuda_runtime():
             raise RuntimeError(
-                "CUDA requires the Murmly CUDA extra. Run `uv sync --extra cuda`."
+                "CUDA requires the Murmly CUDA extra. Run `uv sync --extra cuda`, "
+                "naming every extra you already have on the same line -- a sync "
+                "removes whatever it is not given."
             )
 
         compute_type = config.compute_type
@@ -198,62 +275,14 @@ class FasterWhisperTranscriber:
 
     @staticmethod
     def _load_cuda_runtime() -> bool:
-        libraries = (
-            ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublasLt.so.12"),
-            ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublas.so.12"),
-            ("nvidia-cudnn-cu12", "nvidia/cudnn/lib/libcudnn.so.9"),
-        )
-        for distribution_name, relative_path in libraries:
-            library_path = FasterWhisperTranscriber._trusted_library_path(
-                distribution_name,
-                relative_path,
-            )
-            if library_path is None:
-                return False
-            try:
-                ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
-            except OSError as error:
-                raise RuntimeError(
-                    f"Unable to load trusted CUDA runtime library {library_path}: {error}"
-                ) from error
-        return True
+        return load_cuda_libraries(CTRANSLATE2_CUDA_LIBRARIES)
 
     @staticmethod
     def _trusted_library_path(
         distribution_name: str,
         relative_path: str,
     ) -> Path | None:
-        try:
-            package = distribution(distribution_name)
-        except PackageNotFoundError:
-            return None
-
-        package_file = next(
-            (file for file in package.files or () if str(file) == relative_path),
-            None,
-        )
-        if package_file is None:
-            return None
-
-        unresolved_path = Path(package.locate_file(package_file))
-        if unresolved_path.is_symlink():
-            raise RuntimeError(f"Refusing symlinked CUDA runtime library: {unresolved_path}")
-
-        try:
-            library_path = unresolved_path.resolve(strict=True)
-            library_path.relative_to(Path(sys.prefix).resolve(strict=True))
-        except (OSError, ValueError) as error:
-            raise RuntimeError(
-                f"CUDA runtime library is outside the active environment: {unresolved_path}"
-            ) from error
-
-        if not library_path.is_file():
-            return None
-        if library_path.stat().st_mode & 0o022:
-            raise RuntimeError(
-                f"Refusing writable CUDA runtime library: {library_path}"
-            )
-        return library_path
+        return trusted_library_path(distribution_name, relative_path)
 
     def _write_wav(self, path: Path, pcm_audio: bytes, sample_rate_hz: int) -> None:
         with wave.open(str(path), "wb") as wav_handle:

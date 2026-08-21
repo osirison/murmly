@@ -66,3 +66,49 @@ enabled = true
 bottom_margin_px = 32   # Logical pixels from the display's bottom edge, 0-512
 reduced_motion = false  # Stepped level feedback instead of continuous animation
 text_size_px = 13       # Live transcript panel text size, 8-48
+
+[tts]
+# Speech output. Off by default: a machine that starts talking after an upgrade
+# is producing sound its owner did not ask for. An agent opens a speech session
+# on the command socket and sends text; nothing here starts playback on its own.
+#
+# Needs the synthesis extra and espeak-ng from your distribution:
+#
+#     uv sync --extra tts
+#     sudo dnf install espeak-ng
+#
+# `uv sync` makes the environment match exactly the extras it is given, so name
+# every extra you want on one line: on a CUDA install the first line is
+# `uv sync --extra cuda --extra tts`.
+#
+# That runs synthesis on the CPU, at roughly five times real time, whatever
+# `[stt] device` above says: that setting is about transcription and neither
+# moves synthesis to the GPU nor turns it off. The GPU build of ONNX Runtime
+# replaces the CPU one rather than joining it, because both install into the
+# same package namespace:
+#
+#     uv sync --extra cuda --extra tts
+#     uv pip uninstall onnxruntime
+#     uv pip install "onnxruntime-gpu==1.24.4"
+#
+# Both extras on the first line: `uv sync` makes the environment match exactly
+# what it is given, so `--extra cuda` alone would remove kokoro-onnx.
+#
+# `murmly doctor` reports what is missing under `speech_output`.
+enabled = false
+
+# One of the model's English voices, such as af_heart, af_bella, bf_emma or
+# am_michael. An unrecognized name falls back to af_heart and doctor reports
+# both the configured value and the one in use.
+voice = "af_heart"
+
+# Speaking rate as a percentage of the model's own, 50-200. 100 is unmodified.
+rate = 100
+
+# Output device name or index, as `python -m sounddevice` prints it. Empty means
+# let the system choose, which is what the capture side does too.
+output_device = ""
+
+# Where kokoro-v1.0.onnx and voices-v1.0.bin are. Defaults to
+# $XDG_DATA_HOME/murmly, which is ~/.local/share/murmly.
+# model_dir = "~/.local/share/murmly"

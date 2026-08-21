@@ -23,7 +23,7 @@ import sys
 import time
 
 from murmly.desktop import PlasmaShortcuts
-from murmly.hotkey import Hotkey, parse_hotkey
+from murmly.hotkey import Hotkey, HotkeyError, parse_hotkey
 from murmly.integrations import PasteInjection, select_paste_injection
 
 
@@ -39,6 +39,11 @@ COMMAND_TIMEOUT_SECONDS = 30.0
 #: "net.local." prefix matches what the System Settings shortcut editor writes.
 DESKTOP_ID = "net.local.murmly.desktop"
 APPLICATION_NAME = "murmly"
+#: The second hotkey needs a second component. One launcher file carries one
+#: Exec line and one X-KDE-Shortcuts line, and the desktop cannot tell two
+#: bindings on one component apart, so each purpose gets its own entry.
+SESSION_DESKTOP_ID = "net.local.murmly-session.desktop"
+SESSION_APPLICATION_NAME = "murmly speech session"
 REGISTRATION_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.2
 
@@ -84,7 +89,22 @@ class HotkeyNotConfirmedError(InstallError):
 
     Distinct from other failures because the binding is already persisted: it
     will be in effect at the next login even though it is not active now.
+
+    Carries the keys it concerns, which is not always every key requested: an
+    install of two can fail on either, and naming both tells the person that a
+    key which is bound, confirmed and working right now is not active.
     """
+
+    def __init__(
+        self, message: str, hotkeys: "Hotkey | tuple[Hotkey, ...] | None" = None
+    ) -> None:
+        super().__init__(message)
+        if hotkeys is None:
+            self.hotkeys: tuple[Hotkey, ...] = ()
+        elif isinstance(hotkeys, tuple):
+            self.hotkeys = hotkeys
+        else:
+            self.hotkeys = (hotkeys,)
 
 
 class HotkeyConflictError(InstallError):
@@ -167,13 +187,51 @@ def default_shortcut_config_path(env: dict[str, str] | None = None) -> Path:
     return base / "kglobalshortcutsrc"
 
 
-def launcher_text(entrypoint: Path, hotkey: Hotkey, name: str = APPLICATION_NAME) -> str:
+@dataclass(frozen=True, slots=True)
+class HotkeyPurpose:
+    """What one bound hotkey is for, and the desktop state that carries it.
+
+    Every rule in this module about claiming, binding, verifying, releasing and
+    reporting applies to each purpose on its own, so a failure affecting one is
+    never reported as a failure of the other.
+    """
+
+    key: str
+    desktop_id: str
+    name: str
+    command: str
+    description: str
+
+
+WINDOW_HOTKEY = HotkeyPurpose(
+    key="window",
+    desktop_id=DESKTOP_ID,
+    name=APPLICATION_NAME,
+    command="toggle",
+    description="dictate into the focused window",
+)
+SESSION_HOTKEY = HotkeyPurpose(
+    key="session",
+    desktop_id=SESSION_DESKTOP_ID,
+    name=SESSION_APPLICATION_NAME,
+    command="toggle-session",
+    description="dictate into the open speech session",
+)
+HOTKEY_PURPOSES = (WINDOW_HOTKEY, SESSION_HOTKEY)
+
+
+def launcher_text(
+    entrypoint: Path,
+    hotkey: Hotkey,
+    name: str = APPLICATION_NAME,
+    command: str = "toggle",
+) -> str:
     """The launcher body.
 
     A literal ``%`` is doubled, matching how the desktop's own shortcut editor
     escapes an Exec value.
     """
-    exec_line = f"{entrypoint} toggle".replace("%", "%%")
+    exec_line = f"{entrypoint} {command}".replace("%", "%%")
     return LAUNCHER_TEMPLATE.format(name=name, exec_line=exec_line, shortcut=hotkey.portable)
 
 
@@ -305,7 +363,9 @@ class ShortcutLauncher:
         timeout: float = REGISTRATION_TIMEOUT_SECONDS,
         poll_interval: float = POLL_INTERVAL_SECONDS,
         cache_builder: str = "kbuildsycoca6",
+        purpose: HotkeyPurpose = WINDOW_HOTKEY,
     ) -> None:
+        self._purpose = purpose
         self._shortcuts = shortcuts if shortcuts is not None else PlasmaShortcuts()
         self._run_command = run_command
         self._applications_dir = (
@@ -321,8 +381,12 @@ class ShortcutLauncher:
         self._cache_builder = cache_builder
 
     @property
+    def purpose(self) -> HotkeyPurpose:
+        return self._purpose
+
+    @property
     def launcher_path(self) -> Path:
-        return self._applications_dir / DESKTOP_ID
+        return self._applications_dir / self._purpose.desktop_id
 
     @property
     def is_present(self) -> bool:
@@ -341,6 +405,24 @@ class ShortcutLauncher:
                 return line.removeprefix("X-KDE-Shortcuts=").strip() or None
         return None
 
+    def declared_entrypoint(self) -> str | None:
+        """The command the launcher file runs, if it exists.
+
+        Read so that reinstalling after the checkout moved rewrites the
+        launcher. Comparing only the hotkey would find it already bound and skip
+        the write, leaving `Exec=` pointing at a path that no longer exists.
+        """
+        if not self.is_present:
+            return None
+        try:
+            content = self.launcher_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for line in content.splitlines():
+            if line.startswith("Exec="):
+                return line.removeprefix("Exec=").strip().replace("%%", "%") or None
+        return None
+
     def user_override(self) -> str | None:
         """A hotkey the user has set through the desktop's own settings.
 
@@ -353,7 +435,7 @@ class ShortcutLauncher:
             content = self._shortcut_config_path.read_text(encoding="utf-8")
         except OSError:
             return None
-        header = f"[services][{DESKTOP_ID}]"
+        header = f"[services][{self._purpose.desktop_id}]"
         in_group = False
         for line in content.splitlines():
             stripped = line.strip()
@@ -372,12 +454,18 @@ class ShortcutLauncher:
         the rest of the session while the file claimed otherwise.
         """
         self.unregister()
-        write_atomically(self.launcher_path, launcher_text(entrypoint, hotkey))
+        write_atomically(
+            self.launcher_path,
+            launcher_text(
+                entrypoint, hotkey, name=self._purpose.name, command=self._purpose.command
+            ),
+        )
         self._rebuild_cache()
-        if not self._wait_until(lambda: self._shortcuts.component_exists(DESKTOP_ID)):
+        if not self._wait_until(lambda: self._shortcuts.component_exists(self._purpose.desktop_id)):
             raise HotkeyNotConfirmedError(
                 f"The desktop did not register {hotkey.portable} within "
-                f"{self._timeout:g} seconds."
+                f"{self._timeout:g} seconds.",
+                hotkey,
             )
 
     def unregister(self) -> bool:
@@ -391,7 +479,9 @@ class ShortcutLauncher:
             return False
         self.launcher_path.unlink(missing_ok=True)
         self._rebuild_cache()
-        if not self._wait_until(lambda: not self._shortcuts.component_exists(DESKTOP_ID)):
+        if not self._wait_until(
+            lambda: not self._shortcuts.component_exists(self._purpose.desktop_id)
+        ):
             raise InstallError(
                 "The desktop still holds the previous Murmly hotkey. It will be released "
                 "at the next login."
@@ -441,6 +531,10 @@ class InstallOutcome:
     session_verified: bool
     user_override: str | None
     messages: tuple[str, ...]
+    # Last and defaulted, so every existing construction of this record keeps
+    # working: an installation that binds one hotkey is still an installation.
+    session_hotkey: Hotkey | None = None
+    session_hotkey_registered: bool = False
 
 
 class Installer:
@@ -454,10 +548,16 @@ class Installer:
         session=None,
         entrypoint_resolver: Callable[[], Path] = resolve_entrypoint,
         injection_selector: Callable[[], PasteInjection] = select_paste_injection,
+        session_launcher: ShortcutLauncher | None = None,
     ) -> None:
         self._shortcuts = shortcuts if shortcuts is not None else PlasmaShortcuts()
         self._service = service if service is not None else UserService()
         self._launcher = launcher if launcher is not None else ShortcutLauncher(self._shortcuts)
+        self._session_launcher = (
+            session_launcher
+            if session_launcher is not None
+            else ShortcutLauncher(self._shortcuts, purpose=SESSION_HOTKEY)
+        )
         self._session = session
         self._resolve_entrypoint = entrypoint_resolver
         self._select_injection = injection_selector
@@ -469,10 +569,28 @@ class Installer:
 
         return detect_desktop_session()
 
-    def install(self, hotkey: Hotkey) -> InstallOutcome:
+    def install(self, hotkey: Hotkey, session_hotkey: Hotkey | None = None) -> InstallOutcome:
+        """Install the service and bind one or both hotkeys.
+
+        The second is optional. An installation performed without it binds the
+        focused-window hotkey alone and leaves speech output reachable only by a
+        sender that opens a session itself, which is what an existing
+        installation upgrading in place gets.
+        """
         entrypoint = self._resolve_entrypoint()
         session = self._current_session()
         messages: list[str] = []
+
+        # Before anything is written. Two Murmly bindings on one key cannot be
+        # told apart by the desktop, so one of them would silently never receive
+        # the keypress.
+        if session_hotkey is not None and session_hotkey.keycode == hotkey.keycode:
+            raise HotkeyConflictError(
+                f"{hotkey.portable} was requested for both the focused window and the "
+                "speech session. The desktop cannot tell two bindings on one key apart, "
+                "so one of them would never receive the keypress. Choose a different key "
+                "for one of them."
+            )
 
         if not session.supported:
             self._service.install(entrypoint)
@@ -481,12 +599,23 @@ class Installer:
                 "Murmly did not register a hotkey. Bind this command to a shortcut "
                 f"in your desktop settings:\n    {entrypoint} toggle"
             )
+            if session_hotkey is not None:
+                # Named too, or the second key the person asked for disappears
+                # from the report entirely: the install reads as a success and
+                # nothing ever says the session hotkey was not bound.
+                messages.append(
+                    "Murmly did not register a hotkey for the speech session either. "
+                    "Bind this command to a second shortcut to "
+                    f"{SESSION_HOTKEY.description}:\n    {entrypoint} toggle-session"
+                )
             messages.extend(self._paste_injection_messages())
             return InstallOutcome(
                 entrypoint=entrypoint,
                 hotkey=None,
+                session_hotkey=None,
                 service_installed=True,
                 hotkey_registered=False,
+                session_hotkey_registered=False,
                 already_bound=False,
                 session_supported=False,
                 session_verified=False,
@@ -498,33 +627,101 @@ class Installer:
             messages.append(session.detail)
 
         # Refuse a conflict before writing anything, so a refusal leaves no
-        # partial state behind.
-        owners = self._shortcuts.owners_of(hotkey.keycode)
-        foreign = [owner for owner in owners if owner.component_unique != DESKTOP_ID]
-        if foreign:
-            names = ", ".join(sorted({owner.label for owner in foreign}))
-            raise HotkeyConflictError(
-                f"{hotkey.portable} is already used by {names}. Choose a different hotkey, "
-                "or release that one in your desktop shortcut settings first."
-            )
+        # partial state behind. Both requested keys are judged first: a
+        # collision on the second must not leave the first bound.
+        requested = [(self._launcher, hotkey)]
+        if session_hotkey is not None:
+            requested.append((self._session_launcher, session_hotkey))
+        # Every component this run is about to rewrite. A key one of them holds
+        # now is a key it is about to release, so it is not a foreign claim --
+        # without this, swapping Murmly's own two hotkeys was refused with a
+        # message naming Murmly as the other application.
+        rewriting = {self._purpose_of(launcher).desktop_id for launcher, _key in requested}
+        for launcher, requested_hotkey in requested:
+            self._refuse_conflict(launcher, requested_hotkey, rewriting)
 
-        already_bound = bool(owners) and self._launcher.declared_hotkey() == hotkey.portable
+        already_bound = bool(self._shortcuts.owners_of(hotkey.keycode)) and (
+            self._launcher.declared_hotkey() == hotkey.portable
+        )
 
         service_existed = self._service.is_installed
         self._service.install(entrypoint)
 
-        if already_bound:
-            messages.append(f"{hotkey.portable} is already bound to Murmly.")
-        else:
+        # A launcher this run did not request, still bound, whose command has
+        # moved. Reinstalling one hotkey is how a moved checkout is repaired,
+        # and repairing only the requested one leaves the other running a path
+        # that is gone -- silently, since nothing reports a launcher's command.
+        for launcher in self._stale_launchers(entrypoint, requested):
+            requested.append((launcher, parse_hotkey(launcher.declared_hotkey())))
+
+        # A key moving from one Murmly purpose to another has to be released
+        # before it is claimed: the desktop delivers a key to whichever
+        # component claimed it first, so writing the new claim while the old one
+        # still holds it binds nothing.
+        claimed = {key.keycode for _launcher, key in requested}
+        for launcher, key in requested:
+            declared = launcher.declared_hotkey()
+            if declared is None or declared == key.portable:
+                continue
             try:
-                self._launcher.register(entrypoint, hotkey)
-                self._verify(hotkey)
+                held = parse_hotkey(declared).keycode
+            except HotkeyError:
+                continue
+            if held in claimed:
+                launcher.unregister()
+
+        # Only what this run writes, so a failure removes nothing that was
+        # working before the command was typed.
+        written: list[object] = []
+        # A key the desktop did not confirm in time is still persisted, so the
+        # remaining ones are still attempted and every unconfirmed key is
+        # reported together. Raising on the first left the second never written
+        # at all: not bound now, and not bound at the next login either.
+        unconfirmed: list[Hotkey] = []
+        for launcher, requested_hotkey in requested:
+            purpose = self._purpose_of(launcher)
+            bound = (
+                bool(self._shortcuts.owners_of(requested_hotkey.keycode))
+                and launcher.declared_hotkey() == requested_hotkey.portable
+                # Rewritten when the command it runs has moved, even though the
+                # key is unchanged: reinstalling after the checkout moved is how
+                # a stale entrypoint gets repaired, and skipping the write here
+                # would leave the launcher pointing at a path that is gone.
+                and launcher.declared_entrypoint() == f"{entrypoint} {purpose.command}"
+            )
+            if bound:
+                messages.append(
+                    f"{requested_hotkey.portable} is already bound to Murmly "
+                    f"({purpose.description})."
+                )
+                continue
+            try:
+                written.append(launcher)
+                launcher.register(entrypoint, requested_hotkey)
+                self._verify(requested_hotkey, purpose)
             except HotkeyNotConfirmedError:
-                # The launcher stays: the binding is persisted for next login.
+                # The launcher stays: the binding is persisted for next login,
+                # so a later failure's rollback must not take away the one thing
+                # this key still has going for it.
+                written.pop()
+                unconfirmed.append(requested_hotkey)
+            except Exception as error:
+                self._rollback(service_existed, written)
+                if unconfirmed:
+                    keys = ", ".join(key.portable for key in unconfirmed)
+                    raise InstallError(
+                        f"{error} {keys} was written but not confirmed in this "
+                        f"session, and has been left in place for the next login."
+                    ) from error
                 raise
-            except Exception:
-                self._rollback(service_existed)
-                raise
+
+        if unconfirmed:
+            keys = ", ".join(key.portable for key in unconfirmed)
+            raise HotkeyNotConfirmedError(
+                f"The desktop did not register {keys} within "
+                f"{REGISTRATION_TIMEOUT_SECONDS:g} seconds.",
+                tuple(unconfirmed),
+            )
 
         override = self._launcher.user_override()
         if override is not None and override != hotkey.portable:
@@ -537,12 +734,18 @@ class Installer:
             f"Registered {hotkey.portable}. Press it once to confirm it reaches Murmly: "
             "registration is confirmed, but only a keypress proves the desktop delivers it."
         )
+        if session_hotkey is not None:
+            messages.append(
+                f"Registered {session_hotkey.portable} to {SESSION_HOTKEY.description}."
+            )
         messages.extend(self._paste_injection_messages())
         return InstallOutcome(
             entrypoint=entrypoint,
             hotkey=hotkey,
+            session_hotkey=session_hotkey,
             service_installed=True,
             hotkey_registered=True,
+            session_hotkey_registered=session_hotkey is not None,
             already_bound=already_bound,
             session_supported=True,
             session_verified=session.verified,
@@ -570,14 +773,70 @@ class Installer:
             messages.append(f"To paste in this session, run:\n{remedy}")
         return tuple(messages)
 
-    def _verify(self, hotkey: Hotkey) -> None:
+    def _refuse_conflict(self, launcher, hotkey: Hotkey, rewriting=frozenset()) -> None:
+        purpose = self._purpose_of(launcher)
+        owners = self._shortcuts.owners_of(hotkey.keycode)
+        own = {purpose.desktop_id, *rewriting}
+        foreign = [owner for owner in owners if owner.component_unique not in own]
+        if not foreign:
+            return
+        if all(o.component_unique in {DESKTOP_ID, SESSION_DESKTOP_ID} for o in foreign):
+            # Murmly's own other hotkey, which this run was not asked to touch.
+            # The generic message sends the person to their desktop settings to
+            # release a binding Murmly wrote and Murmly can move -- and naming
+            # Murmly as the conflicting application reads as a bug report.
+            other = self._purpose_of(
+                self._session_launcher
+                if purpose.desktop_id == DESKTOP_ID
+                else self._launcher
+            )
+            raise HotkeyConflictError(
+                f"{hotkey.portable} is currently Murmly's own hotkey to "
+                f"{other.description}. Name both keys in one command to move it "
+                f"-- `murmly install <window-key> <session-key>` -- or run "
+                f"`murmly uninstall` first."
+            )
+        names = ", ".join(sorted({owner.label for owner in foreign}))
+        raise HotkeyConflictError(
+            f"{hotkey.portable} is already used by {names}. Choose a different hotkey, "
+            "or release that one in your desktop shortcut settings first."
+        )
+
+    def _stale_launchers(self, entrypoint: Path, requested) -> list[object]:
+        """Bound launchers this run did not ask about whose command has moved."""
+        asked = {id(launcher) for launcher, _hotkey in requested}
+        stale = []
+        for launcher in (self._launcher, self._session_launcher):
+            if id(launcher) in asked:
+                continue
+            declared = launcher.declared_hotkey()
+            if declared is None:
+                continue
+            purpose = self._purpose_of(launcher)
+            if launcher.declared_entrypoint() == f"{entrypoint} {purpose.command}":
+                continue
+            try:
+                parse_hotkey(declared)
+            except HotkeyError:
+                # Its own file says something Murmly cannot parse, so there is
+                # no key to rebind it to. Left exactly as found.
+                continue
+            stale.append(launcher)
+        return stale
+
+    @staticmethod
+    def _purpose_of(launcher) -> HotkeyPurpose:
+        return getattr(launcher, "purpose", WINDOW_HOTKEY)
+
+    def _verify(self, hotkey: Hotkey, purpose: HotkeyPurpose = WINDOW_HOTKEY) -> None:
         """Confirm the desktop resolved the launcher to the intended key.
 
         The key-code comparison checks Murmly's own key table against the
         desktop's parser, so a wrong constant fails here rather than silently
-        binding something else.
+        binding something else. Each purpose is verified against its own
+        component, so a failure affecting one is never reported for the other.
         """
-        registered = self._shortcuts.registered_keys(DESKTOP_ID)
+        registered = self._shortcuts.registered_keys(purpose.desktop_id)
         if registered != [hotkey.keycode]:
             raise InstallError(
                 f"The desktop registered a different hotkey than requested. Asked for "
@@ -585,7 +844,7 @@ class Installer:
             )
 
         owners = self._shortcuts.owners_of(hotkey.keycode)
-        others = [owner for owner in owners if owner.component_unique != DESKTOP_ID]
+        others = [owner for owner in owners if owner.component_unique != purpose.desktop_id]
         if others:
             names = ", ".join(sorted({owner.label for owner in others}))
             raise InstallError(
@@ -596,12 +855,18 @@ class Installer:
         if not owners:
             raise InstallError(f"The desktop reports no owner for {hotkey.portable} after registering it.")
 
-    def _rollback(self, service_existed: bool) -> None:
-        """Undo what this run created, leaving anything pre-existing alone."""
-        try:
-            self._launcher.unregister()
-        except InstallError:
-            logger.warning("Could not remove the Murmly launcher during rollback.")
+    def _rollback(self, service_existed: bool, written: "list[object]") -> None:
+        """Undo what this run created, leaving anything pre-existing alone.
+
+        Only the launchers this run wrote. Removing both would delete a hotkey
+        that was bound and working before the command started and that the
+        failure never touched.
+        """
+        for launcher in written:
+            try:
+                launcher.unregister()
+            except InstallError:
+                logger.warning("Could not remove a Murmly launcher during rollback.")
         if not service_existed:
             try:
                 self._service.remove()
@@ -613,11 +878,15 @@ class Installer:
         messages: list[str] = []
         problems: list[str] = []
 
-        try:
-            hotkey_removed = self._launcher.unregister()
-        except InstallError as error:
-            hotkey_removed = True
-            problems.append(str(error))
+        # Each binding released on its own, so an installation carrying only
+        # one of them succeeds and does not report the absent one as a failure.
+        hotkey_removed = False
+        for launcher in (self._launcher, self._session_launcher):
+            try:
+                hotkey_removed = launcher.unregister() or hotkey_removed
+            except InstallError as error:
+                hotkey_removed = True
+                problems.append(str(error))
 
         try:
             service_removed = self._service.remove()
@@ -636,8 +905,10 @@ class Installer:
         return InstallOutcome(
             entrypoint=None,
             hotkey=None,
+            session_hotkey=None,
             service_installed=False,
             hotkey_registered=False,
+            session_hotkey_registered=False,
             already_bound=False,
             session_supported=True,
             session_verified=True,
@@ -646,7 +917,11 @@ class Installer:
         )
 
     def status(self) -> dict[str, object]:
-        """Installation state for diagnostics."""
+        """Installation state for diagnostics.
+
+        The top-level `hotkey` keys keep describing the focused-window binding,
+        unchanged, and `hotkeys` lists every binding with the purpose it serves.
+        """
         service = self._service.status()
         declared = self._launcher.declared_hotkey()
         report: dict[str, object] = {
@@ -662,25 +937,59 @@ class Installer:
         if override is not None:
             report["hotkey_override"] = override
 
+        report["hotkeys"] = [
+            self._hotkey_status(launcher)
+            for launcher in (self._launcher, self._session_launcher)
+        ]
+
         if declared is None:
             if service.installed:
                 report["detail"] = "The Murmly service is installed but no hotkey is registered."
             return report
 
+        window = report["hotkeys"][0]
+        report["hotkey_held"] = window["held"]
+        if "holder" in window:
+            report["hotkey_holder"] = window["holder"]
+        if window.get("detail") is not None:
+            report["detail"] = window["detail"]
+        return report
+
+    def _hotkey_status(self, launcher) -> dict[str, object]:
+        """One binding, judged on its own against its own component."""
+        purpose = self._purpose_of(launcher)
+        declared = launcher.declared_hotkey()
+        override = launcher.user_override()
+        entry: dict[str, object] = {
+            "purpose": purpose.key,
+            "description": purpose.description,
+            "command": purpose.command,
+            "hotkey": declared,
+            "held": False,
+            "detail": None,
+        }
+        if override is not None:
+            entry["override"] = override
+        if declared is None:
+            entry["detail"] = f"No hotkey is bound to {purpose.description}."
+            return entry
+
         try:
             hotkey = parse_hotkey(override or declared)
             owners = self._shortcuts.owners_of(hotkey.keycode)
         except Exception as error:  # noqa: BLE001 - diagnostics must not raise
-            report["detail"] = f"Unable to check the Murmly hotkey: {error}"
-            return report
+            entry["detail"] = f"Unable to check {declared}: {error}"
+            return entry
 
-        ours = [owner for owner in owners if owner.component_unique == DESKTOP_ID]
-        others = [owner for owner in owners if owner.component_unique != DESKTOP_ID]
-        report["hotkey_held"] = bool(ours) and not others
+        ours = [owner for owner in owners if owner.component_unique == purpose.desktop_id]
+        others = [owner for owner in owners if owner.component_unique != purpose.desktop_id]
+        entry["held"] = bool(ours) and not others
         if others:
             names = ", ".join(sorted({owner.label for owner in others}))
-            report["hotkey_holder"] = names
-            report["detail"] = f"{hotkey.portable} is held by {names}, not Murmly."
+            entry["holder"] = names
+            entry["detail"] = f"{hotkey.portable} is held by {names}, not Murmly."
         elif not ours:
-            report["detail"] = f"{hotkey.portable} is registered for Murmly but no owner is reported."
-        return report
+            entry["detail"] = (
+                f"{hotkey.portable} is registered for Murmly but no owner is reported."
+            )
+        return entry
