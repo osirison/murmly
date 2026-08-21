@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from types import ModuleType
 
@@ -17,6 +18,7 @@ from murmly.daemon import (
     CommandCode,
     MurmlyDaemon,
     ProcessingResult,
+    SpeechSessionConnection,
     send_command,
 )
 from murmly.focus import WindowIdentity
@@ -403,6 +405,10 @@ class OneShotCommandTests(SpeechSessionHarness):
             message="the SPEAKING state",
         )
 
+        # SPEAKING is true while a unit is merely queued, so it does not mean any
+        # audio exists yet. Playing on that signal alone consumes an empty device
+        # and leaves the real audio unplayed, and heard_all never arrives.
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
         player.play()
         client.send({"command": "end"})
         client.read_until(EVENT_HEARD_ALL)
@@ -423,6 +429,11 @@ class SessionLifetimeTests(SpeechSessionHarness):
 
         client.close()
         self.wait_for(lambda: not engine.active, message="the engine to stop")
+        # `active` is cleared at the head of end(), before the playback thread is
+        # joined, so a count taken on it alone can still be moved by a chunk
+        # already inside the producer. Closing the device is the last thing end()
+        # does, after the join, which is what makes the count below stable.
+        self.wait_for(lambda: not player.active, message="the output device to close")
         written = player.frames_written
         time.sleep(0.1)
 
@@ -648,6 +659,125 @@ class TranscriptRoutingTests(SpeechSessionHarness):
         self.assertFalse(response["delivered"])
         self.assertEqual(["hello world"], capture.copied)
         self.assertEqual(0, capture.targets_captured, "a window was substituted for the session")
+
+    def test_the_session_hotkey_response_carries_no_transcript(self) -> None:
+        """A response is not the exception the spec makes for carrying one.
+
+        The transcript goes to the session that asked for it and nowhere else.
+        The hotkey process is not the recipient the person chose, and in
+        continuous mode the response would accumulate the whole exchange.
+        """
+        _daemon, socket_path, _engine, _player, capture = self.serve()
+        client = self.client(socket_path)
+        client.declare()
+
+        send_command(str(socket_path), "toggle_session")
+        response = send_command(str(socket_path), "toggle_session")
+
+        self.assertEqual("", response["text"])
+        self.assertEqual(["hello world"], capture.delivered_to_session)
+        self.assertEqual("hello world", client.read_until(EVENT_TRANSCRIPT)["text"])
+
+    def test_a_transcript_the_session_could_not_take_is_reported_as_undelivered(self) -> None:
+        """A session object still registered is not a session still reading.
+
+        `send` drops what it is handed once the connection is closing, and a
+        delivery reported on the existence of the object alone reaches neither
+        the socket nor the clipboard: the person's words are simply lost.
+        """
+        daemon, socket_path, _engine, _player, capture = self.serve()
+        client = SessionClient(socket_path)
+        self.addCleanup(client.close)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+
+        send_command(str(socket_path), "toggle_session")
+        # Closing without the reader having noticed: the session is still
+        # registered, and every frame it is handed from here on is dropped.
+        daemon._speech_session.close()
+        response = send_command(str(socket_path), "toggle_session")
+
+        self.assertFalse(response["delivered"])
+        self.assertEqual(["hello world"], capture.copied)
+
+
+class CaptureFailureTests(SpeechSessionHarness):
+    def test_a_failing_stop_releases_the_speech_hold(self) -> None:
+        """Capture has ended, so the hold ends with it.
+
+        Every other path that ends capture releases it. Without this one the
+        session is silent until some later capture happens to finish cleanly,
+        and `status` reports SPEAKING the whole time with the device closed.
+        """
+
+        class FailingStopSession(DummyCaptureSession):
+            def stop_recording(self) -> bytes:
+                raise RuntimeError("the input stream would not close")
+
+        _daemon, socket_path, engine, player, _capture = self.serve(
+            session=FailingStopSession()
+        )
+        client = self.client(socket_path)
+        client.declare()
+
+        send_command(str(socket_path), "toggle_session")
+        response = send_command(str(socket_path), "toggle_session")
+
+        self.assertFalse(response["ok"])
+        self.wait_for(lambda: player.active, message="the output device to reopen")
+        client.send({"command": "speak", "name": "after", "text": "A sentence."})
+        self.wait_for(lambda: player.frames_written > 0, message="speech after the failure")
+
+    def test_speech_that_will_not_stop_keeps_the_microphone_shut(self) -> None:
+        """Both running at once is the one thing the barge-in exists to prevent.
+
+        So a barge-in that fails refuses the capture rather than opening the
+        microphone anyway, and releases the hold so the session is not wedged.
+        """
+
+        class UnstoppableSpeech(SpeechEngine):
+            def suspend(self):
+                raise RuntimeError("the output stream would not close")
+
+        engine = UnstoppableSpeech(
+            MurmlyConfig(
+                socket_path=Path(tempfile.mkdtemp()) / "unused.sock",
+                config_path=Path(tempfile.mkdtemp()) / "unused.toml",
+                tts_enabled=True,
+            ),
+            synthesizer=FakeSynthesizer(),
+            player=RecordingPlayer(),
+        )
+        _daemon, socket_path, _engine, _player, capture = self.serve(engine=engine)
+        self.client(socket_path).declare()
+
+        response = send_command(str(socket_path), "toggle_session")
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.COMMAND_FAILED, response["code"])
+        self.assertEqual(0, capture.started, "the microphone opened while speech was playing")
+        self.assertEqual("IDLE", send_command(str(socket_path), "status")["state"])
+
+    def test_a_session_that_could_not_start_does_not_block_the_next_one(self) -> None:
+        """A half-started session left registered refuses every later one.
+
+        The device is open and the session recorded by the time the threads are
+        started, so a failure there has to undo both or the daemon answers
+        `speech_session_in_use` for the rest of its life.
+        """
+        _daemon, socket_path, _engine, player, _capture = self.serve()
+
+        def refuse_to_start(self, *args, **kwargs):
+            raise RuntimeError("no thread available")
+
+        with unittest.mock.patch.object(SpeechSessionConnection, "start", refuse_to_start):
+            refusal = self.client(socket_path).declare()
+
+        self.assertFalse(refusal["ok"])
+        self.assertEqual(CommandCode.COMMAND_FAILED, refusal["code"])
+        self.wait_for(lambda: not player.active, message="the device to be released")
+
+        self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
 
 
 class CaptureNeverHearsSpeechTests(unittest.TestCase):

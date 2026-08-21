@@ -629,8 +629,21 @@ class SpeechSessionConnection:
         """Release the duplicated handle of a session that never started.
 
         Only that handle: the original is still owed the refusal that is about
-        to be written on it.
+        to be written on it, and shutting the connection down would close the
+        socket the refusal has to go out on.
+
+        A writer thread that did start is stopped first. `start` can fail
+        between the two threads, and a writer left running would spin against a
+        handle that has gone.
         """
+        self._closing.set()
+        with self._outbox_lock:
+            self._outbox.clear()
+            self._outbox.append(None)
+            self._outbox_ready.set()
+        writer = self._writer
+        if writer is not None and writer is not threading.current_thread():
+            writer.join(timeout=SESSION_WRITER_JOIN_SECONDS)
         try:
             self._write_handle.close()
         except OSError:
@@ -638,24 +651,32 @@ class SpeechSessionConnection:
 
     def start(self) -> None:
         self._connection.settimeout(SESSION_POLL_SECONDS)
-        self._writer = threading.Thread(
+        writer = threading.Thread(
             target=self._write_loop, name="murmly-speech-writer", daemon=True
         )
-        self._writer.start()
-        self._reader = threading.Thread(
+        writer.start()
+        # Assigned only once it is running. A thread that failed to start is one
+        # close() would join and one shutdown() would raise on.
+        self._writer = writer
+        reader = threading.Thread(
             target=self._read_loop, name="murmly-speech-session", daemon=True
         )
-        self._reader.start()
+        reader.start()
+        self._reader = reader
 
-    def send(self, frame: dict[str, object]) -> None:
+    def send(self, frame: dict[str, object]) -> bool:
         """Queue one frame for this session, never waiting on it.
 
         A session that will not read what it is sent is disconnected rather than
         allowed to hold up the playback thread, which is the posture the level
         meter takes with a sink that raises.
+
+        Reports whether the frame was queued. Both refusals drop it silently
+        otherwise, and a transcript dropped without the caller knowing is the
+        person's words lost with nothing on the clipboard either.
         """
         if self._closing.is_set():
-            return
+            return False
         with self._outbox_lock:
             if len(self._outbox) >= SESSION_EVENT_BACKLOG:
                 logger.warning("Disconnecting a speech session that is not reading its events.")
@@ -664,9 +685,10 @@ class SpeechSessionConnection:
                 self._outbox.append(None)
                 self._outbox_ready.set()
                 self._shutdown_socket()
-                return
+                return False
             self._outbox.append(frame)
             self._outbox_ready.set()
+            return True
 
     def close(self, *, drain: bool = False) -> None:
         """Stop this session, optionally letting queued frames reach the peer."""
@@ -1284,12 +1306,26 @@ class MurmlyDaemon:
                 )
             self._speech_session = session
 
+        try:
+            session.start()
+        except Exception as error:  # noqa: BLE001 - a refusal, not a crash
+            # The device is open and the session is registered by this point, so
+            # a half-started session left in place would refuse every later
+            # declaration for the life of the daemon.
+            with self._speech_session_lock:
+                if self._speech_session is session:
+                    self._speech_session = None
+                    self._speech.end()
+            session.dispose()
+            return failure_response(
+                CommandCode.COMMAND_FAILED, f"The speech session could not be started: {error}"
+            )
+
         # Nothing further is owed on this connection as a one-shot command, so
         # shutdown must stop waiting to answer it.
         with self._connections_lock:
             self._answering.discard(connection)
             self._claimed.discard(connection)
-        session.start()
         session.send({"ok": True, "session": "speech"})
         return ADOPT_SESSION
 
@@ -1331,18 +1367,24 @@ class MurmlyDaemon:
             if self._speech_session is not session:
                 return
             self._speech_session = None
-        self._speech.end()
+            # Torn down while still holding the lock. Released first, a session
+            # declared in the window would be accepted, given the engine, and
+            # then have it closed underneath it by this call.
+            self._speech.end()
         session.close()
         with self._connections_lock:
             self._connections.discard(session.connection)
 
     def _send_to_session(self, frame: dict[str, object]) -> bool:
+        """Send one frame to the open session, reporting whether it was taken."""
         with self._speech_session_lock:
             session = self._speech_session
         if session is None:
             return False
-        session.send(frame)
-        return True
+        # Not merely that a session object exists: a session already closing
+        # drops what it is handed, and a transcript reported as delivered on
+        # that basis reaches neither the socket nor the clipboard.
+        return session.send(frame)
 
     def _report_interruption(self, interruption: Interruption | None) -> None:
         if interruption is None:
@@ -1387,7 +1429,20 @@ class MurmlyDaemon:
                 # Before the microphone opens, never after. The silence
                 # detector, live partials and the final transcript all read the
                 # live stream, and each would hear Murmly.
-                self._barge_in()
+                try:
+                    self._barge_in()
+                except Exception as error:  # noqa: BLE001 - the microphone stays shut
+                    # Capture must not begin: speech is not known to have
+                    # stopped, and the two running at once is the one thing the
+                    # barge-in exists to prevent. The hold is released so the
+                    # session is not left silent until some later capture.
+                    self._publish_error()
+                    self._speech.resume()
+                    return failure_response(
+                        CommandCode.COMMAND_FAILED,
+                        f"Speech could not be stopped before capture: {error}",
+                        state="IDLE",
+                    )
                 try:
                     self._session.start_recording()
                 except Exception as error:
@@ -1412,6 +1467,11 @@ class MurmlyDaemon:
                 with self._lock:
                     self._state = "IDLE"
                 self._publish_error()
+                # Capture has ended, so the hold ends with it. Every other path
+                # that ends capture releases it; without this one the session
+                # stays silent and `status` keeps reporting SPEAKING until some
+                # later capture happens to finish cleanly.
+                self._speech.resume()
                 return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
             # Published only once capture has stopped: the processing presentation
             # must never be shown while the waveform still represents live input.
@@ -1476,9 +1536,16 @@ class MurmlyDaemon:
         response: dict[str, object] = {
             "ok": True,
             "state": result.state,
-            "text": " ".join(texts),
             "delivered": delivered,
         }
+        if self._capture_destination == DESTINATION_SESSION:
+            # A transcript produced inside a speech session goes to that session
+            # and nowhere else. The hotkey process is not the recipient the
+            # person chose, and a command response is not the one exception the
+            # spec makes for carrying it.
+            response["text"] = ""
+        else:
+            response["text"] = " ".join(texts)
         if len(texts) > 1:
             response["segments"] = len(texts)
         detail = result.detail
