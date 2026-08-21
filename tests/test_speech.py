@@ -621,6 +621,32 @@ class InterruptionTests(EngineHarness):
             message="heard_all for the second batch",
         )
 
+    def test_a_unit_named_in_an_interruption_is_not_put_back(self) -> None:
+        """The producer holds a unit across the barge-in that discards it.
+
+        Waking to a set hold, it put the unit back at the head of the queue --
+        so text the sender had just been told was dropped was spoken after the
+        capture that dropped it. The gated queue parks the producer in that
+        window, which timing cannot reach.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        queue = GatedQueue()
+        self.addCleanup(queue.release.set)
+        engine._queue = queue
+
+        engine.speak("m1", "A sentence.")
+        self.assertTrue(queue.handed.wait(5), "the queue never handed the unit out")
+        interruption = engine.suspend()
+        queue.release.set()
+        time.sleep(0.1)
+
+        self.assertEqual(("m1",), interruption.pending)
+        self.assertEqual([], engine._queue.waiting, "a unit reported as dropped came back")
+        engine.resume()
+        time.sleep(0.1)
+        self.assertEqual(0, player.frames_written, "text reported as dropped was spoken")
+
     def test_interrupting_without_a_session_reports_nothing(self) -> None:
         engine, _player, _events = self.engine()
 
@@ -838,6 +864,25 @@ class CaptureGatingTests(EngineHarness):
 
         self.assertIsNotNone(raised.exception.interruption)
         self.assertFalse(raised.exception.interruption.nothing_unheard)
+
+    def test_a_device_failure_frame_carries_the_name_key(self) -> None:
+        """A sender reads `name` on every failed frame.
+
+        This one is about the device rather than a named piece of text, so the
+        key is present and null: absent, `frame["name"]` raises in a handler
+        written from the documented shape.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        engine.suspend()
+        player.start_error = RuntimeError("Unable to open an audio output.")
+
+        engine.resume()
+
+        failures = [e for e in events if e.get("event") == "failed"]
+        self.assertEqual(1, len(failures))
+        self.assertIn("name", failures[0])
+        self.assertIsNone(failures[0]["name"])
 
     def test_resuming_without_a_session_opens_nothing(self) -> None:
         engine, player, _events = self.engine()

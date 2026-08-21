@@ -153,10 +153,17 @@ class SpeechQueue:
             return self._in_flight is not None
 
     def putback(self, unit: SpeechUnit) -> None:
-        """Return a unit to the front, so its place in the order is kept."""
+        """Return a unit to the front, so its place in the order is kept.
+
+        Only if the queue still holds it. A discard running while the unit was
+        out with the producer has already named it in the interruption report,
+        and putting it back would speak text the sender has been told was
+        dropped -- after the barge-in that dropped it.
+        """
         with self._lock:
-            if self._in_flight is unit:
-                self._in_flight = None
+            if self._in_flight is not unit:
+                return
+            self._in_flight = None
             self._units.appendleft(unit)
             self._arrived.set()
 
@@ -370,7 +377,12 @@ class SpeechEngine:
             self._player.start()
         except RuntimeError as error:
             logger.warning("Speech output could not be reopened after capture: %s", error)
-            self._emit(self._sink, {"event": EVENT_FAILED, "error": str(error)})
+            # `name` present and null: a sender reads `frame["name"]` for every
+            # failed frame, and this one is about the device rather than a named
+            # piece of text. Null is what says so without changing the shape.
+            self._emit(
+                self._sink, {"event": EVENT_FAILED, "name": None, "error": str(error)}
+            )
         finally:
             # Released whether or not the device came back. Capture has ended,
             # and the hold means "the person is talking" -- keeping it set for a

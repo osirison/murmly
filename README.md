@@ -423,7 +423,7 @@ Profile mapping:
 With `device = "auto"`, Murmly uses CUDA `float16` when a compatible GPU and the
 CUDA extra are available, and falls back to CPU `int8` otherwise. The first use
 of a profile downloads its model; later sessions reuse the local cache. The
-tested CUDA runtime wheels are about 1.4 GB and the cached `large-v3-turbo`
+tested CUDA runtime wheels are about 1.8 GB and the cached `large-v3-turbo`
 model about 1.6 GB. The balanced model revision is pinned for reproducible
 downloads.
 

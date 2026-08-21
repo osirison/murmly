@@ -19,7 +19,11 @@ import subprocess
 import threading
 
 from murmly.config import MurmlyConfig
-from murmly.stt import CTRANSLATE2_CUDA_LIBRARIES, load_cuda_libraries
+from murmly.stt import (
+    CTRANSLATE2_CUDA_LIBRARIES,
+    cuda_device_count_available,
+    load_cuda_libraries,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -202,7 +206,12 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         return [CPU_PROVIDER]
 
     if CUDA_PROVIDER not in available:
-        logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
+        # Silent only when there is no GPU to use. `device = "auto"` is the
+        # default and the documented CPU install hits this branch on every
+        # machine, so printing the GPU-swap remedy there tells someone with no
+        # NVIDIA device to replace a working runtime to fix an absence.
+        if config.device == "cuda" or (cuda_device_count_available() or 0) > 0:
+            logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
         return [CPU_PROVIDER]
 
     try:

@@ -51,8 +51,10 @@ Both extras on the sync line if speech output is installed. `uv sync` makes the
 environment match exactly the extras it is given, so `--extra cuda` alone
 removes `kokoro-onnx` and leaves speech output unavailable.
 
-The resolved wheels include cuBLAS, cuDNN, and NVRTC and require roughly
-1.4 GB of downloads on Linux x86-64. The Whisper model download is additional.
+The resolved wheels are the seven NVIDIA distributions the `cuda` extra now
+names -- cuBLAS, cuDNN, NVRTC, the CUDA runtime, cuFFT, cuRAND and nvJitLink --
+and require roughly 1.8 GB of downloads on Linux x86-64, measured from
+`uv.lock`. The Whisper model download is additional.
 
 ## Installer gates
 
@@ -98,5 +100,5 @@ The full balanced path was also validated with `large-v3-turbo`, CUDA
 `float16`, beam size 5, and VAD enabled. The model completed transcription of
 the retained diagnostic WAV after its one-time Hugging Face download. Its
 cache directory used 1.6 GB, bringing the tested CUDA runtime and balanced
-model footprint to roughly 3 GB. The balanced model is pinned to Hugging Face
+model footprint to roughly 3.4 GB. The balanced model is pinned to Hugging Face
 revision `0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf`.

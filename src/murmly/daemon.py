@@ -736,7 +736,14 @@ class SpeechSessionConnection:
         if not self._closing.is_set():
             self._closing.set()
             with self._outbox_lock:
-                self._wake_waiters_locked()
+                if not drain:
+                    # Dropped, so the waiters are woken undelivered. Draining
+                    # instead means the writer is about to send them and will
+                    # resolve each one itself -- waking them here would report a
+                    # transcript undelivered and then put it on the wire, which
+                    # is the clipboard copy and the socket both.
+                    self._wake_waiters_locked()
+                    self._outbox.clear()
                 self._outbox.append(None)
                 self._outbox_ready.set()
         writer = self._writer

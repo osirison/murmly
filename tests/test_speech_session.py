@@ -978,6 +978,34 @@ class ProtocolDocumentationTests(unittest.TestCase):
             )
 
 
+class DrainedDeliveryTests(SpeechSessionHarness):
+    def test_a_transcript_drained_on_close_is_reported_delivered(self) -> None:
+        """Draining writes what is queued, so it must not be reported dropped.
+
+        Waking the waiters undelivered and then sending the frame anyway is the
+        clipboard copy and the socket both: the person's words arrive at the
+        sender and are also pasted somewhere they did not choose.
+        """
+        daemon, socket_path, _engine, _player, _capture = self.serve()
+        client = SessionClient(socket_path)
+        self.addCleanup(client.close)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+        session = daemon._speech_session
+
+        results: list[bool] = []
+        sender = threading.Thread(
+            target=lambda: results.append(
+                session.send({"event": EVENT_TRANSCRIPT, "text": "the words"}, confirm=True)
+            )
+        )
+        sender.start()
+        sender.join(5)
+
+        self.assertEqual([True], results)
+        self.assertEqual("the words", client.read_until(EVENT_TRANSCRIPT)["text"])
+
+
 class ResumeOrderingTests(SpeechSessionHarness):
     def test_the_state_lock_is_held_across_the_resume_that_ends_capture(self) -> None:
         """`resume` reopens the device and clears the barge-in hold.

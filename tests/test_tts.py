@@ -348,6 +348,31 @@ class RuntimeResolutionTests(unittest.TestCase):
         with self._gpu_build(), patch("murmly.tts.load_cuda_libraries", return_value=False):
             self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
 
+    def test_a_machine_with_no_gpu_is_not_told_to_replace_its_runtime(self) -> None:
+        """`auto` is the default and the documented CPU install hits this branch.
+
+        The GPU-swap remedy tells the reader to uninstall the CPU runtime, so
+        printing it on a machine with no NVIDIA device sends someone to break a
+        working install to fix an absence.
+        """
+        with (
+            patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]),
+            patch("murmly.tts.cuda_device_count_available", return_value=0),
+        ):
+            with self.assertNoLogs("murmly.tts", level="WARNING"):
+                self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
+
+    def test_a_machine_with_a_gpu_is_still_told_about_the_swap(self) -> None:
+        """The remedy is right when there is a device it would put to use."""
+        with (
+            patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]),
+            patch("murmly.tts.cuda_device_count_available", return_value=1),
+            self.assertLogs("murmly.tts", level="WARNING") as logged,
+        ):
+            self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
+
+        self.assertIn("onnxruntime-gpu", "\n".join(logged.output))
+
     def test_cpu_still_proves_the_runtime_exists(self) -> None:
         """CPU synthesis needs onnxruntime every bit as much as CUDA does.
 

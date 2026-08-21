@@ -25,6 +25,24 @@ CTRANSLATE2_CUDA_LIBRARIES = (
 )
 
 
+def cuda_device_count_available() -> int | None:
+    """How many CUDA devices this machine has, or None when nothing can say.
+
+    Shared with speech output, which needs the same answer for the same reason:
+    on a machine with no NVIDIA device the CPU is the resolution rather than a
+    fault, and a remedy printed there sends someone to fix an absence.
+    """
+    try:
+        import ctranslate2
+    except ModuleNotFoundError:
+        return None
+    try:
+        return ctranslate2.get_cuda_device_count()
+    except RuntimeError as error:
+        logger.warning("CUDA device probe failed; falling back to CPU: %s", error)
+        return 0
+
+
 def trusted_library_path(distribution_name: str, relative_path: str) -> Path | None:
     """The path of a CUDA library shipped by a wheel, or None when absent.
 
@@ -233,16 +251,10 @@ class FasterWhisperTranscriber:
     def resolve_runtime(cls, config: MurmlyConfig) -> tuple[str, str]:
         device = config.device
         if device == "auto":
-            try:
-                import ctranslate2
-            except ModuleNotFoundError:
+            cuda_device_count = cuda_device_count_available()
+            if cuda_device_count is None:
                 device = "cpu"
             else:
-                try:
-                    cuda_device_count = ctranslate2.get_cuda_device_count()
-                except RuntimeError as error:
-                    logger.warning("CUDA device probe failed; falling back to CPU: %s", error)
-                    cuda_device_count = 0
                 cuda_available = cuda_device_count > 0 and cls._load_cuda_runtime()
                 if cuda_device_count > 0 and not cuda_available:
                     logger.warning(

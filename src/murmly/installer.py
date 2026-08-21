@@ -780,6 +780,22 @@ class Installer:
         foreign = [owner for owner in owners if owner.component_unique not in own]
         if not foreign:
             return
+        if all(o.component_unique in {DESKTOP_ID, SESSION_DESKTOP_ID} for o in foreign):
+            # Murmly's own other hotkey, which this run was not asked to touch.
+            # The generic message sends the person to their desktop settings to
+            # release a binding Murmly wrote and Murmly can move -- and naming
+            # Murmly as the conflicting application reads as a bug report.
+            other = self._purpose_of(
+                self._session_launcher
+                if purpose.desktop_id == DESKTOP_ID
+                else self._launcher
+            )
+            raise HotkeyConflictError(
+                f"{hotkey.portable} is currently Murmly's own hotkey to "
+                f"{other.description}. Name both keys in one command to move it "
+                f"-- `murmly install <window-key> <session-key>` -- or run "
+                f"`murmly uninstall` first."
+            )
         names = ", ".join(sorted({owner.label for owner in foreign}))
         raise HotkeyConflictError(
             f"{hotkey.portable} is already used by {names}. Choose a different hotkey, "

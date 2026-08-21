@@ -953,6 +953,40 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual("Meta+A", launcher.declared_hotkey())
         self.assertEqual("Meta+X", session_launcher.declared_hotkey())
 
+    def test_taking_the_other_murmly_hotkey_says_how_to_move_it(self) -> None:
+        """Still refused -- naming one key must not silently unbind the other.
+
+        But the generic message sends the person to their desktop settings to
+        release a binding Murmly wrote and Murmly can move, and names Murmly as
+        the conflicting application, which reads as a bug rather than a choice.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY, HotkeyConflictError
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/bin/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/bin/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly speech session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(HotkeyConflictError) as raised:
+            installer.install(parse_hotkey("Meta+A"))
+
+        message = str(raised.exception)
+        self.assertIn("Murmly's own hotkey", message)
+        self.assertIn("murmly install", message)
+        self.assertNotIn("desktop shortcut settings", message)
+        self.assertEqual([], launcher.registrations, "the refusal wrote a launcher")
+
     def test_a_key_moving_between_purposes_is_released_before_it_is_claimed(self) -> None:
         """The desktop delivers a key to whichever component claimed it first.
 
@@ -1435,6 +1469,30 @@ class TwoHotkeyTests(unittest.TestCase):
         self.assertEqual([(Path("/bin/murmly"), "Meta+A")], session.registrations)
         self.assertTrue(outcome.hotkey_registered)
         self.assertTrue(outcome.session_hotkey_registered)
+
+    def test_a_registered_launcher_runs_its_own_purpose_command(self) -> None:
+        """Through the real launcher, not the template it is built from.
+
+        Asserting `launcher_text` output proves the template takes a command,
+        not that each launcher passes its own -- a session launcher writing
+        `toggle` would produce a second hotkey that dictates into the focused
+        window, and that assertion would not notice.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import SESSION_HOTKEY
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = make_launcher(temp_dir, FakeShortcuts(present=True))
+            session = make_launcher(
+                temp_dir, FakeShortcuts(present=True), purpose=SESSION_HOTKEY
+            )
+
+            window.register(Path("/bin/murmly"), parse_hotkey("Meta+X"))
+            session.register(Path("/bin/murmly"), parse_hotkey("Meta+A"))
+
+            self.assertEqual("/bin/murmly toggle", window.declared_entrypoint())
+            self.assertEqual("/bin/murmly toggle-session", session.declared_entrypoint())
+            self.assertNotEqual(window.launcher_path, session.launcher_path)
 
     def test_each_launcher_carries_its_own_command(self) -> None:
         from murmly.hotkey import parse_hotkey
