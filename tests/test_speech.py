@@ -733,6 +733,33 @@ class CaptureGatingTests(EngineHarness):
         self.assertFalse(player.active, "the output stream was still open")
         self.assertEqual(1, player.aborted)
 
+    def test_the_hold_is_taken_before_the_interruption(self) -> None:
+        """Order, not timing.
+
+        Taken afterwards, a unit sent in the gap is picked up by the producer
+        and written into a device that is about to close: neither spoken nor
+        named in the report, so the sender is never told it was dropped. The
+        gap is a few instructions, so what is asserted is that there is no gap.
+        """
+        engine, _player, events = self.engine()
+        self.begin(engine, events)
+        held_when_interrupted: list[bool] = []
+        original = engine.interrupt
+
+        def observe():
+            held_when_interrupted.append(engine._hold.is_set())
+            return original()
+
+        engine.interrupt = observe
+        try:
+            engine.suspend()
+        finally:
+            engine.interrupt = original
+
+        self.assertEqual(
+            [True], held_when_interrupted, "the hold was taken after the interruption"
+        )
+
     def test_text_arriving_while_capture_runs_is_held_and_spoken_after(self) -> None:
         engine, player, events = self.engine()
         self.begin(engine, events)

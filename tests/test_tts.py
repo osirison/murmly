@@ -348,6 +348,19 @@ class RuntimeResolutionTests(unittest.TestCase):
         with self._gpu_build(), patch("murmly.tts.load_cuda_libraries", return_value=False):
             self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
 
+    def test_cpu_still_proves_the_runtime_exists(self) -> None:
+        """CPU synthesis needs onnxruntime every bit as much as CUDA does.
+
+        Returning early for `device = "cpu"` skipped the check entirely, so the
+        probe reported speech output available on an environment where the first
+        session would fail -- the accept-then-fail the probe exists to prevent.
+        """
+        with patch.dict(sys.modules, {"onnxruntime": None}):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_providers(self._config("cpu"))
+
+        self.assertIn("uv sync", str(raised.exception))
+
     def test_an_unanticipated_probe_failure_refuses_speech_rather_than_the_daemon(self) -> None:
         """The backstop, not the two known arms.
 

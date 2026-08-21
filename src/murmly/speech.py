@@ -344,8 +344,13 @@ class SpeechEngine:
         stream that is shut is the only version of that guarantee a test can
         check.
         """
-        interruption = self.interrupt()
+        # The hold first. Taken after the interruption, a unit sent in the gap is
+        # taken by the producer and written into a device that is about to be
+        # closed -- and is then neither spoken nor named in the report, so the
+        # sender is never told it was dropped. Held first, it stays queued and
+        # `resume()` speaks it, which is what the spec asks for.
         self.hold()
+        interruption = self.interrupt()
         try:
             self._player.stop()
         except Exception as error:  # noqa: BLE001 - the report survives the failure

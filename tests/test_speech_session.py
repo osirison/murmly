@@ -978,6 +978,83 @@ class ProtocolDocumentationTests(unittest.TestCase):
             )
 
 
+class ResumeOrderingTests(SpeechSessionHarness):
+    def test_the_state_lock_is_held_across_the_resume_that_ends_capture(self) -> None:
+        """`resume` reopens the device and clears the barge-in hold.
+
+        Run after the lock is released, a capture starting in that window has
+        the loudspeaker opened underneath it -- speech and the microphone in the
+        room together, with no echo cancellation behind it. Asserting the
+        ordering rather than racing it: the window is a handful of bytecodes and
+        a test that tried to land inside it would pass on any machine that did
+        not happen to switch there.
+        """
+        observed: list[bool] = []
+
+        class LockObservingSpeech(SpeechEngine):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.daemon = None
+
+            def resume(self) -> None:
+                lock = self.daemon._lock
+                free = lock.acquire(blocking=False)
+                if free:
+                    lock.release()
+                observed.append(not free)
+                super().resume()
+
+        config = MurmlyConfig(
+            socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+            config_path=Path(tempfile.mkdtemp()) / "config.toml",
+            tts_enabled=True,
+        )
+        engine = LockObservingSpeech(
+            config, synthesizer=FakeSynthesizer(), player=RecordingPlayer()
+        )
+        daemon, socket_path, _engine, _player, _capture = self.serve(engine=engine)
+        engine.daemon = daemon
+        self.client(socket_path).declare()
+
+        send_command(str(socket_path), "toggle_session")
+        send_command(str(socket_path), "toggle_session")
+
+        self.assertTrue(observed, "no resume was observed")
+        self.assertNotIn(
+            False, observed, "capture ended with the speech hold released outside the state lock"
+        )
+
+
+class ConfirmedDeliveryTests(SpeechSessionHarness):
+    def test_a_transcript_is_undelivered_when_the_write_never_happens(self) -> None:
+        """Queued is not delivered.
+
+        A session that dies between the queue and the write leaves the person's
+        words on neither the socket nor the clipboard, because the clipboard
+        fallback was skipped on the strength of the queueing alone.
+        """
+        daemon, socket_path, _engine, _player, capture = self.serve()
+        client = SessionClient(socket_path)
+        self.addCleanup(client.close)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+
+        send_command(str(socket_path), "toggle_session")
+        # The writer stops taking frames, so anything queued from here on is
+        # never written -- but the session is still registered, so the delivery
+        # is attempted and must report what actually happened.
+        session = daemon._speech_session
+        session._outbox_ready.clear()
+        original = session._outbox_ready.set
+        session._outbox_ready.set = lambda: None
+        self.addCleanup(setattr, session._outbox_ready, "set", original)
+
+        response = send_command(str(socket_path), "toggle_session")
+
+        self.assertFalse(response["delivered"])
+        self.assertEqual(["hello world"], capture.copied)
+
+
 class SessionSendTests(SpeechSessionHarness):
     def test_a_frame_queued_as_the_session_closes_is_reported_as_dropped(self) -> None:
         """The flag is set before the sentinel is queued, both under the lock.

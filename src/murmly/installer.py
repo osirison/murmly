@@ -632,8 +632,13 @@ class Installer:
         requested = [(self._launcher, hotkey)]
         if session_hotkey is not None:
             requested.append((self._session_launcher, session_hotkey))
+        # Every component this run is about to rewrite. A key one of them holds
+        # now is a key it is about to release, so it is not a foreign claim --
+        # without this, swapping Murmly's own two hotkeys was refused with a
+        # message naming Murmly as the other application.
+        rewriting = {self._purpose_of(launcher).desktop_id for launcher, _key in requested}
         for launcher, requested_hotkey in requested:
-            self._refuse_conflict(launcher, requested_hotkey)
+            self._refuse_conflict(launcher, requested_hotkey, rewriting)
 
         already_bound = bool(self._shortcuts.owners_of(hotkey.keycode)) and (
             self._launcher.declared_hotkey() == hotkey.portable
@@ -648,6 +653,22 @@ class Installer:
         # that is gone -- silently, since nothing reports a launcher's command.
         for launcher in self._stale_launchers(entrypoint, requested):
             requested.append((launcher, parse_hotkey(launcher.declared_hotkey())))
+
+        # A key moving from one Murmly purpose to another has to be released
+        # before it is claimed: the desktop delivers a key to whichever
+        # component claimed it first, so writing the new claim while the old one
+        # still holds it binds nothing.
+        claimed = {key.keycode for _launcher, key in requested}
+        for launcher, key in requested:
+            declared = launcher.declared_hotkey()
+            if declared is None or declared == key.portable:
+                continue
+            try:
+                held = parse_hotkey(declared).keycode
+            except HotkeyError:
+                continue
+            if held in claimed:
+                launcher.unregister()
 
         # Only what this run writes, so a failure removes nothing that was
         # working before the command was typed.
@@ -679,10 +700,19 @@ class Installer:
                 launcher.register(entrypoint, requested_hotkey)
                 self._verify(requested_hotkey, purpose)
             except HotkeyNotConfirmedError:
-                # The launcher stays: the binding is persisted for next login.
+                # The launcher stays: the binding is persisted for next login,
+                # so a later failure's rollback must not take away the one thing
+                # this key still has going for it.
+                written.pop()
                 unconfirmed.append(requested_hotkey)
-            except Exception:
+            except Exception as error:
                 self._rollback(service_existed, written)
+                if unconfirmed:
+                    keys = ", ".join(key.portable for key in unconfirmed)
+                    raise InstallError(
+                        f"{error} {keys} was written but not confirmed in this "
+                        f"session, and has been left in place for the next login."
+                    ) from error
                 raise
 
         if unconfirmed:
@@ -743,10 +773,11 @@ class Installer:
             messages.append(f"To paste in this session, run:\n{remedy}")
         return tuple(messages)
 
-    def _refuse_conflict(self, launcher, hotkey: Hotkey) -> None:
+    def _refuse_conflict(self, launcher, hotkey: Hotkey, rewriting=frozenset()) -> None:
         purpose = self._purpose_of(launcher)
         owners = self._shortcuts.owners_of(hotkey.keycode)
-        foreign = [owner for owner in owners if owner.component_unique != purpose.desktop_id]
+        own = {purpose.desktop_id, *rewriting}
+        foreign = [owner for owner in owners if owner.component_unique not in own]
         if not foreign:
             return
         names = ", ".join(sorted({owner.label for owner in foreign}))

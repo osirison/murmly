@@ -450,7 +450,6 @@ class SoundDevicePlayer:
                         continue
                     self._stream = stream
                     self._sample_rate_hz = int(round(stream.samplerate))
-                    self._channels = channels
                     name = self._device_property(sd, device, "name")
                     self._device_name = (
                         str(name) if name is not None else self._device_label(device)
@@ -487,6 +486,12 @@ class SoundDevicePlayer:
                 dtype="int16",
                 callback=self._callback,
             )
+            # Published before the stream starts, not after it is chosen. The
+            # callback divides by this to count frames, and PortAudio can call
+            # it before `start()` returns -- with the previous open's value it
+            # reads the wrong number of bytes per frame and the played position
+            # is wrong from the first period.
+            self._channels = channels
             stream.start()
         except (sd.PortAudioError, ValueError) as error:
             if stream is not None:

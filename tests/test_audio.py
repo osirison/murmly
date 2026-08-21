@@ -904,6 +904,40 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual("Built-in Audio", player.output_device)
         self.assertIn("Missing Headset", player.device_detail)
 
+    def test_the_channel_count_is_published_before_the_stream_starts(self) -> None:
+        """PortAudio may call the callback before `start()` returns.
+
+        The callback divides by the channel count to turn bytes into frames, so
+        published afterwards it runs with the previous open's value and the
+        played position is wrong from the first period -- and the position is
+        what a sender is told the person heard.
+        """
+        def check_output_settings(**kwargs: object) -> None:
+            if kwargs["channels"] == 1:
+                raise FakePortAudioError("this device will not take mono")
+
+        player, _streams, sounddevice = self._player(check_output_settings=check_output_settings)
+        seen: list[int] = []
+
+        def raw_output_stream(**kwargs: object) -> FakeOutputStream:
+            stream = FakeOutputStream(kwargs["callback"], kwargs["samplerate"], kwargs["channels"])
+            starting = stream.start
+
+            def start_and_call_back() -> None:
+                seen.append(player.channels)
+                starting()
+
+            stream.start = start_and_call_back
+            return stream
+
+        sounddevice.RawOutputStream = raw_output_stream
+        player.start()
+
+        self.assertEqual(2, player.channels, "the stereo fallback was expected here")
+        self.assertEqual(
+            [2], seen, "a callback at start() would have used the previous open's channel count"
+        )
+
     def test_the_stream_is_halted_before_the_counters_are_squared(self) -> None:
         """The callback runs on its own thread and advances the played position.
 

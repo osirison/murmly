@@ -175,12 +175,16 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
     never allowed is a silent fallback -- the reason is logged and `murmly
     doctor` reports both the providers in use and the remedy.
     """
-    if config.device == "cpu":
-        return [CPU_PROVIDER]
-
-    # Whether this runtime build carries the provider at all, which is what the
-    # module-level list is for. What it must never be used for is proof that a
-    # session ran on it -- that comes off the session.
+    # Before the cpu shortcut, not after it. CPU synthesis needs the runtime
+    # every bit as much as CUDA does, so skipping the check for `device = "cpu"`
+    # reported speech output as available on an environment where the first
+    # session would fail -- accept-then-fail, which is what the probe exists to
+    # prevent.
+    #
+    # Whether this runtime build carries the CUDA provider is a separate
+    # question, and the module-level list is what answers it. What that list
+    # must never be used for is proof that a session ran on it -- that comes off
+    # the session.
     try:
         import onnxruntime
 
@@ -193,6 +197,9 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         # daemon outright, taking transcription with it, for a feature that is
         # meant to degrade on its own.
         raise RuntimeError(RUNTIME_UNUSABLE_REMEDY) from error
+
+    if config.device == "cpu":
+        return [CPU_PROVIDER]
 
     if CUDA_PROVIDER not in available:
         logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
