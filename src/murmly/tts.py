@@ -149,6 +149,14 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
     TensorRT is never requested. It heads the runtime's default provider list,
     fails on a missing `libnvinfer`, and only then falls back, which turns every
     session construction into a page of error output.
+
+    `device` is the `[stt]` setting, and there is no separate one for synthesis.
+    So it is read as a preference and never as a demand: a person who pinned
+    transcription to the GPU has not asked for GPU synthesis, and refusing every
+    speech session because the GPU build of ONNX Runtime is absent would make a
+    setting about transcription disable a feature it does not name. What is
+    never allowed is a silent fallback -- the reason is logged and `murmly
+    doctor` reports both the providers in use and the remedy.
     """
     if config.device == "cpu":
         return [CPU_PROVIDER]
@@ -159,8 +167,7 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
     import onnxruntime
 
     if CUDA_PROVIDER not in onnxruntime.get_available_providers():
-        if config.device == "cuda":
-            raise RuntimeError(GPU_RUNTIME_REMEDY)
+        logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
         return [CPU_PROVIDER]
 
     try:
@@ -169,11 +176,10 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         logger.warning("Speech output falling back to the CPU: %s", error)
         return [CPU_PROVIDER]
     if not cuda_ready:
-        if config.device == "cuda":
-            raise RuntimeError(
-                "Speech output on CUDA needs the Murmly CUDA extra. Run "
-                "`uv sync --extra cuda`."
-            )
+        logger.warning(
+            "Speech output falling back to the CPU: synthesis on CUDA needs the "
+            "Murmly CUDA extra. Run `uv sync --extra cuda`."
+        )
         return [CPU_PROVIDER]
     return [CUDA_PROVIDER, CPU_PROVIDER]
 

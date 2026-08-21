@@ -89,7 +89,15 @@ class HotkeyNotConfirmedError(InstallError):
 
     Distinct from other failures because the binding is already persisted: it
     will be in effect at the next login even though it is not active now.
+
+    Carries the key it concerns. An install requesting two hotkeys can fail on
+    either one, and naming both tells the person that a key which is bound,
+    confirmed and working right now is not active.
     """
+
+    def __init__(self, message: str, hotkey: "Hotkey | None" = None) -> None:
+        super().__init__(message)
+        self.hotkey = hotkey
 
 
 class HotkeyConflictError(InstallError):
@@ -390,6 +398,24 @@ class ShortcutLauncher:
                 return line.removeprefix("X-KDE-Shortcuts=").strip() or None
         return None
 
+    def declared_entrypoint(self) -> str | None:
+        """The command the launcher file runs, if it exists.
+
+        Read so that reinstalling after the checkout moved rewrites the
+        launcher. Comparing only the hotkey would find it already bound and skip
+        the write, leaving `Exec=` pointing at a path that no longer exists.
+        """
+        if not self.is_present:
+            return None
+        try:
+            content = self.launcher_path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for line in content.splitlines():
+            if line.startswith("Exec="):
+                return line.removeprefix("Exec=").strip().replace("%%", "%") or None
+        return None
+
     def user_override(self) -> str | None:
         """A hotkey the user has set through the desktop's own settings.
 
@@ -431,7 +457,8 @@ class ShortcutLauncher:
         if not self._wait_until(lambda: self._shortcuts.component_exists(self._purpose.desktop_id)):
             raise HotkeyNotConfirmedError(
                 f"The desktop did not register {hotkey.portable} within "
-                f"{self._timeout:g} seconds."
+                f"{self._timeout:g} seconds.",
+                hotkey,
             )
 
     def unregister(self) -> bool:
@@ -599,10 +626,19 @@ class Installer:
         service_existed = self._service.is_installed
         self._service.install(entrypoint)
 
+        # Only what this run writes, so a failure removes nothing that was
+        # working before the command was typed.
+        written: list[object] = []
         for launcher, requested_hotkey in requested:
             purpose = self._purpose_of(launcher)
-            bound = bool(self._shortcuts.owners_of(requested_hotkey.keycode)) and (
-                launcher.declared_hotkey() == requested_hotkey.portable
+            bound = (
+                bool(self._shortcuts.owners_of(requested_hotkey.keycode))
+                and launcher.declared_hotkey() == requested_hotkey.portable
+                # Rewritten when the command it runs has moved, even though the
+                # key is unchanged: reinstalling after the checkout moved is how
+                # a stale entrypoint gets repaired, and skipping the write here
+                # would leave the launcher pointing at a path that is gone.
+                and launcher.declared_entrypoint() == f"{entrypoint} {purpose.command}"
             )
             if bound:
                 messages.append(
@@ -611,13 +647,14 @@ class Installer:
                 )
                 continue
             try:
+                written.append(launcher)
                 launcher.register(entrypoint, requested_hotkey)
                 self._verify(requested_hotkey, purpose)
             except HotkeyNotConfirmedError:
                 # The launcher stays: the binding is persisted for next login.
                 raise
             except Exception:
-                self._rollback(service_existed)
+                self._rollback(service_existed, written)
                 raise
 
         override = self._launcher.user_override()
@@ -713,9 +750,14 @@ class Installer:
         if not owners:
             raise InstallError(f"The desktop reports no owner for {hotkey.portable} after registering it.")
 
-    def _rollback(self, service_existed: bool) -> None:
-        """Undo what this run created, leaving anything pre-existing alone."""
-        for launcher in (self._launcher, self._session_launcher):
+    def _rollback(self, service_existed: bool, written: "list[object]") -> None:
+        """Undo what this run created, leaving anything pre-existing alone.
+
+        Only the launchers this run wrote. Removing both would delete a hotkey
+        that was bound and working before the command started and that the
+        failure never touched.
+        """
+        for launcher in written:
             try:
                 launcher.unregister()
             except InstallError:

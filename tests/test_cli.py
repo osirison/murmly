@@ -1279,13 +1279,20 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config = self._config(temp_dir, tts_enabled=True, tts_voice="bf_emma", tts_rate_percent=120)
-            with patch("murmly.cli.negotiated_output", return_value=(48_000, None, None)):
+            with patch(
+                "murmly.cli.negotiated_output",
+                return_value=(48_000, "Studio Speakers", None, None),
+            ):
                 report = speech_output_diagnostics(config, FakeSynthesizer())
 
         self.assertTrue(report["available"])
         self.assertEqual("bf_emma", report["voice"])
         self.assertEqual(120, report["rate_percent"])
         self.assertEqual(48_000, report["negotiated_output_rate_hz"])
+        # The spec has the working report naming the device in use. The
+        # configured value cannot stand in: it is empty by default, which is
+        # the case a person with sound in the wrong place is looking at.
+        self.assertEqual("Studio Speakers", report["output_device_in_use"])
 
     def test_a_configured_value_that_was_not_honoured_is_reported_alongside_the_one_in_use(
         self,
@@ -1311,12 +1318,15 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
             config = self._config(temp_dir, tts_enabled=True)
             with patch(
                 "murmly.cli.negotiated_output",
-                return_value=(None, None, "No output device could be opened: nothing there"),
+                return_value=(None, None, None, "No output device could be opened: nothing there"),
             ):
                 report = speech_output_diagnostics(config, FakeSynthesizer())
 
         self.assertIsNone(report["negotiated_output_rate_hz"])
         self.assertIn("No output device could be opened", report["detail"])
+        # The daemon refuses every session for this same reason, so a report
+        # calling speech available would contradict the next thing that happens.
+        self.assertFalse(report["available"])
 
     def test_a_configured_device_that_was_not_used_names_what_was(self) -> None:
         from murmly.cli import speech_output_diagnostics
@@ -1326,11 +1336,12 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
             config = self._config(temp_dir, tts_enabled=True, tts_output_device="Missing Headset")
             with patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "The configured output device 'Missing Headset' could not be opened; using the system default instead.", None),
+                return_value=(48_000, "Built-in Audio", "The configured output device 'Missing Headset' could not be opened; using the system default instead.", None),
             ):
                 report = speech_output_diagnostics(config, FakeSynthesizer())
 
         self.assertEqual("Missing Headset", report["output_device"])
+        self.assertEqual("Built-in Audio", report["output_device_in_use"])
         self.assertIn("instead", report["output_device_detail"])
 
     def test_a_probe_that_fails_does_not_abandon_the_rest_of_the_report(self) -> None:

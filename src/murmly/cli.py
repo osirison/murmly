@@ -250,8 +250,12 @@ def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> in
         outcome = Installer().install(hotkey, session_hotkey)
     except HotkeyNotConfirmedError as error:
         print(str(error), file=sys.stderr)
-        unconfirmed = ", ".join(
-            key.portable for key in (hotkey, session_hotkey) if key is not None
+        # Only the key that was not confirmed. An install of two hotkeys can
+        # fail on either, and the other one is bound and working right now.
+        unconfirmed = (
+            error.hotkey.portable
+            if error.hotkey is not None
+            else ", ".join(key.portable for key in (hotkey, session_hotkey) if key is not None)
         )
         print(
             f"{unconfirmed} is not active in this session. The binding is saved and will "
@@ -476,16 +480,23 @@ def speech_output_diagnostics(
         report["providers"] = None
         report["provider_detail"] = str(error)
 
-    rate, device_detail, probe_detail = negotiated_output(config)
+    rate, device_name, device_detail, probe_detail = negotiated_output(config)
     report["negotiated_output_rate_hz"] = rate
+    report["output_device_in_use"] = device_name
     if device_detail is not None:
         report["output_device_detail"] = device_detail
     if probe_detail is not None:
+        # A device that will not open means no speech at all: the daemon refuses
+        # every session with this same reason. Reporting availability from the
+        # probe alone would say speech works while every session is refused.
+        report["available"] = False
         report["detail"] = probe_detail
     return report
 
 
-def negotiated_output(config: MurmlyConfig) -> tuple[int | None, str | None, str | None]:
+def negotiated_output(
+    config: MurmlyConfig,
+) -> tuple[int | None, str | None, str | None, str | None]:
     """Open the output device briefly to learn what a session would get.
 
     The same reason the capture side is probed rather than reported from
@@ -496,9 +507,9 @@ def negotiated_output(config: MurmlyConfig) -> tuple[int | None, str | None, str
     try:
         player.start()
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
-        return None, None, f"No output device could be opened: {error}"
+        return None, None, None, f"No output device could be opened: {error}"
     try:
-        return player.sample_rate_hz, player.device_detail, None
+        return player.sample_rate_hz, player.output_device, player.device_detail, None
     finally:
         try:
             player.stop()

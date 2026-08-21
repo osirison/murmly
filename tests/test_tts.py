@@ -320,28 +320,51 @@ class RuntimeResolutionTests(unittest.TestCase):
         with self._gpu_build(), patch("murmly.tts.load_cuda_libraries", return_value=False):
             self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
 
-    def test_cuda_requested_explicitly_and_unavailable_names_the_remedy(self) -> None:
+    def test_the_cuda_extra_missing_falls_back_and_logs_the_remedy(self) -> None:
+        """`device` is the transcription setting; it cannot disable speech.
+
+        A person who pinned Whisper to the GPU has not asked for GPU synthesis,
+        so a missing synthesis library falls back rather than refusing every
+        speech session. Silence about it is what is not allowed.
+        """
         with (
             patch("murmly.tts.load_cuda_libraries", return_value=False),
             patch("onnxruntime.get_available_providers", return_value=[CUDA_PROVIDER]),
+            self.assertLogs("murmly.tts", level="WARNING") as logged,
         ):
-            with self.assertRaises(RuntimeError) as raised:
-                resolve_providers(self._config("cuda"))
+            self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("cuda")))
 
-        self.assertIn("--extra cuda", str(raised.exception))
+        self.assertIn("--extra cuda", "\n".join(logged.output))
 
-    def test_a_cpu_only_runtime_build_is_named_as_the_swap_it_needs(self) -> None:
+    def test_a_cpu_only_runtime_build_falls_back_and_names_the_swap_it_needs(self) -> None:
         """The CPU and GPU builds share one package namespace.
 
         An environment holding both leaves the survivor of any later uninstall
-        broken, so the remedy has to say replace, not add.
+        broken, so the remedy has to say replace, not add. It is a remedy, not a
+        refusal: the documented CUDA install carries the CPU runtime on purpose.
         """
-        with patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]):
-            with self.assertRaises(RuntimeError) as raised:
-                resolve_providers(self._config("cuda"))
+        with (
+            patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]),
+            self.assertLogs("murmly.tts", level="WARNING") as logged,
+        ):
+            self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("cuda")))
 
-        self.assertIn("onnxruntime-gpu==1.24.4", str(raised.exception))
-        self.assertIn("uninstall onnxruntime", str(raised.exception))
+        message = "\n".join(logged.output)
+        self.assertIn("onnxruntime-gpu==1.24.4", message)
+        self.assertIn("uninstall onnxruntime", message)
+
+    def test_speech_survives_transcription_being_pinned_to_the_gpu(self) -> None:
+        """The documented CUDA install: CTranslate2 on the GPU, ONNX on the CPU.
+
+        `uv sync --extra cuda --extra tts` deliberately carries the CPU runtime,
+        so this is the ordinary configuration rather than a broken one, and a
+        synthesizer must come out of it available.
+        """
+        config = self._config("cuda")
+        with patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]):
+            providers = resolve_providers(config)
+
+        self.assertEqual([CPU_PROVIDER], providers)
 
     def test_a_cpu_only_runtime_build_falls_back_rather_than_raising_on_auto(self) -> None:
         with patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]):

@@ -602,6 +602,7 @@ class FakeLauncher:
         override: str | None = None,
         fail=None,
         purpose=None,
+        entrypoint: str | None = None,
     ) -> None:
         from murmly.installer import WINDOW_HOTKEY
 
@@ -609,11 +610,17 @@ class FakeLauncher:
         self._override = override
         self._fail = fail
         self.purpose = purpose or WINDOW_HOTKEY
+        # The whole Exec line, as the real launcher reports it, so a test can
+        # place a launcher whose key is current and whose command has moved.
+        self._entrypoint = entrypoint
         self.registrations: list[tuple[Path, str]] = []
         self.unregistrations = 0
 
     def declared_hotkey(self):
         return self._declared
+
+    def declared_entrypoint(self):
+        return self._entrypoint
 
     def user_override(self):
         return self._override
@@ -623,10 +630,12 @@ class FakeLauncher:
             raise self._fail
         self.registrations.append((entrypoint, hotkey.portable))
         self._declared = hotkey.portable
+        self._entrypoint = f"{entrypoint} {self.purpose.command}"
 
     def unregister(self) -> bool:
         self.unregistrations += 1
         existed, self._declared = self._declared is not None, None
+        self._entrypoint = None
         return existed
 
 
@@ -723,7 +732,7 @@ class IdempotenceTests(unittest.TestCase):
         from murmly.hotkey import parse_hotkey
         from murmly.installer import DESKTOP_ID
 
-        launcher = FakeLauncher(declared="Meta+X")
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/bin/murmly toggle")
         shortcuts = OwnerRegistry(
             owners={268435544: [owner(DESKTOP_ID, "murmly")]},
             keys={DESKTOP_ID: [268435544]},
@@ -736,11 +745,17 @@ class IdempotenceTests(unittest.TestCase):
         self.assertEqual([], launcher.registrations, "must not rebind an identical hotkey")
 
     def test_reinstall_repairs_a_stale_entrypoint(self) -> None:
+        """The launcher is rewritten too, not only the service unit.
+
+        Asserting the service alone passed while the launcher kept running a
+        command that no longer exists, which is the whole failure a person
+        reinstalls to repair.
+        """
         from murmly.hotkey import parse_hotkey
         from murmly.installer import DESKTOP_ID
 
         service = FakeService(installed=True, entrypoint="/old/murmly")
-        launcher = FakeLauncher(declared="Meta+X")
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/old/murmly toggle")
         shortcuts = OwnerRegistry(
             owners={268435544: [owner(DESKTOP_ID, "murmly")]},
             keys={DESKTOP_ID: [268435544]},
@@ -752,6 +767,36 @@ class IdempotenceTests(unittest.TestCase):
         installer.install(parse_hotkey("Meta+X"))
 
         self.assertEqual([Path("/new/murmly")], service.installs)
+        self.assertEqual([(Path("/new/murmly"), "Meta+X")], launcher.registrations)
+        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+
+    def test_reinstalling_one_hotkey_repairs_the_other_launcher_too(self) -> None:
+        """Both launchers run the entrypoint, so both go stale when it moves."""
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/old/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/old/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher,
+            session_launcher=session_launcher,
+            shortcuts=shortcuts,
+            entrypoint="/new/murmly",
+        )
+
+        installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+        self.assertEqual("/new/murmly toggle-session", session_launcher.declared_entrypoint())
 
 
 class VerificationTests(unittest.TestCase):
