@@ -544,17 +544,23 @@ class SoundDevicePlayer:
         holds, which is the one thing a person reaching for the hotkey is asking
         it not to do.
         """
+        stream = self._stream
+        if stream is not None:
+            # Halted before the counters are squared up. The callback advances
+            # `_frames_played` from its own thread, so pinning `_frames_written`
+            # to it first leaves one more period free to run and push the played
+            # position past the written one -- and the reported position past
+            # what the device was ever given.
+            try:
+                stream.abort()
+            except Exception as error:  # noqa: BLE001 - the caller is stopping, not starting
+                logger.warning("Audio output did not abort cleanly: %s", error)
         with self._write_lock:
             self._blocks.clear()
             self._frames_written = self._frames_played
-        stream = self._stream
         if stream is None:
             self._carry = b""
             return self._frames_played
-        try:
-            stream.abort()
-        except Exception as error:  # noqa: BLE001 - the caller is stopping, not starting
-            logger.warning("Audio output did not abort cleanly: %s", error)
         # Cleared while the device is stopped, so the callback cannot be holding
         # a slice of it.
         self._carry = b""

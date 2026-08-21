@@ -142,9 +142,12 @@ written into the code. Across four voices at three speeds the boundary gap the m
 produces ranges from 0.159 s to 0.435 s, falling as the speaking rate rises, and one
 voice (`bf_emma`) produces *longer* audio sentence by sentence than it does in one
 pass, so a fixed insertion would stretch it further. The pause is therefore derived
-per voice and speaking rate: one calibration passage is produced whole at
-synthesizer start, and the silent run the model leaves between its sentences is
-measured out of that audio. What is inserted at a boundary is that gap less the
+per voice and speaking rate: one calibration passage is produced whole, and the
+silent run the model leaves between its sentences is measured out of that audio.
+The measurement happens at the first sentence boundary rather than at synthesizer
+start, so it runs while the first sentence is already playing instead of ahead of
+it — putting a whole extra synthesis in front of the first audible word is the
+delay this design exists to remove. A passage of one sentence never pays for it. What is inserted at a boundary is that gap less the
 silence the two units already carry — `max(0, gap - trailing(previous) -
 leading(next))` — because independently produced units keep their own leading and
 trailing silence and inserting the whole gap on top would double it.

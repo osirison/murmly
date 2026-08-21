@@ -820,6 +820,11 @@ class MurmlyDaemon:
         self._speech_session: SpeechSessionConnection | None = None
         self._speech_session_lock = threading.Lock()
         self._capture_destination = DESTINATION_WINDOW
+        # The session this capture is for, fixed when it starts. The one that
+        # happens to be open when the transcript is ready is a different
+        # question, and answering with it delivers a person's words to a
+        # sender that was not there when they spoke them.
+        self._capture_session: SpeechSessionConnection | None = None
         self._segments: list[str] = []
         self._session_delivered = True
         # Held for the whole produce-and-deliver of one unit of audio, by both the
@@ -1293,30 +1298,46 @@ class MurmlyDaemon:
                 f"Speech output is unavailable: {self._speech.unavailable_reason}",
             )
 
-        with self._speech_session_lock:
-            if self._speech_session is not None:
+        # The state lock first, and held across `begin`. Declaring a session
+        # opens the output device and clears the barge-in hold, so one arriving
+        # while the microphone is open put speech and capture back into the room
+        # together -- which is the arrangement the whole design rules out, and
+        # the reason there is no echo cancellation to fall back on. The raw
+        # state, not the derived property: SPEAKING is IDLE with speech running
+        # and must still accept a session.
+        #
+        # The order matters. A toggle holds this lock and then reaches
+        # `_speech_session_lock` through `_barge_in`, so taking them the other
+        # way round here would deadlock.
+        with self._lock:
+            if self._state != STATE_IDLE:
                 return failure_response(
-                    CommandCode.SPEECH_SESSION_IN_USE,
-                    "A speech session is already open.",
+                    CommandCode.BUSY, "Daemon is busy.", state=self._state
                 )
-            session = SpeechSessionConnection(
-                connection,
-                self._handle_session_frame,
-                self._session_closed,
-                self._shutdown,
-            )
-            try:
-                # Opens the output device, so a session that cannot be given one
-                # is refused now rather than accepted and failed once somebody
-                # is listening.
-                self._speech.begin(session.send)
-            except Exception as error:  # noqa: BLE001 - a refusal, not a crash
-                session.dispose()
-                return failure_response(
-                    CommandCode.SPEECH_UNAVAILABLE,
-                    f"Speech output could not be started: {error}",
+            with self._speech_session_lock:
+                if self._speech_session is not None:
+                    return failure_response(
+                        CommandCode.SPEECH_SESSION_IN_USE,
+                        "A speech session is already open.",
+                    )
+                session = SpeechSessionConnection(
+                    connection,
+                    self._handle_session_frame,
+                    self._session_closed,
+                    self._shutdown,
                 )
-            self._speech_session = session
+                try:
+                    # Opens the output device, so a session that cannot be given
+                    # one is refused now rather than accepted and failed once
+                    # somebody is listening.
+                    self._speech.begin(session.send)
+                except Exception as error:  # noqa: BLE001 - a refusal, not a crash
+                    session.dispose()
+                    return failure_response(
+                        CommandCode.SPEECH_UNAVAILABLE,
+                        f"Speech output could not be started: {error}",
+                    )
+                self._speech_session = session
 
         try:
             session.start()
@@ -1327,7 +1348,14 @@ class MurmlyDaemon:
             with self._speech_session_lock:
                 if self._speech_session is session:
                     self._speech_session = None
-                    self._speech.end()
+                    try:
+                        self._speech.end()
+                    except Exception as stop_error:  # noqa: BLE001 - the handle still goes
+                        # A device that will not close must not also cost the
+                        # duplicated handle and the writer thread below.
+                        logger.warning(
+                            "Speech output did not stop cleanly: %s", stop_error
+                        )
             session.dispose()
             return failure_response(
                 CommandCode.COMMAND_FAILED, f"The speech session could not be started: {error}"
@@ -1458,6 +1486,12 @@ class MurmlyDaemon:
                 self._segments = []
                 self._session_delivered = True
                 self._capture_destination = destination
+                with self._speech_session_lock:
+                    self._capture_session = (
+                        self._speech_session
+                        if destination == DESTINATION_SESSION
+                        else None
+                    )
                 # Before the microphone opens, never after. The silence
                 # detector, live partials and the final transcript all read the
                 # live stream, and each would hear Murmly.
@@ -1533,7 +1567,20 @@ class MurmlyDaemon:
         return self._session.process_recording(pcm_audio, target)
 
     def _deliver_to_session(self, text: str) -> bool:
-        return self._send_to_session({"event": EVENT_TRANSCRIPT, "text": text})
+        """Deliver to the session this capture was started for, or to nobody.
+
+        Not "whichever session is open now": one sender can disconnect and
+        another connect while a transcript is being produced, and the second
+        one would receive words spoken to the first. Undelivered is the
+        correct answer there -- the clipboard fallback then keeps them.
+        """
+        with self._speech_session_lock:
+            session = self._capture_session
+            if session is not self._speech_session:
+                session = None
+        if session is None:
+            return False
+        return session.send({"event": EVENT_TRANSCRIPT, "text": text})
 
     def _finish_toggle(self, pcm_audio: bytes, target: WindowIdentity | None) -> dict[str, object]:
 

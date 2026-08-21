@@ -53,6 +53,11 @@ class _Scheduled:
     name: str
     start_frame: int
     end_frame: int | None = None
+    # Whether the whole unit has been handed to the device. `end_frame` only
+    # says where the audio so far ends, and it moves with every chunk, so a
+    # playback position that has caught up mid-unit means "heard everything
+    # produced", never "heard the unit".
+    produced: bool = False
     started: bool = False
     heard: bool = False
 
@@ -308,12 +313,14 @@ class SpeechEngine:
         self._thread = thread
 
     def speak(self, name: str, text: str) -> None:
-        # Queued first, suppressor re-armed second. The other order leaves a
-        # window in which a publish sees the suppressor cleared while the
-        # end-of-input marker is still latched, which is the report this pair
-        # exists to prevent.
-        self._queue.send(SpeechUnit(name=name, text=text))
-        self._reported_heard_all = False
+        # Both under the engine lock, which `_publish` holds across the whole
+        # heard-all gate and the flag it writes. Split, a speak could land
+        # between the gate deciding to report and the flag being set: the flag
+        # then latched for a batch that had not been heard, and the next one
+        # never got its report at all.
+        with self._lock:
+            self._queue.send(SpeechUnit(name=name, text=text))
+            self._reported_heard_all = False
 
     def end_input(self) -> None:
         self._queue.end_input()
@@ -454,39 +461,50 @@ class SpeechEngine:
         with self._lock:
             generation = self._generation
         entry: _Scheduled | None = None
-        for samples, sample_rate_hz in self._synthesizer.synthesize(unit.text):
-            if stop.is_set() or self._stale(generation):
-                return
-            self._wait_for_room(sink, generation, stop)
-            with self._lock:
-                # The write happens under the lock interrupt() aborts under, so
-                # there is no window in which a chunk checked as current is
-                # handed to the device after the abort has emptied it -- which
-                # is audible speech after the person asked for silence.
+        try:
+            for samples, sample_rate_hz in self._synthesizer.synthesize(unit.text):
                 if stop.is_set() or self._stale(generation):
                     return
-                if entry is None and not self._queue.holds(unit):
-                    # Discarded in the window between being taken and the
-                    # generation being read, so the staleness check above cannot
-                    # see it. Once there is an entry, that entry and the
-                    # generation are what report for this unit.
-                    return
-                if not self._player.active:
-                    raise RuntimeError("The speech output device is not open.")
-                frames = self._player.write(samples, sample_rate_hz)
-                if frames == 0:
-                    continue
-                if entry is None:
-                    # Registered on the first chunk rather than the last, so a
-                    # unit whose audio starts playing while its later sentences
-                    # are still being produced is not missed by the crossing.
-                    entry = _Scheduled(unit.name, self._player.frames_written - frames)
-                    self._scheduled.append(entry)
-                    # This entry reports the unit's position from here on, so
-                    # the queue stops reporting for it and an interruption names
-                    # it once rather than twice.
-                    self._queue.settle(unit)
-                entry.end_frame = self._player.frames_written
+                self._wait_for_room(sink, generation, stop)
+                with self._lock:
+                    # The write happens under the lock interrupt() aborts under,
+                    # so there is no window in which a chunk checked as current
+                    # is handed to the device after the abort has emptied it --
+                    # which is audible speech after the person asked for silence.
+                    if stop.is_set() or self._stale(generation):
+                        return
+                    if entry is None and not self._queue.holds(unit):
+                        # Discarded in the window between being taken and the
+                        # generation being read, so the staleness check above
+                        # cannot see it. Once there is an entry, that entry and
+                        # the generation are what report for this unit.
+                        return
+                    if not self._player.active:
+                        raise RuntimeError("The speech output device is not open.")
+                    frames = self._player.write(samples, sample_rate_hz)
+                    if frames == 0:
+                        continue
+                    if entry is None:
+                        # Registered on the first chunk rather than the last, so
+                        # a unit whose audio starts playing while its later
+                        # sentences are still being produced is not missed by
+                        # the crossing.
+                        entry = _Scheduled(unit.name, self._player.frames_written - frames)
+                        self._scheduled.append(entry)
+                        # This entry reports the unit's position from here on,
+                        # so the queue stops reporting for it and an
+                        # interruption names it once rather than twice.
+                        self._queue.settle(unit)
+                    entry.end_frame = self._player.frames_written
+        finally:
+            # Whatever ended this unit -- the last chunk, an interruption, a
+            # synthesis error -- no more of it is coming. Until this is set the
+            # entry's end_frame is only "where the audio so far ends", and a
+            # played position that has caught up to it would otherwise read as
+            # the whole unit having been heard.
+            if entry is not None:
+                with self._lock:
+                    entry.produced = True
 
     def _wait_for_room(
         self, sink: EventSink | None, generation: int, stop: threading.Event
@@ -518,7 +536,7 @@ class SpeechEngine:
                 if not entry.started and played > entry.start_frame:
                     entry.started = True
                     started.append(entry.name)
-                if entry.end_frame is not None and played >= entry.end_frame:
+                if entry.produced and entry.end_frame is not None and played >= entry.end_frame:
                     entry.heard = True
             outstanding = any(not entry.heard for entry in self._scheduled)
             while self._scheduled and self._scheduled[0].heard:
@@ -547,7 +565,7 @@ class SpeechEngine:
         for entry in self._scheduled:
             if played > entry.start_frame:
                 entry.started = True
-            if entry.end_frame is not None and played >= entry.end_frame:
+            if entry.produced and entry.end_frame is not None and played >= entry.end_frame:
                 entry.heard = True
 
     @staticmethod

@@ -757,13 +757,22 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual([], streams)
 
     def test_a_stream_that_fails_to_open_is_closed_before_the_next_candidate(self) -> None:
-        opened: list[FakeStream] = []
+        """The construction succeeds and the start fails, which is the only way
+        there is a stream object to leak. Raising from the constructor instead
+        means nothing was ever built, so the close the test is named for is
+        never reached and the assertion holds with the close deleted.
+        """
+        opened: list[FakeOutputStream] = []
 
-        def raw_output_stream(**kwargs: object) -> FakeStream:
+        def raw_output_stream(**kwargs: object) -> FakeOutputStream:
             stream = FakeOutputStream(kwargs["callback"], kwargs["samplerate"], kwargs["channels"])
             opened.append(stream)
             if kwargs["samplerate"] == 24_000:
-                raise FakePortAudioError("device busy")
+
+                def refuse() -> None:
+                    raise FakePortAudioError("device busy")
+
+                stream.start = refuse
             return stream
 
         player, _streams, sounddevice = self._player()
@@ -771,6 +780,26 @@ class PlaybackTests(unittest.TestCase):
         player.start()
 
         self.assertEqual(44_100, player.sample_rate_hz)
+        self.assertTrue(opened[0].closed, "the stream that would not start was left open")
+        self.assertFalse(opened[-1].closed, "the stream that did start was closed")
+
+    def test_a_constructor_that_raises_still_falls_through_to_the_next_candidate(self) -> None:
+        """The other half of the same path, kept separately named."""
+        opened: list[FakeOutputStream] = []
+
+        def raw_output_stream(**kwargs: object) -> FakeOutputStream:
+            if kwargs["samplerate"] == 24_000:
+                raise FakePortAudioError("device busy")
+            stream = FakeOutputStream(kwargs["callback"], kwargs["samplerate"], kwargs["channels"])
+            opened.append(stream)
+            return stream
+
+        player, _streams, sounddevice = self._player()
+        sounddevice.RawOutputStream = raw_output_stream
+        player.start()
+
+        self.assertEqual(44_100, player.sample_rate_hz)
+        self.assertEqual(1, len(opened))
 
     def test_written_audio_reaches_the_device_unchanged_at_the_negotiated_rate(self) -> None:
         player, streams, _sd = self._player()
@@ -874,6 +903,36 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual([0], opened)
         self.assertEqual("Built-in Audio", player.output_device)
         self.assertIn("Missing Headset", player.device_detail)
+
+    def test_the_stream_is_halted_before_the_counters_are_squared(self) -> None:
+        """The callback runs on its own thread and advances the played position.
+
+        Pinning `_frames_written` to it first leaves one more period free to
+        run, which pushes the played position past the written one -- and the
+        position reported to a sender past what the device was ever given.
+        Asserting the ordering rather than racing a real callback against it.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(4_800), 24_000)
+        observed: dict[str, int] = {}
+        stream = streams[0]
+        original = stream.abort
+
+        def record_then_abort() -> None:
+            observed["written"] = player.frames_written
+            observed["played"] = player.frames_played
+            original()
+
+        stream.abort = record_then_abort
+
+        player.abort()
+
+        self.assertGreater(
+            observed["written"],
+            observed["played"],
+            "the counters were squared up before the device was halted",
+        )
 
     def test_a_device_that_will_not_restart_after_an_abort_is_closed(self) -> None:
         """Reported through `active`, so the next start rebuilds it.

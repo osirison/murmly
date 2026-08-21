@@ -599,6 +599,15 @@ class Installer:
                 "Murmly did not register a hotkey. Bind this command to a shortcut "
                 f"in your desktop settings:\n    {entrypoint} toggle"
             )
+            if session_hotkey is not None:
+                # Named too, or the second key the person asked for disappears
+                # from the report entirely: the install reads as a success and
+                # nothing ever says the session hotkey was not bound.
+                messages.append(
+                    "Murmly did not register a hotkey for the speech session either. "
+                    "Bind this command to a second shortcut to "
+                    f"{SESSION_HOTKEY.description}:\n    {entrypoint} toggle-session"
+                )
             messages.extend(self._paste_injection_messages())
             return InstallOutcome(
                 entrypoint=entrypoint,

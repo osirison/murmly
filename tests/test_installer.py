@@ -1038,6 +1038,37 @@ class SessionScopeTests(unittest.TestCase):
         self.assertIn("/bin/murmly toggle", joined)
         self.assertIn("KDE Plasma", joined)
 
+    def test_an_unsupported_desktop_names_the_session_command_too(self) -> None:
+        """A requested key that is silently dropped is worse than a refused one.
+
+        The install reports success, nothing mentions the second hotkey, and the
+        person has no way to tell it was never bound -- so the manual-binding
+        instructions have to cover every purpose that was asked for.
+        """
+        from murmly.hotkey import parse_hotkey
+
+        installer = make_installer(
+            session=FakeSession(supported=False, detail="Hotkey registration requires KDE Plasma."),
+        )
+
+        outcome = installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        joined = " ".join(outcome.messages)
+        self.assertIn("/bin/murmly toggle", joined)
+        self.assertIn("/bin/murmly toggle-session", joined)
+
+    def test_a_one_key_install_is_not_told_to_bind_a_second(self) -> None:
+        """Binding one hotkey is a deliberate path, not an incomplete install."""
+        from murmly.hotkey import parse_hotkey
+
+        installer = make_installer(
+            session=FakeSession(supported=False, detail="Hotkey registration requires KDE Plasma."),
+        )
+
+        outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertNotIn("toggle-session", " ".join(outcome.messages))
+
     def test_unverified_session_proceeds_and_says_so(self) -> None:
         from murmly.hotkey import parse_hotkey
 

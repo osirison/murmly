@@ -107,14 +107,22 @@ class LockObservingQueue(SpeechQueue):
         super().__init__()
         self._engine = engine
         self.discarded_under_lock: bool | None = None
+        self.sent_under_lock: bool | None = None
+
+    def _engine_lock_held(self) -> bool:
+        free = self._engine._lock.acquire(blocking=False)
+        if free:
+            self._engine._lock.release()
+        return not free
+
+    def send(self, unit) -> None:
+        self.sent_under_lock = self._engine_lock_held()
+        return super().send(unit)
 
     def discard(self) -> list[str]:
         # A non-reentrant lock refuses this if anyone holds it, including the
         # thread asking -- which is the case being checked.
-        free = self._engine._lock.acquire(blocking=False)
-        if free:
-            self._engine._lock.release()
-        self.discarded_under_lock = not free
+        self.discarded_under_lock = self._engine_lock_held()
         return super().discard()
 
 
@@ -517,6 +525,100 @@ class InterruptionTests(EngineHarness):
         self.wait_for(
             lambda: any(e.get("event") == EVENT_HEARD_ALL for e in events),
             message="heard_all for the new batch",
+        )
+
+    def test_a_half_produced_unit_is_not_reported_as_heard(self) -> None:
+        """`end_frame` is where the audio SO FAR ends, and it moves per chunk.
+
+        A playback position that has caught up to it means the person heard
+        everything produced, never that they heard the unit. Reported as heard,
+        an interruption tells the sender nothing was cut off and it never
+        re-sends the half of the reply the person did not get.
+        """
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        engine, player, events = self.engine(synthesizer=FakeSynthesizer(gate=gate))
+        self.begin(engine, events)
+        engine.speak("half", "The first part. The second part.")
+        self.wait_for(lambda: player.frames_written > 0, message="the first sentence")
+        # Everything produced so far has been played, and the rest of the unit
+        # is still inside the model.
+        player.play()
+
+        interruption = engine.interrupt()
+
+        self.assertEqual("half", interruption.playing)
+        self.assertFalse(interruption.nothing_unheard, "a cut-off unit was reported as heard")
+
+    def test_everything_heard_waits_for_the_rest_of_the_unit_being_produced(self) -> None:
+        """The publish path, which the interruption test does not reach.
+
+        `_settle` and `_publish` each decide `heard` for themselves, so guarding
+        one leaves the other reporting a unit as heard the moment playback
+        catches up to the audio produced so far -- mid-unit, with the rest still
+        in the model.
+        """
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        engine, player, events = self.engine(synthesizer=FakeSynthesizer(gate=gate))
+        sink = self.begin(engine, events)
+        engine.speak("half", "The first part. The second part.")
+        self.wait_for(lambda: player.frames_written > 0, message="the first sentence")
+        player.play()
+        engine.end_input()
+
+        # Published from here: the thread that publishes is parked inside the
+        # model, so nothing would evaluate the gate while the unit is half done.
+        engine._publish(sink)
+
+        self.assertEqual([], [e for e in events if e.get("event") == EVENT_HEARD_ALL])
+
+    def test_speak_is_one_step_under_the_engine_lock(self) -> None:
+        """`_publish` holds this lock across the whole gate and the flag it sets.
+
+        A speak that took the queue without it could land between the gate
+        deciding to report and the flag being written. Asserting the ordering
+        rather than racing it: the window is a few instructions wide and a test
+        that tried to land inside it would pass on any machine that did not
+        happen to switch there.
+        """
+        engine, _player, events = self.engine()
+        self.begin(engine, events)
+        engine._queue = LockObservingQueue(engine)
+
+        engine.speak("one", "A sentence.")
+
+        self.assertTrue(
+            engine._queue.sent_under_lock,
+            "speak queued text outside the lock the heard-all gate is decided under",
+        )
+
+    def test_a_speak_racing_the_heard_all_gate_still_gets_its_own_report(self) -> None:
+        """The queue write and the suppressor reset are one step.
+
+        Split, a speak could land between the gate deciding to report and the
+        flag being set: the flag then latched for a batch that had not been
+        heard, and the batch that arrived never got a report at all.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        engine.speak("first", "A sentence.")
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        player.play()
+        engine.end_input()
+        self.wait_for(
+            lambda: [e for e in events if e.get("event") == EVENT_HEARD_ALL],
+            message="heard_all for the first batch",
+        )
+
+        engine.speak("second", "Another sentence.")
+        self.wait_for(lambda: player.pending_frames > 0, message="the second unit")
+        player.play()
+        engine.end_input()
+
+        self.wait_for(
+            lambda: len([e for e in events if e.get("event") == EVENT_HEARD_ALL]) == 2,
+            message="heard_all for the second batch",
         )
 
     def test_interrupting_without_a_session_reports_nothing(self) -> None:

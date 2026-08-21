@@ -63,9 +63,11 @@ CUDA_EXTRA_REMEDY = (
     "reapply the ONNX Runtime swap -- the sync restores the CPU build."
 )
 RUNTIME_UNUSABLE_REMEDY = (
-    "the ONNX Runtime is missing or unusable. Recreate the environment with "
-    "`uv sync --extra tts`, naming every extra you already have on the same "
-    "line, and reapply the GPU runtime swap if you want GPU synthesis."
+    "the ONNX Runtime is missing or unusable. Reinstall it with `uv sync "
+    "--reinstall --extra tts`, naming every extra you already have on the same "
+    "line, and reapply the GPU runtime swap if you want GPU synthesis. A plain "
+    "sync does not repair a half-installed runtime: the metadata still says it "
+    "is there, so there is nothing for the sync to do."
 )
 
 # Anything below this counts as silence when the pause between sentences is

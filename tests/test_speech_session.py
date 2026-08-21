@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import tempfile
 import threading
@@ -24,6 +25,7 @@ from murmly.daemon import (
 from murmly.focus import WindowIdentity
 from murmly.overlay import NullOverlayController
 from murmly.speech import (
+    EVENT_FAILED,
     EVENT_HEARD_ALL,
     EVENT_INTERRUPTED,
     EVENT_SHUTTING_DOWN,
@@ -869,6 +871,111 @@ class ClosingOnFirstUse:
 
     def __exit__(self, *arguments):
         return self._real.__exit__(*arguments)
+
+
+class DeclarationDuringCaptureTests(SpeechSessionHarness):
+    def test_a_session_cannot_be_declared_while_the_microphone_is_open(self) -> None:
+        """Declaring opens the output device and drops the barge-in hold.
+
+        Accepted during capture, that puts speech and the microphone in the room
+        together -- the one arrangement the design rules out, and the reason
+        there is no echo cancellation to fall back on. The refusal is the
+        ordinary busy one, so a sender retries rather than treating it as fatal.
+        """
+        daemon, socket_path, _engine, player, capture = self.serve()
+
+        self.assertEqual("LISTENING", send_command(str(socket_path), "toggle")["state"])
+        self.assertFalse(player.active, "the barge-in was expected to close the device")
+
+        refusal = self.client(socket_path).declare()
+
+        self.assertFalse(refusal["ok"])
+        self.assertEqual(CommandCode.BUSY, refusal["code"])
+        self.assertFalse(player.active, "the output device was reopened during capture")
+        self.assertEqual(0, capture.stopped, "capture was expected to be still running")
+
+    def test_a_session_is_still_accepted_while_speech_is_playing(self) -> None:
+        """SPEAKING is IDLE with speech running, and must not refuse a session."""
+        daemon, socket_path, _engine, player, _capture = self.serve()
+        first = SessionClient(socket_path)
+        first.declare()
+        first.send({"command": "speak", "name": "one", "text": "A sentence."})
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        self.assertEqual("SPEAKING", send_command(str(socket_path), "status")["state"])
+
+        first.close()
+        self.wait_for(lambda: daemon._speech_session is None, message="the session to clear")
+
+        self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
+
+
+class TranscriptBindingTests(SpeechSessionHarness):
+    def test_a_transcript_is_not_delivered_to_a_session_that_replaced_the_bound_one(
+        self,
+    ) -> None:
+        """Defence in depth, and deliberately so.
+
+        Refusing declarations during capture already stops a second sender
+        appearing between the key press and the transcript, so there is no
+        end-to-end route to this any more. The binding is what makes the
+        delivery correct on its own terms rather than by relying on that
+        refusal, so it is exercised directly: a delivery resolving against
+        "whichever session is open now" hands one sender the words another
+        person spoke, which no clipboard fallback can undo.
+        """
+        daemon, socket_path, _engine, _player, capture = self.serve()
+        bound = self.client(socket_path)
+        bound.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+        daemon._capture_session = daemon._speech_session
+        daemon._capture_destination = "session"
+
+        # The sender that was bound goes, and a different one takes the slot.
+        replacement = object()
+        with daemon._speech_session_lock:
+            daemon._speech_session = replacement
+
+        delivered = daemon._deliver_to_session("the words the person said")
+
+        self.assertFalse(delivered, "a transcript went to a session it was not for")
+        self.assertEqual(
+            [],
+            [f for f in bound.drain() if f.get("event") == EVENT_TRANSCRIPT],
+            "the bound session was sent a transcript after being replaced",
+        )
+        with daemon._speech_session_lock:
+            daemon._speech_session = None
+
+
+class ProtocolDocumentationTests(unittest.TestCase):
+    def test_the_readme_documents_every_event_the_daemon_can_send(self) -> None:
+        """A sender writes its handler from this table.
+
+        An event missing from it is one nobody handles: `failed` is the one that
+        says a piece of the reply is never coming, so a sender that does not
+        know about it waits for audio that will not arrive.
+        """
+        readme = (Path(__file__).parents[1] / "README.md").read_text()
+        # Anchored on the sentence above it: there are two "| Frame | Meaning |"
+        # tables in this section, and the first lists what a sender may send.
+        table = re.search(
+            r"Frames Murmly sends, without being asked:\n\n(.*?)\n\n", readme, re.DOTALL
+        )
+        self.assertIsNotNone(table, "no session event table found in README")
+
+        for event in (
+            EVENT_STARTED,
+            EVENT_HEARD_ALL,
+            EVENT_INTERRUPTED,
+            EVENT_TRANSCRIPT,
+            EVENT_FAILED,
+            EVENT_SHUTTING_DOWN,
+        ):
+            self.assertIn(
+                f'"{event}"',
+                table.group(1),
+                f"the session protocol table does not document the {event} event",
+            )
 
 
 class SessionSendTests(SpeechSessionHarness):

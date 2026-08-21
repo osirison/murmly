@@ -35,12 +35,21 @@ cuda = [
 ]
 ```
 
+That is the CTranslate2 requirement alone. The extra now also carries
+`nvidia-cuda-runtime-cu12`, `nvidia-cufft-cu12`, `nvidia-curand-cu12` and
+`nvidia-nvjitlink-cu12` for the ONNX CUDA provider — see
+`docs/agent-notes/onnxruntime-gpu-cuda-version.md`.
+
 Then install it explicitly:
 
 ```bash
 uv lock
-uv sync --extra cuda
+uv sync --extra cuda --extra tts
 ```
+
+Both extras on the sync line if speech output is installed. `uv sync` makes the
+environment match exactly the extras it is given, so `--extra cuda` alone
+removes `kokoro-onnx` and leaves speech output unavailable.
 
 The resolved wheels include cuBLAS, cuDNN, and NVRTC and require roughly
 1.4 GB of downloads on Linux x86-64. The Whisper model download is additional.

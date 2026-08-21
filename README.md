@@ -278,6 +278,7 @@ Frames Murmly sends, without being asked:
 | `{"event": "heard_all"}` | everything queued was heard, and the sender had said it was finished |
 | `{"event": "interrupted", "playing": "m2", "pending": ["m3"], "code": "speech_interrupted"}` | the person interrupted; `m2` was cut off and `m3` never started |
 | `{"event": "transcript", "text": "..."}` | what the person said, when the session hotkey started the capture |
+| `{"event": "failed", "name": "m4", "error": "..."}` | `m4` could not be produced; the session continues |
 | `{"event": "shutting_down"}` | Murmly is stopping |
 
 Three things a sender should know:
