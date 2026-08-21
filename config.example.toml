@@ -77,13 +77,18 @@ text_size_px = 13       # Live transcript panel text size, 8-48
 #     uv sync --extra tts
 #     sudo dnf install espeak-ng
 #
-# That runs synthesis on the CPU, at roughly five times real time. The GPU build
-# of ONNX Runtime replaces the CPU one rather than joining it, because both
-# install into the same package namespace:
+# That runs synthesis on the CPU, at roughly five times real time, whatever
+# `[stt] device` above says: that setting is about transcription and neither
+# moves synthesis to the GPU nor turns it off. The GPU build of ONNX Runtime
+# replaces the CPU one rather than joining it, because both install into the
+# same package namespace:
 #
-#     uv sync --extra cuda
+#     uv sync --extra cuda --extra tts
 #     uv pip uninstall onnxruntime
 #     uv pip install "onnxruntime-gpu==1.24.4"
+#
+# Both extras on the first line: `uv sync` makes the environment match exactly
+# what it is given, so `--extra cuda` alone would remove kokoro-onnx.
 #
 # `murmly doctor` reports what is missing under `speech_output`.
 enabled = false

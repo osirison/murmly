@@ -117,6 +117,33 @@ Confirmed in a fresh environment on 2026-08-21: after the swap
 `onnxruntime.InferenceSession` exists, `get_available_providers()` lists CUDA,
 and `faster_whisper.vad.get_vad_model()` still loads through the survivor.
 
+## `uv sync` is exact, so name every extra every time
+
+`uv sync --extra cuda` does not add the CUDA extra to what is installed. It
+makes the environment match exactly what it was given, and removes everything
+else — including the speech synthesizer:
+
+```console
+$ uv sync --extra cuda --dry-run          # in an environment that has [tts]
+Would uninstall 2 packages
+ - kokoro-onnx==0.6.1
+ + onnxruntime==1.28.0
+```
+
+Confirmed on 2026-08-21. The GPU recipe therefore has to start
+`uv sync --extra cuda --extra tts`; starting it with `--extra cuda` alone
+removes `kokoro-onnx` and leaves speech output unavailable for a reason that
+looks nothing like the command that caused it.
+
+## Synthesis is not gated on `[stt] device`
+
+`resolve_providers` reads `config.device`, which is the `[stt] device` key —
+there is no separate one for synthesis. It is read as a preference: a person who
+pinned transcription to the GPU has not asked for GPU synthesis, so a missing
+`onnxruntime-gpu` falls back to the CPU and logs the remedy rather than raising.
+Raising made `device = "cuda"` refuse every speech session on the documented
+`--extra cuda --extra tts` install, which deliberately carries the CPU runtime.
+
 ## Also
 
 `onnxruntime` and `onnxruntime-gpu` install into the same `onnxruntime` package

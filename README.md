@@ -197,22 +197,30 @@ Then place the model files in `~/.local/share/murmly`:
 And set `enabled = true` under `[tts]` in your configuration. `murmly doctor`
 reports what is missing under `speech_output` and names the remedy for each.
 
-Synthesis runs on the CPU at roughly five times real time, which is enough. To
-run it on the GPU, note that the GPU build of ONNX Runtime **replaces** the CPU
-one rather than joining it — both install into the same `onnxruntime` package
-namespace, and an environment holding both leaves the survivor of any later
-uninstall broken:
+Synthesis runs on the CPU at roughly five times real time, which is enough, and
+it does so whatever `[stt] device` says — that setting is about transcription,
+and pinning Whisper to the GPU neither moves synthesis there nor disables it.
+
+To run synthesis on the GPU too, note that the GPU build of ONNX Runtime
+**replaces** the CPU one rather than joining it — both install into the same
+`onnxruntime` package namespace, and an environment holding both leaves the
+survivor of any later uninstall broken:
 
 ```bash
-uv sync --extra cuda
+uv sync --extra cuda --extra tts
 uv pip uninstall onnxruntime
 uv pip install "onnxruntime-gpu==1.24.4"
 ```
 
+Both extras on the first line, every time. `uv sync` makes the environment match
+exactly what it is given, so `uv sync --extra cuda` alone removes `kokoro-onnx`
+and leaves speech output unavailable.
+
 `murmly doctor` reports which execution providers speech output resolved, and
 Murmly reads the provider back off the session it constructed rather than off
 the module's advertised list — that list says CUDA on a session running on the
-CPU.
+CPU. When synthesis falls back to the CPU because the GPU build is absent, the
+providers it reports say so and the log names the remedy.
 
 ### The two hotkeys
 

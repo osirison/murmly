@@ -104,6 +104,28 @@ class SynthesisTests(unittest.TestCase):
 
         self.assertGreater(abs(naive - len(whole)), int(0.01 * rate))
 
+    def test_the_pause_holds_when_sentences_begin_on_silence(self) -> None:
+        """The leading term of the derivation, which nothing else exercises.
+
+        `FakeKokoroModel.lead` defaults to zero and no other test sets it, so
+        `_leading_silence` evaluated to zero in every case and the whole
+        subtraction could be deleted with the suite still green. A voice whose
+        chunks begin on silence over-pads every boundary by that much without
+        it, which is the doubling the derivation exists to prevent.
+        """
+        model = FakeKokoroModel(lead=0.08)
+        synthesizer = self._synthesizer(model)
+
+        chunked = sum(len(samples) for samples, _rate in synthesizer.synthesize(PASSAGE))
+        whole, rate = model.create(PASSAGE, voice=DEFAULT_TTS_VOICE, speed=1.0)
+
+        tolerance = int(0.01 * rate)
+        self.assertLessEqual(
+            abs(chunked - len(whole)),
+            tolerance,
+            f"chunked {chunked / rate:.3f}s against whole {len(whole) / rate:.3f}s",
+        )
+
     def test_the_pause_is_measured_rather_than_assumed(self) -> None:
         """Two models that pause differently produce differently long output."""
         short_pause = self._synthesizer(FakeKokoroModel(boundary_pause=0.20))
