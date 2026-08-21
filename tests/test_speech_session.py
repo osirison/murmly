@@ -550,6 +550,40 @@ class BargeInTests(SpeechSessionHarness):
         send_command(str(socket_path), "toggle")
         self.wait_for(lambda: player.frames_written > 0, message="the held text to be spoken")
 
+    def test_a_continuous_session_that_ends_on_a_refusal_still_releases_the_hold(self) -> None:
+        """Every capture-end path owes the held text its turn, not just the toggle.
+
+        A continuous auto-transcribe session ends on its own when delivery is
+        refused. Without the release there, text queued during that recording
+        waits for some later capture to end instead.
+        """
+        _daemon, socket_path, engine, player, _capture = self.serve()
+        client = self.client(socket_path)
+        client.declare()
+        engine.suspend()
+        client.send({"command": "speak", "name": "held", "text": "Held until you finish."})
+        time.sleep(0.1)
+        self.assertEqual(0, player.frames_written, "spoke over the person")
+
+        _daemon._finish_continuous_session()
+
+        self.wait_for(lambda: player.frames_written > 0, message="the held text to be spoken")
+
+    def test_a_transition_that_cannot_start_still_releases_the_hold(self) -> None:
+        _daemon, socket_path, engine, player, _capture = self.serve()
+        client = self.client(socket_path)
+        client.declare()
+        engine.suspend()
+        client.send({"command": "speak", "name": "held", "text": "Held until you finish."})
+        time.sleep(0.1)
+
+        from unittest.mock import patch
+
+        with patch("threading.Thread.start", side_effect=RuntimeError("no thread")):
+            _daemon._start_transition(lambda: None, "murmly-test")
+
+        self.wait_for(lambda: player.frames_written > 0, message="the held text to be spoken")
+
     def test_a_hotkey_press_while_silent_starts_capture_as_it_does_today(self) -> None:
         _daemon, socket_path, _engine, _player, capture = self.serve()
 

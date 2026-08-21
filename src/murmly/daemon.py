@@ -1622,6 +1622,7 @@ class MurmlyDaemon:
             self._publish_error()
             with self._lock:
                 self._state = "IDLE"
+            self._speech.resume()
 
     def _finish_continuous_session(self) -> None:
         try:
@@ -1635,6 +1636,10 @@ class MurmlyDaemon:
             self._publish_error()
             with self._lock:
                 self._state = "IDLE"
+            # Every path that ends capture releases the hold, this one included:
+            # text a sender queued while the person was speaking is owed its turn
+            # as soon as the microphone closes, however the recording ended.
+            self._speech.resume()
 
     @staticmethod
     def _create_overlay(config: MurmlyConfig) -> OverlayLifecycle:
