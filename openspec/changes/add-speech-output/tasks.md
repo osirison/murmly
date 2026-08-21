@@ -93,7 +93,7 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 11. Validation
 
-- [ ] 11.1 `openspec validate add-speech-output --strict` passes
-- [ ] 11.2 `uv run --extra cuda python -m unittest discover -s tests` passes with no test skipped that was not skipped before
-- [ ] 11.3 Confirm `status` and `toggle` request shapes, response shapes, and wording are unchanged, including the exact-dict assertions in `tests/test_daemon.py`
-- [ ] 11.4 Confirm an installation with speech output disabled behaves identically to the previous release
+- [x] 11.1 `openspec validate add-speech-output --strict` passes
+- [x] 11.2 `uv run --extra cuda python -m unittest discover -s tests` passes with no test skipped that was not skipped before
+- [x] 11.3 Confirm `status` and `toggle` request shapes, response shapes, and wording are unchanged, including the exact-dict assertions in `tests/test_daemon.py`
+- [x] 11.4 Confirm an installation with speech output disabled behaves identically to the previous release
