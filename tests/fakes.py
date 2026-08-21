@@ -8,12 +8,15 @@ one is 326 MB of weights and half a second of construction per test.
 from __future__ import annotations
 
 from collections.abc import Iterator
+import threading
 
 import numpy as np
 
 
 FAKE_SAMPLE_RATE_HZ = 24_000
 SAMPLES_PER_CHARACTER = 24  # 1 ms of audio per character, so durations stay small
+# A gate a test forgot to release fails that test rather than hanging the suite.
+GATE_TIMEOUT_SECONDS = 10.0
 
 
 def fake_amplitude(text: str) -> float:
@@ -43,6 +46,8 @@ class FakeSynthesizer:
         rate_percent: int = 100,
         sample_rate_hz: int = FAKE_SAMPLE_RATE_HZ,
         error: Exception | None = None,
+        gate: threading.Event | None = None,
+        gate_after: int = 1,
     ) -> None:
         self._available = available
         self._unavailable_reason = unavailable_reason
@@ -53,6 +58,13 @@ class FakeSynthesizer:
         self.provider = "FakeExecutionProvider"
         self.spoken: list[str] = []
         self._error = error
+        # A pass already inside the real model cannot be interrupted, and how the
+        # engine behaves while one is in flight is most of what there is to test
+        # about interruption. The gate parks production at a chosen chunk so a
+        # test can put the producer in that state exactly, rather than racing a
+        # sleep against it and passing for the wrong reason.
+        self._gate = gate
+        self._gate_after = gate_after
 
     @property
     def available(self) -> bool:
@@ -66,7 +78,9 @@ class FakeSynthesizer:
         self.spoken.append(text)
         if self._error is not None:
             raise self._error
-        for sentence in split_for_fake(text):
+        for index, sentence in enumerate(split_for_fake(text)):
+            if self._gate is not None and index >= self._gate_after:
+                self._gate.wait(GATE_TIMEOUT_SECONDS)
             yield audio_for(sentence), self.sample_rate_hz
 
 

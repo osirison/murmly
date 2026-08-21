@@ -31,17 +31,24 @@ class FakeStream:
         self.started = False
         self.closed = False
         self.aborted = False
+        # Whether PortAudio would be calling the callback. `abort` is
+        # Pa_AbortStream and `stop` is Pa_StopStream, and both leave the stream
+        # stopped until it is started again -- a fake that keeps running after
+        # an abort tests something PortAudio does not do.
+        self.running = False
         self.samplerate = sample_rate_hz
         self.written = bytearray()
 
     def start(self) -> None:
         self.started = True
+        self.running = True
 
     def stop(self) -> None:
-        pass
+        self.running = False
 
     def abort(self) -> None:
         self.aborted = True
+        self.running = False
 
     def close(self) -> None:
         self.closed = True
@@ -77,8 +84,17 @@ class FakeOutputStream(FakeStream):
         self.frame_bytes = channels * sample_width
 
     def pump(self, frames: int, status: object = None) -> bytes:
-        """Run one callback period and record what it produced."""
+        """Run one callback period and record what it produced.
+
+        A stopped stream produces nothing, because PortAudio does not call the
+        callback of one. Silence here rather than a refusal: a test can pump a
+        device that has been aborted and see that it stayed silent.
+        """
         block = bytearray(frames * self.frame_bytes)
+        if not self.running:
+            produced = bytes(block)
+            self.write(produced)
+            return produced
         buffer = memoryview(block)
         self.callback(buffer, frames, object(), status)
         produced = bytes(block)
@@ -811,6 +827,42 @@ class PlaybackTests(unittest.TestCase):
         streams[0].pump(480)
 
         self.assertEqual(bytes(2 * 480), bytes(streams[0].written)[len(before) :])
+
+    def test_speech_written_after_an_abort_still_reaches_the_device(self) -> None:
+        """`abort` is Pa_AbortStream, which leaves the stream stopped.
+
+        A player that does not start it again queues every later chunk to a
+        device that will never ask for one. The session stays open and is never
+        audible again: nothing plays, the played position never moves, and the
+        sender is never told anything was heard.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(4_800), 24_000)
+        streams[0].pump(480)
+
+        player.abort()
+        player.write(self._tone(4_800), 24_000)
+        streams[0].pump(480)
+
+        self.assertTrue(player.active, "the player reports a device it does not have")
+        self.assertEqual(960, player.frames_played, "audio after an abort was never played")
+
+    def test_a_device_that_will_not_restart_after_an_abort_is_closed(self) -> None:
+        """Reported through `active`, so the next start rebuilds it.
+
+        Leaving the stream in place would make `active` claim a working device
+        while every write piled up behind a callback that never runs.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(4_800), 24_000)
+        streams[0].start = lambda: (_ for _ in ()).throw(FakePortAudioError("device gone"))
+
+        player.abort()
+
+        self.assertFalse(player.active)
+        self.assertTrue(streams[0].closed)
 
     def test_a_failing_stop_still_closes_the_stream(self) -> None:
         player, streams, _sd = self._player()

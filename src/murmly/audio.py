@@ -369,6 +369,17 @@ class SoundDevicePlayer:
         self._frames_played = 0
         self._underruns = 0
         self._device_detail: str | None = None
+        self._device_name: str | None = None
+
+    @property
+    def output_device(self) -> str | None:
+        """The device that opened, which is not always the one configured.
+
+        Reported by name rather than by the configured value, because the
+        configured value is empty in the default installation and a person whose
+        speech is coming out of the wrong sink has nothing to compare.
+        """
+        return self._device_name
 
     @property
     def sample_rate_hz(self) -> int:
@@ -427,6 +438,7 @@ class SoundDevicePlayer:
         self._frames_played = 0
         self._underruns = 0
         self._device_detail = None
+        self._device_name = None
 
         configured = self._configured_device()
         failures: list[str] = []
@@ -439,6 +451,10 @@ class SoundDevicePlayer:
                     self._stream = stream
                     self._sample_rate_hz = int(round(stream.samplerate))
                     self._channels = channels
+                    name = self._device_property(sd, device, "name")
+                    self._device_name = (
+                        str(name) if name is not None else self._device_label(device)
+                    )
                     if configured is not None and device != configured:
                         self._device_detail = (
                             f"The configured output device {configured!r} could not be "
@@ -532,12 +548,30 @@ class SoundDevicePlayer:
             self._blocks.clear()
             self._frames_written = self._frames_played
         stream = self._stream
-        if stream is not None:
-            try:
-                stream.abort()
-            except Exception as error:  # noqa: BLE001 - the caller is stopping, not starting
-                logger.warning("Audio output did not abort cleanly: %s", error)
+        if stream is None:
+            self._carry = b""
+            return self._frames_played
+        try:
+            stream.abort()
+        except Exception as error:  # noqa: BLE001 - the caller is stopping, not starting
+            logger.warning("Audio output did not abort cleanly: %s", error)
+        # Cleared while the device is stopped, so the callback cannot be holding
+        # a slice of it.
         self._carry = b""
+        try:
+            # `abort` is Pa_AbortStream, which leaves the stream *stopped*. The
+            # callback is not invoked again until the stream is started, so
+            # without this the next write() is queued to a device that will
+            # never ask for it: nothing plays, the played position never moves,
+            # and the session is silent for the rest of its life. Restarting
+            # here keeps `active` meaning what it says.
+            stream.start()
+        except Exception as error:  # noqa: BLE001 - reported through `active`, not raised
+            logger.warning("Audio output could not be restarted after an abort: %s", error)
+            try:
+                self.stop()
+            except Exception as close_error:  # noqa: BLE001 - already down; nothing left to save
+                logger.warning("Audio output did not close after a failed restart: %s", close_error)
         return self._frames_played
 
     def stop(self) -> None:
@@ -602,6 +636,11 @@ class SoundDevicePlayer:
         if native is not None and int(native) > 0 and int(native) not in sample_rates:
             sample_rates.append(int(native))
         return sample_rates
+
+    @staticmethod
+    def _device_label(device) -> str:
+        """A name for a device the host could not describe."""
+        return "the system default" if device is None else str(device)
 
     @staticmethod
     def _device_property(sounddevice, device, key: str):

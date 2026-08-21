@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from fakes import FakeSynthesizer, split_for_fake
+from fakes import FakeSynthesizer, expected_audio, split_for_fake
 from murmly.config import MurmlyConfig
 from murmly.speech import (
     EVENT_HEARD_ALL,
@@ -236,12 +236,26 @@ class PlaybackTests(EngineHarness):
         """A position taken from production would otherwise be the whole passage."""
         engine, player, events = self.engine()
         self.begin(engine, events)
+        lookahead = int(LOOKAHEAD_SECONDS * player.sample_rate_hz)
 
+        text = " ".join(
+            ["A sentence of a length that makes the arithmetic here plain enough."] * 3
+        )
+        # Sized from the fake's own output rather than guessed. A passage that
+        # cannot exceed the lookahead never enters the throttle at all, and the
+        # assertion below then holds for an engine with no throttle whatsoever.
+        self.assertGreater(
+            40 * len(expected_audio(text)),
+            2 * lookahead,
+            "the passage must be able to exceed the lookahead, or this cannot fail",
+        )
         for index in range(40):
-            engine.speak(f"unit{index}", "A sentence of some length to produce.")
+            engine.speak(f"unit{index}", text)
+        self.wait_for(
+            lambda: player.pending_frames > lookahead, message="the lookahead to be reached"
+        )
         time.sleep(0.3)
 
-        lookahead = int(LOOKAHEAD_SECONDS * player.sample_rate_hz)
         self.assertLessEqual(
             player.pending_frames,
             lookahead + player.written[-1][0],
@@ -323,22 +337,151 @@ class InterruptionTests(EngineHarness):
         self.assertEqual(0, player.pending_frames)
 
     def test_a_late_synthesis_result_is_discarded(self) -> None:
-        """A pass already inside the model cannot be interrupted, so it is dropped."""
-        engine, player, events = self.engine()
+        """A pass already inside the model cannot be interrupted, so it is dropped.
+
+        The producer is parked inside the model by the gate rather than by a
+        sleep. Without it the fake finishes all seven sentences before the
+        interrupt lands, and the test passes without a discard ever happening.
+        """
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        engine, player, events = self.engine(synthesizer=FakeSynthesizer(gate=gate))
         self.begin(engine, events)
         engine.speak("first", "One. Two. Three. Four. Five. Six. Seven.")
-        self.wait_for(lambda: player.frames_written > 0, message="production started")
+        self.wait_for(lambda: player.frames_written > 0, message="the first sentence")
 
         engine.interrupt()
         written_at_interrupt = player.frames_written
+        gate.set()
         time.sleep(0.1)
 
         self.assertEqual(written_at_interrupt, player.frames_written)
+
+    def test_a_unit_taken_but_not_yet_produced_is_reported_as_pending(self) -> None:
+        """It is in the queue no longer and in the schedule not yet.
+
+        The producer parks holding one unit for the whole lookahead, so this is
+        the steady state of any long reply rather than a narrow window. A report
+        built from the queue and the schedule alone omits it, and a sender told
+        it was neither playing nor pending treats it as heard.
+        """
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        synthesizer = FakeSynthesizer(gate=gate, gate_after=0)
+        engine, _player, events = self.engine(synthesizer=synthesizer)
+        self.begin(engine, events)
+
+        engine.speak("taken", "One.")
+        engine.speak("queued", "Two.")
+        self.wait_for(lambda: synthesizer.spoken == ["One."], message="the unit to be taken")
+
+        interruption = engine.interrupt()
+
+        self.assertEqual(("taken", "queued"), interruption.pending)
+
+    def test_a_unit_being_spoken_is_reported_once_not_twice(self) -> None:
+        """Named as playing, and not also as pending.
+
+        The schedule takes over reporting a unit the moment it has audio, and a
+        unit held in both places would be named in both halves of the report.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        engine.speak("one", "A sentence.")
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        # One frame: past the start and nowhere near the end, which is what
+        # "being spoken" means. Playing it all would make it heard instead.
+        player.play(1)
+        self.wait_for(lambda: self.names(events, EVENT_STARTED) == ["one"], message="started")
+
+        interruption = engine.interrupt()
+
+        self.assertEqual("one", interruption.playing)
+        self.assertNotIn("one", interruption.pending)
+
+    def test_an_interrupted_session_is_not_told_everything_was_heard(self) -> None:
+        """The sender said it had finished; the text was thrown away unspoken.
+
+        Reporting heard_all here tells the sender the person heard units that
+        were discarded, which is the one thing the event must never mean.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        for name in ("a", "b", "c"):
+            engine.speak(name, "A sentence.")
+        engine.end_input()
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+
+        interruption = engine.interrupt()
+        time.sleep(0.1)
+
+        self.assertFalse(interruption.nothing_unheard)
+        self.assertEqual([], [e for e in events if e.get("event") == EVENT_HEARD_ALL])
+
+    def test_a_batch_after_an_interruption_can_still_report_heard_all(self) -> None:
+        """Suppressed for the discarded batch, not for the session."""
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        engine.speak("dropped", "A sentence.")
+        engine.end_input()
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        engine.interrupt()
+
+        engine.speak("kept", "Another sentence.")
+        self.wait_for(lambda: player.pending_frames > 0, message="the new unit")
+        player.play()
+        engine.end_input()
+
+        self.wait_for(
+            lambda: any(e.get("event") == EVENT_HEARD_ALL for e in events),
+            message="heard_all for the new batch",
+        )
 
     def test_interrupting_without_a_session_reports_nothing(self) -> None:
         engine, _player, _events = self.engine()
 
         self.assertIsNone(engine.interrupt())
+
+
+class PlaybackThreadTests(EngineHarness):
+    def test_a_thread_that_outlived_the_join_does_not_rejoin_the_loop(self) -> None:
+        """The next session must not find itself sharing the engine.
+
+        `end()` joins for a bounded time and gives up, because a pass inside the
+        model cannot be interrupted. If the thread reads its stop signal off an
+        attribute the next `begin()` rebinds, it wakes to an event nobody set
+        and runs on beside the thread that replaced it -- two producers, one
+        device, and the events of one session going to the sink of another.
+        """
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        engine, player, events = self.engine(synthesizer=FakeSynthesizer(gate=gate))
+        self.begin(engine, events)
+        engine.speak("stuck", "One. Two. Three.")
+        self.wait_for(lambda: player.frames_written > 0, message="the producer to park")
+        outlived = next(
+            thread for thread in threading.enumerate() if thread.name == "murmly-speech"
+        )
+
+        engine.end()
+        self.assertTrue(outlived.is_alive(), "the join was expected to give up here")
+        self.begin(engine, [])
+        gate.set()
+
+        self.wait_for(lambda: not outlived.is_alive(), message="the outlived thread to exit")
+
+    def test_a_unit_is_not_written_into_a_closed_device(self) -> None:
+        """Reported as a failure for that unit rather than queued into nothing."""
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        player.active = False
+
+        engine.speak("orphan", "A sentence.")
+
+        self.wait_for(
+            lambda: any(e.get("event") == "failed" for e in events), message="a failure event"
+        )
+        self.assertEqual(0, player.frames_written)
 
 
 class CaptureGatingTests(EngineHarness):

@@ -67,6 +67,11 @@ class SpeechQueue:
 
     def __init__(self) -> None:
         self._units: deque[SpeechUnit] = deque()
+        # The unit handed to the producer that has not registered audio of its
+        # own yet. Between the two it belongs to no other structure, and an
+        # interruption in that window would report it as neither playing nor
+        # pending -- so the queue keeps holding it.
+        self._in_flight: SpeechUnit | None = None
         self._lock = threading.Lock()
         self._arrived = threading.Event()
         self._end_of_input = False
@@ -102,22 +107,50 @@ class SpeechQueue:
                 self._arrived.clear()
                 return None
             unit = self._units.popleft()
+            # Recorded in the same locked step as the pop, so a discard can
+            # never run between the two and lose sight of it.
+            self._in_flight = unit
             if not self._units:
                 self._arrived.clear()
             return unit
 
+    def settle(self, unit: SpeechUnit) -> None:
+        """Release a unit that something else now reports for.
+
+        Called once the unit has a scheduled entry, which reports its position
+        from that point on. Holding it in both would name it twice in an
+        interruption -- once as playing and again as pending.
+        """
+        with self._lock:
+            if self._in_flight is unit:
+                self._in_flight = None
+
+    def holds(self, unit: SpeechUnit) -> bool:
+        """Whether this unit is still the one the queue handed out."""
+        with self._lock:
+            return self._in_flight is unit
+
     def putback(self, unit: SpeechUnit) -> None:
         """Return a unit to the front, so its place in the order is kept."""
         with self._lock:
+            if self._in_flight is unit:
+                self._in_flight = None
             self._units.appendleft(unit)
             self._arrived.set()
 
     def discard(self) -> list[str]:
-        """Drop everything not yet taken, and report what was dropped."""
+        """Drop everything not yet spoken, and report what was dropped."""
         with self._lock:
-            dropped = [unit.name for unit in self._units]
+            taken = () if self._in_flight is None else (self._in_flight,)
+            dropped = [unit.name for unit in (*taken, *self._units)]
+            self._in_flight = None
             self._units.clear()
             self._arrived.clear()
+            # An interruption throws away text the sender may already have
+            # finished sending. Leaving the marker latched would let the next
+            # publish find an empty queue and a finished sender and report
+            # everything as heard, when it was discarded unspoken.
+            self._end_of_input = False
             return dropped
 
     def wake(self) -> None:
@@ -220,11 +253,18 @@ class SpeechEngine:
         self._player.start()
         self._queue = SpeechQueue()
         self._scheduled = deque()
-        self._stop = threading.Event()
+        # Held by the thread that owns it rather than read off the attribute
+        # every pass. A thread that outlived end()'s bounded join would
+        # otherwise find this rebinding, read an event nobody has set, and
+        # rejoin the loop alongside the thread that replaced it.
+        stop = threading.Event()
+        self._stop = stop
         self._hold.clear()
         self._reported_heard_all = False
         self._sink = sink
-        thread = threading.Thread(target=self._run, name="murmly-speech", daemon=True)
+        thread = threading.Thread(
+            target=self._run, args=(stop, sink), name="murmly-speech", daemon=True
+        )
         try:
             thread.start()
         except RuntimeError as error:
@@ -326,12 +366,11 @@ class SpeechEngine:
 
     # ------------------------------------------------------------------ inside
 
-    def _run(self) -> None:
-        sink = self._sink
-        while not self._stop.is_set():
+    def _run(self, stop: threading.Event, sink: EventSink | None) -> None:
+        while not stop.is_set():
             self._publish(sink)
             if self._hold.is_set():
-                self._stop.wait(POLL_SECONDS)
+                stop.wait(POLL_SECONDS)
                 continue
             unit = self._queue.take(POLL_SECONDS)
             if unit is None:
@@ -342,36 +381,56 @@ class SpeechEngine:
                 self._queue.putback(unit)
                 continue
             try:
-                self._speak(unit, sink)
+                self._speak(unit, sink, stop)
             except Exception as error:  # noqa: BLE001 - one unit must not end the session
                 logger.warning("Speech for %s failed: %s", unit.name, error)
                 self._emit(sink, {"event": EVENT_FAILED, "name": unit.name, "error": str(error)})
+            finally:
+                # Whatever happened, the queue is no longer holding it: either a
+                # scheduled entry reports for it now, or it produced nothing.
+                self._queue.settle(unit)
 
-    def _speak(self, unit: SpeechUnit, sink: EventSink | None) -> None:
+    def _speak(self, unit: SpeechUnit, sink: EventSink | None, stop: threading.Event) -> None:
         with self._lock:
             generation = self._generation
         entry: _Scheduled | None = None
         for samples, sample_rate_hz in self._synthesizer.synthesize(unit.text):
-            if self._stop.is_set() or self._stale(generation):
+            if stop.is_set() or self._stale(generation):
                 return
-            self._wait_for_room(sink, generation)
-            if self._stop.is_set() or self._stale(generation):
-                return
-            frames = self._player.write(samples, sample_rate_hz)
-            if frames == 0:
-                continue
+            self._wait_for_room(sink, generation, stop)
             with self._lock:
-                if self._stale(generation):
+                # The write happens under the lock interrupt() aborts under, so
+                # there is no window in which a chunk checked as current is
+                # handed to the device after the abort has emptied it -- which
+                # is audible speech after the person asked for silence.
+                if stop.is_set() or self._stale(generation):
                     return
+                if entry is None and not self._queue.holds(unit):
+                    # Discarded in the window between being taken and the
+                    # generation being read, so the staleness check above cannot
+                    # see it. Once there is an entry, that entry and the
+                    # generation are what report for this unit.
+                    return
+                if not self._player.active:
+                    raise RuntimeError("The speech output device is not open.")
+                frames = self._player.write(samples, sample_rate_hz)
+                if frames == 0:
+                    continue
                 if entry is None:
                     # Registered on the first chunk rather than the last, so a
                     # unit whose audio starts playing while its later sentences
                     # are still being produced is not missed by the crossing.
                     entry = _Scheduled(unit.name, self._player.frames_written - frames)
                     self._scheduled.append(entry)
+                    # This entry reports the unit's position from here on, so
+                    # the queue stops reporting for it and an interruption names
+                    # it once rather than twice.
+                    self._queue.settle(unit)
                 entry.end_frame = self._player.frames_written
 
-    def _wait_for_room(self, sink: EventSink | None, generation: int) -> None:
+    def _wait_for_room(
+        self, sink: EventSink | None, generation: int, stop: threading.Event
+    ) -> None:
         """Hold the producer back until the device has drained enough.
 
         Without this the whole passage is produced before its first sentence is
@@ -380,10 +439,10 @@ class SpeechEngine:
         """
         lookahead = int(LOOKAHEAD_SECONDS * self._player.sample_rate_hz)
         while self._player.pending_frames > lookahead:
-            if self._stop.is_set() or self._stale(generation):
+            if stop.is_set() or self._stale(generation):
                 return
             self._publish(sink)
-            self._stop.wait(POLL_SECONDS)
+            stop.wait(POLL_SECONDS)
 
     def _stale(self, generation: int) -> bool:
         return generation != self._generation
