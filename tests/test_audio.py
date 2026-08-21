@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import shutil
 import sys
 import tempfile
@@ -847,6 +848,32 @@ class PlaybackTests(unittest.TestCase):
 
         self.assertTrue(player.active, "the player reports a device it does not have")
         self.assertEqual(960, player.frames_played, "audio after an abort was never played")
+
+    def test_the_reported_device_is_the_one_that_opened(self) -> None:
+        """Not the configured value, which is empty in a default installation.
+
+        `murmly doctor` reports this name, and the spec has it naming the device
+        speech would use. A person whose speech comes out of the wrong sink has
+        nothing else to compare against.
+        """
+        opened: list[object] = []
+
+        def check_output_settings(**kwargs: object) -> None:
+            # Refuses the configured device and the system default, so selection
+            # falls through to an indexed one and the name cannot come from the
+            # configuration.
+            if kwargs["device"] in (None, "Missing Headset"):
+                raise FakePortAudioError("no such device")
+            opened.append(kwargs["device"])
+
+        player, _streams, _sd = self._player(check_output_settings=check_output_settings)
+        player._config = replace(player._config, tts_output_device="Missing Headset")
+
+        player.start()
+
+        self.assertEqual([0], opened)
+        self.assertEqual("Built-in Audio", player.output_device)
+        self.assertIn("Missing Headset", player.device_detail)
 
     def test_a_device_that_will_not_restart_after_an_abort_is_closed(self) -> None:
         """Reported through `active`, so the next start rebuilds it.

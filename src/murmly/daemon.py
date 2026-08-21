@@ -998,10 +998,15 @@ class MurmlyDaemon:
         with self._speech_session_lock:
             session = self._speech_session
             self._speech_session = None
-        try:
-            self._speech.end()
-        except Exception as error:  # noqa: BLE001 - shutdown continues regardless
-            logger.warning("Speech output did not stop cleanly: %s", error)
+            # Under the lock, as in `_session_closed`. Released first, a session
+            # declaring itself in the window is accepted and given the engine,
+            # and then has it closed underneath it by this call. Shutdown is
+            # racing incoming connections by definition, so this is the path
+            # where that window is most likely to be hit.
+            try:
+                self._speech.end()
+            except Exception as error:  # noqa: BLE001 - shutdown continues regardless
+                logger.warning("Speech output did not stop cleanly: %s", error)
         if session is None:
             return
         session.send({"event": EVENT_SHUTTING_DOWN, "code": CommandCode.SHUTTING_DOWN})

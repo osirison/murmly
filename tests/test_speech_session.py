@@ -704,6 +704,79 @@ class TranscriptRoutingTests(SpeechSessionHarness):
         self.assertEqual(["hello world"], capture.copied)
 
 
+class EngineTeardownOrderingTests(SpeechSessionHarness):
+    """Both paths that release a session must tear the engine down under the lock.
+
+    Released first, a session declaring itself in the window is accepted, given
+    the engine, and then has it closed underneath it by the call that is still
+    finishing. The window is a few instructions wide and a test that tried to
+    land a declaration inside it would pass on any machine that happened not to
+    switch there, so what is asserted is the ordering itself.
+    """
+
+    def _observing_engine(self, config):
+        class LockObservingSpeech(SpeechEngine):
+            def __init__(self, *args, **kwargs) -> None:
+                super().__init__(*args, **kwargs)
+                self.daemon = None
+                self.ended_under_lock: list[bool] = []
+
+            def end(self) -> None:
+                lock = self.daemon._speech_session_lock
+                # A non-reentrant lock refuses this if anyone holds it,
+                # including the thread asking -- which is the case being checked.
+                free = lock.acquire(blocking=False)
+                if free:
+                    lock.release()
+                self.ended_under_lock.append(not free)
+                super().end()
+
+        return LockObservingSpeech(
+            config, synthesizer=FakeSynthesizer(), player=RecordingPlayer()
+        )
+
+    def test_a_session_closing_tears_the_engine_down_under_the_lock(self) -> None:
+        config = MurmlyConfig(
+            socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+            config_path=Path(tempfile.mkdtemp()) / "config.toml",
+            tts_enabled=True,
+        )
+        engine = self._observing_engine(config)
+        daemon, socket_path, _engine, _player, _capture = self.serve(engine=engine)
+        engine.daemon = daemon
+        client = SessionClient(socket_path)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+        engine.ended_under_lock.clear()
+
+        client.close()
+
+        self.wait_for(lambda: engine.ended_under_lock, message="the engine to be ended")
+        self.assertEqual([True], engine.ended_under_lock)
+
+    def test_shutdown_tears_the_engine_down_under_the_lock(self) -> None:
+        config = MurmlyConfig(
+            socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+            config_path=Path(tempfile.mkdtemp()) / "config.toml",
+            tts_enabled=True,
+        )
+        engine = self._observing_engine(config)
+        daemon, socket_path, _engine, _player, _capture = self.serve(engine=engine)
+        engine.daemon = daemon
+        client = SessionClient(socket_path)
+        self.addCleanup(client.close)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+        engine.ended_under_lock.clear()
+
+        daemon.shutdown()
+
+        self.assertTrue(engine.ended_under_lock, "the engine was never ended")
+        self.assertNotIn(
+            False, engine.ended_under_lock, "the engine was ended outside the session lock"
+        )
+
+
 class CaptureFailureTests(SpeechSessionHarness):
     def test_a_failing_stop_releases_the_speech_hold(self) -> None:
         """Capture has ended, so the hold ends with it.

@@ -250,12 +250,10 @@ def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> in
         outcome = Installer().install(hotkey, session_hotkey)
     except HotkeyNotConfirmedError as error:
         print(str(error), file=sys.stderr)
-        # Only the key that was not confirmed. An install of two hotkeys can
+        # Only the keys that were not confirmed. An install of two hotkeys can
         # fail on either, and the other one is bound and working right now.
-        unconfirmed = (
-            error.hotkey.portable
-            if error.hotkey is not None
-            else ", ".join(key.portable for key in (hotkey, session_hotkey) if key is not None)
+        unconfirmed = ", ".join(key.portable for key in error.hotkeys) or ", ".join(
+            key.portable for key in (hotkey, session_hotkey) if key is not None
         )
         print(
             f"{unconfirmed} is not active in this session. The binding is saved and will "

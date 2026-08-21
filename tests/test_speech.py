@@ -27,6 +27,9 @@ class RecordingPlayer:
     """
 
     def __init__(self, sample_rate_hz: int = 24_000, start_error: Exception | None = None) -> None:
+        # Public so a test can make the device fail on a *later* open, which is
+        # the case that matters: a sink that goes away while capture is running.
+        self.start_error = start_error
         self.sample_rate_hz = sample_rate_hz
         self.frames_written = 0
         self.frames_played = 0
@@ -35,11 +38,10 @@ class RecordingPlayer:
         self.aborted = 0
         self.active = False
         self.written: list[tuple[int, int]] = []
-        self._start_error = start_error
 
     def start(self) -> None:
-        if self._start_error is not None:
-            raise self._start_error
+        if self.start_error is not None:
+            raise self.start_error
         self.started += 1
         self.active = True
 
@@ -88,6 +90,31 @@ class GatedQueue(SpeechQueue):
             self.handed.set()
             self.release.wait(GATE_TIMEOUT_SECONDS)
         return unit
+
+
+class LockObservingQueue(SpeechQueue):
+    """Records whether the engine lock was held when the queue was discarded.
+
+    Asserting the ordering rather than trying to out-race it. The window this
+    guards is a few bytecodes wide and a test that tried to land a publish
+    inside it would pass on a machine that happened not to switch there; what
+    is actually required is that the discard and the schedule teardown are one
+    step, and that is directly observable.
+    """
+
+    def __init__(self, engine) -> None:
+        super().__init__()
+        self._engine = engine
+        self.discarded_under_lock: bool | None = None
+
+    def discard(self) -> list[str]:
+        # A non-reentrant lock refuses this if anyone holds it, including the
+        # thread asking -- which is the case being checked.
+        free = self._engine._lock.acquire(blocking=False)
+        if free:
+            self._engine._lock.release()
+        self.discarded_under_lock = not free
+        return super().discard()
 
 
 class EngineHarness(unittest.TestCase):
@@ -496,6 +523,59 @@ class InterruptionTests(EngineHarness):
 
         self.assertIsNone(engine.interrupt())
 
+    def test_an_interruption_tears_down_the_schedule_and_the_queue_in_one_step(self) -> None:
+        """Nothing can observe the engine half torn down.
+
+        Two things fit in a gap between emptying the schedule and discarding the
+        queue: a publish that sees no schedule, no queue and a finished sender,
+        and so reports everything heard for the batch being cut off; and the
+        producer's own stale return releasing the unit it holds, so the discard
+        finds nothing and the report names it nowhere.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        engine._queue = LockObservingQueue(engine)
+
+        for name in ("a", "b"):
+            engine.speak(name, "A sentence.")
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        engine.end_input()
+
+        interruption = engine.interrupt()
+
+        self.assertTrue(
+            engine._queue.discarded_under_lock,
+            "the queue was discarded outside the lock that emptied the schedule",
+        )
+        self.assertFalse(interruption.nothing_unheard)
+        self.assertEqual([], [e for e in events if e.get("event") == EVENT_HEARD_ALL])
+
+    def test_everything_heard_waits_for_a_unit_the_producer_is_holding(self) -> None:
+        """A unit being produced has been taken, so `waiting` does not see it.
+
+        Anything asking whether the exchange is over has to count it, or a unit
+        about to be spoken is reported as one already heard.
+        """
+        engine, player, events = self.engine()
+        sink = self.begin(engine, events)
+        queue = GatedQueue()
+        self.addCleanup(queue.release.set)
+        engine._queue = queue
+
+        engine.speak("held", "A sentence.")
+        self.assertTrue(queue.handed.wait(5), "the queue never handed the unit out")
+        engine.end_input()
+
+        # Published from here rather than waited for. The thread that publishes
+        # is the thread that produces, so while it is holding a unit it cannot
+        # publish at all -- a test that waited for the event would pass whatever
+        # the predicate said, because nothing would ever evaluate it.
+        engine._publish(sink)
+
+        self.assertTrue(engine.speaking, "a unit about to be spoken is not speech")
+        self.assertEqual(0, player.frames_written, "the producer was expected to be parked")
+        self.assertEqual([], [e for e in events if e.get("event") == EVENT_HEARD_ALL])
+
 
 class PlaybackThreadTests(EngineHarness):
     def test_a_thread_that_outlived_the_join_does_not_rejoin_the_loop(self) -> None:
@@ -575,6 +655,29 @@ class CaptureGatingTests(EngineHarness):
 
         self.assertTrue(player.active)
         self.assertEqual(2, player.started)
+
+    def test_a_device_that_will_not_reopen_still_ends_the_hold(self) -> None:
+        """Capture has ended, so the hold ends with it.
+
+        The hold means the person is talking. Keeping it set for a device fault
+        stops the queue being drained at all: the sender is told nothing about
+        anything it sends afterwards, and `speaking` stays true for a daemon
+        that is idle and silent. A unit that cannot be produced is reported
+        failed, which is something the sender can act on.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        engine.suspend()
+        player.start_error = RuntimeError("Unable to open an audio output.")
+
+        engine.resume()
+
+        engine.speak("after", "A sentence.")
+        self.wait_for(
+            lambda: [e for e in events if e.get("event") == "failed" and e.get("name") == "after"],
+            message="the unit to be reported failed",
+        )
+        self.assertFalse(engine.speaking, "the daemon would report SPEAKING while idle")
 
     def test_resuming_without_a_session_opens_nothing(self) -> None:
         engine, player, _events = self.engine()

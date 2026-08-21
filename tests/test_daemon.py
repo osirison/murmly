@@ -336,7 +336,10 @@ class DaemonTests(unittest.TestCase):
             self.assertTrue(session.processing.wait(timeout=1))
 
             daemon.shutdown()
-            server_thread.join(timeout=0.5)
+            # Not 0.5: SHUTDOWN_DRAIN_SECONDS is itself 0.5, so a bound equal to
+            # the drain fails under load for a shutdown that is working
+            # perfectly. What is asserted is that the thread exits, not how fast.
+            server_thread.join(timeout=3.0)
 
             self.assertFalse(server_thread.is_alive())
             self.assertFalse(socket_path.exists())

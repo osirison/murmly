@@ -770,6 +770,45 @@ class IdempotenceTests(unittest.TestCase):
         self.assertEqual([(Path("/new/murmly"), "Meta+X")], launcher.registrations)
         self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
 
+    def test_reinstalling_one_hotkey_repairs_a_launcher_it_did_not_request(self) -> None:
+        """The session hotkey goes stale whether or not the command names it.
+
+        Reinstalling one hotkey is how a moved checkout is repaired. Repairing
+        only the requested launcher leaves the other running a path that no
+        longer exists, and nothing reports a launcher's command, so the person
+        sees a healthy installation and a hotkey that does nothing.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        launcher = FakeLauncher(declared="Meta+X", entrypoint="/old/murmly toggle")
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/old/murmly toggle-session"
+        )
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher,
+            session_launcher=session_launcher,
+            shortcuts=shortcuts,
+            entrypoint="/new/murmly",
+        )
+
+        installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+        self.assertEqual(
+            "/new/murmly toggle-session",
+            session_launcher.declared_entrypoint(),
+            "a hotkey the command did not name was left running a path that is gone",
+        )
+        self.assertEqual("Meta+A", session_launcher.declared_hotkey(), "its key changed")
+
     def test_reinstalling_one_hotkey_repairs_the_other_launcher_too(self) -> None:
         """Both launchers run the entrypoint, so both go stale when it moves."""
         from murmly.hotkey import parse_hotkey
@@ -816,6 +855,44 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("268435545", str(raised.exception))
         self.assertEqual(1, launcher.unregistrations)
         self.assertEqual(1, service.removes)
+
+    def test_a_first_hotkey_that_is_not_confirmed_still_writes_the_second(self) -> None:
+        """A key the desktop was slow to confirm is persisted, not abandoned.
+
+        Raising on the first left the second never written at all: not bound
+        now, and not bound at the next login either, while the message named
+        only the first. Both are attempted and both unconfirmed keys reported.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import (
+            DESKTOP_ID,
+            SESSION_DESKTOP_ID,
+            SESSION_HOTKEY,
+            HotkeyNotConfirmedError,
+        )
+
+        launcher = FakeLauncher(fail=HotkeyNotConfirmedError("slow", parse_hotkey("Meta+X")))
+        session_launcher = FakeLauncher(purpose=SESSION_HOTKEY)
+        shortcuts = OwnerRegistry(
+            owners={
+                268435544: [owner(DESKTOP_ID, "murmly")],
+                268435521: [owner(SESSION_DESKTOP_ID, "murmly session")],
+            },
+            keys={DESKTOP_ID: [268435544], SESSION_DESKTOP_ID: [268435521]},
+        )
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(HotkeyNotConfirmedError) as raised:
+            installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertEqual(
+            [(Path("/bin/murmly"), "Meta+A")],
+            session_launcher.registrations,
+            "the second hotkey was never written",
+        )
+        self.assertEqual(("Meta+X",), tuple(k.portable for k in raised.exception.hotkeys))
 
     def test_a_failed_install_leaves_a_hotkey_it_never_touched_bound(self) -> None:
         """Rollback undoes this run, not the installation.

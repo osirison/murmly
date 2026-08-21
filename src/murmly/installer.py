@@ -23,7 +23,7 @@ import sys
 import time
 
 from murmly.desktop import PlasmaShortcuts
-from murmly.hotkey import Hotkey, parse_hotkey
+from murmly.hotkey import Hotkey, HotkeyError, parse_hotkey
 from murmly.integrations import PasteInjection, select_paste_injection
 
 
@@ -90,14 +90,21 @@ class HotkeyNotConfirmedError(InstallError):
     Distinct from other failures because the binding is already persisted: it
     will be in effect at the next login even though it is not active now.
 
-    Carries the key it concerns. An install requesting two hotkeys can fail on
-    either one, and naming both tells the person that a key which is bound,
-    confirmed and working right now is not active.
+    Carries the keys it concerns, which is not always every key requested: an
+    install of two can fail on either, and naming both tells the person that a
+    key which is bound, confirmed and working right now is not active.
     """
 
-    def __init__(self, message: str, hotkey: "Hotkey | None" = None) -> None:
+    def __init__(
+        self, message: str, hotkeys: "Hotkey | tuple[Hotkey, ...] | None" = None
+    ) -> None:
         super().__init__(message)
-        self.hotkey = hotkey
+        if hotkeys is None:
+            self.hotkeys: tuple[Hotkey, ...] = ()
+        elif isinstance(hotkeys, tuple):
+            self.hotkeys = hotkeys
+        else:
+            self.hotkeys = (hotkeys,)
 
 
 class HotkeyConflictError(InstallError):
@@ -626,9 +633,21 @@ class Installer:
         service_existed = self._service.is_installed
         self._service.install(entrypoint)
 
+        # A launcher this run did not request, still bound, whose command has
+        # moved. Reinstalling one hotkey is how a moved checkout is repaired,
+        # and repairing only the requested one leaves the other running a path
+        # that is gone -- silently, since nothing reports a launcher's command.
+        for launcher in self._stale_launchers(entrypoint, requested):
+            requested.append((launcher, parse_hotkey(launcher.declared_hotkey())))
+
         # Only what this run writes, so a failure removes nothing that was
         # working before the command was typed.
         written: list[object] = []
+        # A key the desktop did not confirm in time is still persisted, so the
+        # remaining ones are still attempted and every unconfirmed key is
+        # reported together. Raising on the first left the second never written
+        # at all: not bound now, and not bound at the next login either.
+        unconfirmed: list[Hotkey] = []
         for launcher, requested_hotkey in requested:
             purpose = self._purpose_of(launcher)
             bound = (
@@ -652,10 +671,18 @@ class Installer:
                 self._verify(requested_hotkey, purpose)
             except HotkeyNotConfirmedError:
                 # The launcher stays: the binding is persisted for next login.
-                raise
+                unconfirmed.append(requested_hotkey)
             except Exception:
                 self._rollback(service_existed, written)
                 raise
+
+        if unconfirmed:
+            keys = ", ".join(key.portable for key in unconfirmed)
+            raise HotkeyNotConfirmedError(
+                f"The desktop did not register {keys} within "
+                f"{REGISTRATION_TIMEOUT_SECONDS:g} seconds.",
+                tuple(unconfirmed),
+            )
 
         override = self._launcher.user_override()
         if override is not None and override != hotkey.portable:
@@ -718,6 +745,28 @@ class Installer:
             f"{hotkey.portable} is already used by {names}. Choose a different hotkey, "
             "or release that one in your desktop shortcut settings first."
         )
+
+    def _stale_launchers(self, entrypoint: Path, requested) -> list[object]:
+        """Bound launchers this run did not ask about whose command has moved."""
+        asked = {id(launcher) for launcher, _hotkey in requested}
+        stale = []
+        for launcher in (self._launcher, self._session_launcher):
+            if id(launcher) in asked:
+                continue
+            declared = launcher.declared_hotkey()
+            if declared is None:
+                continue
+            purpose = self._purpose_of(launcher)
+            if launcher.declared_entrypoint() == f"{entrypoint} {purpose.command}":
+                continue
+            try:
+                parse_hotkey(declared)
+            except HotkeyError:
+                # Its own file says something Murmly cannot parse, so there is
+                # no key to rebind it to. Left exactly as found.
+                continue
+            stale.append(launcher)
+        return stale
 
     @staticmethod
     def _purpose_of(launcher) -> HotkeyPurpose:

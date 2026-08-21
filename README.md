@@ -112,6 +112,10 @@ uv sync --extra cuda
 uv run --extra cuda murmly install Meta+X
 ```
 
+`uv sync` makes the environment match exactly the extras it is given, so name
+every extra you want on one line. If speech output is already installed, this is
+`uv sync --extra cuda --extra tts` — the shorter form would remove it.
+
 Check everything was detected correctly:
 
 ```bash

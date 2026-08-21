@@ -130,6 +130,18 @@ class SpeechQueue:
         with self._lock:
             return self._in_flight is unit
 
+    @property
+    def holding(self) -> bool:
+        """Whether a unit is out with the producer and has no audio yet.
+
+        `waiting` cannot answer this: it reports what has not been taken, and a
+        unit being produced has been. Anything asking whether the exchange is
+        finished has to count this one, or it counts a unit that is about to be
+        spoken as one that already was.
+        """
+        with self._lock:
+            return self._in_flight is not None
+
     def putback(self, unit: SpeechUnit) -> None:
         """Return a unit to the front, so its place in the order is kept."""
         with self._lock:
@@ -239,7 +251,9 @@ class SpeechEngine:
         """Whether anything is queued, being produced, or still to be heard."""
         with self._lock:
             outstanding = any(not entry.heard for entry in self._scheduled)
-        return self.active and (outstanding or bool(self._queue.waiting))
+        return self.active and (
+            outstanding or bool(self._queue.waiting) or self._queue.holding
+        )
 
     def begin(self, sink: EventSink) -> None:
         """Take the output device and start playing whatever this session sends.
@@ -315,8 +329,15 @@ class SpeechEngine:
         except RuntimeError as error:
             logger.warning("Speech output could not be reopened after capture: %s", error)
             self._emit(self._sink, {"event": EVENT_FAILED, "error": str(error)})
-            return
-        self.release()
+        finally:
+            # Released whether or not the device came back. Capture has ended,
+            # and the hold means "the person is talking" -- keeping it set for a
+            # device fault stops the queue being drained at all, so the sender
+            # is told nothing about any unit it goes on to send and `status`
+            # reports SPEAKING for a daemon that is idle and silent. A unit that
+            # cannot be produced is reported failed, which is what the sender
+            # can act on.
+            self.release()
 
     def interrupt(self) -> Interruption | None:
         """Stop speech and report what was playing and what never started.
@@ -338,7 +359,13 @@ class SpeechEngine:
             )
             never_started = [entry.name for entry in self._scheduled if not entry.started]
             self._scheduled = deque()
-        pending = tuple(never_started + self._queue.discard())
+            # Discarded under the same lock that emptied the schedule, so the
+            # teardown is one step. Released first, two things fit in the gap: a
+            # publish seeing an empty schedule, an empty queue and a finished
+            # sender, which reports everything heard for a batch just cut off;
+            # and the producer's own stale return clearing the unit it holds, so
+            # the discard finds nothing and the report names it nowhere.
+            pending = tuple(never_started + self._queue.discard())
         return Interruption(playing=playing, pending=pending)
 
     def end(self) -> None:
@@ -351,7 +378,10 @@ class SpeechEngine:
         with self._lock:
             self._generation += 1
             self._scheduled = deque()
-        self._queue.discard()
+            # One step, as in interrupt(). Nothing reads the report here, but
+            # the split is what let a publish run against a half-torn-down
+            # engine, and leaving one of the two shapes in place invites it back.
+            self._queue.discard()
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=PLAYBACK_JOIN_SECONDS)
             if thread.is_alive():
@@ -467,6 +497,7 @@ class SpeechEngine:
                 self._queue.input_ended
                 and not outstanding
                 and not self._queue.waiting
+                and not self._queue.holding
                 and self._player.pending_frames == 0
                 and not self._reported_heard_all
             )
