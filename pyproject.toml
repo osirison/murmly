@@ -30,6 +30,10 @@ cuda = [
 # model files in $XDG_DATA_HOME/murmly; `murmly doctor` names whichever is
 # missing.
 #
+# `uv sync` makes the environment match exactly the extras it is given, so an
+# install wanting both names both: `uv sync --extra cuda --extra tts`. Either
+# extra alone removes the other's packages.
+#
 # onnxruntime-gpu is deliberately not listed. It installs into the same
 # `onnxruntime` package namespace as the CPU build that faster-whisper and
 # kokoro-onnx both depend on, so listing it here would resolve both

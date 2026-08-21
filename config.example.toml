@@ -77,6 +77,10 @@ text_size_px = 13       # Live transcript panel text size, 8-48
 #     uv sync --extra tts
 #     sudo dnf install espeak-ng
 #
+# `uv sync` makes the environment match exactly the extras it is given, so name
+# every extra you want on one line: on a CUDA install the first line is
+# `uv sync --extra cuda --extra tts`.
+#
 # That runs synthesis on the CPU, at roughly five times real time, whatever
 # `[stt] device` above says: that setting is about transcription and neither
 # moves synthesis to the GPU nor turns it off. The GPU build of ONNX Runtime

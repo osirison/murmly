@@ -333,7 +333,11 @@ def _rejected_value(value: object, resolved: int) -> object | None:
         if int(value) == resolved:
             return None
     except (TypeError, ValueError):
-        return value
+        # Stringified because the report is serialised as JSON, and every TOML
+        # type json cannot encode -- date, datetime, time -- reaches this branch
+        # exactly because `int()` refuses it. Returned raw, one mistyped setting
+        # made `murmly doctor` print no report at all.
+        return str(value)
     return value
 
 

@@ -1336,6 +1336,27 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
         self.assertEqual(100, report["rate_percent"])
         self.assertEqual(900, report["rate_rejected_value"])
 
+    def test_a_rate_that_json_cannot_encode_still_produces_a_report(self) -> None:
+        """`rate = 1979-05-27` is a TOML date, and the report is serialised.
+
+        The rejected value was carried through raw, so one mistyped setting made
+        `murmly doctor` print no report at all -- including every section that
+        had nothing to do with it.
+        """
+        import json
+
+        from murmly.cli import speech_output_diagnostics
+        from murmly.config import load_config
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text("[tts]\nrate = 1979-05-27\n")
+            report = speech_output_diagnostics(load_config(config_path))
+
+        self.assertEqual(100, report["rate_percent"])
+        self.assertEqual("1979-05-27", report["rate_rejected_value"])
+        json.dumps(report)
+
     def test_a_device_that_cannot_be_opened_is_named_in_the_report(self) -> None:
         from murmly.cli import speech_output_diagnostics
         from fakes import FakeSynthesizer

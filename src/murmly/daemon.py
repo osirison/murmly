@@ -38,6 +38,7 @@ from murmly.speech import (
     EVENT_TRANSCRIPT,
     Interruption,
     SpeechEngine,
+    SpeechSuspendError,
 )
 from murmly.stt import FasterWhisperTranscriber
 
@@ -675,9 +676,15 @@ class SpeechSessionConnection:
         otherwise, and a transcript dropped without the caller knowing is the
         person's words lost with nothing on the clipboard either.
         """
-        if self._closing.is_set():
-            return False
         with self._outbox_lock:
+            # Checked while holding the lock, not before taking it. `close` and
+            # `dispose` both set the flag and then queue the sentinel under this
+            # lock, so a send that wins the lock afterwards must see the flag --
+            # and a send that checked outside it would append behind a sentinel
+            # the writer has already stopped at, report the frame as queued, and
+            # leave the transcript on neither the socket nor the clipboard.
+            if self._closing.is_set():
+                return False
             if len(self._outbox) >= SESSION_EVENT_BACKLOG:
                 logger.warning("Disconnecting a speech session that is not reading its events.")
                 self._closing.set()
@@ -1375,7 +1382,14 @@ class MurmlyDaemon:
             # Torn down while still holding the lock. Released first, a session
             # declared in the window would be accepted, given the engine, and
             # then have it closed underneath it by this call.
-            self._speech.end()
+            try:
+                self._speech.end()
+            except Exception as error:  # noqa: BLE001 - the session still has to be closed
+                # An output device that will not close would otherwise take this
+                # thread out through the reader's `finally`, leaving the writer
+                # thread and both socket handles alive for the life of the
+                # daemon -- and the session still registered as connected.
+                logger.warning("Speech output did not stop cleanly: %s", error)
         # Drained, and outside the lock. A session is sometimes closed by Murmly
         # having just written it a refusal -- a frame that could not be read, or
         # one past the size bound -- and shutting the socket down without
@@ -1417,7 +1431,13 @@ class MurmlyDaemon:
         the person was talking to. Playback and capture never overlap, which is
         what makes echo cancellation unnecessary.
         """
-        interruption = self._speech.suspend()
+        try:
+            interruption = self._speech.suspend()
+        except SpeechSuspendError as error:
+            # Speech stopped; the device did not close. The session is still
+            # owed the report, and the caller still has to refuse the capture.
+            self._report_interruption(error.interruption)
+            raise
         self._report_interruption(interruption)
 
     def handle_command(self, command: str) -> dict[str, object]:

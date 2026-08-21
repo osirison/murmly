@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import ast
+import re
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import patch
 
 import numpy as np
 
+import murmly.tts
 from fakes import FakeKokoroModel
 from murmly.config import DEFAULT_TTS_RATE_PERCENT, DEFAULT_TTS_VOICE, MurmlyConfig, load_config
 from murmly.tts import (
     CALIBRATION_TEXT,
     CPU_PROVIDER,
+    CUDA_EXTRA_REMEDY,
     CUDA_PROVIDER,
     KokoroSynthesizer,
     resolve_espeak,
@@ -341,6 +347,88 @@ class RuntimeResolutionTests(unittest.TestCase):
     def test_auto_falls_back_to_the_cpu_when_the_libraries_are_absent(self) -> None:
         with self._gpu_build(), patch("murmly.tts.load_cuda_libraries", return_value=False):
             self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
+
+    def test_an_unanticipated_probe_failure_refuses_speech_rather_than_the_daemon(self) -> None:
+        """The backstop, not the two known arms.
+
+        The spec requires speech output to start and refuse with a reason rather
+        than stop the daemon starting, so anything unexpected inside the probe
+        has to become a reason too -- including a failure nobody predicted.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir)
+            (config.tts_model_dir).mkdir(parents=True, exist_ok=True)
+            for name in ("kokoro-v1.0.onnx", "voices-v1.0.bin"):
+                (config.tts_model_dir / name).write_bytes(b"")
+            with (
+                patch("importlib.util.find_spec", return_value=object()),
+                patch("murmly.tts.resolve_espeak", side_effect=ValueError("something odd")),
+            ):
+                synthesizer = KokoroSynthesizer(config)
+
+        self.assertFalse(synthesizer.available)
+        self.assertIn("something odd", synthesizer.unavailable_reason)
+
+    def test_an_absent_runtime_refuses_speech_rather_than_the_daemon(self) -> None:
+        """Speech output degrades on its own; it does not take the daemon down.
+
+        A bare import here ran on the daemon's startup path, so an environment
+        without onnxruntime raised ModuleNotFoundError out of the probe and
+        killed transcription too, for a feature that is meant to switch itself
+        off with a reason.
+        """
+        with patch.dict(sys.modules, {"onnxruntime": None}):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_providers(self._config("auto"))
+
+        self.assertIn("uv sync", str(raised.exception))
+
+    def test_a_half_installed_runtime_refuses_speech_rather_than_the_daemon(self) -> None:
+        """What an interrupted swap between the CPU and GPU builds leaves.
+
+        The module imports and has no `get_available_providers`, so the failure
+        is an AttributeError rather than an ImportError -- which is why catching
+        the import error alone was not enough.
+        """
+        broken = ModuleType("onnxruntime")
+        with patch.dict(sys.modules, {"onnxruntime": broken}):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_providers(self._config("auto"))
+
+        self.assertIn("uv sync", str(raised.exception))
+
+    def test_no_remedy_names_a_command_that_removes_speech_output(self) -> None:
+        """`uv sync` is exact, so a bare single-extra command is destructive.
+
+        These strings are printed to the person as the thing to do next. One
+        that names `--extra cuda` alone tells someone whose speech output is
+        broken to run the command that removes it.
+        """
+        # Parsed rather than grepped: adjacent string literals are joined by the
+        # parser, and a line-wrapped remedy read as a bare command on the source
+        # line where it happens to break.
+        tree = ast.parse(Path(murmly.tts.__file__).read_text())
+        literals: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                literals.append(node.value)
+            elif isinstance(node, ast.JoinedStr):
+                literals.append(
+                    "".join(
+                        part.value
+                        for part in node.values
+                        if isinstance(part, ast.Constant) and isinstance(part.value, str)
+                    )
+                )
+
+        for literal in literals:
+            for command in re.findall(r"`(uv sync [^`]*)`", literal):
+                self.assertNotEqual(
+                    "uv sync --extra cuda",
+                    " ".join(command.split()),
+                    f"a remedy names a command that uninstalls speech output: {literal!r}",
+                )
+        self.assertIn("--extra cuda --extra tts", " ".join(CUDA_EXTRA_REMEDY.split()))
 
     def test_the_cuda_extra_missing_falls_back_and_logs_the_remedy(self) -> None:
         """`device` is the transcription setting; it cannot disable speech.

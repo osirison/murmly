@@ -251,7 +251,9 @@ class FasterWhisperTranscriber:
                 device = "cuda" if cuda_available else "cpu"
         elif device == "cuda" and not cls._load_cuda_runtime():
             raise RuntimeError(
-                "CUDA requires the Murmly CUDA extra. Run `uv sync --extra cuda`."
+                "CUDA requires the Murmly CUDA extra. Run `uv sync --extra cuda`, "
+                "naming every extra you already have on the same line -- a sync "
+                "removes whatever it is not given."
             )
 
         compute_type = config.compute_type

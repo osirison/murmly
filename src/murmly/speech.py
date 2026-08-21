@@ -79,6 +79,11 @@ class SpeechQueue:
     def send(self, unit: SpeechUnit) -> None:
         with self._lock:
             self._units.append(unit)
+            # More text means the sender was not finished after all. The marker
+            # latched for the life of the session otherwise, so a sender that
+            # said `end` and then sent more was told everything was heard the
+            # moment that new text drained -- for a batch it had never ended.
+            self._end_of_input = False
             self._arrived.set()
 
     def end_input(self) -> None:
@@ -179,6 +184,19 @@ class Interruption:
     @property
     def nothing_unheard(self) -> bool:
         return self.playing is None and not self.pending
+
+
+class SpeechSuspendError(RuntimeError):
+    """The output device would not close, but speech had already stopped.
+
+    Carries the report anyway. The interruption is what a sender needs most and
+    is the one thing it cannot learn any other way, so it must not be lost with
+    the failure that happened after speech was already silent.
+    """
+
+    def __init__(self, interruption: "Interruption | None", error: BaseException) -> None:
+        super().__init__(str(error))
+        self.interruption = interruption
 
 
 class SpeechEngine:
@@ -290,8 +308,12 @@ class SpeechEngine:
         self._thread = thread
 
     def speak(self, name: str, text: str) -> None:
-        self._reported_heard_all = False
+        # Queued first, suppressor re-armed second. The other order leaves a
+        # window in which a publish sees the suppressor cleared while the
+        # end-of-input marker is still latched, which is the report this pair
+        # exists to prevent.
         self._queue.send(SpeechUnit(name=name, text=text))
+        self._reported_heard_all = False
 
     def end_input(self) -> None:
         self._queue.end_input()
@@ -317,7 +339,15 @@ class SpeechEngine:
         """
         interruption = self.interrupt()
         self.hold()
-        self._player.stop()
+        try:
+            self._player.stop()
+        except Exception as error:  # noqa: BLE001 - the report survives the failure
+            # Speech has already stopped by this point, so the session is owed
+            # its interruption whatever the device did on the way out. Raising
+            # bare would take the report with it: the caller has nothing to
+            # send, and the sender keeps generating for someone who stopped
+            # listening -- which is the one thing the event exists to prevent.
+            raise SpeechSuspendError(interruption, error) from error
         return interruption
 
     def resume(self) -> None:

@@ -90,6 +90,7 @@ class SessionClient:
 
     def __init__(self, socket_path: Path, timeout: float = 5.0) -> None:
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._timeout = timeout
         self._socket.settimeout(timeout)
         self._socket.connect(str(socket_path))
         self._payload = b""
@@ -127,6 +128,25 @@ class SessionClient:
                 return frame
         return None
 
+    def drain(self, timeout: float = 0.3) -> list[dict]:
+        """Everything already sent, without waiting for anything more.
+
+        `read_until` cannot answer "did this event NOT arrive": it blocks until
+        the event shows up or the timeout expires, so a test written with it
+        asserts only that the event eventually comes, never that it was withheld
+        until it should have.
+        """
+        self._socket.settimeout(timeout)
+        frames: list[dict] = []
+        try:
+            while True:
+                frame = self.read()
+                if frame is None:
+                    return frames
+                frames.append(frame)
+        finally:
+            self._socket.settimeout(self._timeout)
+
     def close(self) -> None:
         try:
             self._socket.close()
@@ -158,11 +178,22 @@ class SpeechSessionHarness(unittest.TestCase):
         thread.start()
         self.addCleanup(thread.join, 3)
         self.addCleanup(daemon.shutdown)
+        # Waiting for the socket file is not enough: it appears at bind() and
+        # the daemon does not accept until listen(), several statements later,
+        # so a client connecting in between is refused. Waiting for a connection
+        # to be accepted is the condition the tests actually depend on.
         deadline = time.time() + 3
-        while not config.socket_path.exists():
-            if time.time() >= deadline:
-                self.fail("daemon socket was not created")
-            time.sleep(0.01)
+        while True:
+            try:
+                # A whole exchange rather than a bare connect: it proves the
+                # daemon is answering, and leaves nothing half-read behind for
+                # it to log as a broken connection.
+                send_command(str(config.socket_path), "status")
+                break
+            except Exception:  # noqa: BLE001 - not up yet is the ordinary case here
+                if time.time() >= deadline:
+                    self.fail("daemon socket was not accepting connections")
+                time.sleep(0.01)
         return daemon, config.socket_path, engine, player, capture
 
     def client(self, socket_path: Path) -> SessionClient:
@@ -290,9 +321,46 @@ class SessionFrameTests(SpeechSessionHarness):
         player.play()
         client.read_until(EVENT_STARTED)
 
+        # Everything queued has been heard, but the sender has not finished. The
+        # assertion below alone passes with the end-of-input check removed
+        # entirely, because it only ever waits for the event to arrive.
+        early = client.drain()
+        self.assertEqual(
+            [],
+            [f for f in early if f.get("event") == EVENT_HEARD_ALL],
+            "heard-all arrived before the sender said it had finished",
+        )
+
         client.send({"command": "end"})
 
         self.assertIsNotNone(client.read_until(EVENT_HEARD_ALL), "no heard-all event arrived")
+
+    def test_speaking_again_after_the_end_marker_reopens_the_exchange(self) -> None:
+        """The marker latched for the life of the session.
+
+        A sender that said `end` and then sent more was told everything was
+        heard the moment that new text drained -- for a batch it had never
+        ended -- because nothing ever cleared the marker.
+        """
+        _daemon, socket_path, _engine, player, _capture = self.serve()
+        client = self.client(socket_path)
+        client.declare()
+
+        client.send({"command": "speak", "name": "first", "text": "The first thing."})
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        player.play()
+        client.send({"command": "end"})
+        self.assertIsNotNone(client.read_until(EVENT_HEARD_ALL), "no heard-all for the first")
+
+        client.send({"command": "speak", "name": "second", "text": "The second thing."})
+        self.wait_for(lambda: player.pending_frames > 0, message="the second unit")
+        player.play()
+
+        self.assertEqual(
+            [],
+            [f for f in client.drain() if f.get("event") == EVENT_HEARD_ALL],
+            "heard-all for a batch the sender never ended",
+        )
 
     def test_a_speak_frame_without_a_name_is_reported_and_not_fatal(self) -> None:
         _daemon, socket_path, _engine, player, _capture = self.serve()
@@ -775,6 +843,104 @@ class EngineTeardownOrderingTests(SpeechSessionHarness):
         self.assertNotIn(
             False, engine.ended_under_lock, "the engine was ended outside the session lock"
         )
+
+
+class ClosingOnFirstUse:
+    """Closes the session the first time the outbox lock is taken.
+
+    The window between `send` testing the closing flag and `send` taking the
+    lock is a few instructions wide and cannot be reached by timing. Firing the
+    close from inside the acquisition puts it exactly there, and every other
+    acquisition -- including the close's own -- passes straight through.
+    """
+
+    def __init__(self, real, session) -> None:
+        self._real = real
+        self._session = session
+        self.fired = False
+
+    def __enter__(self):
+        if not self.fired:
+            self.fired = True
+            closer = threading.Thread(target=self._session.close, kwargs={"drain": True})
+            closer.start()
+            closer.join(timeout=5)
+        return self._real.__enter__()
+
+    def __exit__(self, *arguments):
+        return self._real.__exit__(*arguments)
+
+
+class SessionSendTests(SpeechSessionHarness):
+    def test_a_frame_queued_as_the_session_closes_is_reported_as_dropped(self) -> None:
+        """The flag is set before the sentinel is queued, both under the lock.
+
+        A send that checked the flag outside the lock could append behind a
+        sentinel the writer has already stopped at, report the frame as queued,
+        and leave the transcript on neither the socket nor the clipboard.
+        """
+        daemon, socket_path, _engine, _player, _capture = self.serve()
+        client = SessionClient(socket_path)
+        self.addCleanup(client.close)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+        session = daemon._speech_session
+
+        # The interleaving itself, not the settled state after it. Asserting
+        # only that a send AFTER close returns False passes with the check left
+        # outside the lock, because by then the flag is set either way. What
+        # has to hold is that a send already past an unlocked check still
+        # observes the close that lands before it takes the lock.
+        closing = ClosingOnFirstUse(session._outbox_lock, session)
+        session._outbox_lock = closing
+
+        queued = session.send({"event": EVENT_TRANSCRIPT, "text": "the words"})
+
+        self.assertTrue(closing.fired, "the close never landed inside the window")
+        self.assertFalse(queued, "a frame behind the sentinel was reported as queued")
+
+    def test_a_session_whose_device_will_not_close_is_still_released(self) -> None:
+        """The reader thread carries this call, so an exception ends the session
+        teardown half done: writer thread alive, both handles open, and the
+        connection still counted as live for the life of the daemon.
+        """
+
+        class FailingStopPlayer(RecordingPlayer):
+            """Fails the way a device that has gone away does.
+
+            `end()` closes the device last, so the failure escapes after the
+            engine state has already been torn down -- which is what makes it
+            reach the reader thread rather than being caught earlier.
+            """
+
+            def stop(self) -> None:
+                super().stop()
+                raise RuntimeError("the output stream would not close")
+
+        config = MurmlyConfig(
+            socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+            config_path=Path(tempfile.mkdtemp()) / "config.toml",
+            tts_enabled=True,
+        )
+        engine = SpeechEngine(
+            config, synthesizer=FakeSynthesizer(), player=FailingStopPlayer()
+        )
+        daemon, socket_path, _engine, _player, _capture = self.serve(engine=engine)
+        client = SessionClient(socket_path)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+        session = daemon._speech_session
+
+        client.close()
+
+        self.wait_for(lambda: daemon._speech_session is None, message="the session to clear")
+        self.wait_for(
+            lambda: session._writer is not None and not session._writer.is_alive(),
+            message="the writer thread to exit",
+        )
+        self.assertNotIn(session.connection, daemon._connections)
+        # And the slot is free, so the next sender is not refused forever.
+        self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
 
 
 class CaptureFailureTests(SpeechSessionHarness):

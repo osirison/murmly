@@ -191,6 +191,11 @@ uv sync --extra tts
 sudo dnf install espeak-ng
 ```
 
+`uv sync` makes the environment match exactly the extras it is given, so name
+every extra you want on one line. On a CUDA install this is
+`uv sync --extra cuda --extra tts` — the shorter form would remove the CUDA
+wheels, exactly as the CUDA line alone would remove this one.
+
 Then place the model files in `~/.local/share/murmly`:
 
 | File | From |
@@ -250,8 +255,12 @@ and wait for the acknowledgement before sending anything else:
 ```
 
 Murmly answers `{"ok": true, "session": "speech"}`, or one refusal frame and a
-closed connection carrying `speech_disabled`, `speech_unavailable`, or
-`speech_session_in_use`. One session is open at a time.
+closed connection. `speech_disabled`, `speech_unavailable` and
+`speech_session_in_use` are the reasons specific to speech; a declaration can
+also be refused for the reasons any command can, such as `command_failed`,
+`over_capacity` or `shutting_down`. Treat any frame carrying `"ok": false` as a
+refusal and report its message, rather than matching the speech reasons alone.
+One session is open at a time.
 
 Frames a sender may send:
 

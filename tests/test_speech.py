@@ -14,6 +14,7 @@ from murmly.speech import (
     LOOKAHEAD_SECONDS,
     SpeechEngine,
     SpeechQueue,
+    SpeechSuspendError,
     SpeechUnit,
 )
 
@@ -678,6 +679,36 @@ class CaptureGatingTests(EngineHarness):
             message="the unit to be reported failed",
         )
         self.assertFalse(engine.speaking, "the daemon would report SPEAKING while idle")
+
+    def test_an_interruption_survives_a_device_that_will_not_close(self) -> None:
+        """Speech has already stopped by the time the close is attempted.
+
+        Raising bare took the report with it: the daemon had nothing to send,
+        so the sender was never told it had been cut off and kept generating
+        for someone who had stopped listening.
+        """
+        player = RecordingPlayer()
+
+        def refuse_to_stop() -> None:
+            player.active = False
+            raise RuntimeError("the output stream would not close")
+
+        engine, _player, events = self.engine(player=player)
+        self.begin(engine, events)
+        engine.speak("one", "A sentence.")
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        engine.speak("two", "Another sentence.")
+        self.wait_for(lambda: engine._queue.waiting or player.written[1:], message="a second unit")
+        # Restored before the harness tears the engine down, which closes the
+        # device too and would otherwise fail the cleanup rather than the test.
+        self.addCleanup(setattr, player, "stop", player.stop)
+        player.stop = refuse_to_stop
+
+        with self.assertRaises(SpeechSuspendError) as raised:
+            engine.suspend()
+
+        self.assertIsNotNone(raised.exception.interruption)
+        self.assertFalse(raised.exception.interruption.nothing_unheard)
 
     def test_resuming_without_a_session_opens_nothing(self) -> None:
         engine, player, _events = self.engine()

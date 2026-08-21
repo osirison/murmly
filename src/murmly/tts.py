@@ -52,6 +52,21 @@ GPU_RUNTIME_REMEDY = (
     "the CPU one rather than joining it. Run `uv pip uninstall onnxruntime` "
     "then `uv pip install \"onnxruntime-gpu==1.24.4\"`."
 )
+# States the rule rather than a literal command, because the literal command is
+# destructive half the time: `uv sync` makes the environment match exactly the
+# extras it is given, so `--extra cuda` alone removes kokoro-onnx and the very
+# feature this message is about. A remedy that undoes the thing it is fixing is
+# worse than no remedy, because it is followed.
+CUDA_EXTRA_REMEDY = (
+    "synthesis on CUDA needs the Murmly CUDA extra. Run `uv sync --extra cuda "
+    "--extra tts`, naming every extra you already have on the same line, then "
+    "reapply the ONNX Runtime swap -- the sync restores the CPU build."
+)
+RUNTIME_UNUSABLE_REMEDY = (
+    "the ONNX Runtime is missing or unusable. Recreate the environment with "
+    "`uv sync --extra tts`, naming every extra you already have on the same "
+    "line, and reapply the GPU runtime swap if you want GPU synthesis."
+)
 
 # Anything below this counts as silence when the pause between sentences is
 # measured, and a run shorter than the floor is not a pause at all.
@@ -164,9 +179,20 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
     # Whether this runtime build carries the provider at all, which is what the
     # module-level list is for. What it must never be used for is proof that a
     # session ran on it -- that comes off the session.
-    import onnxruntime
+    try:
+        import onnxruntime
 
-    if CUDA_PROVIDER not in onnxruntime.get_available_providers():
+        available = onnxruntime.get_available_providers()
+    except Exception as error:  # noqa: BLE001 - reported as unavailable, not raised
+        # A bare import here reached the daemon's startup path: absent, it
+        # raised ModuleNotFoundError, and half-installed -- the state an
+        # interrupted swap between the CPU and GPU builds leaves behind -- it
+        # imported and then had no `get_available_providers`. Either killed the
+        # daemon outright, taking transcription with it, for a feature that is
+        # meant to degrade on its own.
+        raise RuntimeError(RUNTIME_UNUSABLE_REMEDY) from error
+
+    if CUDA_PROVIDER not in available:
         logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
         return [CPU_PROVIDER]
 
@@ -176,10 +202,7 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         logger.warning("Speech output falling back to the CPU: %s", error)
         return [CPU_PROVIDER]
     if not cuda_ready:
-        logger.warning(
-            "Speech output falling back to the CPU: synthesis on CUDA needs the "
-            "Murmly CUDA extra. Run `uv sync --extra cuda`."
-        )
+        logger.warning("Speech output falling back to the CPU: %s", CUDA_EXTRA_REMEDY)
         return [CPU_PROVIDER]
     return [CUDA_PROVIDER, CPU_PROVIDER]
 
@@ -272,15 +295,20 @@ class KokoroSynthesizer:
         if not sentences:
             return
         model = self._load_model()
-        # Only when there is a boundary to put one in. Calibration costs a
-        # synthesis, and a sender that streams one sentence at a time would
-        # otherwise pay for it before its first word is audible.
-        pause = self._pause_for(model) if len(sentences) > 1 else 0.0
+        # Measured at the first boundary rather than before the first sentence.
+        # Calibration is a whole extra synthesis, and paying for it up front put
+        # it in front of the first audible word of every multi-sentence passage
+        # -- which is the delay this whole class exists to avoid. Deferred, it
+        # runs while sentence one is already playing, and a sender streaming one
+        # sentence at a time never pays for it at all.
+        pause: float | None = None
         previous_tail = 0.0
         for index, sentence in enumerate(sentences):
             samples, sample_rate_hz = self._create(model, sentence)
             samples = np.asarray(samples, dtype=np.float32)
             if index:
+                if pause is None:
+                    pause = self._pause_for(model)
                 gap = max(0.0, pause - previous_tail - _leading_silence(samples, sample_rate_hz))
                 if gap > 0:
                     samples = np.concatenate(
@@ -336,7 +364,8 @@ class KokoroSynthesizer:
         except ModuleNotFoundError:
             return (
                 f"{SYNTHESIS_PACKAGE} is not installed. Run "
-                f"`uv sync --extra tts` to install it."
+                f"`uv sync --extra tts`, naming every extra you already have on "
+                f"the same line -- a sync removes whatever it is not given."
             )
         except ImportError as error:
             return f"{SYNTHESIS_PACKAGE} could not be inspected: {error}"
@@ -359,6 +388,12 @@ class KokoroSynthesizer:
             resolve_providers(self._config)
         except RuntimeError as error:
             return str(error)
+        except Exception as error:  # noqa: BLE001 - a broken part refuses speech, not the daemon
+            # The backstop for the whole probe. Speech output is required to
+            # start and refuse with a reason rather than prevent the daemon
+            # starting, so anything unanticipated in here becomes a reason too.
+            # `murmly doctor` reports it and it is logged where it is caught.
+            return f"speech output could not be checked: {error}"
         return None
 
     def _load_model(self):
@@ -377,7 +412,8 @@ class KokoroSynthesizer:
         except ModuleNotFoundError as error:
             raise RuntimeError(
                 f"{SYNTHESIS_PACKAGE} is required for speech output. Run "
-                f"`uv sync --extra tts` before enabling it."
+                f"`uv sync --extra tts` before enabling it, naming every extra you "
+                f"already have on the same line."
             ) from error
 
         library_path, data_path = resolve_espeak()

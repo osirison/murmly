@@ -434,9 +434,18 @@ class ExampleConfigTests(unittest.TestCase):
         }
         for name, section in sections.items():
             self.assertIsNotNone(section, f"no speech section found in {name}")
-            for line in re.findall(r"^[#\s]*(uv sync [^\n]*)$", section.group(0), re.MULTILINE):
+            body = section.group(0)
+            for line in re.findall(r"^[#\s]*(uv sync [^\n]*)$", body, re.MULTILINE):
                 if "--extra cuda" in line and "--extra tts" not in line:
                     self.fail(
                         f"{name}: {line.strip()!r} syncs the speech extra away. "
                         "Name --extra tts alongside --extra cuda."
                     )
+            # And the rule itself, not only the commands that obey it. Someone
+            # adapting an example needs to know why every extra is named, or the
+            # next command they write is the destructive one.
+            self.assertIn(
+                "match exactly the extras",
+                body,
+                f"{name}: the speech section never states that `uv sync` is exact",
+            )
