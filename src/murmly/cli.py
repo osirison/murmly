@@ -15,7 +15,7 @@ import time
 import traceback
 from collections.abc import Callable
 
-from murmly.audio import SoundDeviceRecorder
+from murmly.audio import SoundDeviceRecorder, SoundDevicePlayer
 from murmly.config import MurmlyConfig, default_config_path, load_config
 from murmly.daemon import (
     DaemonNotRespondingError,
@@ -44,6 +44,7 @@ from murmly.focus import FocusObserver, create_focus_observer, record_target, sh
 from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend, renderer_environment
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
+from murmly.tts import KokoroSynthesizer, resolve_providers
 
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
@@ -371,6 +372,17 @@ def _run_doctor(config: MurmlyConfig) -> None:
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         overlay = {"available": False, "detail": f"Unable to check the overlay: {error}"}
 
+    # Guarded on its own, like every other probe: a speech stack that cannot be
+    # inspected must not take the rest of the report with it.
+    try:
+        speech = speech_output_diagnostics(config)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        speech = {
+            "enabled": config.tts_enabled,
+            "available": False,
+            "detail": f"Unable to check speech output: {error}",
+        }
+
     report: dict[str, object] = {
         "config_path": str(config.config_path),
         "socket_path": str(config.socket_path),
@@ -389,6 +401,7 @@ def _run_doctor(config: MurmlyConfig) -> None:
         "live_transcription": live_transcription_diagnostics(config),
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
+        "speech_output": speech,
         "installation": installation_diagnostics(),
     }
     if session_detail is not None:
@@ -419,6 +432,78 @@ def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
             "command socket is protected by its file permissions alone."
         )
     return report
+
+
+def speech_output_diagnostics(
+    config: MurmlyConfig,
+    synthesizer: KokoroSynthesizer | None = None,
+) -> dict[str, object]:
+    """What `murmly doctor` says about speech output.
+
+    Reports the settings in use alongside any configured value that was not
+    honoured, because a setting that silently falls back looks to its owner like
+    one that was ignored. Never loads the model: the probe checks that every
+    part is present, which is what decides whether a session can be opened.
+    """
+    report: dict[str, object] = {
+        "enabled": config.tts_enabled,
+        "voice": config.tts_voice,
+        "rate_percent": config.tts_rate_percent,
+        "model_dir": str(config.tts_model_dir),
+        "output_device": config.tts_output_device or None,
+    }
+    if config.tts_voice_rejected_value is not None:
+        report["voice_rejected_value"] = config.tts_voice_rejected_value
+    if config.tts_rate_rejected_value is not None:
+        report["rate_rejected_value"] = config.tts_rate_rejected_value
+
+    if not config.tts_enabled:
+        report["available"] = False
+        report["detail"] = "Speech output is disabled. Set enabled = true under [tts]."
+        return report
+
+    probe = synthesizer if synthesizer is not None else KokoroSynthesizer(config)
+    report["available"] = probe.available
+    if not probe.available:
+        # The reason is written as the remedy: what to install, or what to place
+        # where, so the report is the whole answer rather than the start of one.
+        report["detail"] = probe.unavailable_reason
+        return report
+
+    try:
+        report["providers"] = resolve_providers(config)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        report["providers"] = None
+        report["provider_detail"] = str(error)
+
+    rate, device_detail, probe_detail = negotiated_output(config)
+    report["negotiated_output_rate_hz"] = rate
+    if device_detail is not None:
+        report["output_device_detail"] = device_detail
+    if probe_detail is not None:
+        report["detail"] = probe_detail
+    return report
+
+
+def negotiated_output(config: MurmlyConfig) -> tuple[int | None, str | None, str | None]:
+    """Open the output device briefly to learn what a session would get.
+
+    The same reason the capture side is probed rather than reported from
+    configuration: the device negotiates the rate, and the configured output
+    device may not be the one that opens.
+    """
+    player = SoundDevicePlayer(config)
+    try:
+        player.start()
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return None, None, f"No output device could be opened: {error}"
+    try:
+        return player.sample_rate_hz, player.device_detail, None
+    finally:
+        try:
+            player.stop()
+        except Exception:  # noqa: BLE001 - diagnostics must not raise
+            pass
 
 
 def paste_injection_diagnostics(injection: PasteInjection) -> dict[str, object]:

@@ -84,11 +84,11 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 10. Diagnostics and documentation
 
-- [ ] 10.1 Nest the `doctor` report (`cli.py:351-370`) so a speech section can sit alongside the existing flat keys without changing the success shape pinned at `tests/test_cli.py:88`
-- [ ] 10.2 Report speech enablement, availability, voice and rate in use with any unhonoured configured values, and the output device; name the remedy when unavailable
-- [ ] 10.3 Guard the speech probe individually with `except Exception  # noqa: BLE001 - diagnostics must not raise` and report its failure in a dedicated detail field, following the existing probes
-- [ ] 10.4 Report both hotkeys with their purposes and whether each is held by Murmly
-- [ ] 10.5 Document speech output, the two hotkeys, and the session protocol in `README.md`
+- [x] 10.1 Nest the `doctor` report (`cli.py:351-370`) so a speech section can sit alongside the existing flat keys without changing the success shape pinned at `tests/test_cli.py:88`
+- [x] 10.2 Report speech enablement, availability, voice and rate in use with any unhonoured configured values, and the output device; name the remedy when unavailable
+- [x] 10.3 Guard the speech probe individually with `except Exception  # noqa: BLE001 - diagnostics must not raise` and report its failure in a dedicated detail field, following the existing probes
+- [x] 10.4 Report both hotkeys with their purposes and whether each is held by Murmly
+- [x] 10.5 Document speech output, the two hotkeys, and the session protocol in `README.md`
 - [x] 10.6 Move `docs/agent-notes/onnxruntime-gpu-cuda-version.md` and `docs/agent-notes/espeakng-loader-data-path.md` into the tree with this change; both are currently untracked
 
 ## 11. Validation

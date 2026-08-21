@@ -89,6 +89,13 @@ uv sync
 uv run murmly install Meta+X
 ```
 
+To also bind the hotkey that dictates into an open speech session, pass a
+second key:
+
+```bash
+uv run murmly install Meta+X Meta+A
+```
+
 That is the whole installation. It:
 
 - writes a systemd user service that starts `murmly` with your graphical
@@ -126,9 +133,10 @@ Murmly checks before binding and tells you who owns a key it will not take.
 | --- | --- |
 | `~/.config/systemd/user/murmly.service` | starts the daemon with your session |
 | `~/.local/share/applications/net.local.murmly.desktop` | carries the hotkey |
+| `~/.local/share/applications/net.local.murmly-session.desktop` | carries the speech-session hotkey, when one was requested |
 
 Nothing else. Murmly never edits your global shortcut configuration, and
-`murmly uninstall` removes both files.
+`murmly uninstall` removes every one of these files.
 
 ## Use it
 
@@ -158,6 +166,116 @@ uv run murmly uninstall
 If you move the project directory or rebuild its environment, the recorded path
 goes stale. Run `murmly install <hotkey>` again from the new location to repair
 it; `murmly doctor` shows the path currently recorded.
+
+## Speech output
+
+Murmly can also speak. It is off by default, because a machine that starts
+talking after an upgrade is producing sound its owner did not ask for.
+
+An agent connects to the command socket, declares a speech session, and streams
+text as it produces it. Murmly speaks that text a sentence at a time and tells
+the session what the person actually heard. When the person reaches for a
+capture hotkey, speech stops before the microphone opens, the session is told it
+was interrupted and what was never spoken, and — if the session hotkey was the
+one pressed — the person's reply is delivered back to that session rather than
+pasted into whatever window has focus.
+
+### Turning it on
+
+```bash
+uv sync --extra tts
+sudo dnf install espeak-ng
+```
+
+Then place the model files in `~/.local/share/murmly`:
+
+| File | From |
+| --- | --- |
+| `kokoro-v1.0.onnx` | the Kokoro ONNX release |
+| `voices-v1.0.bin` | the same release |
+
+And set `enabled = true` under `[tts]` in your configuration. `murmly doctor`
+reports what is missing under `speech_output` and names the remedy for each.
+
+Synthesis runs on the CPU at roughly five times real time, which is enough. To
+run it on the GPU, note that the GPU build of ONNX Runtime **replaces** the CPU
+one rather than joining it — both install into the same `onnxruntime` package
+namespace, and an environment holding both leaves the survivor of any later
+uninstall broken:
+
+```bash
+uv sync --extra cuda
+uv pip uninstall onnxruntime
+uv pip install "onnxruntime-gpu==1.24.4"
+```
+
+`murmly doctor` reports which execution providers speech output resolved, and
+Murmly reads the provider back off the session it constructed rather than off
+the module's advertised list — that list says CUDA on a session running on the
+CPU.
+
+### The two hotkeys
+
+| Hotkey | What it does |
+| --- | --- |
+| the first, for example `Meta+X` | transcribes into the focused window, exactly as it always has |
+| the second, for example `Meta+A` | transcribes into the open speech session, pasting nothing and leaving the clipboard alone |
+
+Both stop speech before the microphone opens, and both tell the session it was
+interrupted, because a sender has to stop generating whoever the person was
+talking to. They differ only in where the transcript goes. Installing without a
+second hotkey leaves speech output reachable by a sender that opens a session
+itself; `murmly doctor` reports the session hotkey as not bound, which is not a
+failure.
+
+### The session protocol
+
+One connection, newline-delimited JSON in both directions. Declare the session
+and wait for the acknowledgement before sending anything else:
+
+```json
+{"command": "speech_session"}
+```
+
+Murmly answers `{"ok": true, "session": "speech"}`, or one refusal frame and a
+closed connection carrying `speech_disabled`, `speech_unavailable`, or
+`speech_session_in_use`. One session is open at a time.
+
+Frames a sender may send:
+
+| Frame | Meaning |
+| --- | --- |
+| `{"command": "speak", "name": "m1", "text": "..."}` | speak this, and call it `m1` |
+| `{"command": "end"}` | no more text is coming |
+| `{"command": "cancel"}` | stop speaking and discard what is queued |
+
+Frames Murmly sends, without being asked:
+
+| Frame | Meaning |
+| --- | --- |
+| `{"event": "started", "name": "m1"}` | `m1` has begun to be audible |
+| `{"event": "heard_all"}` | everything queued was heard, and the sender had said it was finished |
+| `{"event": "interrupted", "playing": "m2", "pending": ["m3"], "code": "speech_interrupted"}` | the person interrupted; `m2` was cut off and `m3` never started |
+| `{"event": "transcript", "text": "..."}` | what the person said, when the session hotkey started the capture |
+| `{"event": "shutting_down"}` | Murmly is stopping |
+
+Three things a sender should know:
+
+- **Wait for the acknowledgement.** The declaration is read by the same path
+  that reads every other command, which reads one frame; text pipelined behind
+  the declaration in a single write arrives as one unreadable request.
+- **The position reported is what was heard, not what was produced.** Murmly
+  produces sentence five while sentence four is audible, so a position taken
+  from production would claim the person heard something they did not.
+- **Events carry names, never text.** The one exception is the transcript, which
+  is the whole point of delivering it.
+
+### What speech output does not do
+
+Reading a highlighted selection aloud, voice-activated barge-in, a visual
+indicator while speaking, voice cloning, and languages other than English are
+all out of scope. Interruption is a keypress, which is what makes echo
+cancellation unnecessary: playback and capture never overlap.
 
 ## Scope and limitations
 

@@ -169,6 +169,7 @@ class MurmlyConfig:
     tts_voice: str = DEFAULT_TTS_VOICE
     tts_voice_rejected_value: str | None = None
     tts_rate_percent: int = DEFAULT_TTS_RATE_PERCENT
+    tts_rate_rejected_value: object | None = None
     tts_output_device: str = ""
     tts_model_dir: Path = field(default_factory=default_tts_model_dir)
 
@@ -222,6 +223,13 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
     if tts_voice not in VALID_TTS_VOICES:
         tts_voice_rejected_value = tts_voice
         tts_voice = DEFAULT_TTS_VOICE
+    tts_rate_percent = _bounded_int(
+        tts.get("rate"),
+        DEFAULT_TTS_RATE_PERCENT,
+        minimum=MIN_TTS_RATE_PERCENT,
+        maximum=MAX_TTS_RATE_PERCENT,
+    )
+    tts_rate_rejected_value = _rejected_value(tts.get("rate"), tts_rate_percent)
     model_dir = tts.get("model_dir")
     tts_model_dir = (
         Path(str(model_dir)).expanduser() if model_dir else default_tts_model_dir(env)
@@ -290,12 +298,8 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         tts_enabled=_boolean(tts.get("enabled"), False),
         tts_voice=tts_voice,
         tts_voice_rejected_value=tts_voice_rejected_value,
-        tts_rate_percent=_bounded_int(
-            tts.get("rate"),
-            DEFAULT_TTS_RATE_PERCENT,
-            minimum=MIN_TTS_RATE_PERCENT,
-            maximum=MAX_TTS_RATE_PERCENT,
-        ),
+        tts_rate_percent=tts_rate_percent,
+        tts_rate_rejected_value=tts_rate_rejected_value,
         tts_output_device=str(tts.get("output_device", "")),
         tts_model_dir=tts_model_dir,
     )
@@ -314,6 +318,23 @@ def _bounded_int(value: object, default: int, *, minimum: int, maximum: int) -> 
     except (TypeError, ValueError):
         return default
     return parsed if minimum <= parsed <= maximum else default
+
+
+def _rejected_value(value: object, resolved: int) -> object | None:
+    """The configured value when it was not the one used, for diagnostics.
+
+    `_bounded_int` falls back silently, which is right for starting up and
+    wrong for explaining: a report that cannot name what the user asked for
+    leaves them looking at a setting that appears to have been ignored.
+    """
+    if value is None:
+        return None
+    try:
+        if int(value) == resolved:
+            return None
+    except (TypeError, ValueError):
+        return value
+    return value
 
 
 def _boolean(value: object, default: bool) -> bool:

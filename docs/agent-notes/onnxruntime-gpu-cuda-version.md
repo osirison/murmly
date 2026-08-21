@@ -64,6 +64,59 @@ through distribution metadata instead — see `src/murmly/stt.py`
 `_load_cuda_runtime` and `docs/agent-notes/uv-sync-cuda-runtime.md`, which apply
 the same provenance checks any ONNX path should reuse rather than duplicate.
 
+## The CUDA extra is not enough on its own
+
+Pinning the version fixes the CUDA *major* line. It does not give the provider
+every library it links, and the two runtimes do not link the same set.
+`libonnxruntime_providers_cuda.so` needs six:
+
+```console
+$ ldd .../onnxruntime/capi/libonnxruntime_providers_cuda.so | grep 'not found'
+	libcublasLt.so.12 => not found
+	libcublas.so.12 => not found
+	libcurand.so.10 => not found
+	libcufft.so.11 => not found
+	libcudart.so.12 => not found
+	libcudnn.so.9 => not found
+```
+
+Murmly's `cuda` extra shipped only the first two and the last. The provider then
+fails to load and ONNX Runtime reports it as a **warning** before running on the
+CPU, which is the same silent fallback this note already warns about, reached a
+different way. The extra now also carries `nvidia-cuda-runtime-cu12`,
+`nvidia-cufft-cu12`, `nvidia-curand-cu12` and `nvidia-nvjitlink-cu12`, and
+`src/murmly/tts.py` preloads all seven through `load_cuda_libraries` with the
+provenance checks in `src/murmly/stt.py`.
+
+Do not request `TensorrtExecutionProvider`. It heads the runtime's default
+provider list, fails on a missing `libnvinfer.so.10`, and prints a page of
+errors before falling back — build the session with
+`providers=["CUDAExecutionProvider", "CPUExecutionProvider"]` explicitly.
+
+## Do not install both distributions
+
+`kokoro-onnx` and `faster-whisper` both depend on the CPU `onnxruntime`, so
+listing `onnxruntime-gpu` as a dependency alongside them resolves **both** into
+one environment:
+
+```console
+$ uv pip install --dry-run "murmly[cuda,tts] @ ."
+ + onnxruntime==1.29.0
+ + onnxruntime-gpu==1.24.4
+```
+
+That is the broken combination described below. The GPU build is a swap, not an
+addition, and the swap is clean in that direction:
+
+```bash
+uv pip uninstall onnxruntime
+uv pip install "onnxruntime-gpu==1.24.4"
+```
+
+Confirmed in a fresh environment on 2026-08-21: after the swap
+`onnxruntime.InferenceSession` exists, `get_available_providers()` lists CUDA,
+and `faster_whisper.vad.get_vad_model()` still loads through the survivor.
+
 ## Also
 
 `onnxruntime` and `onnxruntime-gpu` install into the same `onnxruntime` package

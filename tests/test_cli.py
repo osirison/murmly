@@ -975,6 +975,7 @@ class DoctorCompletenessTests(unittest.TestCase):
         "live_transcription",
         "delivery",
         "overlay",
+        "speech_output",
         "installation",
     )
 
@@ -1236,3 +1237,153 @@ class SecondHotkeyCommandTests(unittest.TestCase):
                 main(["--config", str(config_path), "toggle"])
 
         self.assertEqual(["toggle"], sent)
+
+
+class SpeechOutputDiagnosticsTests(unittest.TestCase):
+    def _config(self, temp_dir: str, **overrides):
+        return MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            tts_model_dir=Path(temp_dir) / "models",
+            **overrides,
+        )
+
+    def test_disabled_speech_output_is_reported_as_disabled(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = speech_output_diagnostics(self._config(temp_dir))
+
+        self.assertFalse(report["enabled"])
+        self.assertFalse(report["available"])
+        self.assertIn("disabled", report["detail"])
+
+    def test_an_unavailable_stack_names_what_to_install(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+        from fakes import FakeSynthesizer
+
+        probe = FakeSynthesizer(
+            available=False,
+            unavailable_reason="kokoro-onnx is not installed. Run `uv sync --extra tts`.",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = speech_output_diagnostics(self._config(temp_dir, tts_enabled=True), probe)
+
+        self.assertTrue(report["enabled"])
+        self.assertFalse(report["available"])
+        self.assertIn("--extra tts", report["detail"])
+
+    def test_a_working_stack_names_the_voice_rate_and_output_device(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+        from fakes import FakeSynthesizer
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir, tts_enabled=True, tts_voice="bf_emma", tts_rate_percent=120)
+            with patch("murmly.cli.negotiated_output", return_value=(48_000, None, None)):
+                report = speech_output_diagnostics(config, FakeSynthesizer())
+
+        self.assertTrue(report["available"])
+        self.assertEqual("bf_emma", report["voice"])
+        self.assertEqual(120, report["rate_percent"])
+        self.assertEqual(48_000, report["negotiated_output_rate_hz"])
+
+    def test_a_configured_value_that_was_not_honoured_is_reported_alongside_the_one_in_use(
+        self,
+    ) -> None:
+        from murmly.cli import speech_output_diagnostics
+        from murmly.config import load_config
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('[tts]\nvoice = "morgan_freeman"\nrate = 900\n')
+            report = speech_output_diagnostics(load_config(config_path))
+
+        self.assertEqual("af_heart", report["voice"])
+        self.assertEqual("morgan_freeman", report["voice_rejected_value"])
+        self.assertEqual(100, report["rate_percent"])
+        self.assertEqual(900, report["rate_rejected_value"])
+
+    def test_a_device_that_cannot_be_opened_is_named_in_the_report(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+        from fakes import FakeSynthesizer
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir, tts_enabled=True)
+            with patch(
+                "murmly.cli.negotiated_output",
+                return_value=(None, None, "No output device could be opened: nothing there"),
+            ):
+                report = speech_output_diagnostics(config, FakeSynthesizer())
+
+        self.assertIsNone(report["negotiated_output_rate_hz"])
+        self.assertIn("No output device could be opened", report["detail"])
+
+    def test_a_configured_device_that_was_not_used_names_what_was(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+        from fakes import FakeSynthesizer
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir, tts_enabled=True, tts_output_device="Missing Headset")
+            with patch(
+                "murmly.cli.negotiated_output",
+                return_value=(48_000, "The configured output device 'Missing Headset' could not be opened; using the system default instead.", None),
+            ):
+                report = speech_output_diagnostics(config, FakeSynthesizer())
+
+        self.assertEqual("Missing Headset", report["output_device"])
+        self.assertIn("instead", report["output_device_detail"])
+
+    def test_a_probe_that_fails_does_not_abandon_the_rest_of_the_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch(
+                    "murmly.cli.speech_output_diagnostics",
+                    side_effect=RuntimeError("the probe exploded"),
+                ),
+                patch.object(
+                    FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")
+                ),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIn("the probe exploded", report["speech_output"]["detail"])
+        self.assertFalse(report["speech_output"]["available"])
+        self.assertEqual("cpu", report["runtime_device"], "another section was abandoned")
+        self.assertIn("installation", report)
+
+    def test_diagnostics_report_both_hotkeys_with_their_purposes(self) -> None:
+        from murmly.cli import installation_diagnostics
+
+        class FakeInstaller:
+            def status(self):
+                return {
+                    "installed": True,
+                    "service_active": True,
+                    "entrypoint": "/bin/murmly",
+                    "hotkey": "Meta+X",
+                    "hotkey_held": True,
+                    "detail": "running",
+                    "hotkeys": [
+                        {"purpose": "window", "hotkey": "Meta+X", "held": True},
+                        {"purpose": "session", "hotkey": "Meta+A", "held": False},
+                    ],
+                }
+
+        with patch("murmly.cli.Installer", FakeInstaller):
+            report = installation_diagnostics()
+
+        purposes = {entry["purpose"]: entry for entry in report["hotkeys"]}
+        self.assertEqual({"window", "session"}, set(purposes))
+        self.assertTrue(purposes["window"]["held"])
+        self.assertFalse(purposes["session"]["held"])
