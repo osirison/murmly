@@ -106,6 +106,12 @@ class SpeechQueue:
                 self._arrived.clear()
             return unit
 
+    def putback(self, unit: SpeechUnit) -> None:
+        """Return a unit to the front, so its place in the order is kept."""
+        with self._lock:
+            self._units.appendleft(unit)
+            self._arrived.set()
+
     def discard(self) -> list[str]:
         """Drop everything not yet taken, and report what was dropped."""
         with self._lock:
@@ -209,7 +215,8 @@ class SpeechEngine:
         cannot be given one has to be refused at the moment it is declared, not
         accepted and failed once somebody is listening.
         """
-        self.end()
+        if self._sink is not None or self._thread is not None:
+            self.end()
         self._player.start()
         self._queue = SpeechQueue()
         self._scheduled = deque()
@@ -329,6 +336,11 @@ class SpeechEngine:
             unit = self._queue.take(POLL_SECONDS)
             if unit is None:
                 continue
+            if self._hold.is_set():
+                # Taken in the window between the check above and the hotkey
+                # press. Put back rather than spoken: the person is talking.
+                self._queue.putback(unit)
+                continue
             try:
                 self._speak(unit, sink)
             except Exception as error:  # noqa: BLE001 - one unit must not end the session
@@ -382,7 +394,9 @@ class SpeechEngine:
         with self._lock:
             played = self._player.frames_played
             for entry in self._scheduled:
-                if not entry.started and played >= entry.start_frame:
+                # Strictly past the start: a unit beginning at frame N has not
+                # been heard at all until frame N itself has gone to the device.
+                if not entry.started and played > entry.start_frame:
                     entry.started = True
                     started.append(entry.name)
                 if entry.end_frame is not None and played >= entry.end_frame:
@@ -411,7 +425,7 @@ class SpeechEngine:
         report cannot move while it is being built.
         """
         for entry in self._scheduled:
-            if played >= entry.start_frame:
+            if played > entry.start_frame:
                 entry.started = True
             if entry.end_frame is not None and played >= entry.end_frame:
                 entry.heard = True

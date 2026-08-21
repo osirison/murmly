@@ -40,40 +40,40 @@ description: Track implementation and validation of local synthesis, the speech 
 
 ## 5. Speech queue and playback lifecycle
 
-- [ ] 5.1 Add a queue of named units with an explicit end-of-input marker, so "empty because the sender is still thinking" and "empty because the exchange is over" are distinguishable
-- [ ] 5.2 Add a daemon state meaning output is active, alongside the existing three (`daemon.py:945-962`), and leave `OverlayState` (`overlay.py:43-46`) unchanged, since speech has no visual indicator in this change
-- [ ] 5.3 Run playback on its own `daemon=True` thread named `murmly-speech`, wrapping `thread.start()` so a `RuntimeError` degrades the feature rather than failing the command, following `audio.py:255-266`
-- [ ] 5.4 Implement cancellation as a `threading.Event` plus a bounded join plus a generation check that discards a late result, following `_live_stop` (`daemon.py:439-453`) and `stop_partials` (`stt.py:47`); never a forced kill
-- [ ] 5.5 Track played position per unit and assert in tests that it never reports a unit that was only produced
-- [ ] 5.6 Add a `CommandCode` member for speech that was interrupted (`daemon.py:56-70`); the spec requires distinct codes for distinct categories
-- [ ] 5.7 Stop speech and close the output stream on shutdown before the drain expires (`SHUTDOWN_DRAIN_SECONDS`, `daemon.py:44`), alongside `_close_overlay` (`daemon.py:696`)
+- [x] 5.1 Add a queue of named units with an explicit end-of-input marker, so "empty because the sender is still thinking" and "empty because the exchange is over" are distinguishable
+- [x] 5.2 Add a daemon state meaning output is active, alongside the existing three (`daemon.py:945-962`), and leave `OverlayState` (`overlay.py:43-46`) unchanged, since speech has no visual indicator in this change
+- [x] 5.3 Run playback on its own `daemon=True` thread named `murmly-speech`, wrapping `thread.start()` so a `RuntimeError` degrades the feature rather than failing the command, following `audio.py:255-266`
+- [x] 5.4 Implement cancellation as a `threading.Event` plus a bounded join plus a generation check that discards a late result, following `_live_stop` (`daemon.py:439-453`) and `stop_partials` (`stt.py:47`); never a forced kill
+- [x] 5.5 Track played position per unit and assert in tests that it never reports a unit that was only produced
+- [x] 5.6 Add a `CommandCode` member for speech that was interrupted (`daemon.py:56-70`); the spec requires distinct codes for distinct categories
+- [x] 5.7 Stop speech and close the output stream on shutdown before the drain expires (`SHUTDOWN_DRAIN_SECONDS`, `daemon.py:44`), alongside `_close_overlay` (`daemon.py:696`)
 
 ## 6. Speech sessions on the command socket
 
-- [ ] 6.1 Add a session declaration to the request path, refused with a single response when speech output is disabled or unavailable, so a caller that cannot have a session is answered like any other unsupported request
-- [ ] 6.2 Read many frames from a declared session rather than one, leaving `_read_request` (`daemon.py:901-918`) unchanged for every other connection
-- [ ] 6.3 Write many frames to a declared session, leaving `_write_response` and `_claim_response` (`daemon.py:783-798`) governing one-shot connections exactly as they do today
-- [ ] 6.4 Account for sessions outside the eight command worker slots (`MAX_COMMAND_WORKERS`, `daemon.py:39`) so open sessions cannot deny `status` or `toggle`
-- [ ] 6.5 Bound the size of a single text frame with its own named constant; `MAX_COMMAND_BYTES` (`daemon.py:38`) stays 4096 for every existing command
-- [ ] 6.6 Stop speech and discard that session's queue when its connection closes for any reason
-- [ ] 6.7 Disconnect a session that will not accept its events rather than letting the write block playback, taking the same posture as `audio.py:296-298`
-- [ ] 6.8 Add tests over a real socket asserting frame ordering, the end-of-input marker, refusal when disabled, a session that stops reading, and that `status` and `toggle` still answer with sessions open
+- [x] 6.1 Add a session declaration to the request path, refused with a single response when speech output is disabled or unavailable, so a caller that cannot have a session is answered like any other unsupported request
+- [x] 6.2 Read many frames from a declared session rather than one, leaving `_read_request` (`daemon.py:901-918`) unchanged for every other connection
+- [x] 6.3 Write many frames to a declared session, leaving `_write_response` and `_claim_response` (`daemon.py:783-798`) governing one-shot connections exactly as they do today
+- [x] 6.4 Account for sessions outside the eight command worker slots (`MAX_COMMAND_WORKERS`, `daemon.py:39`) so open sessions cannot deny `status` or `toggle`
+- [x] 6.5 Bound the size of a single text frame with its own named constant; `MAX_COMMAND_BYTES` (`daemon.py:38`) stays 4096 for every existing command
+- [x] 6.6 Stop speech and discard that session's queue when its connection closes for any reason
+- [x] 6.7 Disconnect a session that will not accept its events rather than letting the write block playback, taking the same posture as `audio.py:296-298`
+- [x] 6.8 Add tests over a real socket asserting frame ordering, the end-of-input marker, refusal when disabled, a session that stops reading, and that `status` and `toggle` still answer with sessions open
 
 ## 7. Barge-in and capture gating
 
-- [ ] 7.1 Stop playback and confirm the output stream is closed before `start_recording` opens the microphone (`daemon.py:315`)
-- [ ] 7.2 Send the interruption event to the open session before capture begins, and before any transcript that follows it
-- [ ] 7.3 Hold text that arrives while capture is running, and speak it once capture ends
-- [ ] 7.4 Add a test asserting the recording produced by a barge-in contains none of the synthesized audio, driven through the output fake
-- [ ] 7.5 Add a test asserting the interruption names the unit that was playing and every unit that never started
+- [x] 7.1 Stop playback and confirm the output stream is closed before `start_recording` opens the microphone (`daemon.py:315`)
+- [x] 7.2 Send the interruption event to the open session before capture begins, and before any transcript that follows it
+- [x] 7.3 Hold text that arrives while capture is running, and speak it once capture ends
+- [x] 7.4 Add a test asserting the recording produced by a barge-in contains none of the synthesized audio, driven through the output fake
+- [x] 7.5 Add a test asserting the interruption names the unit that was playing and every unit that never started
 
 ## 8. Transcript routing
 
-- [ ] 8.1 Carry the pressed hotkey's purpose through the capture lifecycle so the destination is fixed when capture starts, not inferred when the transcript is ready
-- [ ] 8.2 Skip target recording and verification for session-bound capture (`integrations.py`, and the target recorded at `daemon.py:331`), and deliver to the session instead
-- [ ] 8.3 Leave the focused-window path byte-identical in behaviour whether or not a session is open
-- [ ] 8.4 Report an undeliverable transcript when the session closed before it was produced, and do not fall back to pasting it
-- [ ] 8.5 Add tests for both hotkeys with a session open, the session hotkey with no session open, and a session that closes mid-transcription
+- [x] 8.1 Carry the pressed hotkey's purpose through the capture lifecycle so the destination is fixed when capture starts, not inferred when the transcript is ready
+- [x] 8.2 Skip target recording and verification for session-bound capture (`integrations.py`, and the target recorded at `daemon.py:331`), and deliver to the session instead
+- [x] 8.3 Leave the focused-window path byte-identical in behaviour whether or not a session is open
+- [x] 8.4 Report an undeliverable transcript when the session closed before it was produced, and do not fall back to pasting it
+- [x] 8.5 Add tests for both hotkeys with a session open, the session hotkey with no session open, and a session that closes mid-transcription
 
 ## 9. Second hotkey and installer
 
