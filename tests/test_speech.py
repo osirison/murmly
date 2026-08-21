@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from fakes import FakeSynthesizer, expected_audio, split_for_fake
+from fakes import GATE_TIMEOUT_SECONDS, FakeSynthesizer, expected_audio, split_for_fake
 from murmly.config import MurmlyConfig
 from murmly.speech import (
     EVENT_HEARD_ALL,
@@ -66,6 +66,28 @@ class RecordingPlayer:
         """Let the device consume what is queued, or `frames` of it."""
         available = self.pending_frames if frames is None else min(frames, self.pending_frames)
         self.frames_played += available
+
+
+class GatedQueue(SpeechQueue):
+    """Blocks after handing a unit out, holding none of its own locks.
+
+    The window between the queue releasing a unit and the producer claiming a
+    generation for it is a few instructions wide and cannot be reached by
+    timing. A test that needs an interruption to land inside it has to hold the
+    producer there.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.handed = threading.Event()
+        self.release = threading.Event()
+
+    def take(self, timeout: float):
+        unit = super().take(timeout)
+        if unit is not None:
+            self.handed.set()
+            self.release.wait(GATE_TIMEOUT_SECONDS)
+        return unit
 
 
 class EngineHarness(unittest.TestCase):
@@ -387,17 +409,49 @@ class InterruptionTests(EngineHarness):
         """
         engine, player, events = self.engine()
         self.begin(engine, events)
-        engine.speak("one", "A sentence.")
-        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        engine, player, events = self.engine(synthesizer=FakeSynthesizer(gate=gate))
+        self.begin(engine, events)
+        # Interrupted with its first sentence audible and its second still
+        # inside the model, which is the only state in which the queue and the
+        # schedule could both be holding it.
+        engine.speak("one", "First part. Second part.")
+        self.wait_for(lambda: player.frames_written > 0, message="the first sentence")
         # One frame: past the start and nowhere near the end, which is what
         # "being spoken" means. Playing it all would make it heard instead.
+        # No `started` event to wait on here -- the loop publishes between
+        # units, and this one is parked inside the model. The interruption
+        # settles the position itself from the count taken after the abort.
         player.play(1)
-        self.wait_for(lambda: self.names(events, EVENT_STARTED) == ["one"], message="started")
 
         interruption = engine.interrupt()
 
         self.assertEqual("one", interruption.playing)
         self.assertNotIn("one", interruption.pending)
+
+    def test_a_unit_discarded_before_its_generation_was_read_is_not_spoken(self) -> None:
+        """The producer claims a generation after the queue hands the unit out.
+
+        An interruption landing between the two bumps the generation first, so
+        the producer reads the new one and never registers as stale -- and would
+        write audio to the device after the person asked for silence, while the
+        sender was told nothing was left unheard.
+        """
+        engine, player, events = self.engine()
+        self.begin(engine, events)
+        queue = GatedQueue()
+        self.addCleanup(queue.release.set)
+        engine._queue = queue
+
+        engine.speak("cancelled", "A sentence.")
+        self.assertTrue(queue.handed.wait(5), "the queue never handed the unit out")
+        interruption = engine.interrupt()
+        queue.release.set()
+        time.sleep(0.1)
+
+        self.assertEqual(("cancelled",), interruption.pending)
+        self.assertEqual(0, player.frames_written, "audio reached the device after the abort")
 
     def test_an_interrupted_session_is_not_told_everything_was_heard(self) -> None:
         """The sender said it had finished; the text was thrown away unspoken.

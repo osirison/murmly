@@ -1371,7 +1371,14 @@ class MurmlyDaemon:
             # declared in the window would be accepted, given the engine, and
             # then have it closed underneath it by this call.
             self._speech.end()
-        session.close()
+        # Drained, and outside the lock. A session is sometimes closed by Murmly
+        # having just written it a refusal -- a frame that could not be read, or
+        # one past the size bound -- and shutting the socket down without
+        # waiting for the writer loses the very explanation for the
+        # disconnection it explains. A peer that has already gone makes the
+        # write fail at once, so this waits only when there is something to
+        # wait for.
+        session.close(drain=True)
         with self._connections_lock:
             self._connections.discard(session.connection)
 

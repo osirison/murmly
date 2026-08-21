@@ -692,9 +692,12 @@ class TranscriptRoutingTests(SpeechSessionHarness):
         self.wait_for(lambda: daemon._speech_session is not None, message="the session")
 
         send_command(str(socket_path), "toggle_session")
-        # Closing without the reader having noticed: the session is still
-        # registered, and every frame it is handed from here on is dropped.
-        daemon._speech_session.close()
+        # Closing, and the reader has not noticed yet: the socket is still open,
+        # so the session stays registered while every frame it is handed from
+        # here on is dropped. Calling close() instead would take the session out
+        # of the register and the delivery would be refused for a different
+        # reason -- the one this daemon already handled.
+        daemon._speech_session._closing.set()
         response = send_command(str(socket_path), "toggle_session")
 
         self.assertFalse(response["delivered"])
@@ -737,8 +740,13 @@ class CaptureFailureTests(SpeechSessionHarness):
 
         class UnstoppableSpeech(SpeechEngine):
             def suspend(self):
+                # Fails the way the real one does. `suspend` takes the hold and
+                # then closes the device, so a device that will not close leaves
+                # speech held -- which is what the release below is about.
+                self.hold()
                 raise RuntimeError("the output stream would not close")
 
+        player = RecordingPlayer()
         engine = UnstoppableSpeech(
             MurmlyConfig(
                 socket_path=Path(tempfile.mkdtemp()) / "unused.sock",
@@ -746,10 +754,11 @@ class CaptureFailureTests(SpeechSessionHarness):
                 tts_enabled=True,
             ),
             synthesizer=FakeSynthesizer(),
-            player=RecordingPlayer(),
+            player=player,
         )
         _daemon, socket_path, _engine, _player, capture = self.serve(engine=engine)
-        self.client(socket_path).declare()
+        client = self.client(socket_path)
+        client.declare()
 
         response = send_command(str(socket_path), "toggle_session")
 
@@ -757,6 +766,11 @@ class CaptureFailureTests(SpeechSessionHarness):
         self.assertEqual(CommandCode.COMMAND_FAILED, response["code"])
         self.assertEqual(0, capture.started, "the microphone opened while speech was playing")
         self.assertEqual("IDLE", send_command(str(socket_path), "status")["state"])
+        # And the hold was released, so the session is not silent until some
+        # later capture happens to finish. Letting the failure escape to the
+        # daemon's outer handler answers identically and fails here.
+        client.send({"command": "speak", "name": "after", "text": "A sentence."})
+        self.wait_for(lambda: player.frames_written > 0, message="speech after the refusal")
 
     def test_a_session_that_could_not_start_does_not_block_the_next_one(self) -> None:
         """A half-started session left registered refuses every later one.

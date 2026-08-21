@@ -634,6 +634,32 @@ class InstallCommandTests(unittest.TestCase):
         self.assertIn("next login", errors.getvalue())
         self.assertIn("not active in this session", errors.getvalue())
 
+    def test_only_the_hotkey_that_was_not_confirmed_is_named(self) -> None:
+        """The other one is bound, confirmed and working right now.
+
+        An install of two hotkeys can fail on either, and naming both tells the
+        person that a key which works is not active.
+        """
+        from murmly.cli import _run_install
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import HotkeyNotConfirmedError
+
+        with (
+            patch("murmly.cli.Installer") as installer,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            installer.return_value.install.side_effect = HotkeyNotConfirmedError(
+                "The desktop did not register Meta+A within 5 seconds.",
+                parse_hotkey("Meta+A"),
+            )
+            exit_code = _run_install("Meta+X", "Meta+A")
+
+        self.assertEqual(1, exit_code)
+        report = errors.getvalue()
+        self.assertIn("Meta+A is not active in this session", report)
+        self.assertNotIn("Meta+X is not active", report)
+        self.assertNotIn("Meta+X, Meta+A", report)
+
 
 class UninstallCommandTests(unittest.TestCase):
     def test_prints_what_was_removed(self) -> None:

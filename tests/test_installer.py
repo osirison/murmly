@@ -817,6 +817,39 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(1, launcher.unregistrations)
         self.assertEqual(1, service.removes)
 
+    def test_a_failed_install_leaves_a_hotkey_it_never_touched_bound(self) -> None:
+        """Rollback undoes this run, not the installation.
+
+        Rebinding the window hotkey on a two-hotkey installation must not
+        release the session hotkey. It was bound and working before the command
+        was typed, this run never mentioned it, and its loss would be reported
+        nowhere -- the error names the key that failed.
+        """
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_HOTKEY, InstallError
+
+        launcher = FakeLauncher()
+        session_launcher = FakeLauncher(
+            declared="Meta+A",
+            purpose=SESSION_HOTKEY,
+            entrypoint="/bin/murmly toggle-session",
+        )
+        # The desktop resolves the window launcher to a different key, so this
+        # install fails after writing it.
+        shortcuts = OwnerRegistry(keys={DESKTOP_ID: [268435545]})
+        installer = make_installer(
+            launcher=launcher, session_launcher=session_launcher, shortcuts=shortcuts
+        )
+
+        with self.assertRaises(InstallError):
+            installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual(1, launcher.unregistrations, "this run's launcher was left behind")
+        self.assertEqual(
+            0, session_launcher.unregistrations, "a hotkey this run never touched was released"
+        )
+        self.assertEqual("Meta+A", session_launcher.declared_hotkey())
+
     def test_conflict_introduced_after_the_preflight_check_fails_and_cleans_up(self) -> None:
         """The pre-flight saw a free key, but a second claimant appeared before
         verification. Plasma reports both owners and delivers to neither of
