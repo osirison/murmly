@@ -130,6 +130,34 @@ class FakeOverlay:
         self.closed = True
 
 
+def wait_until_served(
+    test: unittest.TestCase,
+    daemon: MurmlyDaemon,
+    timeout: float = 3.0,
+) -> None:
+    """Wait until the daemon is listening, not until its socket path exists.
+
+    `serve_forever` binds the socket, sets its mode, and only then listens, so
+    the path exists for a window in which a connect is refused. Waiting on the
+    path alone made these tests fail as `ConnectionRefusedError` with nothing
+    wrong in the daemon: rarely on an idle machine, and on the first CI run that
+    ever exercised them.
+
+    `SO_ACCEPTCONN` is read off the daemon's own socket rather than a connection
+    being made to it, because a probe connection is not free. The daemon counts
+    every accepted connection through its peer-identity check, and a test that
+    answers that check differently per connection would be answering one of these
+    probes.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        server = daemon._server
+        if server is not None and server.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+            return
+        time.sleep(0.01)
+    test.fail("daemon socket was not listening")
+
+
 class DaemonTests(unittest.TestCase):
     def test_daemon_initializes_without_clipboard_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -157,11 +185,7 @@ class DaemonTests(unittest.TestCase):
             self.addCleanup(daemon.shutdown)
             self.addCleanup(thread.join, 2)
 
-            deadline = time.time() + 2
-            while not socket_path.exists():
-                if time.time() >= deadline:
-                    self.fail("daemon socket was not created")
-                time.sleep(0.05)
+            wait_until_served(self, daemon)
 
             status = send_command(str(socket_path), "status")
             first = send_command(str(socket_path), "toggle")
@@ -292,11 +316,7 @@ class DaemonTests(unittest.TestCase):
             daemon = MurmlyDaemon(config, session=DummySession(), overlay=overlay)
             thread = threading.Thread(target=daemon.serve_forever, daemon=True)
             thread.start()
-            deadline = time.time() + 2
-            while not socket_path.exists():
-                if time.time() >= deadline:
-                    self.fail("daemon socket was not created")
-                time.sleep(0.05)
+            wait_until_served(self, daemon)
 
             daemon.shutdown()
             thread.join(timeout=2)
@@ -326,11 +346,7 @@ class DaemonTests(unittest.TestCase):
             daemon = MurmlyDaemon(config, session=session, overlay=overlay)
             thread = threading.Thread(target=daemon.serve_forever, daemon=True)
             thread.start()
-            deadline = time.time() + 2
-            while not socket_path.exists():
-                if time.time() >= deadline:
-                    self.fail("daemon socket was not created")
-                time.sleep(0.05)
+            wait_until_served(self, daemon)
 
             with self.assertLogs("murmly.daemon", level="WARNING"):
                 daemon.shutdown()
@@ -350,11 +366,7 @@ class DaemonTests(unittest.TestCase):
             daemon = MurmlyDaemon(config, session=session, overlay=overlay)
             server_thread = threading.Thread(target=daemon.serve_forever, daemon=True)
             server_thread.start()
-            deadline = time.time() + 2
-            while not socket_path.exists():
-                if time.time() >= deadline:
-                    self.fail("daemon socket was not created")
-                time.sleep(0.01)
+            wait_until_served(self, daemon)
             self.assertEqual("LISTENING", send_command(str(socket_path), "toggle")["state"])
 
             responses: list[dict[str, object]] = []
@@ -398,11 +410,7 @@ class DaemonTests(unittest.TestCase):
             daemon = MurmlyDaemon(config, session=DummySession())
             server_thread = threading.Thread(target=daemon.serve_forever, daemon=True)
             server_thread.start()
-            deadline = time.time() + 2
-            while not socket_path.exists():
-                if time.time() >= deadline:
-                    self.fail("daemon socket was not created")
-                time.sleep(0.01)
+            wait_until_served(self, daemon)
 
             for _index in range(MAX_COMMAND_WORKERS + 4):
                 client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -444,11 +452,7 @@ class DaemonTests(unittest.TestCase):
             daemon = MurmlyDaemon(config, session=DummySession())
             server_thread = threading.Thread(target=daemon.serve_forever, daemon=True)
             server_thread.start()
-            deadline = time.time() + 2
-            while not socket_path.exists():
-                if time.time() >= deadline:
-                    self.fail("daemon socket was not created")
-                time.sleep(0.01)
+            wait_until_served(self, daemon)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.connect(str(socket_path))
                 client.sendall(b"x" * 4_097)
@@ -1420,11 +1424,7 @@ class ServedDaemonTests(unittest.TestCase):
         thread.start()
         self.addCleanup(thread.join, 3)
         self.addCleanup(daemon.shutdown)
-        deadline = time.time() + 3
-        while not config.socket_path.exists():
-            if time.time() >= deadline:
-                self.fail("daemon socket was not created")
-            time.sleep(0.01)
+        wait_until_served(self, daemon)
         return daemon, config.socket_path
 
     def wait_for_connections(self, daemon: MurmlyDaemon, count: int) -> int:
