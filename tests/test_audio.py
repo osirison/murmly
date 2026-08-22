@@ -15,6 +15,7 @@ from murmly.audio import (
     LevelSmoother,
     SoundDeviceRecorder,
     SoundDevicePlayer,
+    disable_portaudio_exit_teardown,
     pcm16_from_float32,
     pcm16_rms,
     resample_float32,
@@ -1089,6 +1090,55 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual([], acquisitions, "the playback callback must take no lock")
 
         player._write_lock = real_lock
+
+
+class ExitTeardownTests(unittest.TestCase):
+    """PortAudio tears down every host API it initialised when the process exits.
+
+    Its JACK backend aborts the process when the server behind it has already
+    gone, which is what a logout is, so the daemon drops the hook that runs it.
+    """
+
+    def test_nothing_is_unregistered_when_sounddevice_was_never_imported(self) -> None:
+        with patch.dict(sys.modules):
+            sys.modules.pop("sounddevice", None)
+            with patch("murmly.audio.atexit.unregister") as unregister:
+                disable_portaudio_exit_teardown()
+
+        unregister.assert_not_called()
+
+    def test_the_exit_hook_is_unregistered_when_sounddevice_is_imported(self) -> None:
+        module = ModuleType("sounddevice")
+        module._exit_handler = lambda: None
+        with patch.dict(sys.modules, {"sounddevice": module}):
+            with patch("murmly.audio.atexit.unregister") as unregister:
+                disable_portaudio_exit_teardown()
+
+        unregister.assert_called_once_with(module._exit_handler)
+
+    def test_a_hook_that_is_no_longer_there_is_reported_not_raised(self) -> None:
+        module = ModuleType("sounddevice")
+        with patch.dict(sys.modules, {"sounddevice": module}):
+            with patch("murmly.audio.atexit.unregister") as unregister:
+                with self.assertLogs("murmly.audio", level="WARNING") as logs:
+                    disable_portaudio_exit_teardown()
+
+        unregister.assert_not_called()
+        self.assertIn("exit handler", logs.output[0])
+
+    def test_the_installed_sounddevice_still_exposes_the_hook(self) -> None:
+        """`_exit_handler` is private, so a release is free to rename it.
+
+        This is what turns that rename into a failing test here rather than an
+        abort at the user's next logout, where the warning above is the only
+        sign anything changed.
+        """
+        try:
+            import sounddevice
+        except Exception as error:  # noqa: BLE001 - nothing to check against here
+            self.skipTest(f"sounddevice is not importable: {error}")
+
+        self.assertTrue(callable(getattr(sounddevice, "_exit_handler", None)))
 
 
 class SampleConversionTests(unittest.TestCase):

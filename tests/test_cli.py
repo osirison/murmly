@@ -18,6 +18,7 @@ from unittest.mock import Mock, patch
 
 from murmly.cli import (
     _measurement_clip,
+    _run_daemon,
     _run_doctor,
     command_socket_diagnostics,
     delivery_diagnostics,
@@ -1445,3 +1446,72 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
         self.assertEqual({"window", "session"}, set(purposes))
         self.assertTrue(purposes["window"]["held"])
         self.assertFalse(purposes["session"]["held"])
+
+
+class DaemonExitTeardownTests(unittest.TestCase):
+    """The daemon must not leave PortAudio's exit-time teardown registered.
+
+    It aborts the process when the audio server has already stopped -- which is
+    what a logout is -- and systemd records the abort as a failed unit that will
+    not start again until it is reset by hand.
+    """
+
+    def _config(self, temp_dir: str) -> MurmlyConfig:
+        return MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+
+    def test_a_clean_run_disables_the_teardown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("murmly.cli._serve_daemon", return_value=0),
+                patch("murmly.cli.disable_portaudio_exit_teardown") as disable,
+            ):
+                self.assertEqual(0, _run_daemon(self._config(temp_dir)))
+
+        disable.assert_called_once_with()
+
+    def test_a_startup_refusal_disables_the_teardown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("murmly.cli.MurmlyDaemon", side_effect=DaemonStartupError("refused")),
+                patch("murmly.cli.disable_portaudio_exit_teardown") as disable,
+                redirect_stderr(StringIO()),
+            ):
+                self.assertEqual(1, _run_daemon(self._config(temp_dir)))
+
+        disable.assert_called_once_with()
+
+    def test_an_unhandled_error_disables_the_teardown_on_its_way_out(self) -> None:
+        """The abort happens at process exit whatever the process is exiting for."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("murmly.cli.MurmlyDaemon", side_effect=RuntimeError("worker exploded")),
+                patch("murmly.cli.disable_portaudio_exit_teardown") as disable,
+            ):
+                with self.assertRaises(RuntimeError):
+                    _run_daemon(self._config(temp_dir))
+
+        disable.assert_called_once_with()
+
+    def test_a_command_other_than_the_daemon_leaves_the_teardown_alone(self) -> None:
+        """A short-lived command keeps sounddevice's own exit behavior."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                f'[daemon]\nsocket_path = "{Path(temp_dir) / "murmly.sock"}"\n',
+                encoding="utf-8",
+            )
+            with (
+                patch("murmly.cli.disable_portaudio_exit_teardown") as disable,
+                patch.object(
+                    FasterWhisperTranscriber,
+                    "resolve_runtime",
+                    return_value=("cpu", "int8"),
+                ),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(0, main(["--config", str(config_path), "doctor"]))
+
+        disable.assert_not_called()

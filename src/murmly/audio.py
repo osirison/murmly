@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from array import array
+import atexit
 from collections import deque
 import logging
 import math
@@ -22,6 +23,39 @@ MAX_LEVEL_DBFS = -6.0
 # first, so the common case costs no resampling at all.
 DEFAULT_PLAYBACK_RATE_HZ = 24_000
 MAX_PLAYBACK_CHANNELS = 2
+
+
+def disable_portaudio_exit_teardown() -> None:
+    """Stop PortAudio tearing its host APIs down when this process exits.
+
+    `sounddevice` registers that teardown with `atexit` when it is imported. It
+    disconnects every host API PortAudio initialised rather than only the one a
+    stream was opened on, and the JACK one aborts the process when the server
+    behind it has already gone -- which is what a logout is, since nothing
+    orders a user service's stop before the audio server's. There is nothing
+    else the teardown does that the kernel does not do when the process exits.
+
+    The caller owns closing the streams Murmly opened: the hook dropped here is
+    also what closed the last one.
+
+    A module that was never imported has no hook to drop, so this reads
+    `sys.modules` rather than importing one just to disable it.
+    """
+    sounddevice = sys.modules.get("sounddevice")
+    if sounddevice is None:
+        return
+    handler = getattr(sounddevice, "_exit_handler", None)
+    if handler is None:
+        # Reported, never raised. Losing this protection means a shutdown that
+        # outlives the audio server can abort again; it does not mean this
+        # shutdown should stop where it stands.
+        logger.warning(
+            "sounddevice no longer exposes the exit handler Murmly disables, so "
+            "PortAudio will tear its host APIs down at exit. A shutdown that "
+            "outlives the audio server can abort."
+        )
+        return
+    atexit.unregister(handler)
 
 
 def pcm16_rms(pcm_audio: bytes) -> float:

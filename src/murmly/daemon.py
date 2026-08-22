@@ -373,8 +373,19 @@ class SpeechSession:
         # Refuse new passes first: a tick already past its wait would otherwise
         # start a full decode during the join and hold the model lock, delaying
         # the final transcription by a whole pass whose result is discarded.
-        self._transcriber.stop_partials()
-        self._stop_live_worker()
+        try:
+            self._transcriber.stop_partials()
+            self._stop_live_worker()
+        except Exception:
+            # The stream closes even when the live worker's teardown fails.
+            # Nothing else closes it now that PortAudio's exit-time teardown is
+            # disabled, so what this would otherwise leave open is the
+            # microphone, held for the life of the process.
+            try:
+                self._recorder.stop()
+            except Exception as stop_error:
+                logger.warning("Unable to close capture after a failed stop: %s", stop_error)
+            raise
         return self._recorder.stop()
 
     def take_segment(self) -> bytes:
@@ -1036,6 +1047,7 @@ class MurmlyDaemon:
         # Before the drain, and before the blanket close below: a session has to
         # be told what happened while its connection is still open.
         self._close_speech_session()
+        self._stop_capture()
         self._drain_answering()
         self._answer_the_rest()
         # A worker that took the claim before the drain expired is writing its
@@ -1055,6 +1067,22 @@ class MurmlyDaemon:
                 pass
         self._config.socket_path.unlink(missing_ok=True)
         self._close_overlay()
+
+    def _stop_capture(self) -> None:
+        """Release the microphone, whether or not a recording is running.
+
+        The audio is discarded. A stop signal is not a request to transcribe
+        what happened to be in the buffer, and the transcript would have nowhere
+        to go: the connections it would be delivered to are closed below.
+
+        Reported rather than raised, like every other step of the shutdown: the
+        socket, the overlay, and the speech output still have to be released
+        whatever one device does.
+        """
+        try:
+            self._session.stop_recording()
+        except Exception as error:  # noqa: BLE001 - shutdown continues regardless
+            logger.warning("Capture did not stop cleanly: %s", error)
 
     def _close_speech_session(self) -> None:
         """Stop speech, tell the session, and close it."""

@@ -15,7 +15,11 @@ import time
 import traceback
 from collections.abc import Callable
 
-from murmly.audio import SoundDeviceRecorder, SoundDevicePlayer
+from murmly.audio import (
+    SoundDeviceRecorder,
+    SoundDevicePlayer,
+    disable_portaudio_exit_teardown,
+)
 from murmly.config import MurmlyConfig, default_config_path, load_config
 from murmly.daemon import (
     DaemonNotRespondingError,
@@ -283,6 +287,17 @@ def _run_uninstall() -> int:
 
 
 def _run_daemon(config: MurmlyConfig) -> int:
+    # Wrapped rather than placed in the inner unwinding below, because every
+    # return from here is the daemon process on its way out: a clean stop, a
+    # startup refusal, and an exception climbing to the top all reach the exit
+    # where PortAudio's teardown would otherwise run.
+    try:
+        return _serve_daemon(config)
+    finally:
+        disable_portaudio_exit_teardown()
+
+
+def _serve_daemon(config: MurmlyConfig) -> int:
     try:
         daemon = MurmlyDaemon(config)
     except DaemonStartupError as error:
