@@ -36,4 +36,4 @@ description: Track the reproduction, the removal of PortAudio's exit-time teardo
 - [x] 5.2 Re-run the reproduction harness against a daemon built from this branch and confirm a stop after the audio server is gone exits 0 with no core dump
 - [x] 5.3 Run `openspec validate --strict` on the change
 - [x] 5.4 Update `README.md` only if it states anything this change contradicts
-- [ ] 5.5 Ask before restarting the user's installed service, and note that the unit ordering needs `murmly install` run again and that a unit already in `failed` needs one `systemctl --user reset-failed`
+- [x] 5.5 Ask before restarting the user's installed service, and note that the unit ordering needs `murmly install` run again and that a unit already in `failed` needs one `systemctl --user reset-failed`
