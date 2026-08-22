@@ -101,7 +101,11 @@ the Python environment, binds the hotkey, and starts the service.
 
 It offers the GPU runtime when an NVIDIA driver is present and speech output
 with its model files, and `--cuda`/`--no-cuda`/`--tts`/`--no-tts` decide either
-without being asked. `--yes` answers every prompt, for an unattended run.
+without being asked. `--yes` answers every prompt, for an unattended run — which
+includes the one confirming what `--purge` is about to delete, so those two
+together remove the environment, the models, and your configuration without
+asking. With nothing attached to the terminal and no `--yes`, every prompt is
+declined rather than assumed.
 
 What it exists to get right is the sync. `uv sync` makes the environment match
 exactly the extras it is given, so a plain sync removes the CUDA wheels or

@@ -80,8 +80,10 @@ Commands:
         environment, the synthesis models, and the configuration.
 
 Options:
-  -y, --yes        Answer every prompt with yes. Required when nothing is
-                   attached to the terminal.
+  -y, --yes        Answer every prompt with yes, including the one confirming
+                   what --purge is about to delete. Required when nothing is
+                   attached to the terminal, where every prompt is otherwise
+                   declined.
       --cuda       Install the GPU runtime extra. Default: offered when an
                    NVIDIA driver is present.
       --no-cuda    Leave the GPU runtime extra out.
