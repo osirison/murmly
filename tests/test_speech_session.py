@@ -553,12 +553,20 @@ class SessionLifetimeTests(SpeechSessionHarness):
 
 class BargeInTests(SpeechSessionHarness):
     def test_the_interruption_names_the_unit_playing_and_the_ones_never_started(self) -> None:
-        _daemon, socket_path, _engine, player, _capture = self.serve()
+        _daemon, socket_path, engine, player, _capture = self.serve()
         client = self.client(socket_path)
         client.declare()
         for name in ("one", "two", "three", "four"):
             client.send({"command": "speak", "name": name, "text": f"Sentence {name} here."})
-        self.wait_for(lambda: len(player.written) >= 2, message="two units produced")
+        # Every unit known to the engine, produced or still queued. Waiting on
+        # two alone leaves the last frame possibly still in the socket, and an
+        # interruption then names three units because the fourth had not
+        # arrived -- the report is right and the test is early.
+        self.wait_for(
+            lambda: len(player.written) >= 2
+            and len(player.written) + len(engine._queue.waiting) >= 4,
+            message="two units produced and all four known to the engine",
+        )
         player.play(player.written[0][0] + 1)
         self.wait_for(lambda: player.frames_played > player.written[0][0], message="the second unit")
 
