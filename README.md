@@ -101,8 +101,10 @@ That is the whole installation. It:
 - writes a systemd user service that starts `murmly` with your graphical
   session and stops it at logout,
 - registers `Meta+X` as a global hotkey, taking effect immediately, and
-- refuses, naming the current owner, if that hotkey already belongs to another
-  application.
+- refuses if a hotkey is already taken, naming the application that owns it —
+  and refuses, having written nothing, when the key is Murmly's own other hotkey
+  (name both keys in one command to move it) or when the same key was given for
+  both.
 
 For the GPU-backed runtime, sync the CUDA extra first so the same environment
 carries it:
@@ -161,6 +163,16 @@ Rebind by installing again with a different key:
 uv run murmly install Meta+Shift+Space
 ```
 
+That rebinds the focused-window hotkey only; a speech-session hotkey keeps the
+key it had. Name both to move both, and to swap them for each other:
+
+```bash
+uv run murmly install Meta+Shift+Space Meta+A
+```
+
+Asking for a key that Murmly's *other* binding currently holds is refused rather
+than silently unbinding it — name both keys in one command instead.
+
 Remove everything:
 
 ```bash
@@ -206,9 +218,13 @@ Then place the model files in `~/.local/share/murmly`:
 And set `enabled = true` under `[tts]` in your configuration. `murmly doctor`
 reports what is missing under `speech_output` and names the remedy for each.
 
-Synthesis runs on the CPU at roughly five times real time, which is enough, and
-it does so whatever `[stt] device` says — that setting is about transcription,
-and pinning Whisper to the GPU neither moves synthesis there nor disables it.
+Synthesis runs on the CPU at roughly five times real time, which is enough.
+`[stt] device` selects the synthesis provider as well as the transcription one,
+but it is read as a preference rather than a demand: with `cuda` set and no GPU
+build of ONNX Runtime installed, synthesis falls back to the CPU and logs the
+remedy instead of refusing sessions. Install the GPU build below and `cuda` or
+`auto` runs synthesis on the GPU too; `cpu` keeps it on the CPU whatever is
+installed.
 
 To run synthesis on the GPU too, note that the GPU build of ONNX Runtime
 **replaces** the CPU one rather than joining it — both install into the same
@@ -236,7 +252,7 @@ providers it reports say so and the log names the remedy.
 | Hotkey | What it does |
 | --- | --- |
 | the first, for example `Meta+X` | transcribes into the focused window, exactly as it always has |
-| the second, for example `Meta+A` | transcribes into the open speech session, pasting nothing and leaving the clipboard alone |
+| the second, for example `Meta+A` | transcribes into the open speech session, pasting nothing. With no session open — or one that closed before the transcript was ready — the transcript goes to the clipboard instead, overwriting what was there, and is reported as undelivered |
 
 Both stop speech before the microphone opens, and both tell the session it was
 interrupted, because a sender has to stop generating whoever the person was
@@ -246,6 +262,11 @@ itself; `murmly doctor` reports the session hotkey as not bound, which is not a
 failure.
 
 ### The session protocol
+
+Nothing in the CLI opens a speech session. `murmly toggle-session` routes a
+transcript to one that is already open; the session itself is opened by a client
+connecting to the command socket, which is what an agent is. To try speech output
+by hand, write that client — the protocol below is all of it.
 
 One connection, newline-delimited JSON in both directions. Declare the session
 and wait for the acknowledgement before sending anything else:
@@ -258,15 +279,23 @@ Murmly answers `{"ok": true, "session": "speech"}`, or one refusal frame and a
 closed connection. `speech_disabled`, `speech_unavailable` and
 `speech_session_in_use` are the reasons specific to speech; a declaration can
 also be refused for the reasons any command can, such as `command_failed`,
-`over_capacity` or `shutting_down`. Treat any frame carrying `"ok": false` as a
+`over_capacity` or `shutting_down`, and with `busy` while a capture is running —
+accepting one then would reopen the loudspeaker into a live microphone. `busy` is
+transient: retry once capture ends. Treat any frame carrying `"ok": false` as a
 refusal and report its message, rather than matching the speech reasons alone.
 One session is open at a time.
+
+Refusals also arrive **inside** an open session. A frame that is not JSON, is not
+an object, or names a command Murmly does not know is answered with
+`{"ok": false, "code": ..., "error": ...}` and the session stays open, so a
+sender that dispatches on `frame["event"]` alone will meet a frame that has no
+`event` key. Branch on whichever of `event` and `ok` the frame carries.
 
 Frames a sender may send:
 
 | Frame | Meaning |
 | --- | --- |
-| `{"command": "speak", "name": "m1", "text": "..."}` | speak this, and call it `m1` |
+| `{"command": "speak", "name": "m1", "text": "..."}` | speak this, and call it `m1`. `name` must be a non-empty string, and one frame must stay under 65536 bytes — a larger one is refused with `malformed_request` and the session is closed, so split a long passage across several frames |
 | `{"command": "end"}` | no more text is coming |
 | `{"command": "cancel"}` | stop speaking and discard what is queued |
 
@@ -276,12 +305,12 @@ Frames Murmly sends, without being asked:
 | --- | --- |
 | `{"event": "started", "name": "m1"}` | `m1` has begun to be audible |
 | `{"event": "heard_all"}` | everything queued was heard, and the sender had said it was finished |
-| `{"event": "interrupted", "playing": "m2", "pending": ["m3"], "code": "speech_interrupted"}` | the person interrupted; `m2` was cut off and `m3` never started |
+| `{"event": "interrupted", "playing": "m2", "pending": ["m3"], "code": "speech_interrupted"}` | speech stopped: `m2` was cut off and `m3` never started. Sent when the person presses a capture hotkey **and** in answer to the sender's own `cancel`, so a sender that stops generating on this event must not mistake the echo of its own cancel for a barge-in. `playing` is null when nothing was audible |
 | `{"event": "transcript", "text": "..."}` | what the person said, when the session hotkey started the capture |
-| `{"event": "failed", "name": "m4", "error": "..."}` | `m4` could not be produced; the session continues |
+| `{"event": "failed", "name": "m4", "error": "..."}` | `m4` could not be produced; the session continues. `name` is null when the failure is the output device itself rather than a named piece of text |
 | `{"event": "shutting_down"}` | Murmly is stopping |
 
-Three things a sender should know:
+Four things a sender should know:
 
 - **Wait for the acknowledgement.** The declaration is read by the same path
   that reads every other command, which reads one frame; text pipelined behind
@@ -291,6 +320,9 @@ Three things a sender should know:
   from production would claim the person heard something they did not.
 - **Events carry names, never text.** The one exception is the transcript, which
   is the whole point of delivering it.
+- **Read continuously.** Events queue per session and never hold up playback, so
+  a sender that stops reading is disconnected once 64 frames are outstanding —
+  with no refusal frame, just a closed connection.
 
 ### What speech output does not do
 
@@ -379,7 +411,8 @@ output_device = ""     # Empty lets the system choose
 
 ### The command socket
 
-`murmly toggle` and `murmly status` reach the daemon over a UNIX socket at
+`murmly toggle`, `murmly toggle-session` and `murmly status` reach the daemon
+over a UNIX socket at
 `daemon.socket_path`. That socket starts and stops the microphone, so it is
 restricted to the account the daemon runs as: the socket is created `0600`, any
 directory Murmly creates for it is `0700`, and a connection whose reported
@@ -524,11 +557,19 @@ applications:
 | --- | --- | --- |
 | X11 with an EWMH window manager | yes | yes |
 | X11 without EWMH | no | yes |
-| Wayland | no | yes |
+| Wayland with `wtype` or `ydotool` | no | yes |
+| Wayland with `xdotool`, which is the KDE Plasma path | no | no |
 
 `murmly doctor` reports which applies under `delivery`.
 
 ### Restoring your previous clipboard
+
+Murmly never restores over a transcript it cannot prove was delivered. `xdotool`
+on Wayland exits 0 whether or not the keystroke reached the window, so on that
+path the previous clipboard is not read and not put back, whatever
+`clipboard.restore` says — an undelivered transcript is the only copy of what you
+said, and restoring over it would destroy it. `murmly doctor` reports
+`paste_injection.confirms_delivery`.
 
 Pasting overwrites your clipboard, so Murmly puts the previous contents back
 afterwards. It waits `restore_delay_ms` first, giving the receiving application
@@ -577,10 +618,21 @@ systemctl --user status murmly.service
 journalctl --user -u murmly.service -b
 ```
 
-**The hotkey does nothing.** Check `installation.hotkey_held` in `murmly doctor`.
-If another application holds the key, it will be named there. Pressing the hotkey
+**A hotkey does nothing.** Check `murmly doctor`. `installation.hotkey_held` and
+`installation.hotkey_holder` describe the focused-window hotkey only;
+`installation.hotkeys` lists every binding with its `purpose`, `hotkey`, `held`
+and `holder`, so read the entry whose purpose is `session` for the speech one. An
+application holding a key is named there. Pressing the hotkey
 also starts the service if it is installed but not running, so a hotkey that does
 nothing at all usually means the binding, not the daemon.
+
+**Speech output says nothing.** Check `speech_output` in `murmly doctor`:
+`available` is false with a `detail` naming what is missing, and
+`output_device_in_use` names the device it would play through. If a client's
+`speech_session` declaration is answered `unsupported_command`, the running
+daemon predates speech output — restart it with `systemctl --user restart
+murmly.service`. `speech_session_in_use` means another client already has the
+session; only one is open at a time.
 
 **Overlay problems.** Inspect the same system-Python imports the renderer uses:
 
@@ -604,6 +656,7 @@ Run commands against the project environment without installing anything:
 uv run murmly doctor
 uv run murmly daemon          # run the daemon in the foreground
 uv run murmly toggle          # drive it from another shell
+uv run murmly toggle-session  # the same, delivered to the open speech session
 uv run murmly status
 uv run murmly spike --seconds 5   # one-off recording, no daemon
 ```

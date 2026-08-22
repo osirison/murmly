@@ -1303,12 +1303,21 @@ def read_frame(client: socket.socket) -> bytes:
 
 
 def send_payload(socket_path: Path, payload: bytes, timeout: float = 5.0) -> bytes:
-    """Send one raw request and read the frame that answers it."""
+    """Send one raw request and read the frame that answers it.
+
+    A refusal that does not depend on the request -- a peer from another account
+    -- is written and the connection closed without the payload being read, so
+    the send can lose the race and raise. That is the refusal arriving, not a
+    failure: the frame is already on the wire and is what the caller wants.
+    """
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(timeout)
         client.connect(str(socket_path))
         if payload:
-            client.sendall(payload)
+            try:
+                client.sendall(payload)
+            except BrokenPipeError:
+                pass
         return read_frame(client)
 
 
