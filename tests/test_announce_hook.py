@@ -152,10 +152,48 @@ class SummaryTests(unittest.TestCase):
 
 
 class SessionSentenceTests(unittest.TestCase):
+    def repository(self, branch: str) -> Path:
+        """A repository of its own, rather than the one the tests are running in.
+
+        A CI checkout is a detached HEAD, so asking this repository for its
+        branch answers differently there than on a workstation. What the
+        sentence says should not depend on how the tests were checked out.
+        """
+        directory = Path(tempfile.mkdtemp(suffix="-project"))
+        self.addCleanup(shutil.rmtree, directory, True)
+        git = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        subprocess.run([*git, "init", "-b", branch, str(directory)], check=True, capture_output=True)
+        subprocess.run(
+            [*git, "-C", str(directory), "commit", "--allow-empty", "-m", "first"],
+            check=True,
+            capture_output=True,
+        )
+        return directory
+
     def test_the_branch_is_named_when_there_is_one(self) -> None:
-        sentence = announce.session_sentence("Claude Code", str(REPO))
-        self.assertTrue(sentence.startswith("Claude Code in murmly, on branch "), sentence)
-        self.assertTrue(sentence.endswith("."))
+        directory = self.repository("release/2.0")
+        sentence = announce.session_sentence("Claude Code", str(directory))
+        self.assertEqual(f"Claude Code in {directory.name}, on branch release/2.0.", sentence)
+
+    def test_a_detached_head_names_only_the_project(self) -> None:
+        """Which is what a CI checkout is. "On branch HEAD" says nothing."""
+        directory = self.repository("main")
+        head = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "-C", str(directory), "checkout", "--detach", head],
+            check=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(
+            f"Claude Code in {directory.name}.",
+            announce.session_sentence("Claude Code", str(directory)),
+        )
 
     def test_a_directory_that_is_not_a_repository_names_only_the_project(self) -> None:
         with tempfile.TemporaryDirectory(suffix="-scratch") as directory:
