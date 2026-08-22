@@ -4,6 +4,7 @@
 #
 #   ./setup.sh install Meta+X [Meta+A]
 #   ./setup.sh upgrade
+#   ./setup.sh hooks [claude|copilot|both|off]
 #   ./setup.sh uninstall [--purge]
 #
 # What this wraps that is easy to get wrong by hand:
@@ -33,6 +34,7 @@ readonly VOICES_FILE="voices-v1.0.bin"
 ASSUME_YES=0
 WANT_CUDA=auto
 WANT_TTS=auto
+WANT_HOOKS=auto
 PURGE=0
 
 # ---------------------------------------------------------------- output ----
@@ -75,9 +77,14 @@ Commands:
   upgrade
         Pull, re-sync with the extras already installed, rebind the recorded
         hotkeys, and restart the service.
+  hooks [claude|copilot|both|off]
+        Announce finished turns out loud: register Murmly's Stop hook with
+        Claude Code, GitHub Copilot CLI, or both. With no argument, offers
+        whichever is installed. `off` unregisters it.
   uninstall [--purge]
-        Remove the service and the hotkeys. --purge also removes the virtual
-        environment, the synthesis models, and the configuration.
+        Remove the service, the hotkeys, and the announcement hook. --purge
+        also removes the virtual environment, the synthesis models, and the
+        configuration.
 
 Options:
   -y, --yes        Answer every prompt with yes, including the one confirming
@@ -89,6 +96,8 @@ Options:
       --no-cuda    Leave the GPU runtime extra out.
       --tts        Install speech output, including the synthesis models.
       --no-tts     Leave speech output out.
+      --hooks      With install: register the announcement hook without asking.
+      --no-hooks   With install: do not offer it at all.
       --purge      With uninstall: also remove the environment, models, and
                    configuration.
   -h, --help       This message.
@@ -314,8 +323,18 @@ swap_in_gpu_onnxruntime() {
 
 # --------------------------------------------------------------- models -----
 
-model_dir() {
+data_dir() {
     printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/murmly"
+}
+
+#: The synthesis models live directly in the data directory, which is what
+#: `[tts] model_dir` defaults to.
+model_dir() {
+    data_dir
+}
+
+hook_dir() {
+    printf '%s\n' "$(data_dir)/hooks"
 }
 
 install_models() {
@@ -356,6 +375,92 @@ install_models() {
             warn "Could not fetch $file. Place it in $directory by hand."
         fi
     done
+}
+
+# ------------------------------------------------- agent announcements ------
+
+#: The agents this machine has. Only what is here is offered.
+detected_agents() {
+    if have claude || [ -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ]; then
+        printf 'claude\n'
+    fi
+    if have copilot || [ -d "${COPILOT_HOME:-$HOME/.copilot}" ]; then
+        printf 'copilot\n'
+    fi
+}
+
+agent_label() {
+    case "$1" in
+        claude) printf 'Claude Code\n' ;;
+        copilot) printf 'GitHub Copilot CLI\n' ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+install_announce_hook() {
+    local agents="$1"
+    local source="$REPO/hooks/murmly-announce.py"
+    local installer="$REPO/hooks/install_hooks.py"
+    local target
+    target="$(hook_dir)/murmly-announce.py"
+
+    if [ ! -f "$source" ] || [ ! -f "$installer" ]; then
+        warn "This checkout has no announcement hook to install."
+        return 0
+    fi
+
+    mkdir -p "$(hook_dir)"
+    # Copied out of the checkout rather than pointed at in place. The hook runs
+    # under the system Python with no virtual environment, and a registration
+    # that names a path inside a moved checkout is a hook that stops firing
+    # without saying so.
+    install -m 0755 "$source" "$target"
+    info "Installed $target"
+    python3 "$installer" --script "$target" --agents "$agents" | while IFS= read -r line; do
+        info "$line"
+    done
+    note "A finished turn now plays three notes, names the project, and speaks a summary."
+    note "Silence the notes with MURMLY_ANNOUNCE_CHIME=0; remove it with ./setup.sh hooks off."
+}
+
+remove_announce_hook() {
+    local installer="$REPO/hooks/install_hooks.py"
+    step "Agent announcements"
+    if [ -f "$installer" ]; then
+        python3 "$installer" --script "$(hook_dir)/murmly-announce.py" \
+            --agents claude,copilot --remove | while IFS= read -r line; do
+            info "$line"
+        done
+    else
+        warn "This checkout has no hook installer, so any registration was left in place."
+    fi
+    rm -f -- "$(hook_dir)/murmly-announce.py"
+    rmdir -- "$(hook_dir)" 2>/dev/null || true
+}
+
+#: Offered during an install, where it is one more question rather than the
+#: point of the run. `./setup.sh hooks` is the way to add it on its own.
+offer_announce_hook() {
+    if [ "$WANT_HOOKS" = "no" ]; then
+        return 0
+    fi
+    local agents name
+    agents="$(detected_agents | paste -sd, -)"
+    if [ -z "$agents" ]; then
+        return 0
+    fi
+    step "Agent announcements"
+    if [ "$WANT_HOOKS" != "yes" ]; then
+        for name in ${agents//,/ }; do
+            info "Found $(agent_label "$name")"
+        done
+        info "Murmly can speak a summary out loud when one of these finishes a turn."
+        if ! confirm "Set that up?"; then
+            note "Skipped. Run './setup.sh hooks' whenever you want it."
+            return 0
+        fi
+    fi
+    install_announce_hook "$agents"
 }
 
 # -------------------------------------------------------------- hotkeys -----
@@ -471,12 +576,48 @@ if not speech.get("available") and speech.get("detail"):
 
 # ------------------------------------------------------------- commands -----
 
+command_hooks() {
+    local choice="${1:-}"
+    case "$choice" in
+        off|remove|none)
+            remove_announce_hook
+            return 0
+            ;;
+        both|"") ;;
+        claude|copilot|claude,copilot|copilot,claude) ;;
+        *) fail "Unknown agent: $choice. Use claude, copilot, both, or off." ;;
+    esac
+
+    step "Agent announcements"
+    local agents="$choice"
+    if [ "$agents" = "both" ]; then
+        agents="claude,copilot"
+    fi
+    if [ -z "$agents" ]; then
+        agents="$(detected_agents | paste -sd, -)"
+        if [ -z "$agents" ]; then
+            fail "Neither Claude Code nor Copilot CLI was found here. Name one anyway:
+    ./setup.sh hooks claude"
+        fi
+        local name
+        for name in ${agents//,/ }; do
+            info "Found $(agent_label "$name")"
+        done
+        if ! confirm "Announce finished turns through Murmly for these?"; then
+            info "Left alone."
+            return 0
+        fi
+    fi
+    install_announce_hook "$agents"
+}
+
 command_install() {
     require_uv
     install_system_packages
     sync_environment
     bind_hotkeys "${1:-}" "${2:-}"
     restart_service
+    offer_announce_hook
     report_state
     step "Done"
     info "Press your hotkey once to confirm the desktop actually delivers it."
@@ -516,6 +657,8 @@ command_upgrade() {
 
 command_uninstall() {
     require_uv
+
+    remove_announce_hook
 
     step "Service and hotkeys"
     if ! murmly uninstall; then
@@ -578,6 +721,8 @@ main() {
             --no-cuda) WANT_CUDA=no ;;
             --tts) WANT_TTS=yes ;;
             --no-tts) WANT_TTS=no ;;
+            --hooks) WANT_HOOKS=yes ;;
+            --no-hooks) WANT_HOOKS=no ;;
             --purge) PURGE=1 ;;
             -h|--help) usage; return 0 ;;
             -*) fail "Unknown option: $1" ;;
@@ -589,6 +734,7 @@ main() {
     case "$command" in
         install) command_install "${positional[@]}" ;;
         upgrade) command_upgrade ;;
+        hooks) command_hooks "${positional[0]:-}" ;;
         uninstall) command_uninstall ;;
         -h|--help|help) usage ;;
         "") usage >&2; return 2 ;;

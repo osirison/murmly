@@ -95,7 +95,8 @@ the Python environment, binds the hotkey, and starts the service.
 ```bash
 ./setup.sh install Meta+X Meta+A   # also bind the speech-session hotkey
 ./setup.sh upgrade                 # pull, re-sync, rebind, restart
-./setup.sh uninstall               # remove the service and the hotkeys
+./setup.sh hooks                   # announce finished agent turns out loud
+./setup.sh uninstall               # remove the service, hotkeys, and announcements
 ./setup.sh uninstall --purge       # and the environment, models, and configuration
 ```
 
@@ -280,6 +281,60 @@ Murmly reads the provider back off the session it constructed rather than off
 the module's advertised list — that list says CUDA on a session running on the
 CPU. When synthesis falls back to the CPU because the GPU build is absent, the
 providers it reports say so and the log names the remedy.
+
+### Announcing a finished agent turn
+
+Speech output is a protocol, so anything can drive it. Murmly ships one thing
+that does: a Stop hook that speaks a summary when a coding agent finishes a
+turn, so you can look away from the terminal and still know when it is done and
+roughly what happened.
+
+```bash
+./setup.sh hooks            # offers whichever agents are installed
+./setup.sh hooks claude     # or name one
+./setup.sh hooks copilot
+./setup.sh hooks off        # unregister
+```
+
+Claude Code and GitHub Copilot CLI both fire a `Stop` event at the end of a turn
+and both hand it the same thing — a JSON payload naming a JSONL transcript — so
+one script serves both. What differs is the row shape inside the transcript, and
+the hook reads either.
+
+What you hear, in order:
+
+| | |
+| --- | --- |
+| three rising notes | so you know a message is arriving before any words start |
+| one short sentence | the agent, the project, and the branch: "Claude Code in murmly, on branch main." |
+| an executive summary | whole sentences from the end of the agent's message, capped at about twenty seconds |
+
+Code fences, tables, links, and headings are stripped before anything is spoken;
+they read as noise out loud. The summary is extractive — it is the agent's own
+opening sentences, not a second model's paraphrase — so nothing is invented and
+no tokens are spent producing it.
+
+The hook stays silent, and exits 0, for every ordinary reason it cannot speak:
+speech output disabled or unavailable, another client already holding the
+session, a capture running, or nothing worth saying in the last message. It
+never fails a turn. It detaches into its own process before speaking, so an
+announcement never holds the agent up.
+
+| Variable | Effect |
+| --- | --- |
+| `MURMLY_ANNOUNCE_CHIME=0` | speak without the notes |
+| `MURMLY_ANNOUNCE_LOG=<path>` | append a line per turn explaining what it did or why it stayed quiet |
+| `MURMLY_ANNOUNCE_AGENT=<name>` | name the agent yourself rather than inferring it from the transcript |
+
+The notes are generated rather than shipped. To use your own, put a WAV at
+`~/.local/share/murmly/announce-chime.wav` and it is played instead. They go to
+the default output device through `pw-play`, `paplay`, or `aplay` — whichever is
+present — rather than through `[tts] output_device`, which is the speech path.
+
+Registration is written to `~/.claude/settings.json` (merged, with the previous
+file kept beside it as `settings.json.murmly-backup`) and to
+`~/.copilot/hooks/murmly-announce.json` (a file of its own). Running it twice
+leaves one registration, and `./setup.sh uninstall` takes both out.
 
 ### The two hotkeys
 
