@@ -85,6 +85,38 @@ the reason.
 ## Install
 
 ```bash
+./setup.sh install Meta+X
+```
+
+One script covers installing, upgrading, and removing. It installs the system
+packages for your session after showing you the `dnf` command and asking, syncs
+the Python environment, binds the hotkey, and starts the service.
+
+```bash
+./setup.sh install Meta+X Meta+A   # also bind the speech-session hotkey
+./setup.sh upgrade                 # pull, re-sync, rebind, restart
+./setup.sh uninstall               # remove the service and the hotkeys
+./setup.sh uninstall --purge       # and the environment, models, and configuration
+```
+
+It offers the GPU runtime when an NVIDIA driver is present and speech output
+with its model files, and `--cuda`/`--no-cuda`/`--tts`/`--no-tts` decide either
+without being asked. `--yes` answers every prompt, for an unattended run — which
+includes the one confirming what `--purge` is about to delete, so those two
+together remove the environment, the models, and your configuration without
+asking. With nothing attached to the terminal and no `--yes`, every prompt is
+declined rather than assumed.
+
+What it exists to get right is the sync. `uv sync` makes the environment match
+exactly the extras it is given, so a plain sync removes the CUDA wheels or
+speech output; the GPU build of ONNX Runtime replaces the CPU one and every sync
+puts the CPU one back. The script reads what is installed before each sync,
+names all of it, and reapplies the swap afterwards, so an upgrade never removes
+a feature you had.
+
+### Installing by hand
+
+```bash
 uv sync
 uv run murmly install Meta+X
 ```
@@ -176,12 +208,14 @@ than silently unbinding it — name both keys in one command instead.
 Remove everything:
 
 ```bash
-uv run murmly uninstall
+./setup.sh uninstall           # or: uv run murmly uninstall
+./setup.sh uninstall --purge   # also the environment, models, and configuration
 ```
 
 If you move the project directory or rebuild its environment, the recorded path
 goes stale. Run `murmly install <hotkey>` again from the new location to repair
-it; `murmly doctor` shows the path currently recorded.
+it; `murmly doctor` shows the path currently recorded. `./setup.sh upgrade` does
+this for you, rebinding the keys it reads back rather than asking for them again.
 
 ## Speech output
 
