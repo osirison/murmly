@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: unittest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject.toml, and the version development
+        # happens on. A break confined to one of them is worth telling apart.
+        python-version: ["3.12", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # sounddevice loads libportaudio at import. Without it, the tests that
+      # exercise the real module skip themselves rather than fail -- including
+      # the one pinning the private symbol Murmly unregisters at daemon exit,
+      # which is the whole point of running them here.
+      - name: Install PortAudio
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libportaudio2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      # --locked, not --frozen: a lockfile that no longer matches
+      # pyproject.toml is a failure worth seeing here rather than at someone's
+      # next sync. No extras are named -- the suite passes without them, and
+      # the cuda extra is gigabytes of wheels for a GPU no runner has.
+      - name: Sync the environment
+        run: uv sync --locked
+
+      - name: Run the suite
+        run: uv run --no-sync python -m unittest discover -s tests
+
+  specs:
+    name: openspec
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the OpenSpec CLI
+        run: npm install -g @fission-ai/openspec
+
+      # Behavioral changes are planned as OpenSpec changes, so a delta spec that
+      # does not parse -- a scenario written with three hashes, a requirement
+      # with no scenario at all -- is a broken plan that currently reaches main
+      # unnoticed.
+      - name: Validate every change and spec
+        run: openspec validate --all --strict
