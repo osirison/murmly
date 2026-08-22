@@ -104,6 +104,16 @@ class UnitTextTests(unittest.TestCase):
         self.assertIn("After=graphical-session.target", text)
         self.assertIn("WantedBy=graphical-session.target", text)
 
+    def test_is_ordered_after_the_audio_server(self) -> None:
+        """systemd stops units in reverse start order, so this stops Murmly first.
+
+        PortAudio's JACK backend aborts the process when it is torn down after
+        the audio server has gone, and a logout stops both in no fixed order.
+        """
+        text = service_unit_text(Path("/opt/murmly/.venv/bin/murmly"))
+
+        self.assertIn("After=pipewire.service wireplumber.service", text)
+
     def test_does_not_activate_on_default_target(self) -> None:
         # The superseded template used WantedBy=default.target, which activates
         # before the session environment exists.

@@ -305,6 +305,42 @@ class DaemonTests(unittest.TestCase):
         self.assertFalse(socket_path.exists())
         self.assertTrue(overlay.closed)
 
+    def test_shutdown_stops_capture(self) -> None:
+        """Nothing else closes the microphone once PortAudio's own teardown is gone."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            config = MurmlyConfig(socket_path=socket_path, config_path=Path(temp_dir) / "config.toml")
+            session = DummySession()
+            daemon = MurmlyDaemon(config, session=session, overlay=FakeOverlay())
+
+            daemon.shutdown()
+
+        self.assertEqual(1, session.stopped)
+
+    def test_shutdown_continues_when_capture_will_not_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = Path(temp_dir) / "murmly.sock"
+            config = MurmlyConfig(socket_path=socket_path, config_path=Path(temp_dir) / "config.toml")
+            session = DummySession(stop_error=RuntimeError("the device is wedged"))
+            overlay = FakeOverlay()
+            daemon = MurmlyDaemon(config, session=session, overlay=overlay)
+            thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+            thread.start()
+            deadline = time.time() + 2
+            while not socket_path.exists():
+                if time.time() >= deadline:
+                    self.fail("daemon socket was not created")
+                time.sleep(0.05)
+
+            with self.assertLogs("murmly.daemon", level="WARNING"):
+                daemon.shutdown()
+            thread.join(timeout=2)
+
+        self.assertEqual(1, session.stopped)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(socket_path.exists())
+        self.assertTrue(overlay.closed)
+
     def test_shutdown_unwinds_server_while_processing_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             socket_path = Path(temp_dir) / "murmly.sock"
@@ -973,6 +1009,22 @@ class LiveTranscriptionSessionTests(unittest.TestCase):
 
         self.assertEqual(["partial words"], published[:1])
         self.assertIsNone(session._silence)
+
+    def test_the_recorder_stops_even_when_the_live_worker_teardown_fails(self) -> None:
+        """A failure on the way to the stream must not leave the microphone open.
+
+        Nothing closes it afterwards: the daemon disables PortAudio's exit-time
+        teardown, so a stream left open here is held for the life of the process.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, live_transcribe=True)
+            session.start_recording()
+            session._transcriber.stop_partials.side_effect = RuntimeError("the model is wedged")
+
+            with self.assertRaises(RuntimeError):
+                session.stop_recording()
+
+        session._recorder.stop.assert_called_once()
 
     def test_stop_recording_stops_partials_before_returning_audio(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

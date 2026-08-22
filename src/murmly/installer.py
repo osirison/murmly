@@ -67,6 +67,10 @@ Description=murmly local voice-to-text daemon
 Documentation=https://github.com/osirison/murmly
 PartOf=graphical-session.target
 After=graphical-session.target
+# Ordered after the audio server so systemd stops Murmly before it, rather than
+# alongside it. PortAudio's JACK backend aborts the process if it is torn down
+# after the server has gone, and a logout stops both in no particular order.
+After=pipewire.service wireplumber.service
 
 [Service]
 Type=simple
