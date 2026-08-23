@@ -931,7 +931,16 @@ class UnhandledFailureTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+            with (
+                # The real one unregisters sounddevice's atexit hook process-wide,
+                # and that hook is the only caller of Pa_Terminate. Leaving it off
+                # means PortAudio's PipeWire loop threads outlive the interpreter,
+                # and Py_Finalize unloads the libraries underneath them - the whole
+                # suite then passes and the process exits 139. See issue #27.
+                patch("murmly.cli.disable_portaudio_exit_teardown"),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()) as errors,
+            ):
                 exit_code = main(["--config", str(config_path), "daemon"])
 
         self.assertEqual(1, exit_code)
