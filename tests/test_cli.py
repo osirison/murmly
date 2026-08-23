@@ -20,6 +20,7 @@ from murmly.cli import (
     _measurement_clip,
     _run_daemon,
     _run_doctor,
+    leave_without_finalizing,
     command_socket_diagnostics,
     delivery_diagnostics,
     live_transcription_diagnostics,
@@ -938,6 +939,9 @@ class UnhandledFailureTests(unittest.TestCase):
                 # and Py_Finalize unloads the libraries underneath them - the whole
                 # suite then passes and the process exits 139. See issue #27.
                 patch("murmly.cli.disable_portaudio_exit_teardown"),
+                # The daemon branch ends in os._exit; performing that here would
+                # take the test runner with it.
+                patch("murmly.cli.leave_without_finalizing"),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -975,6 +979,7 @@ class UnhandledFailureTests(unittest.TestCase):
 
             with (
                 patch("murmly.cli._run_daemon", side_effect=RuntimeError("worker exploded")),
+                patch("murmly.cli.leave_without_finalizing"),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -1524,3 +1529,97 @@ class DaemonExitTeardownTests(unittest.TestCase):
                 self.assertEqual(0, main(["--config", str(config_path), "doctor"]))
 
         disable.assert_not_called()
+
+class DaemonExitWithoutFinalizeTests(unittest.TestCase):
+    """The daemon must leave without running interpreter finalization.
+
+    Dropping PortAudio's exit teardown leaves its `pw-PortAudio` loop threads
+    running, and `Py_Finalize` unloads the extension libraries underneath them.
+    The daemon dumped core exactly that way on 2026-08-22. See issue #27.
+    """
+
+    def _config_file(self, temp_dir: str) -> Path:
+        config_path = Path(temp_dir) / "config.toml"
+        config_path.write_text(
+            f'[daemon]\nsocket_path = "{Path(temp_dir) / "murmly.sock"}"\n',
+            encoding="utf-8",
+        )
+        return config_path
+
+    def test_a_clean_daemon_run_leaves_with_its_own_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._config_file(temp_dir)
+            with (
+                patch("murmly.cli._run_daemon", return_value=0),
+                patch("murmly.cli.leave_without_finalizing") as leave,
+            ):
+                main(["--config", str(config_path), "daemon"])
+
+        leave.assert_called_once_with(0)
+
+    def test_a_daemon_that_refuses_to_start_leaves_with_its_own_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._config_file(temp_dir)
+            with (
+                patch("murmly.cli._run_daemon", return_value=1),
+                patch("murmly.cli.leave_without_finalizing") as leave,
+            ):
+                main(["--config", str(config_path), "daemon"])
+
+        leave.assert_called_once_with(1)
+
+    def test_an_unhandled_error_still_leaves_without_finalizing(self) -> None:
+        """The backstop in main() is a route out of the daemon like any other."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._config_file(temp_dir)
+            with (
+                patch("murmly.cli._run_daemon", side_effect=RuntimeError("worker exploded")),
+                patch("murmly.cli.leave_without_finalizing") as leave,
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()),
+            ):
+                main(["--config", str(config_path), "daemon"])
+
+        leave.assert_called_once_with(1)
+
+    def test_a_command_other_than_the_daemon_returns_the_ordinary_way(self) -> None:
+        """Only the daemon is in the configuration that makes finalization unsafe."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._config_file(temp_dir)
+            with (
+                patch("murmly.cli.leave_without_finalizing") as leave,
+                patch.object(
+                    FasterWhisperTranscriber,
+                    "resolve_runtime",
+                    return_value=("cpu", "int8"),
+                ),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(0, main(["--config", str(config_path), "doctor"]))
+
+        leave.assert_not_called()
+
+    def test_it_flushes_before_leaving(self) -> None:
+        """os._exit skips the flushing finalization would have done."""
+        flushed: list[str] = []
+
+        class RecordingStream(StringIO):
+            def __init__(self, name: str) -> None:
+                super().__init__()
+                self._name = name
+
+            def flush(self) -> None:
+                flushed.append(self._name)
+                super().flush()
+
+        with (
+            patch("murmly.cli.os._exit") as hard_exit,
+            patch("murmly.cli.logging.shutdown") as logging_shutdown,
+            patch("murmly.cli.sys.stdout", RecordingStream("stdout")),
+            patch("murmly.cli.sys.stderr", RecordingStream("stderr")),
+        ):
+            leave_without_finalizing(7)
+
+        self.assertEqual(["stdout", "stderr"], flushed)
+        logging_shutdown.assert_called_once_with()
+        hard_exit.assert_called_once_with(7)

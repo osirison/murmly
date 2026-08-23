@@ -4,6 +4,7 @@ import argparse
 from array import array
 from dataclasses import replace
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -110,11 +111,44 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def leave_without_finalizing(exit_code: int) -> None:
+    """End the daemon process without running interpreter finalization.
+
+    Murmly leaves PortAudio's exit-time teardown unregistered, because that
+    teardown aborts when the audio server has already stopped -- which a logout
+    is. That teardown was also the only thing that stopped PortAudio's own
+    `pw-PortAudio` loop threads, and nothing else calls `Pa_Terminate`. So the
+    daemon reaches the end of its run with those threads still executing.
+
+    `Py_Finalize` then clears module dictionaries, which unloads the extension
+    libraries underneath them, and the threads fault on the next call into
+    memory that has just been unmapped. `murmly daemon` dumped core exactly that
+    way on 2026-08-22, and systemd recorded the unit as failed -- the state the
+    teardown was unregistered to avoid in the first place.
+
+    Reproduced outside Murmly: real PortAudio plus a loaded `onnxruntime` plus
+    the teardown unregistered exits 139; the same run leaving here exits 0.
+    Whether streams were ever opened makes no difference.
+
+    Skipping finalization means skipping the flushing it would have done, so
+    everything whose loss would be observable is flushed first. Sockets, file
+    descriptors and the model memory are reclaimed by the kernel and need
+    nothing.
+
+    Patched by the tests: performing this in-process would take the test runner
+    down with it, so the decision to call it is what gets asserted.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    logging.shutdown()
+    os._exit(exit_code)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return _dispatch(parser, args)
+        exit_code = _dispatch(parser, args)
     except Exception as error:  # noqa: BLE001 - no command terminates with an unhandled error
         # A backstop only. Every failure with something specific to say -- the
         # daemon's startup refusal, an unreadable configuration, a daemon that
@@ -126,7 +160,12 @@ def main(argv: list[str] | None = None) -> int:
             # A person reading the journal needs the frames.
             traceback.print_exc(file=sys.stderr)
         print(f"murmly: unexpected failure: {error}", file=sys.stderr)
-        return 1
+        exit_code = 1
+    if args.command == "daemon":
+        # Every route out of the daemon reaches here with its status already
+        # decided: a clean stop, a startup refusal, and the backstop above.
+        leave_without_finalizing(exit_code)
+    return exit_code
 
 
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
