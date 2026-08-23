@@ -163,12 +163,22 @@ def main(argv: list[str] | None = None) -> int:
         # daemon's startup refusal, an unreadable configuration, a daemon that
         # did not respond -- reports it itself, because a generic message names
         # the wrong thing.
-        if args.command == "daemon":
-            # The daemon runs unattended under the service manager, where this
-            # one line would be all that survived of a crash nothing anticipated.
-            # A person reading the journal needs the frames.
-            traceback.print_exc(file=sys.stderr)
-        print(f"murmly: unexpected failure: {error}", file=sys.stderr)
+        #
+        # Guarded because reporting must not become the failure. A daemon whose
+        # journal socket has already gone raises BrokenPipeError from both calls
+        # below, and that would escape before the daemon branch is reached,
+        # leaving through Py_Finalize -- the crash that branch exists to avoid.
+        # It is what "no command terminates with an unhandled error" asks for
+        # anyway: a shell that closed the pipe is not a reason to raise.
+        try:
+            if args.command == "daemon":
+                # The daemon runs unattended under the service manager, where
+                # this one line would be all that survived of a crash nothing
+                # anticipated. A person reading the journal needs the frames.
+                traceback.print_exc(file=sys.stderr)
+            print(f"murmly: unexpected failure: {error}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 - losing the report beats dumping core
+            pass
         exit_code = 1
     if args.command == "daemon":
         # Every route out of the daemon reaches here with its status already

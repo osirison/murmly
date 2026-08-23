@@ -1582,6 +1582,34 @@ class DaemonExitWithoutFinalizeTests(unittest.TestCase):
 
         leave.assert_called_once_with(1)
 
+    def test_a_broken_stderr_does_not_stop_the_daemon_leaving(self) -> None:
+        """The handler reports before it sets the status, and reporting can fail.
+
+        A daemon whose journal socket has already gone raises BrokenPipeError from
+        `traceback.print_exc` and from `print`. Unguarded, that escapes main()
+        before the daemon branch is reached, and the process leaves through
+        Py_Finalize - the crash this whole path exists to avoid.
+        """
+
+        class BrokenStderr(StringIO):
+            def write(self, _text: str) -> int:
+                raise BrokenPipeError("journal socket is gone")
+
+            def flush(self) -> None:
+                raise BrokenPipeError("journal socket is gone")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._config_file(temp_dir)
+            with (
+                patch("murmly.cli._run_daemon", side_effect=RuntimeError("worker exploded")),
+                patch("murmly.cli.leave_without_finalizing") as leave,
+                patch("murmly.cli.sys.stderr", BrokenStderr()),
+                redirect_stdout(StringIO()),
+            ):
+                main(["--config", str(config_path), "daemon"])
+
+        leave.assert_called_once_with(1)
+
     def test_a_command_other_than_the_daemon_returns_the_ordinary_way(self) -> None:
         """Only the daemon is in the configuration that makes finalization unsafe."""
         with tempfile.TemporaryDirectory() as temp_dir:
