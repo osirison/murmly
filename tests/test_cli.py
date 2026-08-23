@@ -1623,3 +1623,60 @@ class DaemonExitWithoutFinalizeTests(unittest.TestCase):
         self.assertEqual(["stdout", "stderr"], flushed)
         logging_shutdown.assert_called_once_with()
         hard_exit.assert_called_once_with(7)
+
+    def test_a_failed_flush_does_not_stop_it_leaving(self) -> None:
+        """The journal socket can already be gone; a BrokenPipeError here would
+        otherwise escape into main() and leave through Py_Finalize -- the crash
+        this whole path exists to avoid."""
+
+        class BrokenStream(StringIO):
+            def flush(self) -> None:
+                raise BrokenPipeError("journal socket is gone")
+
+        for failing in ("stdout", "stderr", "logging"):
+            with self.subTest(failing=failing):
+                with (
+                    patch("murmly.cli.os._exit") as hard_exit,
+                    patch(
+                        "murmly.cli.logging.shutdown",
+                        side_effect=RuntimeError("handler raised")
+                        if failing == "logging"
+                        else None,
+                    ),
+                    patch(
+                        "murmly.cli.sys.stdout",
+                        BrokenStream() if failing == "stdout" else StringIO(),
+                    ),
+                    patch(
+                        "murmly.cli.sys.stderr",
+                        BrokenStream() if failing == "stderr" else StringIO(),
+                    ),
+                ):
+                    leave_without_finalizing(3)
+
+                hard_exit.assert_called_once_with(3)
+
+    def test_one_failed_flush_does_not_skip_the_others(self) -> None:
+        """A broken stdout says nothing about the log handlers."""
+        flushed: list[str] = []
+
+        class BrokenStdout(StringIO):
+            def flush(self) -> None:
+                raise BrokenPipeError("journal socket is gone")
+
+        class RecordingStderr(StringIO):
+            def flush(self) -> None:
+                flushed.append("stderr")
+                super().flush()
+
+        with (
+            patch("murmly.cli.os._exit") as hard_exit,
+            patch("murmly.cli.logging.shutdown") as logging_shutdown,
+            patch("murmly.cli.sys.stdout", BrokenStdout()),
+            patch("murmly.cli.sys.stderr", RecordingStderr()),
+        ):
+            leave_without_finalizing(0)
+
+        self.assertEqual(["stderr"], flushed)
+        logging_shutdown.assert_called_once_with()
+        hard_exit.assert_called_once_with(0)

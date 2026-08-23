@@ -138,10 +138,19 @@ def leave_without_finalizing(exit_code: int) -> None:
     Patched by the tests: performing this in-process would take the test runner
     down with it, so the decision to call it is what gets asserted.
     """
-    sys.stdout.flush()
-    sys.stderr.flush()
-    logging.shutdown()
-    os._exit(exit_code)
+    # Nothing here may prevent the exit. A journal socket that has already gone
+    # raises BrokenPipeError from a flush, and an exception escaping this
+    # function returns through main() into Py_Finalize -- the crash this exists
+    # to avoid. Each is attempted on its own so that one failure does not skip
+    # the rest: a broken stdout says nothing about the log handlers.
+    try:
+        for flush in (sys.stdout.flush, sys.stderr.flush, logging.shutdown):
+            try:
+                flush()
+            except Exception:  # noqa: BLE001 - losing output beats dumping core
+                pass
+    finally:
+        os._exit(exit_code)
 
 
 def main(argv: list[str] | None = None) -> int:
