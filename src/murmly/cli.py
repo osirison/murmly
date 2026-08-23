@@ -156,34 +156,49 @@ def leave_without_finalizing(exit_code: int) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Decided before the attempt, so the exit below has a status even when a
+    # BaseException never reaches an assignment.
+    exit_code = 1
     try:
-        exit_code = _dispatch(parser, args)
-    except Exception as error:  # noqa: BLE001 - no command terminates with an unhandled error
-        # A backstop only. Every failure with something specific to say -- the
-        # daemon's startup refusal, an unreadable configuration, a daemon that
-        # did not respond -- reports it itself, because a generic message names
-        # the wrong thing.
-        #
-        # Guarded because reporting must not become the failure. A daemon whose
-        # journal socket has already gone raises BrokenPipeError from both calls
-        # below, and that would escape before the daemon branch is reached,
-        # leaving through Py_Finalize -- the crash that branch exists to avoid.
-        # It is what "no command terminates with an unhandled error" asks for
-        # anyway: a shell that closed the pipe is not a reason to raise.
         try:
-            if args.command == "daemon":
-                # The daemon runs unattended under the service manager, where
-                # this one line would be all that survived of a crash nothing
-                # anticipated. A person reading the journal needs the frames.
-                traceback.print_exc(file=sys.stderr)
-            print(f"murmly: unexpected failure: {error}", file=sys.stderr)
-        except Exception:  # noqa: BLE001 - losing the report beats dumping core
-            pass
-        exit_code = 1
-    if args.command == "daemon":
-        # Every route out of the daemon reaches here with its status already
-        # decided: a clean stop, a startup refusal, and the backstop above.
-        leave_without_finalizing(exit_code)
+            exit_code = _dispatch(parser, args)
+        except KeyboardInterrupt:
+            # `except Exception` does not catch this. It arrives when the daemon
+            # is run from a terminal rather than the service manager, which is
+            # how it is run while developing.
+            exit_code = 130
+            raise
+        except Exception as error:  # noqa: BLE001 - no command terminates with an unhandled error
+            # A backstop only. Every failure with something specific to say --
+            # the daemon's startup refusal, an unreadable configuration, a
+            # daemon that did not respond -- reports it itself, because a
+            # generic message names the wrong thing.
+            #
+            # Guarded because reporting must not become the failure. A daemon
+            # whose journal socket has gone raises BrokenPipeError from both
+            # calls below, and that would escape before the exit is reached.
+            # It is what "no command terminates with an unhandled error" asks
+            # for anyway: a shell that closed the pipe is not a reason to raise.
+            try:
+                if args.command == "daemon":
+                    # The daemon runs unattended under the service manager,
+                    # where this one line would be all that survived of a crash
+                    # nothing anticipated. Whoever reads the journal needs the
+                    # frames.
+                    traceback.print_exc(file=sys.stderr)
+                print(f"murmly: unexpected failure: {error}", file=sys.stderr)
+            except Exception:  # noqa: BLE001 - losing the report beats dumping core
+                pass
+            exit_code = 1
+    finally:
+        if args.command == "daemon":
+            # Structural rather than positional. Every way out of the daemon
+            # route leaves through here: a clean stop, a startup refusal, the
+            # backstop above, and a BaseException that backstop cannot catch.
+            # Reaching Py_Finalize instead is the SIGSEGV in issue #27, and both
+            # review findings on this change were a path that slipped past a
+            # call placed after the try rather than inside a finally.
+            leave_without_finalizing(exit_code)
     return exit_code
 
 

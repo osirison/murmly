@@ -1610,6 +1610,43 @@ class DaemonExitWithoutFinalizeTests(unittest.TestCase):
 
         leave.assert_called_once_with(1)
 
+    def test_a_base_exception_still_reaches_the_exit(self) -> None:
+        """`except Exception` catches neither of these, so before the exit moved
+        into a `finally` they escaped main() and the process left through
+        Py_Finalize. Ctrl-C is how the daemon is run while developing."""
+        for raiser, expected in (
+            (KeyboardInterrupt, 130),
+            (SystemExit, 1),
+        ):
+            with self.subTest(raiser=raiser.__name__):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    config_path = self._config_file(temp_dir)
+                    with (
+                        patch("murmly.cli._run_daemon", side_effect=raiser("stopped")),
+                        patch("murmly.cli.leave_without_finalizing") as leave,
+                        redirect_stdout(StringIO()),
+                        redirect_stderr(StringIO()),
+                    ):
+                        with self.assertRaises(raiser):
+                            main(["--config", str(config_path), "daemon"])
+
+                leave.assert_called_once_with(expected)
+
+    def test_a_base_exception_outside_the_daemon_is_left_alone(self) -> None:
+        """Only the daemon is in the configuration that makes finalization unsafe."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = self._config_file(temp_dir)
+            with (
+                patch("murmly.cli._run_doctor", side_effect=KeyboardInterrupt()),
+                patch("murmly.cli.leave_without_finalizing") as leave,
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    main(["--config", str(config_path), "doctor"])
+
+        leave.assert_not_called()
+
     def test_a_command_other_than_the_daemon_returns_the_ordinary_way(self) -> None:
         """Only the daemon is in the configuration that makes finalization unsafe."""
         with tempfile.TemporaryDirectory() as temp_dir:
