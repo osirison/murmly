@@ -1,10 +1,11 @@
 ---
 title: Pin onnxruntime-gpu to 1.24.4 so ONNX and CTranslate2 share one CUDA stack
 description: onnxruntime-gpu 1.25+ moved to CUDA 13, which conflicts with the cu12 wheels Murmly's cuda extra installs for faster-whisper
-trigger: uv pip install onnxruntime-gpu, uv add onnxruntime-gpu, uv sync --extra cuda, pip install kokoro-onnx
+trigger: uv pip install onnxruntime-gpu, uv add onnxruntime-gpu, uv sync --extra cuda, pip install kokoro-onnx, uv run --extra tts, uv run --extra cuda, uv pip uninstall onnxruntime
 
 depends_on: pyproject.toml, uv.lock, docs/agent-notes/uv-sync-cuda-runtime.md
 recorded: 2026-08-20
+updated: 2026-08-23
 ---
 
 ## Symptom
@@ -64,6 +65,61 @@ through distribution metadata instead — see `src/murmly/stt.py`
 `_load_cuda_runtime` and `docs/agent-notes/uv-sync-cuda-runtime.md`, which apply
 the same provenance checks any ONNX path should reuse rather than duplicate.
 
+
+## `uv run --extra` undoes the swap, silently
+
+The GPU build is a swap, not an addition (`pyproject.toml` says so), which means
+nothing in the project metadata records that it happened. Any command that
+resolves the `tts` extra pulls `kokoro-onnx` -> `onnxruntime` (the CPU build) and
+installs it *alongside* `onnxruntime-gpu`, whose libraries it then shadows:
+
+```console
+$ uv run --extra cuda --extra tts python bench.py
+Installed 1 package in 35ms
+Speech output falling back to the CPU: ...
+provider: CPUExecutionProvider
+```
+
+There is no error. The run completes and reports numbers for a CPU session.
+
+**Run one-off scripts and benchmarks with `.venv/bin/python` directly.** `uv run`
+syncs the environment before it runs anything, so it repairs the "missing" CPU
+package every time. A long-lived daemon started before the swap was undone keeps
+its original mappings and goes on using the GPU, so `nvidia-smi` and the daemon
+log will disagree with a fresh interpreter — check
+`.venv/bin/python -c "import onnxruntime as ort; print(ort.get_available_providers())"`,
+not the running process.
+
+## Repairing it needs `--reinstall`
+
+The obvious repair leaves the environment worse than it found it:
+
+```console
+$ uv pip uninstall onnxruntime            # also deletes files onnxruntime-gpu owns
+$ uv pip install "onnxruntime-gpu==1.24.4"
+Checked 1 package in 2ms                  # metadata is intact, so nothing is restored
+```
+
+Both distributions install into the same `onnxruntime/` package directory. The
+uninstall removes the shared files, the plain install sees `onnxruntime-gpu`
+already recorded as present and does nothing, and the result raises
+`the ONNX Runtime is missing or unusable` from `resolve_providers`. Force it:
+
+```bash
+uv pip install --reinstall "onnxruntime-gpu==1.24.4"
+```
+
+Then confirm against a session rather than the module list, per the Symptom
+above:
+
+```console
+$ .venv/bin/python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+```
+
+The reinstall also upgrades whatever shares the dependency closure - it moved
+`protobuf` 7.35.1 -> 7.36.0 here. Run the suite afterwards.
+
 ## The CUDA extra is not enough on its own
 
 Pinning the version fixes the CUDA *major* line. It does not give the provider
@@ -106,7 +162,7 @@ $ uv pip install --dry-run "murmly[cuda,tts] @ ."
 ```
 
 That is the broken combination described below. The GPU build is a swap, not an
-addition, and the swap is clean in that direction:
+addition, and the swap is clean **from a fresh environment**:
 
 ```bash
 uv pip uninstall onnxruntime
@@ -116,6 +172,12 @@ uv pip install "onnxruntime-gpu==1.24.4"
 Confirmed in a fresh environment on 2026-08-21: after the swap
 `onnxruntime.InferenceSession` exists, `get_available_providers()` lists CUDA,
 and `faster_whisper.vad.get_vad_model()` still loads through the survivor.
+
+It is **not** clean when `onnxruntime-gpu` is already installed and the CPU build
+has been reintroduced on top of it — the case you are in whenever `uv run` or
+`uv sync` has touched the environment since the swap. The install then finds its
+own metadata intact and restores nothing the uninstall deleted. Use
+`--reinstall`; see "Repairing it needs `--reinstall`" above.
 
 ## `uv sync` is exact, so name every extra every time
 

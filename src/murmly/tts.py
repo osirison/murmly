@@ -54,7 +54,9 @@ CPU_PROVIDER = "CPUExecutionProvider"
 GPU_RUNTIME_REMEDY = (
     "Speech output on CUDA needs the GPU build of ONNX Runtime, which replaces "
     "the CPU one rather than joining it. Run `uv pip uninstall onnxruntime` "
-    "then `uv pip install \"onnxruntime-gpu==1.24.4\"`."
+    "then `uv pip install --reinstall \"onnxruntime-gpu==1.24.4\"`. The "
+    "`--reinstall` matters: the uninstall deletes files both distributions own, "
+    "and a plain install sees its own metadata intact and restores nothing."
 )
 # States the rule rather than a literal command, because the literal command is
 # destructive half the time: `uv sync` makes the environment match exactly the

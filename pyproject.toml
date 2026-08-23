@@ -41,7 +41,12 @@ cuda = [
 # uninstall broken. Running synthesis on the GPU is a swap, not an addition:
 #
 #     uv pip uninstall onnxruntime
-#     uv pip install "onnxruntime-gpu==1.24.4"
+#     uv pip install --reinstall "onnxruntime-gpu==1.24.4"
+#
+# `--reinstall` is not optional when the GPU build is already present: the
+# uninstall deletes files both distributions own, and a plain install sees its
+# own metadata intact and restores nothing. Any `uv run`/`uv sync` naming the
+# tts extra reintroduces the CPU build and puts you in exactly that state.
 #
 # The version is pinned by docs/agent-notes/onnxruntime-gpu-cuda-version.md:
 # 1.25+ moved to CUDA 13, whose wheels are not on PyPI yet, while the `cuda`
