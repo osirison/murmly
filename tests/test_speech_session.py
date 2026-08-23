@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType
 
 from fakes import FakeSynthesizer, fake_amplitude
+from module_stubs import injected_module
 from murmly.audio import SoundDeviceRecorder, SoundDevicePlayer, pcm16_from_float32
 from murmly.config import MurmlyConfig
 from murmly.daemon import (
@@ -1314,7 +1315,7 @@ class CaptureNeverHearsSpeechTests(unittest.TestCase):
             tts_enabled=True,
         )
 
-        with patch.dict(sys.modules, {"sounddevice": module}):
+        with injected_module("sounddevice", module):
             player = SoundDevicePlayer(config)
             recorder = SoundDeviceRecorder(config)
             engine = SpeechEngine(config, synthesizer=FakeSynthesizer(), player=player)

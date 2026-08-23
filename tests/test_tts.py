@@ -14,6 +14,7 @@ import numpy as np
 
 import murmly.tts
 from fakes import FakeKokoroModel
+from module_stubs import injected_module
 from murmly.config import DEFAULT_TTS_RATE_PERCENT, DEFAULT_TTS_VOICE, MurmlyConfig, load_config
 from murmly.tts import (
     CALIBRATION_TEXT,
@@ -380,7 +381,7 @@ class RuntimeResolutionTests(unittest.TestCase):
         probe reported speech output available on an environment where the first
         session would fail -- the accept-then-fail the probe exists to prevent.
         """
-        with patch.dict(sys.modules, {"onnxruntime": None}):
+        with injected_module("onnxruntime", None):
             with self.assertRaises(RuntimeError) as raised:
                 resolve_providers(self._config("cpu"))
 
@@ -415,7 +416,7 @@ class RuntimeResolutionTests(unittest.TestCase):
         killed transcription too, for a feature that is meant to switch itself
         off with a reason.
         """
-        with patch.dict(sys.modules, {"onnxruntime": None}):
+        with injected_module("onnxruntime", None):
             with self.assertRaises(RuntimeError) as raised:
                 resolve_providers(self._config("auto"))
 
@@ -429,7 +430,7 @@ class RuntimeResolutionTests(unittest.TestCase):
         the import error alone was not enough.
         """
         broken = ModuleType("onnxruntime")
-        with patch.dict(sys.modules, {"onnxruntime": broken}):
+        with injected_module("onnxruntime", broken):
             with self.assertRaises(RuntimeError) as raised:
                 resolve_providers(self._config("auto"))
 
