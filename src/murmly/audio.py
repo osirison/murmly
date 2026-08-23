@@ -32,11 +32,19 @@ def disable_portaudio_exit_teardown() -> None:
     disconnects every host API PortAudio initialised rather than only the one a
     stream was opened on, and the JACK one aborts the process when the server
     behind it has already gone -- which is what a logout is, since nothing
-    orders a user service's stop before the audio server's. There is nothing
-    else the teardown does that the kernel does not do when the process exits.
+    orders a user service's stop before the audio server's.
 
     The caller owns closing the streams Murmly opened: the hook dropped here is
     also what closed the last one.
+
+    It is also the only caller of `Pa_Terminate`, which is what stopped
+    PortAudio's own `pw-PortAudio` loop threads. Dropping it leaves them running
+    for the rest of the process, and interpreter finalization then unloads the
+    extension libraries underneath them -- a SIGSEGV where issue #11 had a
+    SIGABRT, and the same failed unit either way. The daemon therefore leaves
+    through `leave_without_finalizing` in `cli.py` rather than returning into
+    `Py_Finalize`. Anything else calling this must not rely on finalization
+    running cleanly afterwards.
 
     A module that was never imported has no hook to drop, so this reads
     `sys.modules` rather than importing one just to disable it.

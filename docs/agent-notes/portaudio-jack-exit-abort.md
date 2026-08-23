@@ -1,10 +1,11 @@
 ---
 title: Test a PortAudio exit crash against a private PipeWire, never the session's own
 description: How to reproduce the SIGABRT in PortAudio's JACK teardown on demand, and why murmly's daemon unregisters sounddevice's atexit hook
-trigger: sounddevice, Pa_Terminate, pa_jack.c, systemctl --user stop murmly, murmly daemon, coredumpctl
+trigger: sounddevice, Pa_Terminate, pa_jack.c, systemctl --user stop murmly, murmly daemon, coredumpctl, leave_without_finalizing, os._exit, pw-PortAudio
 
 depends_on: src/murmly/audio.py, src/murmly/cli.py, src/murmly/installer.py
 recorded: 2026-08-22
+updated: 2026-08-23
 verified_on: Fedora 44, portaudio 19.7.0-3.fc44, pipewire-jack-audio-connection-kit 1.6.8-1.fc44, sounddevice 0.5.5
 ---
 
@@ -106,3 +107,48 @@ need root to remove. Check what a run left behind with:
 ```bash
 coredumpctl list python
 ```
+
+
+## Dropping the teardown traded the SIGABRT for a SIGSEGV
+
+Recorded 2026-08-23, issue #27. `Pa_Terminate` was also the only thing that stopped
+PortAudio's own `pw-PortAudio` loop threads, and nothing else in the tree calls it.
+Without it the daemon reaches `Py_Finalize` with those threads still running, and
+finalization unloads the extension libraries they are executing in:
+
+```text
+Thread A  #0  0x00007faa280df0a0 n/a (n/a + 0x0)          <- unmapped
+          #1  do_loop            (libpipewire-0.3.so.0)
+Thread B  #0  insertdict.isra.0        (libpython3.14.so.1.0)
+          #1  _PyModule_ClearDict
+          #2  finalize_modules
+          #3  _Py_Finalize
+```
+
+`murmly.service: Failed with result 'core-dump'` again, with signal 11 instead of 6.
+
+The reproduction is not what you would guess. Opening streams is irrelevant; the
+**loaded extension modules** are what decide it:
+
+| loaded | teardown | exit |
+| --- | --- | --- |
+| anything | registered | 0 |
+| nothing heavy | unregistered | 0 |
+| `numpy`, `ctranslate2`, `av`, `tokenizers` or `huggingface_hub` alone | unregistered | 0 |
+| **`onnxruntime` or `faster_whisper`** | unregistered | **139** |
+
+So a reproduction has to import `onnxruntime`, call
+`disable_portaudio_exit_teardown()`, and return through ordinary interpreter shutdown.
+A test that only opens a stream exits 0 and proves nothing.
+
+The daemon now leaves through `leave_without_finalizing` in `cli.py`, which flushes
+and calls `os._exit`. Verify any change to this against **both** stop conditions,
+because the first fix passed one and broke the other:
+
+| stop condition | how to test |
+| --- | --- |
+| audio server alive | `systemctl --user stop murmly.service`, then check `Result` is `success` and `ExecMainCode` is 1, not 3 |
+| audio server already gone | the private-PipeWire harness above |
+
+Re-registering the teardown with the server gone still aborts with 134, which is the
+control that proves the harness is exercising the right path.
