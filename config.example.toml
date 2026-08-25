@@ -81,11 +81,10 @@ text_size_px = 13       # Live transcript panel text size, 8-48
 # every extra you want on one line: on a CUDA install the first line is
 # `uv sync --extra cuda --extra tts`.
 #
-# That runs synthesis on the CPU, at roughly five times real time, whatever
-# `[stt] device` above says: that setting is about transcription and neither
-# moves synthesis to the GPU nor turns it off. The GPU build of ONNX Runtime
-# replaces the CPU one rather than joining it, because both install into the
-# same package namespace:
+# That runs synthesis on the CPU, at roughly five times real time, which is
+# where `device` below leaves it. Moving synthesis to the GPU takes that
+# setting and the GPU build of ONNX Runtime, which replaces the CPU one rather
+# than joining it, because both install into the same package namespace:
 #
 #     uv sync --extra cuda --extra tts
 #     uv pip uninstall onnxruntime
@@ -104,6 +103,15 @@ voice = "af_heart"
 
 # Speaking rate as a percentage of the model's own, 50-200. 100 is unmodified.
 rate = 100
+
+# The processor synthesis runs on: auto | cpu | cuda, the same vocabulary as
+# `[stt] device` and independent of it -- that setting is about transcription
+# only. The CPU is the default because the CUDA provider never gives back the
+# system and GPU memory it takes for synthesis, while the CPU costs about
+# 200 ms more before the first word and nothing after it. "cuda" needs the GPU
+# build described above; a GPU that cannot be used falls back to the CPU and
+# logs the remedy rather than refusing to speak.
+device = "cpu"
 
 # Output device name or index, as `python -m sounddevice` prints it. Empty means
 # let the system choose, which is what the capture side does too.

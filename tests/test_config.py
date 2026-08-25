@@ -16,6 +16,7 @@ from murmly.config import (
     DEFAULT_OVERLAY_TEXT_SIZE_PX,
     DEFAULT_RESTORE_DELAY_MS,
     DEFAULT_SILENCE_MS,
+    DEFAULT_TTS_DEVICE,
     MAX_LIVE_INTERVAL_MS,
     MAX_LIVE_WINDOW_SECONDS,
     MAX_OVERLAY_TEXT_SIZE_PX,
@@ -345,6 +346,46 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual("auto", config.compute_type)
         self.assertEqual(1, config.beam_size)
         self.assertFalse(config.vad_filter)
+
+    def test_synthesis_runs_on_the_cpu_when_no_device_is_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(Path(temp_dir) / "missing.toml")
+
+        self.assertEqual("cpu", config.tts_device)
+        self.assertEqual(DEFAULT_TTS_DEVICE, config.tts_device)
+        self.assertIsNone(config.tts_device_rejected_value)
+
+    def test_the_transcription_device_does_not_decide_the_synthesis_device(self) -> None:
+        """The two settings are independent, which is the point of adding one."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('[stt]\ndevice = "cuda"')
+
+            config = load_config(config_path)
+
+        self.assertEqual("cuda", config.device)
+        self.assertEqual("cpu", config.tts_device)
+
+    def test_every_device_transcription_accepts_is_accepted_for_synthesis(self) -> None:
+        for device in ("auto", "cpu", "cuda"):
+            with self.subTest(device=device), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(f'[tts]\ndevice = "{device}"')
+
+                config = load_config(config_path)
+
+            self.assertEqual(device, config.tts_device)
+            self.assertIsNone(config.tts_device_rejected_value)
+
+    def test_unrecognized_synthesis_device_falls_back_and_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('[tts]\ndevice = "rocm"')
+
+            config = load_config(config_path)
+
+        self.assertEqual("cpu", config.tts_device)
+        self.assertEqual("rocm", config.tts_device_rejected_value)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

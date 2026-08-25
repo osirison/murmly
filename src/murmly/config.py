@@ -109,6 +109,15 @@ DEFAULT_TTS_RATE_PERCENT = 100
 MIN_TTS_RATE_PERCENT = 50
 MAX_TTS_RATE_PERCENT = 200
 
+# The processor synthesis runs on, taking the same vocabulary as `[stt] device`
+# and deliberately independent of it: transcription is a burst the person waits
+# on with nothing to overlap it, while synthesis is produced a sentence ahead of
+# playback. The CPU is the default because the CUDA provider never gives back
+# what it takes for synthesis -- 876 MiB of system memory and 1208 MiB of
+# accelerator memory stay held once a synthesis session has existed -- and the
+# CPU costs only about 200 ms more before the first word.
+DEFAULT_TTS_DEVICE = "cpu"
+
 
 def default_runtime_dir(env: dict[str, str] | None = None) -> Path:
     environment = env or os.environ
@@ -170,6 +179,8 @@ class MurmlyConfig:
     tts_voice_rejected_value: str | None = None
     tts_rate_percent: int = DEFAULT_TTS_RATE_PERCENT
     tts_rate_rejected_value: object | None = None
+    tts_device: str = DEFAULT_TTS_DEVICE
+    tts_device_rejected_value: str | None = None
     tts_output_device: str = ""
     tts_model_dir: Path = field(default_factory=default_tts_model_dir)
 
@@ -230,6 +241,11 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         maximum=MAX_TTS_RATE_PERCENT,
     )
     tts_rate_rejected_value = _rejected_value(tts.get("rate"), tts_rate_percent)
+    tts_device = str(tts.get("device", DEFAULT_TTS_DEVICE))
+    tts_device_rejected_value: str | None = None
+    if tts_device not in VALID_DEVICES:
+        tts_device_rejected_value = tts_device
+        tts_device = DEFAULT_TTS_DEVICE
     model_dir = tts.get("model_dir")
     tts_model_dir = (
         Path(str(model_dir)).expanduser() if model_dir else default_tts_model_dir(env)
@@ -300,6 +316,8 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         tts_voice_rejected_value=tts_voice_rejected_value,
         tts_rate_percent=tts_rate_percent,
         tts_rate_rejected_value=tts_rate_rejected_value,
+        tts_device=tts_device,
+        tts_device_rejected_value=tts_device_rejected_value,
         tts_output_device=str(tts.get("output_device", "")),
         tts_model_dir=tts_model_dir,
     )
