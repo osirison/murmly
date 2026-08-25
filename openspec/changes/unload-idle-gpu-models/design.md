@@ -29,8 +29,9 @@ synthesis session returns now depends on a setting outside this change — see
   needing to know a model can vanish.
 - Make the reload cost invisible for the common case — the user dictates again
   after a gap.
-- Keep the whole feature inert when unconfigured, so the risky paths do not exist
-  in a default install.
+- Ship transcription release enabled and synthesis release disabled, so the path
+  that reclaims accelerator memory is exercised by every install while the one
+  that only costs silence stays opt-in.
 
 **Non-Goals:**
 
@@ -218,26 +219,44 @@ something else included. Treat the numbers in the table above as current.
   daemon already uses for its own shutdown sequencing, so a pending timer cannot
   extend or block exit. `src/murmly/daemon.py` already has this problem solved for
   other background work; reuse it rather than adding a bare `threading.Timer`.
-- **The feature is inert by default, so it will be under-exercised in practice** →
-  Tests must cover the evicted-then-reused path directly rather than relying on it
+- **Transcription release now runs on every install, so a defect in it reaches
+  everyone rather than only opt-in users** → This is the deliberate trade for the
+  path no longer being under-exercised. It raises the bar on section 2's tests
+  rather than lowering it: the evicted-then-reused path, eviction racing a pass,
+  and a failed reload must all be covered directly, because there is no longer a
+  population of users running with the feature off to notice a regression late.
+  The cycle itself was measured stable over eight iterations before this default
+  was chosen — GPU returning to exactly 2240 MiB each time, host drift flat at
+  +2.3 MiB from cycle 1 onward.
+- **Synthesis release stays inert by default, so it will be under-exercised** →
+  Accepted, and it is the lower-risk of the two: it returns host memory rather
+  than accelerator memory, and a defect in it cannot lose a transcript. Tests must
+  still cover the released-then-rebuilt path directly rather than relying on it
   being hit incidentally.
 
 ## Migration Plan
 
-No migration. Both settings are absent in existing installs, which means disabled,
-which is exactly today's behaviour. Rollback is setting them back to `0`.
+Synthesis needs no migration: its default is `0`, so an existing install behaves
+exactly as it does today.
+
+Transcription does change on upgrade. An install that sets nothing begins
+releasing the model after five idle minutes and reloading it when capture next
+begins. Nothing about a transcript changes — the spec requires a release to be
+undetectable except in the time the first use after it takes — and the reload is
+started at capture, so in normal dictation there is nothing to wait for.
+Rollback is `[stt] unload_after_idle_s = 0`.
 
 ## Open Questions
 
-- What the upper bound on each period should be. Any bounded value satisfies the
-  spec; picking the number can wait for implementation. This is the only genuinely
-  deferrable unknown here.
+None. Both questions this section previously carried are now answered.
 
-The shipped default is **not** an open question of this kind, and an earlier
-version of this section wrongly said it changes no requirement. It does. The spec
-requires that "A value of zero, or an absent setting, SHALL disable idle release",
-and its scenario "Disabled by default keeps a model resident" requires an
-unconfigured install to hold both models. Off-by-default is therefore already
-normative. Choosing a non-zero default means amending that requirement and that
-scenario, not just changing a constant. The decision and the evidence for each
-setting are in `proposal.md` — Open decision for review.
+The bounds are **30–86400 seconds**. The floor is 30 s because anything shorter
+would fire between dictations in an ordinary working session, and the ceiling is
+24 hours because beyond that the setting is indistinguishable from `0`, which
+already means never.
+
+The shipped defaults are `300` for transcription and `0` for synthesis, decided
+with the evidence in `proposal.md` — Decision: transcription on, synthesis off.
+An earlier version of this section wrongly called that decision spec-neutral. It
+was not: choosing a non-zero default required amending the requirement and its
+scenario, which this change now does.

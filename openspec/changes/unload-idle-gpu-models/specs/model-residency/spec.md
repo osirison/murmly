@@ -116,18 +116,38 @@ work yields to capture and delivery.
 - **WHEN** the user records again
 - **THEN** Murmly attempts the load again rather than refusing permanently
 
-### Requirement: Idle release is configurable and bounded
+### Requirement: Idle release is configurable, bounded, and defaulted per model
 
 Murmly SHALL provide a separate configuration setting for the transcription idle
-period and the synthesis idle period. A value of zero, or an absent setting, SHALL
-disable idle release for that model, leaving it resident once loaded. A value
-outside the supported bounds MUST fall back to the default rather than being
-applied or refused.
+period and the synthesis idle period, each with its own default. A value of zero
+SHALL disable idle release for that model, leaving it resident once loaded. An
+absent setting SHALL take that setting's default. A value outside the supported
+bounds MUST fall back to that setting's default rather than being applied or
+refused.
 
-#### Scenario: Disabled by default keeps a model resident
+The two defaults differ, because the two releases are not alike. Transcription
+release SHALL be enabled by default: it returns accelerator memory, and its reload
+is already started when capture begins, so the wait is absorbed while the person
+is still speaking. Synthesis release SHALL be disabled by default: it returns
+system memory rather than accelerator memory, and what it costs is silence before
+speech resumes, which has nothing to overlap it.
 
-- **GIVEN** neither idle period is configured
-- **WHEN** a model is loaded and Murmly is left idle indefinitely
+#### Scenario: Transcription release is enabled without configuration
+
+- **GIVEN** no transcription idle period is configured
+- **WHEN** the transcription model is resident and no capture has been active for longer than its default period
+- **THEN** Murmly releases the accelerator memory the model held
+
+#### Scenario: Synthesis release is disabled without configuration
+
+- **GIVEN** no synthesis idle period is configured
+- **WHEN** the synthesis session is resident and Murmly is left idle indefinitely
+- **THEN** the session stays resident and its memory is not released
+
+#### Scenario: Zero disables release for that model
+
+- **GIVEN** an idle period is configured as zero
+- **WHEN** that model is loaded and Murmly is left idle indefinitely
 - **THEN** the model stays resident and its memory is not released
 
 #### Scenario: Out-of-range value falls back

@@ -52,41 +52,50 @@ footprint — it relocates it. See `design.md` — Use `unload_model(to_cpu=Fals
   fire between segments of a continuous-mode session.
 - Murmly begins reloading the transcription model when capture starts rather than
   waiting for the first transcription pass, so the reload overlaps with speech.
-- Two new settings, `[stt] unload_after_idle_s` and `[tts] unload_after_idle_s`.
-  Absent or `0` keeps today's always-resident behaviour.
+- Two new settings, `[stt] unload_after_idle_s` and `[tts] unload_after_idle_s`,
+  each bounded 30–86400 seconds with its own default. `0` disables release for
+  that model. **`[stt]` defaults to `300`** (five minutes, enabled);
+  **`[tts]` defaults to `0`** (disabled).
 - Diagnostics report whether each model is currently resident.
 
-Not breaking: with both settings absent, behaviour is byte-for-byte what it is
-today.
+**This changes behaviour on upgrade for transcription.** An existing install that
+sets nothing will begin releasing the transcription model's accelerator memory
+after five idle minutes, and reloading it when capture next begins. Setting
+`[stt] unload_after_idle_s = 0` restores today's always-resident behaviour.
+Synthesis is unchanged on upgrade, because its default is `0`.
 
-### Open decision for review
+### Decision: transcription on, synthesis off
 
-The proposal assumes both settings **default to `0`, i.e. off**, so that no
-existing install changes behaviour on upgrade and the memory/latency trade stays
-opt-in.
+The two settings are decided separately, which the spec permits — it requires
+them to be independent and never said they share a default.
 
-**This is not a free choice at implementation time.** The spec has already
-committed to it: "Idle release is configurable and bounded" states that an absent
-setting SHALL disable release, and the scenario "Disabled by default keeps a model
-resident" requires an unconfigured install to keep both models resident. Shipping
-a non-zero default contradicts that scenario, so choosing it means amending the
-spec first, not just changing a constant in `config.py`.
+**Transcription: on, at 300 s.** It reclaims 2080 MiB for every user without their
+asking. With `to_cpu=False` it costs no host memory, and the 0.78 s reload is
+hidden by warm-on-capture for any dictation longer than 0.78 s, which is
+substantially all of them. The cycle was measured over eight iterations before
+committing to this: the GPU returns to exactly 2240 MiB and releases to exactly
+160 MiB every time, and host RSS drift is **+2.3 MiB, identical on cycles 1
+through 8** — a one-time cost of the first unload, not per-cycle growth. Unload
+55–57 ms, reload 740–771 ms, transcribe 13 ms. Stable enough to run unattended.
 
-The two settings can be decided separately — the spec requires them to be
-independent and never says they share a default:
+Five minutes is chosen because it does not fire between dictations in an active
+session but does fire during any real break. The period matters less than it
+would otherwise, because firing is close to free.
 
-- **Transcription.** Defaulting on reclaims 2080 MiB for every user without their
-  asking. With `to_cpu=False` it costs no host memory, and the 0.78 s reload is
-  hidden by warm-on-capture for any dictation longer than 0.78 s, which is
-  substantially all of them. Against that, the Risks section below notes the
-  feature will be under-exercised if it ships inert — which argues for on, not off.
-- **Synthesis.** Defaulting on reclaims 377 MiB of host memory and costs 0.76 s of
-  silence before speech resumes after a gap, which a listener notices. Speech
-  output is already opt-in (`[tts] enabled` defaults to false), so leaving this
-  opt-in too is the consistent choice.
+**Synthesis: off, at `0`.** Under the merged `[tts] device = "cpu"` default it
+returns 377 MiB of host memory rather than accelerator memory, and it costs 0.76 s
+of silence before speech resumes, which a listener notices and which nothing
+overlaps. Speech output is already opt-in — `[tts] enabled` defaults to false — so
+leaving this opt-in too is consistent. It is also the release path with measured
+per-cycle drift on the accelerator, which is a further reason not to arm it by
+default.
 
-Decide before implementation, and amend the spec in the same change if the answer
-is non-zero.
+This required amending the spec, not just choosing a constant: the requirement
+"Idle release is configurable and bounded" previously said an absent setting SHALL
+disable release, and its scenario "Disabled by default keeps a model resident"
+required an unconfigured install to keep both models resident. Both are updated in
+this change, and the requirement is renamed to "Idle release is configurable,
+bounded, and defaulted per model".
 
 ### Deliberately not in scope
 
