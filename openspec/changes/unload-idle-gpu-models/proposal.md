@@ -23,9 +23,9 @@ record-start, while the user is still speaking.
 
 `to_cpu=True` is the other mode, and this change does not use it. It reloads in
 0.22 s rather than 0.78 s, but it buys that by keeping the weights in system RAM.
-Measured on this machine across two runs, it moves **1541 MB into host RSS**
-(1316.6 MB to 2857.9 MB) to free the same GPU. Murmly is a daemon that is idle
-almost all of the time and already holds 1812 MB of host RSS, so trading a third
+Measured on this machine across two runs, it moves **1541 MiB into host RSS**
+(1316.6 MiB to 2857.9 MiB) to free the same GPU. Murmly is a daemon that is idle
+almost all of the time and already holds 1812 MiB of host RSS, so trading a third
 of the GPU for one and a half gigabytes of system RAM does not reduce the
 footprint — it relocates it. See `design.md` — Use `unload_model(to_cpu=False)`.
 

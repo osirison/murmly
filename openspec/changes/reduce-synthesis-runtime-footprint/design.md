@@ -3,9 +3,9 @@
 See `proposal.md` — Why, for the motivation and the measurements.
 
 The constraint that shapes everything below is that ONNX Runtime does not give
-back what its CUDA provider takes. Dropping the `InferenceSession` returns 186 MB
-of the 1085 MB the CUDA path holds; `gc.collect()` and `malloc_trim(0)` return
-nothing further. The same session on the CPU provider returns 706 MB of 784 MB.
+back what its CUDA provider takes. Dropping the `InferenceSession` returns 186 MiB
+of the 1085 MiB the CUDA path holds; `gc.collect()` and `malloc_trim(0)` return
+nothing further. The same session on the CPU provider returns 706 MiB of 784 MiB.
 So for synthesis there is no release path to build — there is only a choice about
 whether to allocate.
 
@@ -13,7 +13,7 @@ Two existing facts make the choice cheap. Synthesis is already produced one
 sentence at a time by a producer thread running ahead of the loudspeaker, so a
 slower processor costs a wait before the first word rather than a wait for the
 whole utterance. And `resolve_providers` already returns the CPU provider before
-it reaches the CUDA library preload, so a CPU default removes 190.1 MB from daemon
+it reaches the CUDA library preload, so a CPU default removes 190.1 MiB from daemon
 start-up without any separate work.
 
 ## Goals / Non-Goals
@@ -32,7 +32,7 @@ start-up without any separate work.
 - Releasing synthesis accelerator memory after use. Not achievable — see Context.
   `unload-idle-gpu-models` owns idle release for the case where someone has opted
   back into the accelerator.
-- Reducing the start-up probe below its remaining 32.2 MB and 15 threads. See
+- Reducing the start-up probe below its remaining 32.2 MiB and 15 threads. See
   `proposal.md` — Deliberately not in scope.
 - Changing how transcription resolves its device, or what `[stt] device` means.
 - Speeding up CPU synthesis. The measured real-time factor is already 5.4x ahead
@@ -68,7 +68,7 @@ exact defect being fixed: synthesis reading a setting that does not name it.
 ### Default to the CPU rather than shipping the saving as opt-in
 
 This is the one decision that changes behaviour on upgrade, and it is deliberate.
-An opt-in default would leave 876 MB of system memory and 1208 MiB of accelerator
+An opt-in default would leave 876 MiB of system memory and 1208 MiB of accelerator
 memory held on every install where speech output is enabled, because a setting
 nobody knows about is a setting nobody sets.
 
@@ -89,17 +89,24 @@ The session is currently constructed with no `SessionOptions` at all, which is
 what leaves every ONNX Runtime default in force. Two of those defaults were
 measured; only one is worth changing.
 
-| | steady RSS over 16 utterances | short sentence, warm |
-| --- | --- | --- |
-| defaults | 452 → 784 MB | 257 ms |
-| `enable_cpu_mem_arena=False` | 446 → 510 MB | 261 ms |
-| also `intra_op_num_threads=4` | 451 → 469 MB | 401 ms |
+| | steady RSS over 16 utterances | short sentence, warm (1.37 s audio) | long text, warm (8.02 s audio) |
+| --- | --- | --- | --- |
+| defaults | 452 → 784 MiB | 257 ms | 1487 ms |
+| `enable_cpu_mem_arena=False` | 446 → 510 MiB | 261 ms | 1537 ms |
+| also `intra_op_num_threads=4` | 451 → 469 MiB | 401 ms | 2083 ms |
 
-Disabling the arena bounds the working set at 510 MB instead of letting it grow to
-784 MB, for 4 ms. Capping the intra-op pool on top buys a further 41 MB for a 36%
-latency increase, so it is not done. This mirrors what faster-whisper's own
-bundled VAD already does with its session, minus the thread caps, which it can
-afford because its model is 2 MB.
+Disabling the arena bounds the working set at 510 MiB instead of letting it grow to
+784 MiB, for 4 ms on a short sentence and 50 ms on a long one.
+
+Capping the intra-op pool on top does save a further 41 MiB, so the trade is real
+rather than free — but it costs **+54% on a short sentence** (261 → 401 ms) and
+**+36% on 8.02 s of audio** (1537 → 2083 ms). The percentage is worse on the short
+sentence because the fixed per-call overhead does not scale with the work, and the
+short sentence is precisely what a listener waits through before the first word.
+41 MiB is not worth that, so it is not done.
+
+This mirrors what faster-whisper's own bundled VAD already does with its session,
+minus the thread caps, which it can afford because its model is 2 MB.
 
 ### The fallback path already exists; reuse it
 
@@ -119,9 +126,9 @@ code.
 
 ### Keep the start-up probe eager
 
-Decided with the user. The probe costs 219.3 MB and 15 threads today; 190.1 MB of
+Decided with the user. The probe costs 219.3 MiB and 15 threads today; 190.1 MiB of
 that disappears as a consequence of the CPU default, since `resolve_providers`
-returns before the CUDA preload. The remaining 32.2 MB and 15 idle threads come
+returns before the CUDA preload. The remaining 32.2 MiB and 15 idle threads come
 from `import onnxruntime` itself and are accepted, because deferring the import
 would mean the daemon could not report why speech output is unavailable until
 someone tried to speak.
@@ -146,7 +153,7 @@ someone tried to speak.
 - **All measurements come from one machine** → The numbers in `proposal.md` are
   from an RTX 3080 Laptop with 16 cores, reproduced across two runs. The decision
   does not depend on their precision: the memory difference is a factor of 13
-  (876 MB against 65 MB), which no plausible per-machine variation reverses.
+  (876 MiB against 65 MiB), which no plausible per-machine variation reverses.
 - **`enable_cpu_mem_arena=False` interacts with a future accelerator session** →
   The option is a CPU-arena setting and has no effect on accelerator allocation,
   so someone who sets `[tts] device = "cuda"` gets today's behaviour with one

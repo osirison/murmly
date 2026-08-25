@@ -51,13 +51,13 @@ across two runs with both models warm in one process:
 
 | | unload | reload | host RSS held |
 | --- | --- | --- | --- |
-| `to_cpu=False` | **0.05 s** | 0.78 s | **none** (−6 MB) |
-| `to_cpu=True` | 0.77 s | **0.22 s** | **+1541 MB** |
+| `to_cpu=False` | **0.05 s** | 0.78 s | **none** (−6 MiB) |
+| `to_cpu=True` | 0.77 s | **0.22 s** | **+1541 MiB** |
 
 `to_cpu=False` is chosen. The reload difference — 0.78 s against 0.22 s — is paid
 in the one place this design already hides it: behind warm-on-capture, while the
 user is still speaking. `to_cpu=True` buys that 0.56 s by parking the weights in
-host RAM, measured at 1316.6 MB → 2857.9 MB of RSS, reproduced exactly across two
+host RAM, measured at 1316.6 MiB → 2857.9 MiB of RSS, reproduced exactly across two
 runs.
 
 For a daemon that is idle almost all of the time, that is not a reduction. It

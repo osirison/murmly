@@ -8,13 +8,13 @@
 
 - [ ] 2.1 Change `resolve_providers` in `src/murmly/tts.py` to read the new `[tts]` device setting instead of `config.device`, and update its docstring — the current one states that `device` is the `[stt]` setting and that there is no separate one for synthesis, which this change makes false
 - [ ] 2.2 Confirm `auto` reproduces today's resolution exactly, including the existing fall backs when the CUDA provider is absent from the runtime build and when `load_cuda_libraries` fails
-- [ ] 2.3 Verify by test that the default path returns at the `cpu` shortcut and never reaches `load_cuda_libraries`, since that is what removes 190.1 MB from daemon start-up
+- [ ] 2.3 Verify by test that the default path returns at the `cpu` shortcut and never reaches `load_cuda_libraries`, since that is what removes 190.1 MiB from daemon start-up
 - [ ] 2.4 Tests: `cpu` and default return the CPU provider with transcription still on `cuda`; `cuda` with a usable accelerator returns the CUDA provider first; `cuda` with an unusable accelerator falls back to CPU and logs the remedy
 
 ## 3. Session construction
 
 - [ ] 3.1 Build the `InferenceSession` in `_load_model` with an explicit `onnxruntime.SessionOptions` that sets `enable_cpu_mem_arena = False`
-- [ ] 3.2 Leave `intra_op_num_threads` and `inter_op_num_threads` at the runtime defaults, and say why in a comment — capping intra-op to 4 was measured at 401 ms against 261 ms for a short sentence, a 36% latency cost for 41 MB
+- [ ] 3.2 Leave `intra_op_num_threads` and `inter_op_num_threads` at the runtime defaults, and say why in a comment — capping intra-op to 4 saves 41 MiB but costs +54% on a short sentence (401 ms against 261 ms) and +36% on 8.02 s of audio (2083 ms against 1537 ms)
 - [ ] 3.3 Tests: the session is constructed with a `SessionOptions` whose CPU arena is disabled, and the provider read back off the session is the one resolution asked for
 
 ## 4. Diagnostics

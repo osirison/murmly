@@ -10,7 +10,7 @@
 
 - [ ] 2.1 Replace the `if self._model is None` residency test in `FasterWhisperTranscriber` with one that also treats an unloaded CTranslate2 model as needing a load — the wrapper survives `unload_model()`, so identity is not residency
 - [ ] 2.2 Move the residency re-check and any reload inside the `_model_lock` block next to `_decode`, so eviction cannot land between acquiring the model and using it
-- [ ] 2.3 Add a release method that acquires `_model_lock`, calls `unload_model(to_cpu=False)`, and is a no-op when the model is absent or already unloaded — `to_cpu=True` would free the GPU by moving 1541 MB into host RSS, which is the opposite of what the daemon needs
+- [ ] 2.3 Add a release method that acquires `_model_lock`, calls `unload_model(to_cpu=False)`, and is a no-op when the model is absent or already unloaded — `to_cpu=True` would free the GPU by moving 1541 MiB into host RSS, which is the opposite of what the daemon needs
 - [ ] 2.4 Add a `resident` property that reports residency without loading anything
 - [ ] 2.5 Add an asynchronous warm-up that `begin_capture()` starts and that never blocks the caller
 - [ ] 2.6 Tests: decode after an eviction returns the same transcript; eviction during a pass waits rather than interrupting; warm-up does not block `begin_capture`; `resident` does not load

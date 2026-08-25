@@ -55,11 +55,13 @@ change removes on its own because `resolve_providers` returns before reaching it
   changes: same voice, same audio, same sentence pacing, same failure handling.
 - Synthesis sessions are constructed with an explicit `SessionOptions` that
   disables the ONNX Runtime CPU arena, bounding the working set at 510 MiB rather
-  than letting it grow to 784 MiB. Warm per-sentence latency is unchanged
-  (261 ms against 257 ms for a short sentence).
+  than letting it grow to 784 MiB. Warm latency is essentially unchanged: 261 ms
+  against 257 ms on a short sentence, 1537 ms against 1487 ms on 8.02 s of audio.
 - The intra-op thread count is deliberately left at the runtime default. Capping
-  it to 4 was measured at 2083 ms against 1537 ms for the same audio — a 36%
-  latency cost for no memory saving.
+  it to 4 does save a further 41 MiB, but costs **+54% on a short sentence**
+  (401 ms against 261 ms) and **+36% on 8.02 s of audio** (2083 ms against
+  1537 ms). The short sentence is what a listener waits through before the first
+  word, and 41 MiB does not pay for it.
 - Diagnostics report which processor synthesis is using and which was configured.
 - As a consequence of the default, the start-up probe no longer preloads the CUDA
   libraries, dropping 190.1 MiB from every daemon start with speech output enabled.
