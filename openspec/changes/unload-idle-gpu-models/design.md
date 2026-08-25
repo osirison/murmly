@@ -17,8 +17,9 @@ ONNX Runtime cannot: memory is owned by the `InferenceSession`, and the only way
 to return it is to drop the session and build another.
 
 Measured on an RTX 3080 Laptop (see `proposal.md` for the table): the
-transcription model returns 2080 MiB for a 0.78 s reload; the synthesis session
-returns 528 MiB for a 0.80 s rebuild.
+transcription model returns 2080 MiB of GPU for a 0.78 s reload. What the
+synthesis session returns now depends on a setting outside this change — see
+"Synthesis: drop and rebuild" below.
 
 ## Goals / Non-Goals
 
@@ -28,8 +29,9 @@ returns 528 MiB for a 0.80 s rebuild.
   needing to know a model can vanish.
 - Make the reload cost invisible for the common case — the user dictates again
   after a gap.
-- Keep the whole feature inert when unconfigured, so the risky paths do not exist
-  in a default install.
+- Ship transcription release enabled and synthesis release disabled, so the path
+  that reclaims accelerator memory is exercised by every install while the one
+  that only costs silence stays opt-in.
 
 **Non-Goals:**
 
@@ -148,13 +150,32 @@ not depend on the warm-up winning the race, only latency does.
 ### Synthesis: drop and rebuild, with its own period
 
 ONNX Runtime has no in-place unload, so releasing means dropping the
-`InferenceSession` and constructing a new one. Measured: 1.02 s to drop, 528 MiB
-returned, 0.80 s until speech can start again.
+`InferenceSession` and constructing a new one.
 
-That ratio is much worse than transcription's — a quarter of the memory for triple
-the latency — which is why the spec gives it a separate setting rather than one
-shared period. A user who wants the 2 GB back without a delay before speech can
-enable one and not the other.
+What that returns changed after this proposal was written.
+`reduce-synthesis-runtime-footprint` made `[tts] device = "cpu"` the default, so
+synthesis holds no accelerator memory to reclaim. Re-measured across two runs
+under each setting:
+
+| `[tts] device` | returns | until speech resumes |
+| --- | --- | --- |
+| `cpu` — the default | **377 MiB host**, no GPU | 759–767 ms (491 ms rebuild + 268 ms first speech) |
+| `cuda` | **528 MiB GPU**, 105 MiB host | 607–611 ms (482 ms rebuild + 126 ms first speech) |
+
+So the original framing — "a quarter of the memory for triple the latency" — no
+longer describes the default. Under `cpu` the timer returns proportionally *more*
+memory than transcription's does relative to what the model holds, and the latency
+gap has closed to roughly the same order. The separate setting is still right, but
+now for a different reason: the two timers reclaim **different resources**, so
+someone short of accelerator memory and someone short of system memory want
+different things enabled.
+
+*Measurement discrepancy, recorded rather than silently corrected:* this section
+originally stated 1.02 s to drop the session. Re-measured, dropping it —
+`del session; gc.collect(); malloc_trim(0)` — takes **28–36 ms** under both
+settings. The rebuild is the expensive half, not the drop. Task 6.3 asks for
+exactly this re-measurement; the original figure may have been measured with
+something else included. Treat the numbers in the table above as current.
 
 ## Risks / Trade-offs
 
@@ -170,6 +191,27 @@ enable one and not the other.
   → It cannot: the evictor acquires the lock, so it waits for the pass rather than
   interrupting it. Worst case the release happens later than configured, which no
   requirement forbids.
+- **Repeated synthesis release/rebuild costs host memory on the accelerator path**
+  → Measured over five cycles, drift against the first resident measurement:
+
+  | cycle | `[tts] device = "cpu"` | `[tts] device = "cuda"` |
+  | --- | --- | --- |
+  | 1 | +35.7 MiB | +277.4 MiB |
+  | 2 | +35.8 MiB | +298.3 MiB |
+  | 3 | +3.4 MiB | +301.0 MiB |
+  | 4 | +13.2 MiB | +303.2 MiB |
+  | 5 | +7.5 MiB | +311.3 MiB |
+
+  The CPU path oscillates and returns to baseline — no compounding, and the
+  released floor is stable at 77.3–77.9 MiB. The accelerator path takes a one-time
+  step of roughly 277 MiB on the first cycle and then creeps about 8 MiB per cycle
+  thereafter. It is not a runaway, but a daemon cycling twenty times a day gains
+  around 160 MiB a day. The hazard is the **combination** — `[tts] device = "cuda"`
+  together with a non-zero synthesis period — which trades 528 MiB of accelerator
+  memory for a permanent 277 MiB of host memory plus slow growth. Under the
+  shipped default the combination does not arise. Documented rather than
+  prevented: whoever opts into both should know the trade, and capping cycles
+  would complicate the timer for a case nobody reaches by default.
 - **A rebuild failure leaves synthesis permanently unavailable** → The reload path
   must treat failure the same way first load does, reporting it and remaining
   retryable, per the spec's "does not disable Murmly" scenario.
@@ -177,19 +219,44 @@ enable one and not the other.
   daemon already uses for its own shutdown sequencing, so a pending timer cannot
   extend or block exit. `src/murmly/daemon.py` already has this problem solved for
   other background work; reuse it rather than adding a bare `threading.Timer`.
-- **The feature is inert by default, so it will be under-exercised in practice** →
-  Tests must cover the evicted-then-reused path directly rather than relying on it
+- **Transcription release now runs on every install, so a defect in it reaches
+  everyone rather than only opt-in users** → This is the deliberate trade for the
+  path no longer being under-exercised. It raises the bar on section 2's tests
+  rather than lowering it: the evicted-then-reused path, eviction racing a pass,
+  and a failed reload must all be covered directly, because there is no longer a
+  population of users running with the feature off to notice a regression late.
+  The cycle itself was measured stable over eight iterations before this default
+  was chosen — GPU returning to exactly 2240 MiB each time, host drift flat at
+  +2.3 MiB from cycle 1 onward.
+- **Synthesis release stays inert by default, so it will be under-exercised** →
+  Accepted, and it is the lower-risk of the two: it returns host memory rather
+  than accelerator memory, and a defect in it cannot lose a transcript. Tests must
+  still cover the released-then-rebuilt path directly rather than relying on it
   being hit incidentally.
 
 ## Migration Plan
 
-No migration. Both settings are absent in existing installs, which means disabled,
-which is exactly today's behaviour. Rollback is setting them back to `0`.
+Synthesis needs no migration: its default is `0`, so an existing install behaves
+exactly as it does today.
+
+Transcription does change on upgrade. An install that sets nothing begins
+releasing the model after five idle minutes and reloading it when capture next
+begins. Nothing about a transcript changes — the spec requires a release to be
+undetectable except in the time the first use after it takes — and the reload is
+started at capture, so in normal dictation there is nothing to wait for.
+Rollback is `[stt] unload_after_idle_s = 0`.
 
 ## Open Questions
 
-- Whether the shipped defaults should be `0` (off) or a non-zero period. Recorded
-  as an open decision in `proposal.md`; it changes no requirement, since the spec
-  is written in terms of "the configured period" either way.
-- What the upper bound on each period should be. Any bounded value satisfies the
-  spec; picking the number can wait for implementation.
+None. Both questions this section previously carried are now answered.
+
+The bounds are **30–86400 seconds**. The floor is 30 s because anything shorter
+would fire between dictations in an ordinary working session, and the ceiling is
+24 hours because beyond that the setting is indistinguishable from `0`, which
+already means never.
+
+The shipped defaults are `300` for transcription and `0` for synthesis, decided
+with the evidence in `proposal.md` — Decision: transcription on, synthesis off.
+An earlier version of this section wrongly called that decision spec-neutral. It
+was not: choosing a non-zero default required amending the requirement and its
+scenario, which this change now does.
