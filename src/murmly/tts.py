@@ -173,19 +173,21 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
     fails on a missing `libnvinfer`, and only then falls back, which turns every
     session construction into a page of error output.
 
-    `device` is the `[stt]` setting, and there is no separate one for synthesis.
-    So it is read as a preference and never as a demand: a person who pinned
-    transcription to the GPU has not asked for GPU synthesis, and refusing every
-    speech session because the GPU build of ONNX Runtime is absent would make a
-    setting about transcription disable a feature it does not name. What is
-    never allowed is a silent fallback -- the reason is logged and `murmly
-    doctor` reports both the providers in use and the remedy.
+    The setting read is `[tts] device`, which is synthesis's own and defaults
+    to the CPU. `[stt] device` decided it until that default landed, so pinning
+    transcription to the GPU also put speech there. It is still read as a
+    preference and never as a demand: an explicitly configured `cuda` that
+    cannot be used falls back and speaks, because refusing every speech session
+    over a missing GPU build would leave someone silent to protect a
+    preference. What is never allowed is a silent fallback -- the reason is
+    logged and `murmly doctor` reports both the providers in use and the remedy.
     """
     # Before the cpu shortcut, not after it. CPU synthesis needs the runtime
-    # every bit as much as CUDA does, so skipping the check for `device = "cpu"`
-    # reported speech output as available on an environment where the first
-    # session would fail -- accept-then-fail, which is what the probe exists to
-    # prevent.
+    # every bit as much as CUDA does, so skipping the check for the `cpu`
+    # setting reported speech output as available on an environment where the
+    # first session would fail -- accept-then-fail, which is what the probe
+    # exists to prevent. The `cpu` default makes that the ordinary path rather
+    # than a corner of one.
     #
     # Whether this runtime build carries the CUDA provider is a separate
     # question, and the module-level list is what answers it. What that list
@@ -204,15 +206,16 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         # meant to degrade on its own.
         raise RuntimeError(RUNTIME_UNUSABLE_REMEDY) from error
 
-    if config.device == "cpu":
+    if config.tts_device == "cpu":
         return [CPU_PROVIDER]
 
     if CUDA_PROVIDER not in available:
-        # Silent only when there is no GPU to use. `device = "auto"` is the
-        # default and the documented CPU install hits this branch on every
-        # machine, so printing the GPU-swap remedy there tells someone with no
-        # NVIDIA device to replace a working runtime to fix an absence.
-        if config.device == "cuda" or (cuda_device_count_available() or 0) > 0:
+        # Silent only when there is no GPU to use. The default returns at the
+        # shortcut above, so what reaches here asked for a GPU by name or by
+        # `auto` -- and `auto` on a machine with no NVIDIA device is an absence
+        # rather than a fault, so printing the GPU-swap remedy there would tell
+        # someone to replace a working runtime to fix nothing.
+        if config.tts_device == "cuda" or (cuda_device_count_available() or 0) > 0:
             logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
         return [CPU_PROVIDER]
 
@@ -403,8 +406,12 @@ class KokoroSynthesizer:
             resolve_espeak()
             # Checked here rather than at the first speak: a configuration that
             # names a runtime it cannot have must refuse sessions with a reason,
-            # not accept one and fail once someone is listening. Costs only
-            # distribution metadata and a dlopen.
+            # not accept one and fail once someone is listening. Under the `cpu`
+            # default that costs distribution metadata and nothing else, because
+            # resolution returns above the CUDA preload -- 188 MB of RSS and
+            # seven mapped libraries that a daemon which will never reach them
+            # paid at every start. `[tts] device = "cuda"` still pays it, having
+            # asked for it.
             resolve_providers(self._config)
         except RuntimeError as error:
             return str(error)
@@ -438,11 +445,30 @@ class KokoroSynthesizer:
 
         library_path, data_path = resolve_espeak()
         providers = resolve_providers(self._config)
+        # Nothing was passed here at all, which left every ONNX Runtime default
+        # in force -- the only session in this dependency tree that did, since
+        # faster-whisper's own bundled VAD sets its options explicitly. Measured
+        # over 16 utterances the CPU arena let the working set grow from 452 MiB
+        # to 784 MiB; without it the set holds at 510 MiB, for 4 ms on a short
+        # sentence and 50 ms on 8.02 s of audio. The option governs the CPU
+        # allocator alone, so it is inert under CUDA -- measured rather than
+        # assumed, because this graph runs some operators on the CPU either way.
+        options = onnxruntime.SessionOptions()
+        options.enable_cpu_mem_arena = False
+        # `intra_op_num_threads` and `inter_op_num_threads` stay at the runtime
+        # defaults on purpose. Capping intra-op to 4 saves a further 41 MiB, but
+        # costs +54% on a short sentence (401 ms against 261 ms) and +36% on
+        # 8.02 s of audio (2083 ms against 1537 ms). The short sentence is what
+        # a listener waits through before the first word, and 41 MiB does not
+        # pay for it.
+        #
         # The session is built here rather than left to the package, whose own
         # resolution hands the runtime every provider it can see. TensorRT heads
         # that list, fails on a missing libnvinfer, and prints a page of errors
         # before falling back.
-        session = onnxruntime.InferenceSession(str(self.model_path), providers=providers)
+        session = onnxruntime.InferenceSession(
+            str(self.model_path), sess_options=options, providers=providers
+        )
         model = Kokoro.from_session(
             session,
             str(self.voices_path),

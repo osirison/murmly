@@ -49,7 +49,7 @@ from murmly.focus import FocusObserver, create_focus_observer, record_target, sh
 from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend, renderer_environment
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
-from murmly.tts import KokoroSynthesizer, resolve_providers
+from murmly.tts import CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
 
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
@@ -539,6 +539,7 @@ def speech_output_diagnostics(
         "enabled": config.tts_enabled,
         "voice": config.tts_voice,
         "rate_percent": config.tts_rate_percent,
+        "device": config.tts_device,
         "model_dir": str(config.tts_model_dir),
         "output_device": config.tts_output_device or None,
     }
@@ -546,6 +547,8 @@ def speech_output_diagnostics(
         report["voice_rejected_value"] = config.tts_voice_rejected_value
     if config.tts_rate_rejected_value is not None:
         report["rate_rejected_value"] = config.tts_rate_rejected_value
+    if config.tts_device_rejected_value is not None:
+        report["device_rejected_value"] = config.tts_device_rejected_value
 
     if not config.tts_enabled:
         report["available"] = False
@@ -560,11 +563,34 @@ def speech_output_diagnostics(
         report["detail"] = probe.unavailable_reason
         return report
 
+    providers: list[str] | None = None
+    fallback_reason: str | None = None
     try:
-        report["providers"] = resolve_providers(config)
+        providers, fallback_reason = synthesis_providers(config)
+        report["providers"] = providers
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         report["providers"] = None
         report["provider_detail"] = str(error)
+
+    # Read off a constructed session where there is one, and otherwise off what
+    # resolution would choose. Never off `onnxruntime.get_available_providers()`,
+    # which advertises CUDA on a runtime whose session then falls back to the
+    # CPU, so a report built from it names a processor that never ran the model
+    # -- see docs/agent-notes/onnxruntime-gpu-cuda-version.md. In `murmly doctor`
+    # the probe holds no session, because the probe deliberately does not
+    # construct the model, so what is reported there is resolution's choice.
+    in_use = probe.provider or (providers[0] if providers else None)
+    report["device_in_use"] = None if in_use is None else _processor_name(in_use)
+    if fallback_reason is not None:
+        report["device_detail"] = fallback_reason
+    elif in_use != CUDA_PROVIDER and CUDA_PROVIDER in (providers or ()):
+        # Resolution got the accelerator and the session is running on something
+        # else: accept-then-fail, which nothing but a constructed session can
+        # show. Resolution logged nothing here because from where it stands
+        # nothing went wrong.
+        report["device_detail"] = (
+            f"Speech output resolved {CUDA_PROVIDER} and the session reports {in_use}."
+        )
 
     rate, device_name, device_detail, probe_detail = negotiated_output(config)
     report["negotiated_output_rate_hz"] = rate
@@ -578,6 +604,50 @@ def speech_output_diagnostics(
         report["available"] = False
         report["detail"] = probe_detail
     return report
+
+
+class _CollectedWarnings(logging.Handler):
+    """Keeps the warnings logged while it is attached, for the report to carry."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+def synthesis_providers(config: MurmlyConfig) -> tuple[list[str], str | None]:
+    """The providers synthesis would use, and why it fell back to the CPU.
+
+    The reason is taken from the warning `resolve_providers` already logs rather
+    than worked out a second time here. Three separate conditions send synthesis
+    to the CPU -- a runtime build without the provider, the CUDA extra missing
+    behind it, and a library that refuses to load -- and each names a different
+    remedy. A second copy of that test would drift from the one that decides and
+    name the wrong one, which is worse than naming none, because a remedy is
+    followed. The warning reaches standard error either way; it is carried into
+    the report as well so nobody has to read the two together.
+    """
+    collected = _CollectedWarnings()
+    # Named off the function rather than written out, so resolution and the
+    # report cannot end up watching two different loggers.
+    resolution = logging.getLogger(resolve_providers.__module__)
+    resolution.addHandler(collected)
+    try:
+        providers = resolve_providers(config)
+    finally:
+        resolution.removeHandler(collected)
+    return providers, collected.messages[-1] if collected.messages else None
+
+
+def _processor_name(provider: str) -> str:
+    """An execution provider in the vocabulary `[tts] device` is written in.
+
+    So the two can be read as a pair -- what was asked for, and what is in use.
+    A provider name does not compare against a device setting.
+    """
+    return "cuda" if provider == CUDA_PROVIDER else "cpu"
 
 
 def negotiated_output(

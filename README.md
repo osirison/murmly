@@ -253,18 +253,57 @@ Then place the model files in `~/.local/share/murmly`:
 And set `enabled = true` under `[tts]` in your configuration. `murmly doctor`
 reports what is missing under `speech_output` and names the remedy for each.
 
-Synthesis runs on the CPU at roughly five times real time, which is enough.
-`[stt] device` selects the synthesis provider as well as the transcription one,
-but it is read as a preference rather than a demand: with `cuda` set and no GPU
-build of ONNX Runtime installed, synthesis falls back to the CPU and logs the
-remedy instead of refusing sessions. Install the GPU build below and `cuda` or
-`auto` runs synthesis on the GPU too; `cpu` keeps it on the CPU whatever is
-installed.
+### Where synthesis runs
 
-To run synthesis on the GPU too, note that the GPU build of ONNX Runtime
-**replaces** the CPU one rather than joining it — both install into the same
-`onnxruntime` package namespace, and an environment holding both leaves the
-survivor of any later uninstall broken:
+`[tts] device` chooses the processor synthesis runs on — `auto`, `cpu` or
+`cuda`, the same vocabulary as `[stt] device` — and defaults to `cpu`. It is
+synthesis's own setting: `[stt] device` is about transcription and does not
+decide where speech is produced.
+
+The CPU is the default because the GPU does not give back what synthesis takes
+from it. Measured on one machine (RTX 3080 Laptop, 16 cores, reproduced across
+two runs), still held after the synthesis session has been destroyed:
+
+| `[tts] device` | system memory | GPU memory |
+| --- | --- | --- |
+| `cuda` | 876 MiB | 1208 MiB |
+| `cpu` | 65 MiB | none |
+
+The CPU path gives essentially all of its memory back when the session ends.
+The CUDA path keeps its 876 MiB however hard it is collected or trimmed, so the
+only way not to hold it is not to take it. What the CPU costs is about 200 ms
+more before the first word. Nothing after that: synthesis runs at roughly five
+times real time, so each sentence is finished between 1.0 and 3.4 seconds
+before the audio ahead of it has played out, and every sentence past the first
+is gapless. Same voice, same audio, same pacing, same failure handling.
+
+Set `device = "cuda"` to run synthesis on the GPU, which also needs the GPU
+build of ONNX Runtime installed as below. `auto` uses the GPU when it is usable
+and the CPU when it is not. Either value is read as a preference rather than a
+demand: with `cuda` set and no GPU build installed, synthesis falls back to the
+CPU and logs the remedy instead of refusing sessions.
+
+Synthesis read `[stt] device` before this setting existed, so the `cpu` default
+moves speech output off the GPU on upgrade for some installs and leaves others
+exactly where they were:
+
+| `[tts] enabled` | `[stt] device` | GPU usable | moves to the CPU? |
+| --- | --- | --- | --- |
+| `false` (the default) | any | any | No — synthesis is never constructed |
+| `true` | `cpu` | any | No — already on the CPU |
+| `true` | `auto` | no | No — already falling back to the CPU |
+| `true` | `cuda` | yes | Yes |
+| `true` | `auto` | yes | Yes |
+
+To keep what you had, set `[tts] device` to whatever `[stt] device` is set to,
+and restart the daemon. That reproduces the previous resolution exactly,
+because that is the value synthesis used to read: measured across two runs, it
+holds the same 1208 MiB of GPU memory at the same warm latency as before, and
+`CUDAExecutionProvider` is read back off the session.
+
+The GPU build of ONNX Runtime **replaces** the CPU one rather than joining it —
+both install into the same `onnxruntime` package namespace, and an environment
+holding both leaves the survivor of any later uninstall broken:
 
 ```bash
 uv sync --extra cuda --extra tts
@@ -494,6 +533,7 @@ text_size_px = 13 # Transcript panel text size, 8-48
 enabled = false        # Speech output; see "Speech output" below
 voice = "af_heart"     # An English voice the model carries
 rate = 100             # Percentage of the model's own speaking rate, 50-200
+device = "cpu"         # auto | cpu | cuda, independent of [stt] device
 output_device = ""     # Empty lets the system choose
 # model_dir = "~/.local/share/murmly"   # Where the model and voices are
 ```
@@ -542,12 +582,12 @@ Profile mapping:
 - `balanced` -> `large-v3-turbo`
 - `accurate` -> `large-v3`
 
-With `device = "auto"`, Murmly uses CUDA `float16` when a compatible GPU and the
-CUDA extra are available, and falls back to CPU `int8` otherwise. The first use
-of a profile downloads its model; later sessions reuse the local cache. The
-tested CUDA runtime wheels are about 1.8 GB and the cached `large-v3-turbo`
-model about 1.6 GB. The balanced model revision is pinned for reproducible
-downloads.
+With `[stt] device = "auto"`, Murmly uses CUDA `float16` when a compatible GPU
+and the CUDA extra are available, and falls back to CPU `int8` otherwise. The
+first use of a profile downloads its model; later sessions reuse the local
+cache. The tested CUDA runtime wheels are about 1.8 GB and the cached
+`large-v3-turbo` model about 1.6 GB. The balanced model revision is pinned for
+reproducible downloads.
 
 ### Live transcription
 

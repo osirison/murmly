@@ -1406,6 +1406,161 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
         self.assertEqual("Built-in Audio", report["output_device_in_use"])
         self.assertIn("instead", report["output_device_detail"])
 
+    def test_a_default_install_reports_the_cpu_as_the_processor_in_use(self) -> None:
+        """Through the real probe, which is what `murmly doctor` constructs.
+
+        The probe holds no session, so the processor named is the one
+        resolution would choose -- and an unconfigured `[tts] device` means the
+        CPU, which resolution returns before it reaches the CUDA preload.
+        """
+        from murmly.cli import speech_output_diagnostics
+        from murmly.tts import CPU_PROVIDER, MODEL_FILE_NAME, VOICES_FILE_NAME, KokoroSynthesizer
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir, tts_enabled=True)
+            config.tts_model_dir.mkdir(parents=True, exist_ok=True)
+            for name in (MODEL_FILE_NAME, VOICES_FILE_NAME):
+                (config.tts_model_dir / name).write_bytes(b"")
+            with (
+                patch("importlib.util.find_spec", return_value=object()),
+                patch("murmly.tts.resolve_espeak", return_value=("libespeak-ng.so.1", "/data")),
+                patch(
+                    "murmly.cli.negotiated_output",
+                    return_value=(48_000, "Studio Speakers", None, None),
+                ),
+                # The weights are 326 MB and the report is asked for on a
+                # machine that may be about to explain why speech does not
+                # work. Reporting the processor must not be what loads them.
+                patch.object(KokoroSynthesizer, "_load_model") as load_model,
+            ):
+                report = speech_output_diagnostics(config)
+
+        self.assertEqual("cpu", report["device"])
+        self.assertEqual("cpu", report["device_in_use"])
+        self.assertEqual([CPU_PROVIDER], report["providers"])
+        self.assertNotIn("device_detail", report, "nothing fell back")
+        load_model.assert_not_called()
+
+    def test_an_unrecognized_processor_is_reported_alongside_the_one_in_use(self) -> None:
+        """The one in use here is the default the unrecognized value fell back to.
+
+        Read out of the configuration rather than out of a probe, so it is in
+        the report on a disabled install too -- which is where a setting nobody
+        can see taking effect is most likely to be sitting.
+        """
+        from murmly.cli import speech_output_diagnostics
+        from murmly.config import load_config
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('[tts]\ndevice = "rocm"\n')
+            report = speech_output_diagnostics(load_config(config_path))
+
+        self.assertEqual("cpu", report["device"])
+        self.assertEqual("rocm", report["device_rejected_value"])
+        json.dumps(report)
+
+    def test_an_accelerator_that_cannot_be_used_is_reported_with_its_remedy(self) -> None:
+        """The spec's fall-back scenario, answered by the report on its own.
+
+        `resolve_providers` logs the remedy, and the report carries the same
+        text: someone reading JSON out of `murmly doctor` should not have to
+        correlate it with what went to standard error to find out what to do.
+        """
+        from murmly.cli import speech_output_diagnostics
+        from murmly.tts import CPU_PROVIDER
+        from fakes import FakeSynthesizer
+
+        probe = FakeSynthesizer()
+        # A synthesizer that has not spoken holds no session, which is the state
+        # every probe `murmly doctor` builds is in.
+        probe.provider = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir, tts_enabled=True, tts_device="cuda")
+            with (
+                # A runtime build without the CUDA provider, stood in for so the
+                # assertion does not depend on which build is installed.
+                patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]),
+                patch(
+                    "murmly.cli.negotiated_output",
+                    return_value=(48_000, "Studio Speakers", None, None),
+                ),
+                self.assertLogs("murmly.tts", level="WARNING"),
+            ):
+                report = speech_output_diagnostics(config, probe)
+
+        self.assertEqual("cuda", report["device"])
+        self.assertEqual("cpu", report["device_in_use"])
+        self.assertEqual([CPU_PROVIDER], report["providers"])
+        self.assertIn("onnxruntime-gpu", report["device_detail"])
+        # Speech still works; it is the accelerator that is unavailable, and a
+        # report calling speech unavailable would say the opposite.
+        self.assertTrue(report["available"])
+
+    def test_the_processor_in_use_comes_off_the_session_and_not_the_runtime(self) -> None:
+        """`get_available_providers()` advertises CUDA on a session that fell back.
+
+        Resolution sees a runtime carrying the provider and libraries that load,
+        so it asks for the accelerator and has no way to know the session did
+        not get it. Only the session knows, so the session is what is read. See
+        docs/agent-notes/onnxruntime-gpu-cuda-version.md.
+        """
+        from murmly.cli import speech_output_diagnostics
+        from murmly.tts import CPU_PROVIDER, CUDA_PROVIDER
+        from fakes import FakeSynthesizer
+
+        probe = FakeSynthesizer()
+        probe.provider = CPU_PROVIDER
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir, tts_enabled=True, tts_device="cuda")
+            with (
+                patch(
+                    "onnxruntime.get_available_providers",
+                    return_value=[CUDA_PROVIDER, CPU_PROVIDER],
+                ),
+                patch("murmly.tts.load_cuda_libraries", return_value=True),
+                patch(
+                    "murmly.cli.negotiated_output",
+                    return_value=(48_000, "Studio Speakers", None, None),
+                ),
+            ):
+                report = speech_output_diagnostics(config, probe)
+
+        self.assertEqual([CUDA_PROVIDER, CPU_PROVIDER], report["providers"])
+        self.assertEqual("cpu", report["device_in_use"])
+        self.assertIn(CPU_PROVIDER, report["device_detail"])
+
+    def test_a_runtime_that_cannot_be_resolved_still_produces_a_report(self) -> None:
+        """The processor is one section of the report, not a precondition for it.
+
+        A half-installed ONNX Runtime is the condition someone runs `murmly
+        doctor` to have explained, so the reason belongs in the report rather
+        than in place of it.
+        """
+        from murmly.cli import speech_output_diagnostics
+        from fakes import FakeSynthesizer
+
+        probe = FakeSynthesizer()
+        probe.provider = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(temp_dir, tts_enabled=True)
+            with (
+                patch(
+                    "murmly.cli.resolve_providers",
+                    side_effect=RuntimeError("the ONNX Runtime is missing or unusable"),
+                ),
+                patch(
+                    "murmly.cli.negotiated_output",
+                    return_value=(48_000, "Studio Speakers", None, None),
+                ),
+            ):
+                report = speech_output_diagnostics(config, probe)
+
+        self.assertIsNone(report["providers"])
+        self.assertIsNone(report["device_in_use"])
+        self.assertIn("unusable", report["provider_detail"])
+        self.assertEqual(48_000, report["negotiated_output_rate_hz"], "a later section was lost")
+
     def test_a_probe_that_fails_does_not_abandon_the_rest_of_the_report(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
