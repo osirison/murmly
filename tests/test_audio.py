@@ -7,10 +7,12 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
+from module_stubs import injected_module, removed_module
 from murmly.audio import (
     LevelSmoother,
     SoundDeviceRecorder,
@@ -198,7 +200,7 @@ class AudioTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            with injected_module("sounddevice", sounddevice):
                 recorder = SoundDeviceRecorder(config, level_sink=failing_sink)
                 recorder.start()
                 callback = callback_holder["callback"]
@@ -230,7 +232,7 @@ class AudioTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            with injected_module("sounddevice", sounddevice):
                 recorder = SoundDeviceRecorder(config, level_sink=blocking_sink)
                 recorder.start()
                 callback = callback_holder["stream"]["callback"]
@@ -331,9 +333,9 @@ class AudioTests(unittest.TestCase):
             socket_path=Path(temp_dir) / "murmly.sock",
             config_path=Path(temp_dir) / "config.toml",
         )
-        patcher = patch.dict(sys.modules, {"sounddevice": sounddevice})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        stack = ExitStack()
+        stack.enter_context(injected_module("sounddevice", sounddevice))
+        self.addCleanup(stack.close)
         recorder = SoundDeviceRecorder(config)
         recorder.start()
         return recorder, callback_holder
@@ -356,7 +358,7 @@ class AudioTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            with injected_module("sounddevice", sounddevice):
                 recorder = SoundDeviceRecorder(config, level_sink=lambda _level: None)
                 recorder.start()
                 callback_holder["callback"](b"\x00\x40" * 120, 120, object(), None)
@@ -394,7 +396,7 @@ class AudioTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            with injected_module("sounddevice", sounddevice):
                 recorder = SoundDeviceRecorder(config, level_sink=blocking_sink)
                 recorder.start()
                 callbacks[0](b"\x00\x40" * 120, 120, object(), None)
@@ -427,7 +429,7 @@ class AudioTests(unittest.TestCase):
                 config_path=Path(temp_dir) / "config.toml",
             )
             with (
-                patch.dict(sys.modules, {"sounddevice": sounddevice}),
+                injected_module("sounddevice", sounddevice),
                 patch("murmly.audio.threading.Thread.start", side_effect=RuntimeError("no thread")),
             ):
                 recorder = SoundDeviceRecorder(config, level_sink=lambda _level: None)
@@ -463,7 +465,7 @@ class AudioTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            with injected_module("sounddevice", sounddevice):
                 recorder = SoundDeviceRecorder(config)
                 recorder.start()
 
@@ -494,7 +496,7 @@ class AudioTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            with injected_module("sounddevice", sounddevice):
                 recorder = SoundDeviceRecorder(config)
                 recorder.start()
 
@@ -533,7 +535,7 @@ class AudioTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+            with injected_module("sounddevice", sounddevice):
                 recorder = SoundDeviceRecorder(config)
                 recorder.start()
 
@@ -593,9 +595,9 @@ class CaptureAccumulatorConcurrencyTests(unittest.TestCase):
             socket_path=Path(temp_dir) / "murmly.sock",
             config_path=Path(temp_dir) / "config.toml",
         )
-        patcher = patch.dict(sys.modules, {"sounddevice": sounddevice})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        stack = ExitStack()
+        stack.enter_context(injected_module("sounddevice", sounddevice))
+        self.addCleanup(stack.close)
         recorder = SoundDeviceRecorder(config)
         recorder.start()
         return recorder, callback_holder["callback"]
@@ -707,9 +709,9 @@ class PlaybackTests(unittest.TestCase):
             config_path=Path(temp_dir) / "config.toml",
             tts_enabled=True,
         )
-        patcher = patch.dict(sys.modules, {"sounddevice": sounddevice})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        stack = ExitStack()
+        stack.enter_context(injected_module("sounddevice", sounddevice))
+        self.addCleanup(stack.close)
         return SoundDevicePlayer(config), streams, sounddevice
 
     @staticmethod
@@ -1033,7 +1035,7 @@ class PlaybackTests(unittest.TestCase):
             config_path=Path(temp_dir) / "config.toml",
             tts_output_device="Built-in Audio",
         )
-        with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+        with injected_module("sounddevice", sounddevice):
             player = SoundDevicePlayer(config)
             player.start()
 
@@ -1056,7 +1058,7 @@ class PlaybackTests(unittest.TestCase):
             config_path=Path(temp_dir) / "config.toml",
             tts_output_device="Missing Headset",
         )
-        with patch.dict(sys.modules, {"sounddevice": sounddevice}):
+        with injected_module("sounddevice", sounddevice):
             player = SoundDevicePlayer(config)
             player.start()
 
@@ -1100,8 +1102,7 @@ class ExitTeardownTests(unittest.TestCase):
     """
 
     def test_nothing_is_unregistered_when_sounddevice_was_never_imported(self) -> None:
-        with patch.dict(sys.modules):
-            sys.modules.pop("sounddevice", None)
+        with removed_module("sounddevice"):
             with patch("murmly.audio.atexit.unregister") as unregister:
                 disable_portaudio_exit_teardown()
 
@@ -1110,7 +1111,7 @@ class ExitTeardownTests(unittest.TestCase):
     def test_the_exit_hook_is_unregistered_when_sounddevice_is_imported(self) -> None:
         module = ModuleType("sounddevice")
         module._exit_handler = lambda: None
-        with patch.dict(sys.modules, {"sounddevice": module}):
+        with injected_module("sounddevice", module):
             with patch("murmly.audio.atexit.unregister") as unregister:
                 disable_portaudio_exit_teardown()
 
@@ -1118,7 +1119,7 @@ class ExitTeardownTests(unittest.TestCase):
 
     def test_a_hook_that_is_no_longer_there_is_reported_not_raised(self) -> None:
         module = ModuleType("sounddevice")
-        with patch.dict(sys.modules, {"sounddevice": module}):
+        with injected_module("sounddevice", module):
             with patch("murmly.audio.atexit.unregister") as unregister:
                 with self.assertLogs("murmly.audio", level="WARNING") as logs:
                     disable_portaudio_exit_teardown()
