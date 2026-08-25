@@ -17,7 +17,7 @@
 
 ## 3. Synthesis residency
 
-- [ ] 3.1 Add a release method to `KokoroSynthesizer` that acquires `_model_lock` and drops the `InferenceSession`, since ONNX Runtime has no in-place unload
+- [ ] 3.1 Add a release method to `KokoroSynthesizer` that acquires `_model_lock` and drops the `InferenceSession`, since ONNX Runtime has no in-place unload. Dropping it is cheap — 28-36 ms measured, not the 1.02 s this change originally recorded; the rebuild is the expensive half
 - [ ] 3.2 Make `_load_model` rebuild after a release, and keep a failed rebuild retryable rather than permanently unavailable
 - [ ] 3.3 Add a `resident` property that reports residency without constructing a session
 - [ ] 3.4 Tests: synthesis after a release succeeds; release during synthesis waits; a failed rebuild is retried on the next request
@@ -39,6 +39,7 @@
 ## 6. Verification
 
 - [ ] 6.1 Run the full suite with `.venv/bin/python -m unittest discover -s tests` — not `uv run --extra cuda`, which resyncs the environment and reinstalls the CPU `onnxruntime` over the GPU build, for the same reason 6.3 gives
-- [ ] 6.2 On a CUDA machine, confirm with `nvidia-smi --query-compute-apps` that an idle release actually returns memory to the system, not to an internal pool
+- [ ] 6.2 Confirm an idle release returns memory to the system rather than to an internal pool. For transcription that is `nvidia-smi --query-compute-apps`. For synthesis it depends on `[tts] device`: under the default (`cpu`) there is no accelerator memory to observe and the check is host RSS returning to its released floor of roughly 77 MiB; only under `cuda` does `nvidia-smi` show the 528 MiB
 - [ ] 6.3 Re-measure release and reload timings against the numbers in `proposal.md` using the scratch benchmarks, and record any drift — run them with `.venv/bin/python`, never `uv run --extra`, which reinstalls the CPU `onnxruntime` and makes a synthesis measurement silently report a CPU session (see `docs/agent-notes/onnxruntime-gpu-cuda-version.md`)
 - [ ] 6.4 Confirm a default install with neither setting configured holds both models exactly as it does today
+- [ ] 6.5 Measure host RSS across at least five synthesis release/rebuild cycles under both `[tts] device` values and check it against the drift table in `design.md` — Risks. Expect the `cpu` path to oscillate and return to baseline, and the `cuda` path to take a one-time step of roughly 277 MiB and then creep about 8 MiB per cycle. If the `cuda` creep is materially steeper than measured, the synthesis timer needs a guard rather than only documentation
