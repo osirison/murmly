@@ -13,13 +13,21 @@ Measured here (RTX 3080 Laptop, `large-v3-turbo` float16, kokoro-onnx on
 
 | | Holds | Reclaimable | Cost to restore |
 | --- | --- | --- | --- |
-| Transcription (CTranslate2) | ~2245 MiB | **2080 MiB** | **0.28 s** |
+| Transcription (CTranslate2) | ~2245 MiB | **2080 MiB** | **0.78 s** |
 | Synthesis (ONNX Runtime) | ~701 MiB | **528 MiB** | **0.80 s** |
 
 The reclaim is cheap enough to be invisible. CTranslate2 exposes
-`unload_model(to_cpu=True)`, which returns the GPU memory while keeping the
-weights in system RAM, so the next dictation pays 0.28 s — and that 0.28 s can be
-hidden entirely by warming on record-start, while the user is still speaking.
+`unload_model(to_cpu=False)`, which frees the GPU memory outright, so the next
+dictation pays 0.78 s — and that 0.78 s can be hidden entirely by warming on
+record-start, while the user is still speaking.
+
+`to_cpu=True` is the other mode, and this change does not use it. It reloads in
+0.22 s rather than 0.78 s, but it buys that by keeping the weights in system RAM.
+Measured on this machine across two runs, it moves **1541 MiB into host RSS**
+(1316.6 MiB to 2857.9 MiB) to free the same GPU. Murmly is a daemon that is idle
+almost all of the time and already holds 1812 MiB of host RSS, so trading a third
+of the GPU for one and a half gigabytes of system RAM does not reduce the
+footprint — it relocates it. See `design.md` — Use `unload_model(to_cpu=False)`.
 
 ## What Changes
 
