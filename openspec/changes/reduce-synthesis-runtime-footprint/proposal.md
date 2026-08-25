@@ -2,7 +2,7 @@
 
 Speech output runs on `CUDAExecutionProvider`, and the memory that choice costs
 never comes back. Measured on this machine (RTX 3080 Laptop, 16 GiB, kokoro-v1.0,
-reproduced across two runs), with the daemon holding 3340 MiB of GPU and 1812 MB
+reproduced across two runs), with the daemon holding 3340 MiB of GPU and 1812 MiB
 of host RSS at 0% utilisation:
 
 | | host RSS held after the session is destroyed | GPU |
@@ -10,7 +10,7 @@ of host RSS at 0% utilisation:
 | `CUDAExecutionProvider` | **876 MiB** | **1208 MiB** |
 | `CPUExecutionProvider` | 65 MiB | 0 MiB |
 
-Destroying the ONNX session returns only 186 MB of the CUDA path's 1085 MB; `gc`
+Destroying the ONNX session returns only 186 MiB of the CUDA path's 1085 MiB; `gc`
 and `malloc_trim` return nothing further. The CPU path returns essentially all of
 it. So this memory cannot be reclaimed by the idle-release work in
 `unload-idle-gpu-models` — the only way not to hold it is not to allocate it.
@@ -41,34 +41,80 @@ constructed with no `SessionOptions` at all, which is the only session in this
 dependency tree that accepts every ONNX Runtime default — faster-whisper's own
 bundled VAD sets `intra_op_num_threads=1`, `inter_op_num_threads=1` and
 `enable_cpu_mem_arena=False` on its session. And `KokoroSynthesizer.__init__`
-runs a start-up probe costing 219.3 MB of RSS and 15 idle threads before any model
-is constructed; 190.1 MB of that is the CUDA library preload, which the provider
+runs a start-up probe costing 219.3 MiB of RSS and 15 idle threads before any model
+is constructed; 190.1 MiB of that is the CUDA library preload, which the provider
 change removes on its own because `resolve_providers` returns before reaching it.
 
 ## What Changes
 
-- Synthesis gets its own device setting, `[tts] device`, independent of `[stt]`.
-- **BREAKING for existing installs with speech output enabled**: the new setting
-  defaults to the processor, so synthesis moves off the GPU on upgrade. The first
-  word of a speech session arrives roughly 200 ms later; nothing else about speech
-  output changes. Setting `[tts] device = "cuda"` restores today's behaviour.
+- Synthesis gets its own device setting, `[tts] device`, taking the same
+  `auto | cpu | cuda` vocabulary as `[stt] device` and independent of it.
+- The new setting **defaults to `cpu`**, so synthesis moves off the accelerator on
+  upgrade for the installs listed under "Who this changes" below. The first word of
+  a speech session arrives roughly 200 ms later. Nothing else about speech output
+  changes: same voice, same audio, same sentence pacing, same failure handling.
 - Synthesis sessions are constructed with an explicit `SessionOptions` that
-  disables the ONNX Runtime CPU arena, bounding the working set at 510 MB rather
-  than letting it grow to 784 MB. Warm per-sentence latency is unchanged
+  disables the ONNX Runtime CPU arena, bounding the working set at 510 MiB rather
+  than letting it grow to 784 MiB. Warm per-sentence latency is unchanged
   (261 ms against 257 ms for a short sentence).
 - The intra-op thread count is deliberately left at the runtime default. Capping
   it to 4 was measured at 2083 ms against 1537 ms for the same audio — a 36%
   latency cost for no memory saving.
 - Diagnostics report which processor synthesis is using and which was configured.
 - As a consequence of the default, the start-up probe no longer preloads the CUDA
-  libraries, dropping 190.1 MB from every daemon start with speech output enabled.
+  libraries, dropping 190.1 MiB from every daemon start with speech output enabled.
   The probe otherwise stays exactly as eager as it is today, so speech
   unavailability is still reported with a reason at start-up rather than at first
   use.
 
+### Who this changes
+
+Synthesis reads `[stt] device` today, so who is affected is decided entirely by
+that value and whether speech output is on:
+
+| `[tts] enabled` | `[stt] device` | accelerator usable | affected? |
+| --- | --- | --- | --- |
+| `false` (the default) | any | any | **No.** `KokoroSynthesizer` is never constructed |
+| `true` | `cpu` | any | **No.** Synthesis is already on the CPU |
+| `true` | `auto` | no | **No.** Resolution already falls back to the CPU |
+| `true` | `cuda` | yes | **Yes** |
+| `true` | `auto` | yes | **Yes** |
+
+A stock install is in the first row.
+
+### Restoring today's behaviour
+
+The rule is mechanical: **set `[tts] device` to whatever `[stt] device` is set to.**
+That reproduces today's resolution exactly for every configuration, because today
+synthesis resolves from that value. `cuda` for a pinned accelerator, `auto` for
+today's fall-back-if-absent resolution.
+
+Measured across two runs each, `[tts] device = "cuda"` against today:
+
+| | today | restored |
+| --- | --- | --- |
+| accelerator memory | 1208 / 1216 MiB | 1208 / 1208 MiB |
+| warm latency, 8.02 s of audio | 207 / 209 ms | 195 / 199 ms |
+| real-time factor | 0.026 / 0.026 | 0.024 / 0.025 |
+| system memory after 6 utterances | 1271.0 / 1234.8 MiB | 1240.3 / 1240.5 MiB |
+| provider read back off the session | `CUDAExecutionProvider` | `CUDAExecutionProvider` |
+
+Restored is indistinguishable from today: the run-to-run spread within "today"
+(1271.0 against 1234.8 MiB) is wider than the gap between the two columns. The new
+`SessionOptions` is confirmed inert on the accelerator path — it governs the CPU
+arena, and per-sentence latency was 51–112 ms with it against 55–116 ms without.
+
+Two preconditions, neither of them new:
+
+- The GPU build of ONNX Runtime must still be installed. If a `uv sync` or
+  `uv run --extra` has reinstalled the CPU build over it, asking for `cuda` falls
+  back to the CPU with the existing logged remedy. That is true of today's
+  behaviour too — see `docs/agent-notes/onnxruntime-gpu-cuda-version.md`.
+- The daemon must be restarted, as with every other setting.
+
 ### Deliberately not in scope
 
-Deferring the `import onnxruntime` in the start-up probe. It costs 32.2 MB and 15
+Deferring the `import onnxruntime` in the start-up probe. It costs 32.2 MiB and 15
 idle threads, but removing it would mean the daemon could not report why speech
 output is unavailable until someone tried to speak, reversing a deliberate
 existing decision. The residual is accepted.

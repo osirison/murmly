@@ -129,9 +129,13 @@ someone tried to speak.
 ## Risks / Trade-offs
 
 - **Speech output gets slower on upgrade for anyone who enabled it** → Bounded at
-  roughly 200 ms before the first word, documented in `README.md` and
-  `config.example.toml`, and reversible with one setting. Nothing else about
-  speech changes: same voice, same audio, same sentence pacing.
+  roughly 200 ms before the first word, and it does not reach a stock install at
+  all: `[tts] enabled` defaults to false, and an install with `[stt] device = "cpu"`
+  or no usable accelerator was already synthesising on the CPU. For the two
+  configurations that do move, the reversal is one setting, mechanical to derive,
+  and measured to restore today's numbers within run-to-run noise — see Migration
+  Plan. Nothing else about speech changes: same voice, same audio, same sentence
+  pacing, same failure handling.
 - **A much slower CPU than the one measured could fall behind playback** → The
   measured margin is large (real-time factor 0.185, producer 1.0–3.4 s ahead per
   sentence), but it was measured on 16 cores. A machine with a quarter of the
@@ -157,10 +161,31 @@ someone tried to speak.
 ## Migration Plan
 
 No migration step. The setting is absent in every existing install, which now
-means the CPU, so the change takes effect on the next daemon restart. Rollback is
-`[tts] device = "cuda"` — or `"auto"` for the exact prior resolution, including
-its fall back on machines without a usable accelerator.
+means the CPU, so the change takes effect on the next daemon restart.
 
-The GPU build of ONNX Runtime stays required for anyone who sets `cuda`, so this
-change does not alter the install instructions or let the `onnxruntime-gpu` swap
-be skipped.
+Rollback is mechanical rather than a judgement call: **set `[tts] device` to
+whatever `[stt] device` is set to.** Today synthesis resolves from that value, so
+copying it across reproduces the prior resolution exactly for every configuration
+— `cuda` for a pinned accelerator, `auto` for the resolve-and-fall-back behaviour,
+`cpu` for an install that was already on the CPU and is therefore unaffected
+anyway. See `proposal.md` — Who this changes, for which configurations move at all.
+
+The restoration is verified, not assumed. `[tts] device = "cuda"` was measured
+against today's code across two runs each: identical accelerator memory
+(1208 MiB), warm latency of 195–199 ms against 207–209 ms for 8.02 s of audio, and
+`CUDAExecutionProvider` read back off the session in both. The run-to-run spread
+within today's own numbers is wider than the gap between the two, so the two are
+indistinguishable.
+
+That result also settles a question the `SessionOptions` raises: `enable_cpu_mem_arena`
+governs the CPU allocator, but this graph places 39 Memcpy nodes and runs some
+operators on the CPU even under the accelerator provider, so it was worth checking
+rather than asserting. Per-sentence latency on the accelerator was 51–112 ms with
+the option against 55–116 ms without. Inert, confirmed.
+
+Two preconditions apply to rollback, neither introduced here. The GPU build of
+ONNX Runtime must still be installed — if a `uv sync` or `uv run --extra` has put
+the CPU build back over it, asking for `cuda` falls back to the CPU with the
+existing logged remedy, exactly as it would today. And the daemon must restart, as
+for any setting. This change does not alter the install instructions or let the
+`onnxruntime-gpu` swap be skipped.
