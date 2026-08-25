@@ -17,7 +17,7 @@ ONNX Runtime cannot: memory is owned by the `InferenceSession`, and the only way
 to return it is to drop the session and build another.
 
 Measured on an RTX 3080 Laptop (see `proposal.md` for the table): the
-transcription model returns 2080 MiB for a 0.28 s reload; the synthesis session
+transcription model returns 2080 MiB for a 0.78 s reload; the synthesis session
 returns 528 MiB for a 0.80 s rebuild.
 
 ## Goals / Non-Goals
@@ -41,22 +41,34 @@ returns 528 MiB for a 0.80 s rebuild.
 
 ## Decisions
 
-### Use `unload_model(to_cpu=True)` for transcription, not a reference drop
+### Use `unload_model(to_cpu=False)` for transcription, not a reference drop
 
 CTranslate2 4.8.1 exposes `unload_model(to_cpu: bool)`, `load_model()`, and
 `model_is_loaded` on the `Whisper` object reached through `WhisperModel.model`.
 
-Both modes were measured, and they return the **same** 2080 MiB:
+Both modes were measured, and they return the **same** GPU memory. Re-measured
+across two runs with both models warm in one process:
 
-| | unload | reload | system RAM held |
+| | unload | reload | host RSS held |
 | --- | --- | --- | --- |
-| `to_cpu=False` | 0.05 s | 1.25 s | none |
-| `to_cpu=True` | 0.84 s | **0.28 s** | ~1.6 GB |
+| `to_cpu=False` | **0.05 s** | 0.78 s | **none** (−6 MB) |
+| `to_cpu=True` | 0.77 s | **0.22 s** | **+1541 MB** |
 
-`to_cpu=True` is chosen: the same GPU memory comes back, and the reload — the part
-a user waits on — is 4.5× faster. The cost is roughly 1.6 GB of system RAM, which
-is the trade this design accepts on the user's behalf and which
-`proposal.md` states plainly.
+`to_cpu=False` is chosen. The reload difference — 0.78 s against 0.22 s — is paid
+in the one place this design already hides it: behind warm-on-capture, while the
+user is still speaking. `to_cpu=True` buys that 0.56 s by parking the weights in
+host RAM, measured at 1316.6 MB → 2857.9 MB of RSS, reproduced exactly across two
+runs.
+
+For a daemon that is idle almost all of the time, that is not a reduction. It
+moves the memory from a 16 GiB GPU into system RAM, and murmly's host RSS is
+itself being reduced by separate work — so `to_cpu=True` would hand back with one
+change what another is taking away. The GPU residual is the same either way
+(696 MiB against 702 MiB), so nothing is lost by declining the trade.
+
+*Alternative considered:* `to_cpu=True`. Rejected on the host-memory cost above.
+The mode is a one-word design constant, so if murmly's host footprint later stops
+mattering it can be revisited without touching a requirement.
 
 *Alternative considered:* dropping the `WhisperModel` reference and letting the
 allocator collect it. Rejected — it depends on garbage-collection timing for a
@@ -125,7 +137,7 @@ and cancelled when one begins.
 ### Warm on capture start
 
 `begin_capture()` already exists and already runs on the recording path. Kicking an
-asynchronous reload there hides the 0.28 s behind the user speaking. It must not
+asynchronous reload there hides the 0.78 s behind the user speaking. It must not
 block: capture starting is on the critical path and the spec requires it not be
 delayed.
 
@@ -148,11 +160,12 @@ enable one and not the other.
 
 - **A reload lands in the delivery path rather than during capture** (the user
   starts and stops faster than the warm-up completes) → The wait is bounded at
-  0.28 s, and the transcript is unaffected. Acceptable; the spec permits the first
+  0.78 s, and the transcript is unaffected. Acceptable; the spec permits the first
   use after a release to be slower.
-- **`to_cpu=True` trades GPU memory for ~1.6 GB of system RAM** → Stated in the
-  proposal, configurable off, and the mode is a design constant that can be
-  revisited without changing any requirement.
+- **`to_cpu=False` makes an unhidden reload 0.78 s rather than 0.22 s** → Only
+  reachable when the user stops speaking before the warm-up completes. Bounded,
+  and the spec permits the first use after a release to be slower. The mode is a
+  design constant that can be revisited without changing any requirement.
 - **An evictor firing during a long partial pass holds `_model_lock` and stalls**
   → It cannot: the evictor acquires the lock, so it waits for the pass rather than
   interrupting it. Worst case the release happens later than configured, which no
