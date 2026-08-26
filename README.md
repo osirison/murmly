@@ -508,6 +508,7 @@ model_profile = "balanced" # fast | balanced | accurate
 device = "auto" # auto | cpu | cuda
 compute_type = "auto"
 lazy_load_model = true
+unload_after_idle_s = 300      # Release the model's GPU memory after this idle time, 30-86400; 0 never
 # beam_size and vad_filter follow the profile unless you pin them here
 # beam_size = 5
 # vad_filter = true
@@ -534,6 +535,7 @@ enabled = false        # Speech output; see "Speech output" below
 voice = "af_heart"     # An English voice the model carries
 rate = 100             # Percentage of the model's own speaking rate, 50-200
 device = "cpu"         # auto | cpu | cuda, independent of [stt] device
+unload_after_idle_s = 0        # Drop the synthesis session after this idle time; 0 never
 output_device = ""     # Empty lets the system choose
 # model_dir = "~/.local/share/murmly"   # Where the model and voices are
 ```
@@ -646,6 +648,58 @@ clipboard — it just never appears in command output.
 
 In `continuous` mode a refused delivery ends the session rather than continuing to
 record speech Murmly has just shown it cannot deliver.
+
+### Releasing idle model memory
+
+Murmly loads the transcription model on the first recording and the synthesis
+session on the first speech, and each then sits in memory doing nothing between
+uses. `[stt] unload_after_idle_s` and `[tts] unload_after_idle_s` hand that
+memory back once a model has gone unused for its own idle period, in seconds,
+and Murmly loads it again when it is next needed. Each is bounded 30-86400.
+`0` switches release off for that model, leaving it resident once loaded. A
+value outside the bounds falls back to that setting's own default rather than
+refusing to start — and to its own, not to a shared one, because the two
+defaults differ.
+
+Measured on one machine (RTX 3080 Laptop, 16 cores, reproduced across two runs):
+
+| Releasing | Returns | Costs |
+| --- | --- | --- |
+| Transcription | 2080 MiB of GPU memory | 0.78 s to reload |
+| Synthesis, `[tts] device = "cpu"` — the default | 377 MiB of system memory, no GPU memory | 759-767 ms before speech resumes |
+| Synthesis, `[tts] device = "cuda"` | 528 MiB of GPU memory, 105 MiB of system memory | 607-611 ms before speech resumes |
+
+**Transcription release is enabled by default, at 300 seconds**, because its
+cost is paid where nobody is waiting. Murmly starts the reload when capture
+begins rather than when a transcript is needed, so the 0.78 s runs while you are
+still speaking and is over before you stop. It returns accelerator memory, which
+is the resource another process is most likely to be short of.
+
+**Synthesis release is disabled by default**, because its cost is silence. There
+is nothing to overlap the rebuild with: the wait falls between the moment
+something asks Murmly to speak and the moment it does. Under the default
+`[tts] device = "cpu"` it also returns system memory rather than accelerator
+memory. Speech output is opt-in already, so releasing it is too. Set
+`[tts] unload_after_idle_s` to a period in seconds to turn it on.
+
+Idle means no capture is active, not "no recent transcript". The countdown
+starts when a recording session ends and is abandoned when the next one begins,
+so a `continuous` session is never released while it is still running, however
+long you pause between utterances. Synthesis counts the same way against speech
+sessions.
+
+`[tts] device = "cuda"` together with a non-zero `[tts] unload_after_idle_s` is
+the one combination to think twice about. It is a trade rather than a saving:
+the 528 MiB of GPU memory comes back, but rebuilding the session costs a
+one-time 277 MiB of system memory and then roughly 8 MiB on every release cycle
+after it, which a daemon cycling twenty times a day feels. Neither shipped
+default puts you there.
+
+**This changes behaviour on upgrade.** An install that configures neither
+setting begins releasing the transcription model after five idle minutes. No
+transcript changes and, in ordinary dictation, there is nothing to wait for.
+`[stt] unload_after_idle_s = 0` restores the always-resident behaviour Murmly
+had before. Synthesis is unaffected, because its default is `0`.
 
 Restart the service after changing configuration:
 

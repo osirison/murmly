@@ -28,6 +28,7 @@ from murmly.cli import (
     measure_partial_pass_ms,
     overlay_diagnostics,
     paste_injection_diagnostics,
+    transcription_residency,
 )
 from murmly.config import MurmlyConfig
 from murmly.daemon import DaemonStartupError, MurmlyDaemon
@@ -1013,6 +1014,8 @@ class DoctorCompletenessTests(unittest.TestCase):
         "runtime_compute_type",
         "beam_size",
         "vad_filter",
+        "model_resident",
+        "unload_after_idle_s",
         "live_transcription",
         "delivery",
         "overlay",
@@ -1615,6 +1618,267 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
         self.assertEqual({"window", "session"}, set(purposes))
         self.assertTrue(purposes["window"]["held"])
         self.assertFalse(purposes["session"]["held"])
+
+
+class StubModelHolder:
+    """Answers residency, and records anything that would have loaded weights.
+
+    Written out rather than reached for with `Mock`, for two reasons that both
+    bite here. A `Mock` reports `resident` truthy by accident, so a report built
+    on one says the model is loaded and every guarantee in this class would pass
+    against an implementation that never read the property. A `Mock` also
+    reaches the report itself, where `json.dumps` refuses it.
+
+    `FakeSynthesizer` in tests/fakes.py has no `resident` yet, and it is shared
+    with the daemon, session and audio suites, so the residency stub is local to
+    this module rather than grown there.
+    """
+
+    def __init__(self, *, resident: bool = False, available: bool = True) -> None:
+        self.resident = resident
+        self.available = available
+        self.unavailable_reason = None if available else "kokoro-onnx is not installed."
+        self.provider = "CPUExecutionProvider"
+        self.spoken: list[str] = []
+
+    def synthesize(self, text: str):
+        # The synthesis session is built here and nowhere else, so a report that
+        # never reaches this is a report that loaded no weights.
+        self.spoken.append(text)
+        return iter(())
+
+
+class UnaskableModelHolder:
+    """A runtime whose residency cannot be read at all.
+
+    The real case is a CTranslate2 or ONNX Runtime build that does not expose
+    what residency is read from. Diagnostics exist to explain such a build, so
+    one must be reported rather than allowed to take the section with it.
+    """
+
+    @property
+    def resident(self) -> bool:
+        raise RuntimeError("this build cannot report residency")
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    provider = "CPUExecutionProvider"
+
+
+class ModelResidencyDiagnosticsTests(unittest.TestCase):
+    """`murmly doctor` reports what each model holds and never loads either.
+
+    `murmly doctor` runs in its own process, so what it reports is that
+    process's own residency. It holds no transcription model and no synthesis
+    session of its own, and the point of these tests is that running the report
+    does not give it either.
+    """
+
+    def _config(self, **overrides: object) -> MurmlyConfig:
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        return MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            tts_model_dir=Path(temp_dir) / "models",
+            **overrides,
+        )
+
+    def _report(self, config: MurmlyConfig) -> dict[str, object]:
+        """Run the command and read the report back the way a program would.
+
+        Through `json.loads` rather than off the dictionary the code built,
+        because the report is serialised before anyone sees it and a residency
+        value JSON cannot encode is a report nobody receives.
+        """
+        with (
+            patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+            patch(
+                "murmly.cli.select_paste_injection",
+                return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+            ),
+            redirect_stdout(StringIO()) as output,
+        ):
+            _run_doctor(config)
+        return json.loads(output.getvalue())
+
+    def test_a_fresh_report_says_neither_model_is_resident_and_names_both_periods(self) -> None:
+        config = self._config()
+
+        with patch("murmly.cli.FasterWhisperTranscriber") as transcriber:
+            transcriber.resolve_runtime.return_value = ("cpu", "int8")
+            report = self._report(config)
+
+        self.assertIs(False, report["model_resident"])
+        self.assertEqual(300, report["unload_after_idle_s"])
+        self.assertIs(False, report["speech_output"]["resident"])
+        self.assertEqual(0, report["speech_output"]["unload_after_idle_s"])
+        # The whole of the no-side-effect guarantee for transcription: the report
+        # answered without a transcriber ever being constructed, which is the
+        # only way it could have loaded the weights it was asked about.
+        transcriber.assert_not_called()
+
+    def test_reporting_on_an_enabled_speech_stack_builds_no_session(self) -> None:
+        config = self._config(tts_enabled=True)
+        holder = StubModelHolder()
+
+        with (
+            patch("murmly.cli.KokoroSynthesizer", return_value=holder) as synthesizer,
+            patch(
+                "murmly.cli.negotiated_output",
+                return_value=(48_000, "Speakers", None, None),
+            ),
+        ):
+            from murmly.cli import speech_output_diagnostics
+
+            report = speech_output_diagnostics(config)
+
+        self.assertIs(False, report["resident"])
+        self.assertTrue(report["available"])
+        synthesizer.assert_called_once_with(config)
+        # Constructing the synthesizer is not the load. Building the session is,
+        # and that happens on the first request for audio, which a report has no
+        # reason to make.
+        self.assertEqual([], holder.spoken)
+
+    def test_a_period_of_zero_is_reported_rather_than_left_out(self) -> None:
+        # The reverse of the shipped defaults, so a report that names only the
+        # enabled period cannot pass. A reader who cannot see the zero cannot
+        # tell a model that will never be released from one nobody reported on.
+        config = self._config(
+            tts_enabled=True,
+            unload_after_idle_s=0,
+            tts_unload_after_idle_s=900,
+        )
+
+        with patch("murmly.cli.FasterWhisperTranscriber") as transcriber:
+            transcriber.resolve_runtime.return_value = ("cpu", "int8")
+            with patch(
+                "murmly.cli.negotiated_output",
+                return_value=(48_000, "Speakers", None, None),
+            ):
+                report = self._report(config)
+
+        self.assertEqual(0, report["unload_after_idle_s"])
+        self.assertEqual(900, report["speech_output"]["unload_after_idle_s"])
+
+    def test_a_disabled_speech_stack_still_names_its_period_and_residency(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+
+        report = speech_output_diagnostics(self._config(tts_unload_after_idle_s=900))
+
+        self.assertFalse(report["enabled"])
+        self.assertIs(False, report["resident"])
+        self.assertEqual(900, report["unload_after_idle_s"])
+
+    def test_residency_is_read_off_the_model_rather_than_assumed(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+
+        config = self._config(tts_enabled=True)
+        with patch(
+            "murmly.cli.negotiated_output",
+            return_value=(48_000, "Speakers", None, None),
+        ):
+            speech = speech_output_diagnostics(config, StubModelHolder(resident=True))
+
+        self.assertIs(True, speech["resident"])
+        self.assertEqual((True, None), transcription_residency(StubModelHolder(resident=True)))
+
+    def test_asking_for_transcription_residency_constructs_nothing(self) -> None:
+        with patch("murmly.cli.FasterWhisperTranscriber") as transcriber:
+            resident, detail = transcription_residency()
+
+        self.assertIs(False, resident)
+        self.assertIsNone(detail)
+        transcriber.assert_not_called()
+
+    def test_a_runtime_that_cannot_report_transcription_residency_is_named(self) -> None:
+        resident, detail = transcription_residency(UnaskableModelHolder())
+
+        # None rather than False: a reader must not have to tell a model that is
+        # not loaded from one whose runtime could not be asked.
+        self.assertIsNone(resident)
+        self.assertIn("cannot report residency", detail)
+
+    def test_a_transcription_residency_failure_does_not_abandon_the_report(self) -> None:
+        config = self._config()
+
+        with (
+            patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
+            patch(
+                "murmly.cli.transcription_residency",
+                return_value=(None, "Unable to determine transcription residency: no runtime"),
+            ),
+        ):
+            transcriber.resolve_runtime.return_value = ("cpu", "int8")
+            report = self._report(config)
+
+        self.assertIsNone(report["model_resident"])
+        self.assertIn("no runtime", report["model_resident_detail"])
+        self.assertEqual(300, report["unload_after_idle_s"])
+        self.assertIn("installation", report, "another section was abandoned")
+
+    def test_a_synthesizer_that_cannot_be_asked_does_not_abandon_the_section(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+
+        config = self._config(tts_enabled=True)
+        with patch(
+            "murmly.cli.negotiated_output",
+            return_value=(48_000, "Speakers", None, None),
+        ):
+            report = speech_output_diagnostics(config, UnaskableModelHolder())
+
+        self.assertIsNone(report["resident"])
+        self.assertIn("cannot report residency", report["resident_detail"])
+        self.assertTrue(report["available"], "the rest of the section was abandoned")
+
+    def test_a_speech_probe_that_fails_still_names_its_period_and_residency(self) -> None:
+        config = self._config(tts_enabled=True, tts_unload_after_idle_s=900)
+
+        with (
+            patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
+            patch(
+                "murmly.cli.speech_output_diagnostics",
+                side_effect=RuntimeError("the probe exploded"),
+            ),
+        ):
+            transcriber.resolve_runtime.return_value = ("cpu", "int8")
+            report = self._report(config)
+
+        speech = report["speech_output"]
+        self.assertIn("the probe exploded", speech["detail"])
+        # A section that drops these reads as one the report never asked about,
+        # which is the distinction the residency requirement exists to preserve.
+        self.assertEqual(900, speech["unload_after_idle_s"])
+        self.assertIs(False, speech["resident"])
+
+    def test_residency_is_asked_before_the_report_loads_anything(self) -> None:
+        # The live transcription probe loads the model when live transcription
+        # is enabled. Residency has to describe what was held when the question
+        # was put, not what this report loaded on its way past, so the order the
+        # two run in is the guarantee rather than an accident of layout.
+        order: list[str] = []
+
+        def residency() -> tuple[bool, None]:
+            order.append("residency")
+            return False, None
+
+        def live(config: MurmlyConfig) -> dict[str, object]:
+            order.append("live transcription")
+            return {}
+
+        config = self._config(live_transcribe=True)
+        with (
+            patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
+            patch("murmly.cli.transcription_residency", residency),
+            patch("murmly.cli.live_transcription_diagnostics", live),
+        ):
+            transcriber.resolve_runtime.return_value = ("cpu", "int8")
+            self._report(config)
+
+        self.assertEqual(["residency", "live transcription"], order)
 
 
 class DaemonExitTeardownTests(unittest.TestCase):

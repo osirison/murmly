@@ -5,7 +5,9 @@ import re
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -13,7 +15,7 @@ from unittest.mock import patch
 import numpy as np
 
 import murmly.tts
-from fakes import FakeKokoroModel, FakeSession
+from fakes import GATE_TIMEOUT_SECONDS, FakeKokoroModel, FakeSession
 from module_stubs import injected_module
 from murmly.config import (
     DEFAULT_TTS_DEVICE,
@@ -695,6 +697,278 @@ class SessionConstructionTests(unittest.TestCase):
 
         self.assertEqual([CUDA_PROVIDER, CPU_PROVIDER], constructor.call_args.kwargs["providers"])
         self.assertEqual(CUDA_PROVIDER, synthesizer.provider)
+
+
+class GatedKokoroModel(FakeKokoroModel):
+    """A model that parks inside `create` until a test lets it out.
+
+    A pass already inside the engine cannot be interrupted, and what happens
+    while one is in flight is the whole of what there is to test about a
+    release. The gate puts a pass in that state exactly, rather than racing a
+    sleep against one and passing for the wrong reason.
+    """
+
+    def __init__(self, **overrides: object) -> None:
+        super().__init__(**overrides)
+        self.entered = threading.Event()
+        self.gate = threading.Event()
+
+    def create(self, text, voice="af_heart", speed=1.0, lang="en-us"):
+        self.entered.set()
+        # One-shot: once a test opens the gate every later sentence runs
+        # straight through, so the pass the gate held finishes on its own.
+        self.gate.wait(GATE_TIMEOUT_SECONDS)
+        return super().create(text, voice=voice, speed=speed, lang=lang)
+
+
+class SynthesisResidencyTests(unittest.TestCase):
+    """Releasing the session, and building another one when speech resumes."""
+
+    def _synthesizer(self, model: FakeKokoroModel | None = None) -> KokoroSynthesizer:
+        """A synthesizer holding `model`, constructed without probing.
+
+        Handing the model in is how the rest of this suite avoids reading 326 MB
+        of weights, and it leaves `_construct_model` free to stand in for the
+        whole ONNX path. What a rebuild has to do is `SessionConstructionTests`'
+        subject; what these tests are about is when one happens.
+        """
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        return KokoroSynthesizer(make_config(temp.name), model=model or FakeKokoroModel())
+
+    @contextmanager
+    def _load_path(self, **overrides: object):
+        """A synthesizer whose loads run the real `_construct_model`.
+
+        Same stand-ins as `SessionConstructionTests._construct` -- neither the
+        runtime nor the package may be real -- but the patches stay open for the
+        block, so a release and the load after it can both be watched.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir, **overrides)
+            config.tts_model_dir.mkdir(parents=True, exist_ok=True)
+            for name in (MODEL_FILE_NAME, VOICES_FILE_NAME):
+                (config.tts_model_dir / name).write_bytes(b"")
+            with (
+                injected_module("kokoro_onnx", kokoro_onnx_stub()),
+                patch("importlib.util.find_spec", return_value=object()),
+                patch("murmly.tts.resolve_espeak", return_value=("libespeak-ng.so.1", "/data")),
+                patch(
+                    "onnxruntime.InferenceSession",
+                    side_effect=lambda *args, **kwargs: FakeSession((CPU_PROVIDER,)),
+                ) as constructor,
+            ):
+                yield KokoroSynthesizer(config), constructor
+
+    def test_a_released_synthesizer_reports_itself_as_not_resident(self) -> None:
+        synthesizer = self._synthesizer()
+
+        self.assertTrue(synthesizer.resident)
+        self.assertTrue(synthesizer.release())
+
+        self.assertFalse(synthesizer.resident)
+
+    def test_asking_whether_a_session_is_resident_does_not_construct_one(self) -> None:
+        """`murmly doctor` asks, and the answer must not cost half a second."""
+        synthesizer = self._synthesizer()
+        synthesizer.release()
+
+        with patch.object(synthesizer, "_construct_model") as construct:
+            self.assertFalse(synthesizer.resident)
+
+        construct.assert_not_called()
+
+    def test_releasing_when_nothing_is_resident_constructs_nothing(self) -> None:
+        """An idle timer firing twice must not build a session to drop it.
+
+        The second call reports False, which is how the timer knows there was no
+        transition to log rather than having to ask about residency again.
+        """
+        synthesizer = self._synthesizer()
+
+        with patch.object(synthesizer, "_construct_model") as construct:
+            self.assertTrue(synthesizer.release())
+            self.assertFalse(synthesizer.release())
+
+        construct.assert_not_called()
+        self.assertFalse(synthesizer.resident)
+
+    def test_a_release_hands_the_freed_heap_back_to_the_system(self) -> None:
+        """Under the shipped `[tts] device = "cpu"` this is the whole release.
+
+        The session's memory is host memory there, so dropping it returns it to
+        glibc rather than to the system, and the requirement is that a release
+        reach the system so another process can allocate what it gave up.
+        Measured over five cycles: the released floor sat between 465 and
+        669 MiB without this step and at 83 MiB with it.
+
+        Asserted outside both locks, because a trim walks the arenas and a
+        speech session resuming behind one would wait for it.
+        """
+        synthesizer = self._synthesizer()
+        held: list[bool] = []
+
+        with patch(
+            "murmly.tts.return_free_heap",
+            side_effect=lambda: held.append(
+                synthesizer._model_lock.locked() or synthesizer._load_lock.locked()
+            ),
+        ) as trim:
+            self.assertTrue(synthesizer.release())
+
+        trim.assert_called_once_with()
+        self.assertEqual([False], held, "the heap was trimmed while a lock was held")
+
+    def test_a_release_that_frees_nothing_does_not_trim(self) -> None:
+        """An idle timer firing against an already released session walks no arenas."""
+        synthesizer = self._synthesizer()
+        self.assertTrue(synthesizer.release())
+
+        with patch("murmly.tts.return_free_heap") as trim:
+            self.assertFalse(synthesizer.release())
+
+        trim.assert_not_called()
+
+    def test_synthesis_after_a_release_produces_the_audio_it_would_have(self) -> None:
+        """The spec's only detectable difference is time, not what is spoken."""
+        first = FakeKokoroModel()
+        second = FakeKokoroModel()
+        synthesizer = self._synthesizer(first)
+        before = [samples.tobytes() for samples, _rate in synthesizer.synthesize(PASSAGE)]
+        calls_before = len(first.calls)
+
+        synthesizer.release()
+        with patch.object(synthesizer, "_construct_model", return_value=second):
+            after = [samples.tobytes() for samples, _rate in synthesizer.synthesize(PASSAGE)]
+
+        self.assertEqual(before, after)
+        self.assertTrue(synthesizer.resident)
+        # The dropped session produced none of the second passage, so the audio
+        # above came from the rebuilt one rather than from a survivor.
+        self.assertEqual(calls_before, len(first.calls))
+        self.assertEqual(split_sentences(PASSAGE), [call[0] for call in second.calls])
+
+    def test_a_release_and_the_load_after_it_build_two_sessions(self) -> None:
+        """The provider goes with the session, and comes back with the next one.
+
+        Left set, it has `murmly doctor` name the runtime of a session that no
+        longer exists.
+        """
+        with self._load_path() as (synthesizer, constructor):
+            synthesizer._load_model()
+            self.assertEqual(CPU_PROVIDER, synthesizer.provider)
+
+            synthesizer.release()
+            self.assertFalse(synthesizer.resident)
+            self.assertIsNone(synthesizer.provider)
+
+            synthesizer._load_model()
+
+            self.assertTrue(synthesizer.resident)
+            self.assertEqual(CPU_PROVIDER, synthesizer.provider)
+            self.assertEqual(2, constructor.call_count)
+
+    def test_a_failed_rebuild_is_retried_rather_than_refusing_speech_for_good(self) -> None:
+        """A rebuild that fails is a transient failure, not unavailability.
+
+        `_unavailable_reason` is set once at startup by `_probe` and means
+        speech output cannot run at all. Recording a failed rebuild there would
+        silence the daemon for the rest of its life over one bad load, which is
+        the spec's "a failed reload does not disable Murmly".
+        """
+        rebuilt = FakeKokoroModel()
+        synthesizer = self._synthesizer()
+        synthesizer.release()
+
+        with patch.object(
+            synthesizer,
+            "_construct_model",
+            side_effect=[RuntimeError("the session could not be built"), rebuilt],
+        ):
+            with self.assertRaises(RuntimeError):
+                list(synthesizer.synthesize("First attempt."))
+            self.assertFalse(synthesizer.resident)
+            self.assertTrue(synthesizer.available)
+            self.assertIsNone(synthesizer.unavailable_reason)
+
+            chunks = list(synthesizer.synthesize("Second attempt."))
+
+        self.assertTrue(all(len(samples) for samples, _rate in chunks))
+        self.assertTrue(synthesizer.resident)
+        self.assertEqual(["Second attempt."], [call[0] for call in rebuilt.calls])
+
+    def test_a_release_during_a_synthesis_waits_rather_than_interrupting(self) -> None:
+        """The pass in flight finishes whole and the release lands after it."""
+        model = GatedKokoroModel()
+        synthesizer = self._synthesizer(model)
+        order: list[str] = []
+        produced: list[np.ndarray] = []
+
+        def speak() -> None:
+            produced.extend(samples for samples, _rate in synthesizer.synthesize("One sentence."))
+
+        speaker = threading.Thread(target=speak)
+        speaker.start()
+        self.assertTrue(model.entered.wait(GATE_TIMEOUT_SECONDS))
+
+        def release() -> None:
+            synthesizer.release()
+            order.append("released")
+
+        releaser = threading.Thread(target=release)
+        releaser.start()
+        releaser.join(0.05)
+
+        self.assertTrue(releaser.is_alive(), "the release did not wait for the pass in flight")
+        self.assertTrue(synthesizer.resident)
+        order.append("gate opened")
+        model.gate.set()
+        speaker.join(GATE_TIMEOUT_SECONDS)
+        releaser.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertEqual(["gate opened", "released"], order)
+        # Counted rather than only checked for emptiness: an exception in the
+        # speaker thread prints and leaves `produced` empty, and `all([])` would
+        # have called that a pass that finished whole.
+        self.assertEqual(1, len(produced))
+        self.assertTrue(all(len(samples) for samples in produced))
+        self.assertFalse(synthesizer.resident)
+
+    def test_a_release_racing_a_construction_does_not_leave_the_session_behind(self) -> None:
+        """Why the release takes `_load_lock` as well as `_model_lock`.
+
+        `self._model` is written under `_load_lock` and read under
+        `_model_lock`, so a release holding only the latter can clear the field
+        while a construction is still running, and the construction then assigns
+        the new session over it. The session survives its own release, still
+        holding the memory the release was called to return, and the timer that
+        armed it has already fired and will not fire again.
+        """
+        synthesizer = self._synthesizer()
+        synthesizer.release()
+        constructing = threading.Event()
+        finish = threading.Event()
+
+        def construct() -> FakeKokoroModel:
+            constructing.set()
+            finish.wait(GATE_TIMEOUT_SECONDS)
+            return FakeKokoroModel()
+
+        with patch.object(synthesizer, "_construct_model", side_effect=construct):
+            loader = threading.Thread(target=synthesizer._load_model)
+            loader.start()
+            self.assertTrue(constructing.wait(GATE_TIMEOUT_SECONDS))
+
+            releaser = threading.Thread(target=synthesizer.release)
+            releaser.start()
+            releaser.join(0.05)
+            self.assertTrue(releaser.is_alive(), "the release did not wait for the construction")
+
+            finish.set()
+            loader.join(GATE_TIMEOUT_SECONDS)
+            releaser.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertFalse(synthesizer.resident)
 
 
 class SilenceMeasurementTests(unittest.TestCase):

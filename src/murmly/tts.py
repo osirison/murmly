@@ -19,6 +19,7 @@ import subprocess
 import threading
 
 from murmly.config import MurmlyConfig
+from murmly.idle import return_free_heap
 from murmly.stt import (
     CTRANSLATE2_CUDA_LIBRARIES,
     cuda_device_count_available,
@@ -293,6 +294,17 @@ class KokoroSynthesizer:
         return self._provider
 
     @property
+    def resident(self) -> bool:
+        """Whether a session exists right now, asked without constructing one.
+
+        The idle timer and `murmly doctor` both ask, and neither may pay 326 MB
+        of weights and half a second for the answer. A plain field read rather
+        than a locked one: a caller racing a load or a release gets one side of
+        that edge or the other, and either was true when the question was asked.
+        """
+        return self._model is not None
+
+    @property
     def model_path(self) -> Path:
         return self._config.tts_model_dir / MODEL_FILE_NAME
 
@@ -339,6 +351,53 @@ class KokoroSynthesizer:
                     )
             previous_tail = _trailing_silence(samples, sample_rate_hz)
             yield samples, sample_rate_hz
+
+    def release(self) -> bool:
+        """Drop the session so the memory it holds goes back to the system.
+
+        ONNX Runtime has no in-place unload the way CTranslate2 does: the memory
+        belongs to the `InferenceSession`, so the only way to return it is to
+        drop the session and build another one on the next request. Dropping it
+        is the cheap half -- 28-36 ms measured -- and the rebuild is what costs,
+        which is why this is armed by an idle timer rather than done after every
+        utterance.
+
+        Reports whether anything was released, matching
+        `FasterWhisperTranscriber.release`, so an idle timer can log the
+        transition without asking a second time. A synthesizer that never built
+        a session, and one already released, answer False and do nothing.
+
+        A synthesis already in flight is never interrupted. `synthesize` takes
+        its own reference to the model before it produces anything, so the
+        session stays alive until that pass finishes and only then becomes
+        collectable; this clears the field the next pass would read.
+        """
+        # `_load_lock` as well as `_model_lock`, in the order the use path takes
+        # them. `self._model` is written under `_load_lock` in `_load_model` and
+        # only read under `_model_lock` in `_create`, so a release holding just
+        # the latter can interleave with a construction: the constructing thread
+        # sees None and starts building, the release clears the field, and the
+        # construction then assigns the new session over it. The session would
+        # survive its own release, still holding the memory the release was
+        # called to return, and neither side would look wrong on its own.
+        with self._load_lock, self._model_lock:
+            if self._model is None:
+                return False
+            self._model = None
+            # Cleared with the session that reported it. `_session_provider`
+            # sets it when one is constructed, and left behind it has `murmly
+            # doctor` name the runtime of a session that no longer exists.
+            self._provider = None
+        # Outside the lock, for the same reason the transcription release is:
+        # it walks the heap, and a speech session resuming behind it would
+        # wait for that. Not optional here the way it is an optimisation
+        # there -- under the shipped `[tts] device = "cpu"` the session's
+        # memory is host memory, so a release that stopped at freeing would
+        # hand it to glibc rather than to the system. Measured over five
+        # cycles: 465-669 MiB still held without this, 83 MiB with it.
+        return_free_heap()
+        logger.debug("Released the synthesis session.")
+        return True
 
     def _create(self, model, sentence: str) -> tuple[object, int]:
         # Serialized: one ONNX session is not safe to drive from two threads, and
@@ -426,6 +485,19 @@ class KokoroSynthesizer:
     def _load_model(self):
         # Serialized for the same reason `FasterWhisperTranscriber` serializes
         # its own load: two threads that both saw None would allocate two copies.
+        #
+        # This is the rebuild path after `release()` as well as the first load,
+        # and `is None` is the whole residency test here. Transcription needs a
+        # different one because the CTranslate2 wrapper survives its own unload;
+        # dropping the session is the only unload ONNX Runtime has, so a
+        # released synthesizer really is holding nothing.
+        #
+        # A construction that raises leaves `self._model` None and hands the
+        # error to the caller, which is what keeps a failed rebuild retryable:
+        # the next request tries again. It must never reach
+        # `_unavailable_reason`, which `_probe` sets once at startup to mean
+        # speech output cannot run at all -- one transient failure recorded
+        # there would silence the daemon for the rest of its life.
         with self._load_lock:
             if self._model is None:
                 self._model = self._construct_model()

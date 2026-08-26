@@ -23,6 +23,7 @@ from murmly.focus import (
     record_target,
     should_deliver,
 )
+from murmly.idle import IdleRelease
 from murmly.integrations import ClipboardPaster
 from murmly.overlay import (
     detect_overlay_backend,
@@ -387,6 +388,21 @@ class SpeechSession:
                 logger.warning("Unable to close capture after a failed stop: %s", stop_error)
             raise
         return self._recorder.stop()
+
+    def release_model(self) -> None:
+        """Give the transcription model's memory back, if it still holds any.
+
+        The countdown that calls this lives on the daemon rather than here,
+        because the daemon is what knows the recording has ended and what
+        abandons the countdown on its way out. What is here is only the reach
+        from a capture session to the model it transcribes with.
+
+        Nothing is checked first. The transcriber answers a model that was never
+        built, one already released, and a runtime that cannot be asked all the
+        same way, and it waits for a pass in flight rather than interrupting
+        one -- so a countdown that expires mid-transcription is late, not wrong.
+        """
+        self._transcriber.release()
 
     def take_segment(self) -> bytes:
         """Close the current segment and start speech tracking over for the next."""
@@ -876,6 +892,22 @@ class MurmlyDaemon:
             on_silence=self._on_silence,
         )
         self._speech = speech if speech is not None else SpeechEngine(config)
+        # Two countdowns rather than one. The two models reclaim different
+        # resources, cost different amounts to restore, and are keyed to
+        # lifecycles the other does not have -- capture for one, a speech
+        # session for the other -- so a shared period could not serve both.
+        # Each is inert when its configured period is zero, which is what
+        # leaves synthesis untouched under the shipped defaults.
+        self._transcription_idle = IdleRelease(
+            config.unload_after_idle_s,
+            self._release_transcription,
+            name="murmly-model-release",
+        )
+        self._synthesis_idle = IdleRelease(
+            config.tts_unload_after_idle_s,
+            self._release_synthesis,
+            name="murmly-speech-release",
+        )
         # The connection a sender holds open, at most one at a time. With two
         # open, "deliver the transcript to that session" and "tell the session it
         # was interrupted" would both have to guess which one was meant.
@@ -1048,6 +1080,17 @@ class MurmlyDaemon:
         # be told what happened while its connection is still open.
         self._close_speech_session()
         self._stop_capture()
+        # After both of those, never before. Shutdown ends a recording on its
+        # way out, and `_stop_capture` goes through `_stop_recording` like every
+        # other path that does, so a cancel placed above would be undone by the
+        # line below it -- leaving a five-minute countdown armed with nothing
+        # left to cancel it. The same reading applies to a sender that
+        # disconnects while shutdown is running and reaches `_session_closed`.
+        # Ordering the cancels last was chosen over making every arm site test
+        # the shutdown flag: it is one place rather than five, and it keeps a
+        # shutdown check off the path every recording takes.
+        self._transcription_idle.cancel()
+        self._synthesis_idle.cancel()
         self._drain_answering()
         self._answer_the_rest()
         # A worker that took the claim before the drain expired is writing its
@@ -1080,12 +1123,57 @@ class MurmlyDaemon:
         whatever one device does.
         """
         try:
-            self._session.stop_recording()
+            self._stop_recording()
         except Exception as error:  # noqa: BLE001 - shutdown continues regardless
             logger.warning("Capture did not stop cleanly: %s", error)
 
+    def _stop_recording(self) -> bytes:
+        """Close the microphone and start the transcription model's countdown.
+
+        Every path that ends a recording comes through here rather than calling
+        the capture session directly, so the countdown cannot be lost to
+        whichever exit a recording happens to take: the toggle, the auto-stop,
+        a refused segment ending a continuous session, a transition thread that
+        would not start, and shutdown.
+
+        `take_segment` deliberately does not come through here. A continuous
+        session closing a segment is still capturing, so it is not idle however
+        long its pauses are, and arming there would release the model in the
+        silence between two utterances of one session -- the case that keying on
+        the session lifecycle rather than a last-use timestamp exists to rule
+        out.
+
+        Armed in a `finally` because a stop that raises has still ended the
+        capture. Every caller treats the raise that way, and the model is idle
+        from that moment whether or not the stream closed cleanly.
+        """
+        try:
+            return self._session.stop_recording()
+        finally:
+            self._transcription_idle.arm()
+
+    def _release_transcription(self) -> None:
+        self._session.release_model()
+
+    def _release_synthesis(self) -> None:
+        # A daemon with speech output off never builds a synthesizer, and its
+        # countdown is never armed either, since arming needs a speech session
+        # and one cannot be declared without it. Checked rather than assumed:
+        # the two facts are established in different places.
+        synthesizer = self._speech.synthesizer
+        if synthesizer is None:
+            return
+        synthesizer.release()
+
     def _close_speech_session(self) -> None:
-        """Stop speech, tell the session, and close it."""
+        """Stop speech, tell the session, and close it.
+
+        The one place a speech session ends without the synthesis countdown
+        being armed. `shutdown` is the only caller, and it cancels both
+        countdowns a few lines after calling this, so arming one here would
+        start a thread for the sole purpose of killing it. A second caller
+        would have to arm.
+        """
         with self._speech_session_lock:
             session = self._speech_session
             self._speech_session = None
@@ -1417,6 +1505,13 @@ class MurmlyDaemon:
                         f"Speech output could not be started: {error}",
                     )
                 self._speech_session = session
+                # A speech session beginning is what makes the synthesizer
+                # non-idle, exactly as capture beginning does for the
+                # transcription model. Cancelled here rather than at the first
+                # `speak` frame: the sender may take seconds to produce its
+                # first words, and a rebuild in that gap is silence a listener
+                # hears at the front of the reply.
+                self._synthesis_idle.cancel()
 
         try:
             session.start()
@@ -1435,6 +1530,13 @@ class MurmlyDaemon:
                         logger.warning(
                             "Speech output did not stop cleanly: %s", stop_error
                         )
+                    # A session that never started is a session that has ended,
+                    # so the countdown the declaration cancelled goes back on.
+                    # Under the lock and inside this branch, because the session
+                    # registered here is the one that ended: armed outside it,
+                    # a declaration that had already replaced this one would
+                    # have a countdown running against its live session.
+                    self._synthesis_idle.arm()
             session.dispose()
             return failure_response(
                 CommandCode.COMMAND_FAILED, f"The speech session could not be started: {error}"
@@ -1507,6 +1609,11 @@ class MurmlyDaemon:
         session.close(drain=True)
         with self._connections_lock:
             self._connections.discard(session.connection)
+        # Reached only when this call is the one that owned the session, since
+        # the early return above covers the other case. The synthesizer is idle
+        # from here: there is no sender left to speak for, and nothing else
+        # opens the output device.
+        self._synthesis_idle.arm()
 
     def _send_to_session(self, frame: dict[str, object]) -> bool:
         """Send one frame to the open session, reporting whether it was taken."""
@@ -1588,11 +1695,24 @@ class MurmlyDaemon:
                         f"Speech could not be stopped before capture: {error}",
                         state="IDLE",
                     )
+                # Ahead of `start_recording` rather than after it, because that
+                # call begins warming the model: a countdown expiring in the
+                # window between the two would take the weights back out from
+                # under the warm-up. A countdown already past its own check still
+                # releases, which the transcriber makes correct rather than
+                # merely survivable: the pass reloads behind the same lock, so
+                # that window costs one reload and never a transcript.
+                self._transcription_idle.cancel()
                 try:
                     self._session.start_recording()
                 except Exception as error:
                     self._publish_error()
                     self._speech.resume()
+                    # Capture never began, so the model is idle again and the
+                    # countdown cancelled above has to go back on. Nothing else
+                    # would put it there: the only other arm site is a recording
+                    # ending, and this one never started.
+                    self._transcription_idle.arm()
                     return failure_response(CommandCode.COMMAND_FAILED, str(error), state="IDLE")
                 self._state = STATE_LISTENING
                 state = self._state
@@ -1607,7 +1727,7 @@ class MurmlyDaemon:
         # otherwise its transcript could paste after this one, out of order.
         with self._unit_lock:
             try:
-                pcm_audio = self._session.stop_recording()
+                pcm_audio = self._stop_recording()
             except Exception as error:
                 self._publish_error()
                 # Capture has ended, so the hold ends with it. Every other path
@@ -1761,7 +1881,7 @@ class MurmlyDaemon:
 
     def _finish_auto_stop(self) -> None:
         try:
-            pcm_audio = self._session.stop_recording()
+            pcm_audio = self._stop_recording()
             # Published only once capture has stopped, matching the toggle path:
             # the processing presentation must never be shown while the waveform
             # still represents live input.
@@ -1855,7 +1975,7 @@ class MurmlyDaemon:
         except RuntimeError as error:
             logger.warning("Unable to start %s: %s", name, error)
             try:
-                self._session.stop_recording()
+                self._stop_recording()
             except Exception as stop_error:
                 logger.warning("Unable to stop capture after a failed transition: %s", stop_error)
             self._publish_error()
@@ -1870,7 +1990,7 @@ class MurmlyDaemon:
             # The audio captured since the refused segment closed is discarded:
             # the session is ending because delivery was refused, so delivering
             # more of it would repeat the mistake.
-            self._session.stop_recording()
+            self._stop_recording()
         except Exception as error:
             logger.warning("Ending a continuous session failed: %s", error)
         finally:

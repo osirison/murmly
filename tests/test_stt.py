@@ -16,6 +16,85 @@ from murmly.config import MurmlyConfig
 from murmly.stt import FasterWhisperTranscriber
 
 
+# A gate a test forgot to open fails that test rather than hanging the suite.
+GATE_TIMEOUT_SECONDS = 5.0
+# Long enough that a thread which is genuinely blocked is still blocked when it
+# expires, short enough that asserting so costs nothing.
+BLOCKED_SECONDS = 0.05
+
+
+class FakeCTranslate2Model:
+    """The `Whisper` object behind `WhisperModel.model`, with real residency.
+
+    A bare `Mock()` answers every attribute truthily, so `model.model_is_loaded`
+    on one reads True whether or not the code under test ever consults it, and a
+    missing residency re-check would pass. This tracks the flag for real and
+    records the `to_cpu` argument of every unload, which is the only place in the
+    suite that can catch `to_cpu=True` -- the mode that frees the device by moving
+    1541 MiB into host RSS -- being reintroduced.
+    """
+
+    def __init__(
+        self,
+        *,
+        loaded: bool = True,
+        events: list[str] | None = None,
+        load_gate: threading.Event | None = None,
+        load_error: Exception | None = None,
+    ) -> None:
+        self.model_is_loaded = loaded
+        self.loads = 0
+        self.unloads: list[bool] = []
+        self.events = events if events is not None else []
+        self._load_gate = load_gate
+        self._load_error = load_error
+
+    def load_model(self) -> None:
+        if self._load_gate is not None:
+            self._load_gate.wait(GATE_TIMEOUT_SECONDS)
+        self.loads += 1
+        if self._load_error is not None:
+            # One failure only, so the same fake can show that the next request
+            # tries again rather than giving up on the model for good.
+            error, self._load_error = self._load_error, None
+            raise error
+        self.model_is_loaded = True
+        self.events.append("loaded")
+
+    def unload_model(self, to_cpu: bool = False) -> None:
+        self.unloads.append(to_cpu)
+        self.model_is_loaded = False
+        self.events.append("unloaded")
+
+
+class FakeWhisperModel:
+    """`WhisperModel` as far as murmly uses it: a decode and an inner model.
+
+    The wrapper outlives an unload -- that is the whole reason identity cannot be
+    the residency test -- so this stays a usable object while its inner model
+    reports the weights gone, and decoding in that state raises the way
+    CTranslate2 does rather than quietly returning text.
+    """
+
+    def __init__(self, text: str = " the transcript ", **model_arguments) -> None:
+        self.events: list[str] = []
+        self.model = FakeCTranslate2Model(events=self.events, **model_arguments)
+        self.text = text
+        self.decoded: list[object] = []
+        self.decode_started = threading.Event()
+        self.decode_gate: threading.Event | None = None
+
+    def transcribe(self, audio, **_kwargs):
+        if not self.model.model_is_loaded:
+            raise RuntimeError("Requested a decode from a model whose weights are gone")
+        self.decoded.append(audio)
+        self.decode_started.set()
+        if self.decode_gate is not None:
+            self.decode_gate.wait(GATE_TIMEOUT_SECONDS)
+        self.events.append("decoded")
+        return ([SimpleNamespace(text=self.text)], object())
+
+
 class FasterWhisperTranscriberTests(unittest.TestCase):
     def test_model_load_pins_balanced_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -459,3 +538,273 @@ class TranscriberConcurrencyTests(unittest.TestCase):
             worker.join(timeout=5)
 
         self.assertEqual([None], results)
+
+
+class TranscriberResidencyTests(unittest.TestCase):
+    """The release, reload and warm-up cycle around a model that can vanish.
+
+    These use `FakeWhisperModel` rather than a `Mock`, because a `Mock` reports
+    itself loaded whatever the code does and every one of these guarantees would
+    then pass without being implemented.
+    """
+
+    def _transcriber(self, model) -> FasterWhisperTranscriber:
+        """A transcriber already holding `model`, with no construction involved.
+
+        Assigning `_model` is what a warm daemon looks like from here:
+        `_load_model` finds a wrapper already there and hands it straight back,
+        which is the state an idle release acts on.
+        """
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+        transcriber = FasterWhisperTranscriber(config)
+        transcriber._model = model
+        return transcriber
+
+    def test_a_delivered_transcript_after_an_eviction_is_unchanged(self) -> None:
+        model = FakeWhisperModel()
+        transcriber = self._transcriber(model)
+
+        before = transcriber.transcribe_pcm16(b"\x01\x00" * 16_000)
+        self.assertTrue(transcriber.release())
+        self.assertFalse(transcriber.resident)
+
+        after = transcriber.transcribe_pcm16(b"\x01\x00" * 16_000)
+
+        self.assertEqual("the transcript", before)
+        self.assertEqual(before, after)
+        self.assertTrue(transcriber.resident)
+        # Reloaded in place. A reconstructed wrapper would have counted no load
+        # here and paid a cold build instead.
+        self.assertEqual(1, model.model.loads)
+        # The delivered transcript takes the WAV route, which is the decode site
+        # that goes unchecked if only the array path re-checks residency.
+        self.assertTrue(all(isinstance(audio, str) for audio in model.decoded))
+
+    def test_a_partial_after_an_eviction_is_unchanged(self) -> None:
+        model = FakeWhisperModel()
+        transcriber = self._transcriber(model)
+        transcriber.begin_capture()
+
+        before = transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+        self.assertTrue(transcriber.release())
+
+        after = transcriber.transcribe_partial(b"\x01\x00" * 16_000)
+
+        self.assertEqual("the transcript", before)
+        self.assertEqual(before, after)
+        self.assertTrue(transcriber.partials_available)
+        self.assertEqual(1, model.model.loads)
+        # The other decode site: 16 kHz mono partials hand the model an array and
+        # never touch a temporary WAV.
+        self.assertFalse(any(isinstance(audio, str) for audio in model.decoded))
+
+    def test_eviction_during_a_pass_waits_rather_than_interrupting(self) -> None:
+        model = FakeWhisperModel()
+        model.decode_gate = threading.Event()
+        transcriber = self._transcriber(model)
+
+        decoding = threading.Thread(
+            target=transcriber.transcribe_pcm16, args=(b"\x01\x00" * 16_000,)
+        )
+        decoding.start()
+        self.assertTrue(model.decode_started.wait(GATE_TIMEOUT_SECONDS))
+
+        released: list[bool] = []
+        evictor = threading.Thread(target=lambda: released.append(transcriber.release()))
+        evictor.start()
+        evictor.join(BLOCKED_SECONDS)
+
+        # The evictor is parked on `_model_lock`, which is the whole mechanism:
+        # the weights are still under the decode that is using them.
+        self.assertTrue(evictor.is_alive())
+        self.assertTrue(model.model.model_is_loaded)
+
+        model.decode_gate.set()
+        decoding.join(GATE_TIMEOUT_SECONDS)
+        evictor.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertEqual(["decoded", "unloaded"], model.events)
+        self.assertEqual([True], released)
+
+    def test_a_release_frees_the_device_rather_than_moving_the_weights_to_the_host(self) -> None:
+        """`to_cpu` must stay False.
+
+        `to_cpu=True` returns the same accelerator memory but parks the weights in
+        host RAM, measured at 1541 MiB of added RSS, which for a daemon that is
+        idle almost all of the time relocates the footprint instead of reducing
+        it. Nothing else in the suite would notice that argument changing.
+        """
+        model = FakeWhisperModel()
+        transcriber = self._transcriber(model)
+
+        self.assertTrue(transcriber.release())
+
+        self.assertEqual([False], model.model.unloads)
+        self.assertFalse(model.model.model_is_loaded)
+
+    def test_releasing_a_model_that_is_absent_or_already_released_does_nothing(self) -> None:
+        transcriber = self._transcriber(None)
+        self.assertFalse(transcriber.release())
+
+        model = FakeWhisperModel()
+        transcriber._model = model
+        self.assertTrue(transcriber.release())
+        self.assertFalse(transcriber.release())
+
+        self.assertEqual([False], model.model.unloads)
+
+    def test_a_release_hands_the_freed_heap_back_to_the_system(self) -> None:
+        """Freeing is not returning, and the requirement is that it reach the system.
+
+        Dropping the weights frees the reload's staging into glibc's arenas,
+        where it stays mapped and stays counted against this process. Measured
+        over eight cycles, the released floor sat at 1812 MiB without this step
+        and at 396 MiB with it.
+
+        Asserted outside the model lock as well as at all, because a trim walks
+        the arenas and a transcription starting behind one would wait for it.
+        """
+        model = FakeWhisperModel()
+        transcriber = self._transcriber(model)
+        held: list[bool] = []
+
+        with patch(
+            "murmly.stt.return_free_heap",
+            side_effect=lambda: held.append(transcriber._model_lock.locked()),
+        ) as trim:
+            self.assertTrue(transcriber.release())
+
+        trim.assert_called_once_with()
+        self.assertEqual([False], held, "the heap was trimmed while the model lock was held")
+
+    def test_a_release_that_frees_nothing_does_not_trim(self) -> None:
+        """An idle timer firing against an already released model walks no arenas."""
+        transcriber = self._transcriber(None)
+
+        with patch("murmly.stt.return_free_heap") as trim:
+            self.assertFalse(transcriber.release())
+
+        trim.assert_not_called()
+
+    def test_reporting_residency_loads_nothing(self) -> None:
+        transcriber = self._transcriber(None)
+
+        with patch.object(transcriber, "_load_model") as load_model:
+            self.assertFalse(transcriber.resident)
+        load_model.assert_not_called()
+
+        model = FakeWhisperModel(loaded=False)
+        transcriber._model = model
+        self.assertFalse(transcriber.resident)
+        self.assertEqual(0, model.model.loads)
+
+        model.model.model_is_loaded = True
+        self.assertTrue(transcriber.resident)
+
+    def test_a_failed_reload_is_retried_rather_than_remembered(self) -> None:
+        model = FakeWhisperModel(loaded=False, load_error=RuntimeError("out of memory"))
+        transcriber = self._transcriber(model)
+
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            transcriber.transcribe_pcm16(b"\x01\x00" * 16_000)
+
+        self.assertEqual("the transcript", transcriber.transcribe_pcm16(b"\x01\x00" * 16_000))
+        self.assertEqual(2, model.model.loads)
+
+    def test_warming_the_model_does_not_block_begin_capture(self) -> None:
+        gate = threading.Event()
+        model = FakeWhisperModel(loaded=False, load_gate=gate)
+        transcriber = self._transcriber(model)
+
+        transcriber.begin_capture()
+
+        # begin_capture returned while the reload is still parked on the gate,
+        # which is the guarantee: capture starts without waiting for weights.
+        self.assertFalse(transcriber.resident)
+        self.assertEqual(0, model.model.loads)
+
+        gate.set()
+        transcriber._warm_up_thread.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertTrue(transcriber.resident)
+        self.assertEqual(1, model.model.loads)
+
+    def test_repeated_capture_starts_do_not_stack_warm_up_threads(self) -> None:
+        gate = threading.Event()
+        model = FakeWhisperModel(loaded=False, load_gate=gate)
+        transcriber = self._transcriber(model)
+
+        transcriber.begin_capture()
+        warming = transcriber._warm_up_thread
+        transcriber.begin_capture()
+        transcriber.begin_capture()
+
+        self.assertIs(warming, transcriber._warm_up_thread)
+
+        gate.set()
+        warming.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertEqual(1, model.model.loads)
+
+    def test_capture_does_not_warm_a_model_that_is_already_resident(self) -> None:
+        model = FakeWhisperModel()
+        transcriber = self._transcriber(model)
+
+        transcriber.begin_capture()
+
+        self.assertIsNone(transcriber._warm_up_thread)
+        self.assertEqual(0, model.model.loads)
+
+    def test_capture_does_not_construct_a_model_that_was_never_loaded(self) -> None:
+        """The warm-up undoes a release; it is not a second eager-load switch.
+
+        Building the first model here would put the cold 1.99 s load on exactly
+        the path `lazy_load_model` keeps it off.
+        """
+        transcriber = self._transcriber(None)
+
+        with patch.object(transcriber, "_load_model") as load_model:
+            transcriber.begin_capture()
+
+        load_model.assert_not_called()
+        self.assertIsNone(transcriber._warm_up_thread)
+
+    def test_a_failed_warm_up_does_not_reach_the_caller_that_started_capture(self) -> None:
+        model = FakeWhisperModel(loaded=False, load_error=RuntimeError("out of memory"))
+        transcriber = self._transcriber(model)
+
+        with self.assertLogs("murmly.stt", level="WARNING"):
+            transcriber.begin_capture()
+            transcriber._warm_up_thread.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertFalse(transcriber.resident)
+        # The pass that follows loads the model itself, so a failed warm-up costs
+        # latency rather than the transcript.
+        self.assertEqual("the transcript", transcriber.transcribe_pcm16(b"\x01\x00" * 16_000))
+
+    def test_a_runtime_without_the_unload_methods_stays_resident(self) -> None:
+        """A CTranslate2 build that cannot be asked behaves as murmly does today.
+
+        Degrading to always-resident costs the memory a release would have
+        returned. Raising out of the residency check would cost the transcript,
+        which is the worse of the two by a long way.
+        """
+        older_runtime = SimpleNamespace(
+            model=SimpleNamespace(),
+            transcribe=lambda audio, **_kwargs: (
+                [SimpleNamespace(text=" an older runtime ")],
+                object(),
+            ),
+        )
+        transcriber = self._transcriber(older_runtime)
+
+        self.assertTrue(transcriber.resident)
+        self.assertFalse(transcriber.release())
+        self.assertEqual(
+            "an older runtime", transcriber.transcribe_pcm16(b"\x01\x00" * 16_000)
+        )
