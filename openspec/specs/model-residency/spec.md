@@ -1,6 +1,7 @@
-# model-residency Specification
+# Model Residency Specification
 
 ## Purpose
+
 Defines when Murmly's transcription model and synthesis session occupy accelerator
 memory, when that memory is released back to the system, what releasing it must
 never disturb, and how a person configures and inspects that behaviour.

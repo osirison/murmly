@@ -82,12 +82,24 @@ provider: CPUExecutionProvider
 
 There is no error. The run completes and reports numbers for a CPU session.
 
-**Run one-off scripts and benchmarks with `.venv/bin/python` directly.** `uv run`
+**Run one-off scripts and benchmarks with `uv run --no-sync`.** A bare `uv run`
 syncs the environment before it runs anything, so it repairs the "missing" CPU
-package every time. A long-lived daemon started before the swap was undone keeps
-its original mappings and goes on using the GPU, so `nvidia-smi` and the daemon
-log will disagree with a fresh interpreter — check
-`.venv/bin/python -c "import onnxruntime as ort; print(ort.get_available_providers())"`,
+package every time. `--no-sync` skips that step and leaves the swap in place; it
+is what `.github/workflows/tests.yml` and `setup.sh` already use. Naming no extra
+is not a substitute — the CPU `onnxruntime` arrives as a dependency of
+`faster-whisper`, which is a base dependency, so every sync reinstalls it.
+
+`.venv/bin/python` also works and skips `uv` entirely, but it resolves only from
+the repository root. From a worktree under `.worktrees/` it fails outright, and
+`uv run --no-sync` there creates an empty `.venv` in the worktree before failing
+with `ModuleNotFoundError` — after which `.venv/bin/python` appears to exist. A
+worktree needs its own synced environment, with the swap reapplied, before any
+measurement taken in it means anything.
+
+A long-lived daemon started before the swap was undone keeps its original
+mappings and goes on using the GPU, so `nvidia-smi` and the daemon log will
+disagree with a fresh interpreter — check
+`uv run --no-sync python -c "import onnxruntime as ort; print(ort.get_available_providers())"`,
 not the running process.
 
 ## Repairing it needs `--reinstall`

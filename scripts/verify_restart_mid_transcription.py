@@ -26,8 +26,8 @@ Outcomes, one per attempt:
 
 Usage:
 
-    uv run --extra cuda python scripts/verify_restart_mid_transcription.py
-    uv run --extra cuda python scripts/verify_restart_mid_transcription.py --attempts 3 --speak-seconds 6
+    uv run --no-sync python scripts/verify_restart_mid_transcription.py
+    uv run --no-sync python scripts/verify_restart_mid_transcription.py --attempts 3 --speak-seconds 6
 
 Speak for the whole recording window. Silence can be filtered out before the
 decoder runs, which finishes the transcription too quickly to restart into.
