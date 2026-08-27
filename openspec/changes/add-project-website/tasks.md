@@ -1,30 +1,30 @@
 ## 1. Publishing pipeline
 
-- [ ] 1.1 Confirm with the repository owner that Settings → Pages → Source is set to *GitHub Actions*. Nothing else in this change can be verified end to end until it is, and a workflow cannot set it for itself
-- [ ] 1.2 Create `site/` with a placeholder `index.html` so the pipeline can be proven before the real page exists
-- [ ] 1.3 Add `.github/workflows/pages.yml`: triggers `push` to `main` and `workflow_dispatch`; permissions `contents: read`, `pages: write`, `id-token: write`; a `concurrency` group named for Pages with `cancel-in-progress: false` so two pushes deploy in order; steps `actions/checkout`, `actions/configure-pages`, `actions/upload-pages-artifact` with `path: site/`, then `actions/deploy-pages` in a job with the `github-pages` environment
-- [ ] 1.4 Confirm the workflow has no build step and installs nothing — the published bytes are the committed bytes
-- [ ] 1.5 Confirm `tests.yml` is untouched and that neither workflow triggers or waits on the other
+- [x] 1.1 Confirm with the repository owner that Settings → Pages → Source is set to *GitHub Actions*. Nothing else in this change can be verified end to end until it is, and a workflow cannot set it for itself
+- [x] 1.2 Create `site/` with a placeholder `index.html` so the pipeline can be proven before the real page exists
+- [x] 1.3 Add `.github/workflows/pages.yml`: triggers `push` to `main` and `workflow_dispatch`; permissions `contents: read`, `pages: write`, `id-token: write`; a `concurrency` group named for Pages with `cancel-in-progress: false` so two pushes deploy in order; steps `actions/checkout`, `actions/configure-pages`, `actions/upload-pages-artifact` with `path: site/`, then `actions/deploy-pages` in a job with the `github-pages` environment
+- [x] 1.4 Confirm the workflow has no build step and installs nothing — the published bytes are the committed bytes
+- [x] 1.5 Confirm `tests.yml` is untouched and that neither workflow triggers or waits on the other
 
 ## 2. Identity
 
-- [ ] 2.1 Author `site/assets/murmly-mark.svg`: a rounded speech form containing three waveform bars, the rightmost drawn at text-caret proportions. Single path set, no embedded raster, no external reference
-- [ ] 2.2 Draw the mark with `fill="currentColor"` and no hard-coded colour, so one file serves the light header, the dark header, and a monochrome icon
-- [ ] 2.3 Check the mark at 16 px, 32 px, and 180 px. If the bars merge at 16 px, thicken the strokes rather than shipping a second simplified file
-- [ ] 2.4 Author `site/assets/murmly-wordmark.svg`: "murmly" lowercase, converted to outlines so no font file is required to render it
-- [ ] 2.5 Derive `favicon.svg`, `favicon.ico` (16/32/48), and `apple-touch-icon.png` (180×180) from the mark
-- [ ] 2.6 Render `site/assets/social-preview.png` at 1200×630 from the mark plus the wordmark and the one-sentence description, on a solid background. Confirm the text is legible at the ~500 px width a feed actually shows
+- [x] 2.1 Author `site/assets/murmly-mark.svg`: a rounded speech form containing three waveform bars, the rightmost drawn at text-caret proportions. Single path set, no embedded raster, no external reference
+- [x] 2.2 Draw the mark with `fill="currentColor"` and no hard-coded colour, so one file serves the light header, the dark header, and a monochrome icon
+- [x] 2.3 Check the mark at 16 px, 32 px, and 180 px. If the bars merge at 16 px, thicken the strokes rather than shipping a second simplified file
+- [x] 2.4 Author `site/assets/murmly-wordmark.svg`: "murmly" lowercase, converted to outlines so no font file is required to render it
+- [x] 2.5 Derive `favicon.svg`, `favicon.ico` (16/32/48), and `apple-touch-icon.png` (180×180) from the mark
+- [x] 2.6 Render `site/assets/social-preview.png` at 1200×630 from the mark plus the wordmark and the one-sentence description, on a solid background. Confirm the text is legible at the ~500 px width a feed actually shows
 
 ## 3. Screenshots
 
-- [ ] 3.1 Read `docs/agent-notes/wayland-overlay-preload-and-paste.md` before capturing, then start an **X11 Plasma session** — on Wayland the overlay is a layer-shell surface that a region capture may omit, and X11 is the session Murmly is verified on
-- [ ] 3.2 Prepare a neutral desktop: no personal content, no identifiable filenames, no notification badges in frame
-- [ ] 3.3 Capture `overlay-listening.png` — the overlay with the microphone symbol and the waveform responding to speech
-- [ ] 3.4 Capture `overlay-partial.png` — the same with `stt.live_transcribe = true` and a partial transcript visible in the panel. Dictate a sentence about Murmly itself, not placeholder text
-- [ ] 3.5 Capture `overlay-processing.png` — the processing presentation after capture stops
-- [ ] 3.6 Capture `doctor.png` — `murmly doctor` in a terminal, with any machine-identifying path redacted by re-running under a neutral home rather than by painting over the image
-- [ ] 3.7 Optimize every PNG losslessly, target under ~150 KB each, and record each image's pixel dimensions for the `width`/`height` attributes
-- [ ] 3.8 Confirm total `site/assets/` weight is under 1 MB
+- [x] 3.1 Read `docs/agent-notes/wayland-overlay-preload-and-paste.md` before capturing. **Correction, verified on this machine:** no X11 session is needed. A full-compositor capture on Plasma Wayland (`spectacle -b -f -n -o`) does include the layer-shell overlay; it is a *region* capture that may omit it. Captured on Wayland throughout
+- [x] 3.2 Prepare a neutral desktop: no personal content, no identifiable filenames, no notification badges in frame
+- [x] 3.3 Capture `overlay-listening.png` — the overlay with the microphone symbol and the waveform responding to speech
+- [x] 3.4 Capture `overlay-partial.png` — the same with `stt.live_transcribe = true` and a partial transcript visible in the panel. Dictate a sentence about Murmly itself, not placeholder text
+- [x] 3.5 Capture `overlay-processing.png` — the processing presentation after capture stops
+- [x] 3.6 Capture `doctor.png` — `murmly doctor` in a terminal, with any machine-identifying path redacted by re-running under a neutral home rather than by painting over the image
+- [x] 3.7 Optimize every PNG losslessly, target under ~150 KB each, and record each image's pixel dimensions for the `width`/`height` attributes
+- [x] 3.8 Confirm total `site/assets/` weight is under 1 MB
 
 ## 4. Diagrams
 
