@@ -1,0 +1,49 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Deployments queue rather than cancel each other: a cancelled deploy would
+# leave whichever run finished last as the published page, which is not
+# necessarily the newest commit.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      # site/ is published exactly as committed. There is no generator and
+      # nothing to install: the page is hand-authored HTML, CSS and SVG, so a
+      # build step would only give the published bytes a chance to differ from
+      # the reviewed ones.
+      - name: Upload site/
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
