@@ -66,21 +66,21 @@
 
 - [x] 8.1 Add the site link near the top of `README.md`
 - [x] 8.2 Write `docs/agent-notes/` entries for whatever the capture and publish work turned up that is not obvious — at minimum the layer-shell screenshot constraint if it bit, and the Pages source setting being manual
-- [ ] 8.3 Set the repository's social preview image to `social-preview.png` and add the site URL to the About field
+- [x] 8.3 Set the repository's social preview image to `social-preview.png` and add the site URL to the About field. About field set via `gh repo edit --homepage`. The social preview image has no REST or GraphQL endpoint, so it was uploaded by the repository owner at Settings → General → Social preview; verified by fetching `og:image` from the repo page, which now resolves to `repository-images.githubusercontent.com` at 1200×630 and is sha256-identical to the committed asset
 
 ## 9. Verification
 
 - [x] 9.1 Open `site/index.html` from local disk with no network and confirm the logo, screenshots, diagrams, and typography all render — this proves both the relative paths and the no-third-party-requests requirement in one pass
 - [x] 9.2 Grep `site/` for `http://` and `https://` and confirm every hit is either a navigation `href` or one of the three absolute URLs in the head (`canonical`, `og:url`, `og:image`). No subresource may point off origin
-- [ ] 9.3 After deploy, load `https://osirison.github.io/murmly/` with the network panel recording, and confirm no request leaves the origin, nothing returns 404, no cookie is set, and no persistent storage entry is written
+- [x] 9.3 After deploy, load `https://osirison.github.io/murmly/` with the network panel recording, and confirm no request leaves the origin, nothing returns 404, no cookie is set, and no persistent storage entry is written
 - [x] 9.4 Load the page with scripting disabled and confirm every section, image, link, and the install command are present and readable
 - [x] 9.5 Check every text and background pair against 4.5:1, and 3:1 for text at 24 px or larger, in both colour schemes
 - [x] 9.6 Tab through the page and confirm every link and control takes focus in reading order with a visible indicator
 - [x] 9.7 Confirm every informative image has a text alternative describing what it shows, and that decorative images are marked so a screen reader skips them
 - [x] 9.8 View the page at 360 px, 768 px, and 1280 px and confirm no horizontal scrolling of the body at any of them
 - [x] 9.9 Load the page under both `prefers-color-scheme` values and confirm the mark and wordmark are legible in each
-- [ ] 9.10 Paste the published URL into a link-preview renderer and confirm the title, description, and image come from this origin
-- [ ] 9.11 Open a pull request that changes a file under `site/` and confirm the published page does not change until it merges
-- [ ] 9.12 Run `workflow_dispatch` and confirm the page republishes from the current `main` without a code change
-- [ ] 9.13 Confirm the deploy did not run the Python test matrix
+- [x] 9.10 Paste the published URL into a link-preview renderer and confirm the title, description, and image come from this origin
+- [x] 9.11 Open a pull request that changes a file under `site/` and confirm the published page does not change until it merges
+- [x] 9.12 Run `workflow_dispatch` and confirm the page republishes from the current `main` without a code change
+- [x] 9.13 Confirm the deploy did not run the Python test matrix
 - [x] 9.14 Run `openspec validate add-project-website --strict` and the existing suite once, to confirm this change left neither of them worse
