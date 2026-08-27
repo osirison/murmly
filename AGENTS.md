@@ -15,11 +15,18 @@ Run `openspec list` to see what is active.
 ## Tests
 
 ```bash
-uv run --extra cuda python -m unittest discover -s tests
+uv run --no-sync python -m unittest discover -s tests
 ```
 
 The suite is stdlib `unittest` with no external test dependencies. Tests that need a
 live desktop session skip themselves when it is unavailable rather than failing.
+
+`--no-sync` is what makes this safe, and it is needed whether or not an extra is
+named. `uv run` syncs before it runs anything, and the CPU build of `onnxruntime`
+arrives as a dependency of `faster-whisper`, so any sync reinstalls it over the GPU
+build on a machine that has had the swap applied. The suite still passes, and every
+synthesis measurement taken afterwards silently reports a CPU session. This is the
+command CI runs. See `docs/agent-notes/onnxruntime-gpu-cuda-version.md`.
 
 # Commit Comments
 NEVER USE `🤖 Generated with Claude Code`
