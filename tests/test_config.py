@@ -16,15 +16,19 @@ from murmly.config import (
     DEFAULT_OVERLAY_TEXT_SIZE_PX,
     DEFAULT_RESTORE_DELAY_MS,
     DEFAULT_SILENCE_MS,
+    DEFAULT_STT_UNLOAD_AFTER_IDLE_S,
     DEFAULT_TTS_DEVICE,
+    DEFAULT_TTS_UNLOAD_AFTER_IDLE_S,
     MAX_LIVE_INTERVAL_MS,
     MAX_LIVE_WINDOW_SECONDS,
     MAX_OVERLAY_TEXT_SIZE_PX,
     MAX_RESTORE_DELAY_MS,
     MAX_SILENCE_MS,
+    MAX_UNLOAD_AFTER_IDLE_S,
     MIN_LIVE_INTERVAL_MS,
     MIN_OVERLAY_TEXT_SIZE_PX,
     MIN_SILENCE_MS,
+    MIN_UNLOAD_AFTER_IDLE_S,
     default_socket_path,
     load_config,
 )
@@ -386,6 +390,150 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual("cpu", config.tts_device)
         self.assertEqual("rocm", config.tts_device_rejected_value)
+
+    def test_transcription_release_is_on_and_synthesis_release_off_without_configuration(
+        self,
+    ) -> None:
+        """The two defaults deliberately disagree, so one test pins both together.
+
+        Transcription returns accelerator memory and reloads while the person is
+        still speaking; synthesis returns system memory and costs silence with
+        nothing to overlap it. A later change that quietly gave them one shared
+        default would still satisfy either assertion on its own.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = load_config(Path(temp_dir) / "missing.toml")
+
+        self.assertEqual(DEFAULT_STT_UNLOAD_AFTER_IDLE_S, config.unload_after_idle_s)
+        self.assertEqual(300, config.unload_after_idle_s)
+        self.assertEqual(DEFAULT_TTS_UNLOAD_AFTER_IDLE_S, config.tts_unload_after_idle_s)
+        self.assertEqual(0, config.tts_unload_after_idle_s)
+
+    def test_an_explicit_zero_disables_release_for_either_model(self) -> None:
+        """Zero lies below the supported minimum, and must not be read as out of range.
+
+        The generic `_bounded_int` answers its default for anything outside the
+        bounds, so putting an idle period through it would turn the setting that
+        switches release off into the one that switches it on after five minutes.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [stt]
+                    unload_after_idle_s = 0
+
+                    [tts]
+                    unload_after_idle_s = 0
+                    """
+                ).strip()
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(0, config.unload_after_idle_s)
+        self.assertEqual(0, config.tts_unload_after_idle_s)
+
+    def test_an_out_of_range_idle_period_falls_back_to_that_settings_own_default(self) -> None:
+        """Both are wrong in the same file, because a shared fallback passes either alone."""
+        for stt_value, tts_value in (
+            (MIN_UNLOAD_AFTER_IDLE_S - 1, MAX_UNLOAD_AFTER_IDLE_S + 1),
+            (MAX_UNLOAD_AFTER_IDLE_S + 1, MIN_UNLOAD_AFTER_IDLE_S - 1),
+            (-60, '"never"'),
+            ('"forever"', 999_999_999),
+        ):
+            with (
+                self.subTest(stt=stt_value, tts=tts_value),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [stt]
+                        unload_after_idle_s = {stt_value}
+
+                        [tts]
+                        unload_after_idle_s = {tts_value}
+                        """
+                    ).strip()
+                )
+
+                config = load_config(config_path)
+
+            self.assertEqual(DEFAULT_STT_UNLOAD_AFTER_IDLE_S, config.unload_after_idle_s)
+            self.assertEqual(DEFAULT_TTS_UNLOAD_AFTER_IDLE_S, config.tts_unload_after_idle_s)
+
+    def test_a_fractional_idle_period_falls_back_rather_than_disabling_release(self) -> None:
+        """Only an exact zero means never.
+
+        The zero check used to truncate, so 0.5 and -0.9 read as zero and
+        switched release off. For `[stt]`, whose default is 300, that turned a
+        mistyped period into a silently disabled feature -- the same inversion
+        the helper exists to prevent, one layer further in. These values are all
+        outside the bounds and are not zero, so each takes its setting's own
+        default.
+        """
+        for value in ("0.5", "0.99", "-0.9", "-0.5", "29.9"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [stt]
+                        unload_after_idle_s = {value}
+
+                        [tts]
+                        unload_after_idle_s = {value}
+                        """
+                    ).strip()
+                )
+
+                config = load_config(config_path)
+
+                self.assertEqual(
+                    DEFAULT_STT_UNLOAD_AFTER_IDLE_S,
+                    config.unload_after_idle_s,
+                    f"{value} disabled transcription release instead of falling back",
+                )
+                self.assertEqual(
+                    DEFAULT_TTS_UNLOAD_AFTER_IDLE_S, config.tts_unload_after_idle_s
+                )
+
+    def test_an_idle_period_within_the_bounds_is_used_as_written(self) -> None:
+        for value in (MIN_UNLOAD_AFTER_IDLE_S, 300, 3_600, MAX_UNLOAD_AFTER_IDLE_S):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    f"[stt]\nunload_after_idle_s = {value}\n\n[tts]\nunload_after_idle_s = {value}"
+                )
+
+                config = load_config(config_path)
+
+            self.assertEqual(value, config.unload_after_idle_s)
+            self.assertEqual(value, config.tts_unload_after_idle_s)
+
+    def test_either_model_can_be_released_while_the_other_stays_resident(self) -> None:
+        """The reverse of the shipped defaults, which no fallback path can produce."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                textwrap.dedent(
+                    """
+                    [stt]
+                    unload_after_idle_s = 0
+
+                    [tts]
+                    unload_after_idle_s = 900
+                    """
+                ).strip()
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(0, config.unload_after_idle_s)
+        self.assertEqual(900, config.tts_unload_after_idle_s)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

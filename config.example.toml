@@ -42,6 +42,19 @@ device = "auto"             # auto | cpu | cuda
 compute_type = "auto"       # auto means float16 on CUDA, int8 on CPU
 lazy_load_model = true      # Load the model on the first recording, not at startup
 
+# Hand the transcription model's GPU memory back after this many idle seconds,
+# 30-86400, and reload it when recording next starts. 0 keeps it resident for
+# the life of the daemon, which is what Murmly did before this setting existed.
+# Idle is counted from the end of a recording session and reset when capture
+# begins, so a continuous session is never released while it is still running,
+# however long you pause between utterances.
+#
+# On by default. Measured on one machine (RTX 3080 Laptop, reproduced across two
+# runs) the release returns 2080 MiB of accelerator memory, and the 0.78 s
+# reload is started when capture begins -- so it runs while you are still
+# speaking rather than adding to the wait after you stop.
+unload_after_idle_s = 300
+
 # beam_size and vad_filter follow the profile: beam 1 without VAD for fast, beam 5
 # with VAD for balanced and accurate. Setting either here pins it across every
 # profile, so leave them commented unless you mean to override the profile.
@@ -112,6 +125,24 @@ rate = 100
 # build described above; a GPU that cannot be used falls back to the CPU and
 # logs the remedy rather than refusing to speak.
 device = "cpu"
+
+# Drop the synthesis session after this many idle seconds, 30-86400, and build a
+# new one for the next speech session. ONNX Runtime has no way to release a
+# session's memory in place, so this is the only way to get it back. 0, the
+# default, keeps the session resident once it has been built.
+#
+# Off by default, unlike `[stt] unload_after_idle_s`, because what this one costs
+# is silence with nothing to overlap it. Measured on one machine (RTX 3080
+# Laptop, reproduced across two runs): under `device = "cpu"` above it returns
+# 377 MiB of system memory and no accelerator memory, and 759-767 ms pass before
+# speech resumes. Transcription's reload is spent while you are still speaking;
+# this one is spent waiting for the machine to start talking.
+#
+# Under `device = "cuda"` it returns 528 MiB of accelerator memory and 105 MiB of
+# system memory in 607-611 ms, but that pair of settings is a trade rather than a
+# saving: the rebuilt sessions cost a one-time 277 MiB of system memory and then
+# roughly 8 MiB per release cycle. The shipped defaults never reach it.
+unload_after_idle_s = 0
 
 # Output device name or index, as `python -m sounddevice` prints it. Empty means
 # let the system choose, which is what the capture side does too.

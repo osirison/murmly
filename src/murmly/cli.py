@@ -470,8 +470,19 @@ def _run_doctor(config: MurmlyConfig) -> None:
         speech = {
             "enabled": config.tts_enabled,
             "available": False,
+            # Both residency keys survive a failed probe. A section that drops
+            # them reads as one the report never asked about, which is the
+            # distinction the residency requirement exists to preserve.
+            "unload_after_idle_s": config.tts_unload_after_idle_s,
+            "resident": False,
             "detail": f"Unable to check speech output: {error}",
         }
+
+    # Asked before the report is assembled rather than while it is being
+    # assembled. `live_transcription_diagnostics` below loads the model when
+    # live transcription is enabled, and residency is meant to say what was held
+    # when the question was put, not what this report loaded on its way past.
+    model_resident, model_resident_detail = transcription_residency()
 
     report: dict[str, object] = {
         "config_path": str(config.config_path),
@@ -488,6 +499,11 @@ def _run_doctor(config: MurmlyConfig) -> None:
         "runtime_compute_type": runtime_compute_type,
         "beam_size": config.beam_size,
         "vad_filter": config.vad_filter,
+        "model_resident": model_resident,
+        # Reported even when it is zero. Zero is how release is switched off, and
+        # a reader who cannot see the value cannot tell a model that will never
+        # be released from one this report forgot to mention.
+        "unload_after_idle_s": config.unload_after_idle_s,
         "live_transcription": live_transcription_diagnostics(config),
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
@@ -498,6 +514,8 @@ def _run_doctor(config: MurmlyConfig) -> None:
         report["session_detail"] = session_detail
     if runtime_detail is not None:
         report["runtime_detail"] = runtime_detail
+    if model_resident_detail is not None:
+        report["model_resident_detail"] = model_resident_detail
     print(json.dumps(report, indent=2))
 
 
@@ -524,6 +542,33 @@ def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
     return report
 
 
+def transcription_residency(
+    transcriber: FasterWhisperTranscriber | None = None,
+) -> tuple[bool | None, str | None]:
+    """Whether this process holds the transcription model's weights.
+
+    Answers for this process, which is all `murmly doctor` can observe: it runs
+    in its own process, and the residency of a model inside a running daemon is
+    not reachable from here.
+
+    Nothing is constructed to produce the answer. Building a
+    `FasterWhisperTranscriber` loads the model outright whenever
+    `lazy_load_model` is false, and that is precisely the load reporting
+    residency must never perform, so a caller holding no transcriber is reported
+    as holding no weights rather than being given one to ask.
+
+    Guarded like every other probe, and the failure is returned beside the value
+    rather than substituted into it, so a program reading the report never has
+    to tell "not resident" from "could not be asked".
+    """
+    if transcriber is None:
+        return False, None
+    try:
+        return bool(transcriber.resident), None
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return None, f"Unable to determine transcription residency: {error}"
+
+
 def speech_output_diagnostics(
     config: MurmlyConfig,
     synthesizer: KokoroSynthesizer | None = None,
@@ -542,6 +587,14 @@ def speech_output_diagnostics(
         "device": config.tts_device,
         "model_dir": str(config.tts_model_dir),
         "output_device": config.tts_output_device or None,
+        # Carried by the disabled and the unavailable report as well, and carried
+        # when the period is zero, which is how synthesis release ships. A reader
+        # who cannot see the value cannot tell a release that is switched off
+        # from one this report did not mention. Residency starts False for the
+        # same reason: the early returns below are the cases where no session was
+        # ever built, and a stack that never spoke is holding nothing.
+        "unload_after_idle_s": config.tts_unload_after_idle_s,
+        "resident": False,
     }
     if config.tts_voice_rejected_value is not None:
         report["voice_rejected_value"] = config.tts_voice_rejected_value
@@ -556,6 +609,15 @@ def speech_output_diagnostics(
         return report
 
     probe = synthesizer if synthesizer is not None else KokoroSynthesizer(config)
+    # Read off the probe's own property rather than inferred from the fact that
+    # the probe this function builds has never spoken. `resident` is specified
+    # never to construct a session, and that is the guarantee keeping the report
+    # from building 326 MB of weights in order to say whether they are held.
+    try:
+        report["resident"] = bool(probe.resident)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        report["resident"] = None
+        report["resident_detail"] = f"Unable to determine synthesis residency: {error}"
     report["available"] = probe.available
     if not probe.available:
         # The reason is written as the remedy: what to install, or what to place

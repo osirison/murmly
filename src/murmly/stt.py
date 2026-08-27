@@ -10,6 +10,7 @@ import threading
 import wave
 
 from murmly.config import MurmlyConfig
+from murmly.idle import return_free_heap
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,12 @@ CTRANSLATE2_CUDA_LIBRARIES = (
     ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublas.so.12"),
     ("nvidia-cudnn-cu12", "nvidia/cudnn/lib/libcudnn.so.9"),
 )
+
+# What CTranslate2 4.8.1 puts on the `Whisper` object behind `WhisperModel.model`.
+# All three are needed to run a release and put the weights back, so a runtime
+# that is missing any one of them is treated as one whose model cannot be
+# released rather than one to call half a cycle on.
+RESIDENCY_ATTRIBUTES = ("model_is_loaded", "load_model", "unload_model")
 
 
 def cuda_device_count_available() -> int | None:
@@ -101,12 +108,26 @@ class FasterWhisperTranscriber:
     def __init__(self, config: MurmlyConfig) -> None:
         self._config = config
         self._model = None
+        # The division between these two locks is what keeps an idle release from
+        # racing a transcription, so it is fixed rather than incidental:
+        #
+        #   `_load_lock` guards CONSTRUCTION of the `WhisperModel` wrapper, and
+        #   nothing else.
+        #   `_model_lock` guards RESIDENCY TRANSITIONS -- the reload in
+        #   `_ensure_resident_locked` and the unload in `release` -- together with
+        #   `_decode`, so an evictor waits for a pass in flight rather than taking
+        #   the weights out from under it.
+        #   `_load_lock` is never acquired while `_model_lock` is held, which is
+        #   why `_transcribe` calls `_load_model` before entering its
+        #   `_model_lock` block instead of inside it.
         self._model_lock = threading.Lock()
         self._load_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stopping = threading.Event()
         self._partials_disabled = False
         self._capture_generation = 0
+        self._warming_up = False
+        self._warm_up_thread: threading.Thread | None = None
         if not self._config.lazy_load_model:
             self._load_model()
 
@@ -118,12 +139,67 @@ class FasterWhisperTranscriber:
     def vad_filter(self) -> bool:
         return self._config.vad_filter
 
+    @property
+    def resident(self) -> bool:
+        """Whether the model's weights are on the device right now.
+
+        Answers without loading and without waiting. Diagnostics ask this of a
+        daemon that may never have transcribed, so a model that was never
+        constructed reports False rather than being built to answer, and the read
+        deliberately skips `_model_lock`: taking it would park the report behind
+        whatever decode is currently holding it.
+        """
+        model = self._model
+        if model is None:
+            return False
+        return self._is_resident(model)
+
     def begin_capture(self) -> None:
-        """Allow partial passes again for a new recording."""
+        """Allow partial passes again for a new recording, and warm the model.
+
+        The warm-up is started, not awaited: capture must not be delayed by a
+        reload, and the reload it starts is then spent against speech that is
+        still being recorded.
+        """
         with self._state_lock:
             self._stopping.clear()
             self._partials_disabled = False
             self._capture_generation += 1
+        self._start_warm_up()
+
+    def release(self) -> bool:
+        """Give the model's accelerator memory back, keeping the wrapper.
+
+        Reports whether anything was released, so an idle timer can log the
+        transition without asking a second time. A model that was never
+        constructed, one already unloaded, and a runtime that cannot be asked all
+        answer False and do nothing.
+
+        `to_cpu=False` is a decision rather than a default. `to_cpu=True` returns
+        the same device memory but parks the weights in host RAM -- measured here
+        at 1541 MiB of added RSS -- so for a daemon that is idle almost all of the
+        time it relocates the footprint instead of reducing it.
+
+        Acquiring `_model_lock` is the whole of "a release never interrupts a
+        pass": the release queues behind a decode that holds the lock instead of
+        needing its own mechanism to notice one.
+        """
+        with self._model_lock:
+            model = self._model
+            if model is None:
+                return False
+            handle = self._residency_handle(model)
+            if handle is None or not handle.model_is_loaded:
+                return False
+            handle.unload_model(to_cpu=False)
+        # Outside the lock, because it walks the heap and a transcription
+        # starting behind it would wait for that. What it returns here is not the
+        # weights -- those went back to the device above -- but the staging the
+        # last reload allocated and freed, measured at about 1416 MiB left sitting
+        # in glibc's arenas until something asks for it back.
+        return_free_heap()
+        logger.debug("Released the transcription model's accelerator memory.")
+        return True
 
     def stop_partials(self) -> None:
         """Refuse to start further partial passes.
@@ -187,6 +263,7 @@ class FasterWhisperTranscriber:
         audio = self._as_array(pcm_audio) if fast_path else None
         if audio is not None:
             with self._model_lock:
+                self._ensure_resident_locked(model)
                 return self._decode(model, audio)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
@@ -194,6 +271,10 @@ class FasterWhisperTranscriber:
         try:
             self._write_wav(wav_path, pcm_audio, rate)
             with self._model_lock:
+                # Both decode sites re-check, not just the array one above. A site
+                # that skipped it would fail inside CTranslate2 on an evicted
+                # model, and only for the audio shape that reaches that site.
+                self._ensure_resident_locked(model)
                 return self._decode(model, str(wav_path))
         finally:
             wav_path.unlink(missing_ok=True)
@@ -224,9 +305,73 @@ class FasterWhisperTranscriber:
         samples = np.frombuffer(pcm_audio[:usable], dtype=np.int16).astype(np.float32)
         return samples / 32_768.0
 
+    def _start_warm_up(self) -> None:
+        """Begin putting a released model's weights back, without making anyone wait.
+
+        Capture start is on the critical path, so this returns before the reload
+        has done anything: the 0.78 s it costs is then spent against speech that
+        is still being recorded rather than against the pause after the user
+        stops. Nothing depends on the warm-up winning that race -- `_transcribe`
+        re-checks residency under the same lock and reloads there if it has to --
+        so this is latency work only, and a failure is logged rather than raised
+        into the caller that started capture.
+
+        A model that was never constructed is left alone. The warm-up exists to
+        undo a release; constructing the first model here would move a cold 1.99 s
+        load onto exactly the path `lazy_load_model` keeps it off.
+        """
+        if not self._claim_warm_up():
+            return
+        thread = threading.Thread(
+            target=self._warm_up, name="murmly-model-warmup", daemon=True
+        )
+        try:
+            thread.start()
+        except RuntimeError as error:
+            # Giving the claim back matters more than the warm-up that failed:
+            # left set, it would silently disable warming for the whole process.
+            self._finish_warm_up()
+            logger.warning("Unable to warm the transcription model: %s", error)
+            return
+        self._warm_up_thread = thread
+
+    def _claim_warm_up(self) -> bool:
+        """Whether this caller should start a warm-up, claiming it if so.
+
+        Declines when the weights are already on the device and when a warm-up is
+        still running. Someone toggling capture quickly would otherwise stack
+        threads that all queue on `_model_lock` to redo what the first one is
+        already doing.
+        """
+        model = self._model
+        if model is None or self._is_resident(model):
+            return False
+        with self._state_lock:
+            if self._warming_up:
+                return False
+            self._warming_up = True
+            return True
+
+    def _warm_up(self) -> None:
+        model = self._model
+        try:
+            if model is not None:
+                with self._model_lock:
+                    self._ensure_resident_locked(model)
+        except Exception as error:
+            logger.warning("Unable to warm the transcription model: %s", error)
+        finally:
+            self._finish_warm_up()
+
+    def _finish_warm_up(self) -> None:
+        with self._state_lock:
+            self._warming_up = False
+
     def _load_model(self):
         # Serialized: two threads that both saw `self._model is None` would each
-        # construct a model, allocating two copies of the weights at once.
+        # construct a model, allocating two copies of the weights at once. This
+        # is construction only -- whether the wrapper it returns still has its
+        # weights is a separate question, answered under `_model_lock`.
         with self._load_lock:
             return self._load_model_locked()
 
@@ -246,6 +391,48 @@ class FasterWhisperTranscriber:
                 revision=self._config.model_revision,
             )
         return self._model
+
+    @staticmethod
+    def _residency_handle(model):
+        """The CTranslate2 object that owns the weights, or None when unreachable.
+
+        Residency lives on the `Whisper` reached through `WhisperModel.model`, not
+        on the wrapper: `unload_model()` leaves the wrapper a perfectly valid
+        object and takes only the weights off the device, so `self._model is None`
+        answers a different question than "is this model loaded". Each step uses
+        `getattr` with a default because a CTranslate2 build without these names,
+        or a stand-in that does not reach that far, must degrade to today's
+        always-resident behaviour rather than raise inside a transcription.
+        """
+        handle = getattr(model, "model", None)
+        if handle is None:
+            return None
+        if any(getattr(handle, name, None) is None for name in RESIDENCY_ATTRIBUTES):
+            return None
+        return handle
+
+    def _is_resident(self, model) -> bool:
+        """Whether `model` holds its weights, answering yes when it cannot say."""
+        handle = self._residency_handle(model)
+        if handle is None:
+            return True
+        return bool(handle.model_is_loaded)
+
+    def _ensure_resident_locked(self, model) -> None:
+        """Put the weights back if an idle release took them off the device.
+
+        Called with `_model_lock` held and immediately before `_decode`. Checking
+        earlier -- where `_load_model` hands the wrapper back -- leaves a window in
+        which a release lands between the check and the decode, and CTranslate2
+        then fails inside the decode rather than reloading for us. Reloading is
+        `load_model()` on the wrapper already held, never a fresh `WhisperModel`:
+        reconstruction would discard the tokenizer and feature extractor along
+        with the weights and make every reload a cold load.
+        """
+        handle = self._residency_handle(model)
+        if handle is None or handle.model_is_loaded:
+            return
+        handle.load_model()
 
     @classmethod
     def resolve_runtime(cls, config: MurmlyConfig) -> tuple[str, str]:

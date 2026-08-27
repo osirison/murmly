@@ -65,6 +65,14 @@ class FakeSynthesizer:
         # sleep against it and passing for the wrong reason.
         self._gate = gate
         self._gate_after = gate_after
+        # A fake that never built a session is holding nothing, which is the
+        # state a fresh daemon is in and the one `murmly doctor` reports on.
+        # Present rather than absent because the report distinguishes "not
+        # resident" from "could not be asked": a fake missing the property sends
+        # every caller down the guarded path and makes twelve diagnostics tests
+        # assert against a report that says the question failed.
+        self.resident = False
+        self.released = 0
 
     @property
     def available(self) -> bool:
@@ -73,6 +81,18 @@ class FakeSynthesizer:
     @property
     def unavailable_reason(self) -> str | None:
         return self._unavailable_reason
+
+    def release(self) -> bool:
+        """Drop the session, reporting whether there was one to drop.
+
+        Counted as well as flagged, so a test can tell one release from a timer
+        that fired twice.
+        """
+        if not self.resident:
+            return False
+        self.resident = False
+        self.released += 1
+        return True
 
     def synthesize(self, text: str) -> Iterator[tuple[np.ndarray, int]]:
         self.spoken.append(text)

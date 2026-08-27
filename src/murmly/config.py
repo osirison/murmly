@@ -118,6 +118,23 @@ MAX_TTS_RATE_PERCENT = 200
 # CPU costs only about 200 ms more before the first word.
 DEFAULT_TTS_DEVICE = "cpu"
 
+# How long each model may sit unused before Murmly hands its memory back, with
+# `0` meaning never. The floor is 30 s because anything shorter fires between
+# dictations in an ordinary working session, and the ceiling is 24 hours because
+# past that the setting is indistinguishable from `0`.
+MIN_UNLOAD_AFTER_IDLE_S = 30
+MAX_UNLOAD_AFTER_IDLE_S = 86_400
+
+# The two defaults differ because the two releases are not alike. Transcription
+# returns 2080 MiB of accelerator memory and its 0.78 s reload is started when
+# capture begins, so the wait is spent while the person is still speaking and
+# every install may as well have it. Synthesis returns system memory under the
+# default `[tts] device = "cpu"` and costs 759-767 ms of silence before speech
+# resumes, with nothing to overlap it, so it stays opt-in like speech output
+# itself.
+DEFAULT_STT_UNLOAD_AFTER_IDLE_S = 300
+DEFAULT_TTS_UNLOAD_AFTER_IDLE_S = 0
+
 
 def default_runtime_dir(env: dict[str, str] | None = None) -> Path:
     environment = env or os.environ
@@ -160,6 +177,7 @@ class MurmlyConfig:
     beam_size: int = 5
     vad_filter: bool = True
     lazy_load_model: bool = True
+    unload_after_idle_s: int = DEFAULT_STT_UNLOAD_AFTER_IDLE_S
     live_transcribe: bool = False
     live_interval_ms: int = DEFAULT_LIVE_INTERVAL_MS
     live_window_seconds: int = DEFAULT_LIVE_WINDOW_SECONDS
@@ -181,6 +199,7 @@ class MurmlyConfig:
     tts_rate_rejected_value: object | None = None
     tts_device: str = DEFAULT_TTS_DEVICE
     tts_device_rejected_value: str | None = None
+    tts_unload_after_idle_s: int = DEFAULT_TTS_UNLOAD_AFTER_IDLE_S
     tts_output_device: str = ""
     tts_model_dir: Path = field(default_factory=default_tts_model_dir)
 
@@ -262,6 +281,10 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         beam_size=beam_size,
         vad_filter=bool(stt.get("vad_filter", model.vad_filter)),
         lazy_load_model=bool(stt.get("lazy_load_model", True)),
+        unload_after_idle_s=_idle_period(
+            stt.get("unload_after_idle_s"),
+            DEFAULT_STT_UNLOAD_AFTER_IDLE_S,
+        ),
         live_transcribe=_boolean(stt.get("live_transcribe"), False),
         live_interval_ms=_bounded_int(
             stt.get("live_interval_ms"),
@@ -318,6 +341,10 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         tts_rate_rejected_value=tts_rate_rejected_value,
         tts_device=tts_device,
         tts_device_rejected_value=tts_device_rejected_value,
+        tts_unload_after_idle_s=_idle_period(
+            tts.get("unload_after_idle_s"),
+            DEFAULT_TTS_UNLOAD_AFTER_IDLE_S,
+        ),
         tts_output_device=str(tts.get("output_device", "")),
         tts_model_dir=tts_model_dir,
     )
@@ -336,6 +363,38 @@ def _bounded_int(value: object, default: int, *, minimum: int, maximum: int) -> 
     except (TypeError, ValueError):
         return default
     return parsed if minimum <= parsed <= maximum else default
+
+
+def _idle_period(value: object, default: int) -> int:
+    """An idle period in seconds, where zero means never rather than out of range.
+
+    This exists so that it is not `_bounded_int`. That helper answers the
+    default for anything outside its bounds, and zero is outside these bounds:
+    routing an idle period through it turns a deliberate
+    `unload_after_idle_s = 0` -- which switches idle release off -- into the
+    default period, switching the feature on for the person who asked for it
+    off. The disable knob would enable the feature. So zero is answered before
+    the bounds are consulted, and only a value that is neither zero nor within
+    the bounds falls back to this setting's own default. `_bounded_int` keeps
+    its meaning for its many other callers.
+    """
+    if value is not None:
+        try:
+            # Compared, not truncated. `int(value)` reads 0.5 and -0.9 as zero,
+            # so a mistyped fractional period switched release off instead of
+            # falling back -- and for `[stt]`, whose default is 300, that
+            # silently disabled a feature that ships on. Only an exact zero
+            # means never; everything else outside the bounds falls through.
+            if float(value) == 0:
+                return 0
+        except (TypeError, ValueError):
+            pass
+    return _bounded_int(
+        value,
+        default,
+        minimum=MIN_UNLOAD_AFTER_IDLE_S,
+        maximum=MAX_UNLOAD_AFTER_IDLE_S,
+    )
 
 
 def _rejected_value(value: object, resolved: int) -> object | None:

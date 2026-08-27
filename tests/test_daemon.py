@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from murmly.config import MurmlyConfig, default_socket_path
 from murmly.daemon import (
+    ADOPT_SESSION,
     MAX_COMMAND_BYTES,
     MAX_COMMAND_WORKERS,
     CommandCode,
@@ -22,11 +23,13 @@ from murmly.daemon import (
     ProcessingResult,
     RequestError,
     SpeechSession,
+    SpeechSessionConnection,
     read_peer_identity,
     send_command,
     socket_path_detail,
 )
 from murmly.focus import NullFocusObserver, WindowIdentity
+from murmly.idle import IdleRelease
 from murmly.integrations import DeliveryOutcome
 from murmly.overlay import OverlayHealth, OverlayState
 
@@ -42,6 +45,10 @@ class DummySession:
         self.started = 0
         self.stopped = 0
         self.processed = 0
+        self.released = 0
+        # Set by every release, so a test can wait for one that runs on the
+        # countdown's own thread instead of sleeping for longer than its period.
+        self.release_ran = threading.Event()
         self.targets_captured = 0
         self.received_targets: list[WindowIdentity | None] = []
         self.target = WindowIdentity(window_id=1, pid=10, window_class="editor")
@@ -63,6 +70,10 @@ class DummySession:
         if self.stop_error is not None:
             raise self.stop_error
         return b"recording"
+
+    def release_model(self) -> None:
+        self.released += 1
+        self.release_ran.set()
 
     def process_recording(
         self,
@@ -1346,6 +1357,466 @@ class SegmentToggleConcurrencyTests(unittest.TestCase):
             self.assertEqual(1, session.stopped)
             self.assertEqual({"ok": True, "state": "LISTENING"}, daemon.handle_command("toggle"))
             daemon.handle_command("toggle")
+
+
+class StubSynthesizer:
+    """A synthesis session stand-in that only has to say whether it is held.
+
+    `FakeSynthesizer` in `tests/fakes.py` produces audio and has neither
+    `release` nor `resident`; adding them there would reach the speech, session
+    and audio suites for a concern none of them exercises.
+    """
+
+    def __init__(self) -> None:
+        self.released = 0
+        self.release_ran = threading.Event()
+        self.resident = True
+
+    def release(self) -> bool:
+        self.released += 1
+        self.release_ran.set()
+        if not self.resident:
+            return False
+        self.resident = False
+        return True
+
+
+class StubSpeechEngine:
+    """Enough of `SpeechEngine` for the daemon to open and close a session on."""
+
+    def __init__(self) -> None:
+        self.synthesizer = StubSynthesizer()
+        self.available = True
+        self.unavailable_reason = None
+        self.speaking = False
+        self.begun = 0
+        self.ended = 0
+
+    def begin(self, sink) -> None:
+        self.begun += 1
+
+    def end(self) -> None:
+        self.ended += 1
+
+    def resume(self) -> None:
+        pass
+
+    def suspend(self):
+        return None
+
+
+class StubSessionConnection:
+    """A speech session connection with no socket and no threads behind it."""
+
+    def __init__(self) -> None:
+        self.connection = object()
+        self.closed = 0
+
+    def close(self, *, drain: bool = False) -> None:
+        self.closed += 1
+
+
+# A release that never arrives fails its test rather than hanging the suite. It
+# is not a wait: the countdowns under test expire in hundredths of a second.
+RELEASE_TIMEOUT_SECONDS = 5.0
+
+
+class IdleReleaseTests(unittest.TestCase):
+    """The countdown itself, apart from the lifecycle that arms it."""
+
+    def test_a_period_of_zero_registers_no_countdown_at_all(self) -> None:
+        released: list[str] = []
+        timer = IdleRelease(0, lambda: released.append("released"), name="murmly-test-zero")
+
+        timer.arm()
+
+        # Nothing at all, rather than a countdown of no length: zero is how a
+        # person says the model should stay resident.
+        self.assertFalse(timer.armed)
+        self.assertEqual([], released)
+        self.assertEqual([], self._threads_named("murmly-test-zero"))
+
+    def test_a_countdown_that_runs_out_releases_once(self) -> None:
+        calls: list[str] = []
+        done = threading.Event()
+
+        def release() -> None:
+            calls.append("released")
+            done.set()
+
+        timer = IdleRelease(0.02, release, name="murmly-test-expiry")
+        self.addCleanup(timer.cancel)
+
+        timer.arm()
+
+        self.assertTrue(done.wait(RELEASE_TIMEOUT_SECONDS), "the countdown never released")
+        self.assertEqual(["released"], calls)
+        self.assertFalse(timer.armed)
+
+    def test_arming_again_abandons_the_countdown_already_running(self) -> None:
+        released: list[str] = []
+        timer = IdleRelease(60, lambda: released.append("released"), name="murmly-test-rearm")
+        self.addCleanup(timer.cancel)
+
+        timer.arm()
+        abandoned = timer._generation
+        timer.arm()
+
+        # The abandoned thread reaching its release path after the second arm
+        # took its place. Driven rather than waited for: what decides the
+        # outcome is the generation it captured, not how long it slept.
+        timer._fire(abandoned)
+
+        self.assertEqual([], released)
+        self.assertTrue(timer.armed)
+
+    def test_a_cancel_that_lands_as_the_countdown_expires_abandons_the_release(self) -> None:
+        released: list[str] = []
+        timer = IdleRelease(60, lambda: released.append("released"), name="murmly-test-race")
+
+        timer.arm()
+        expiring = timer._generation
+        timer.cancel()
+        # The window setting the event alone does not close: this thread was
+        # already past its wait when the cancel set it, so only the generation
+        # check can still stop it.
+        timer._fire(expiring)
+
+        self.assertEqual([], released)
+        self.assertFalse(timer.armed)
+
+    def test_a_countdown_that_has_fired_cannot_fire_again(self) -> None:
+        released: list[str] = []
+        timer = IdleRelease(60, lambda: released.append("released"), name="murmly-test-once")
+
+        timer._fire(timer._generation)
+        timer._fire(0)
+
+        self.assertEqual(["released"], released)
+
+    def test_a_release_that_raises_is_reported_rather_than_printed(self) -> None:
+        """It runs on a thread with no caller to report to.
+
+        Left uncaught it would be printed by the threading machinery, and the
+        countdown would look from the outside as though it had run.
+        """
+
+        def release() -> None:
+            raise RuntimeError("the model is wedged")
+
+        timer = IdleRelease(60, release, name="murmly-test-failure")
+
+        with self.assertLogs("murmly.idle", level="WARNING") as logs:
+            timer._fire(timer._generation)
+
+        self.assertIn("the model is wedged", "\n".join(logs.output))
+
+    def test_the_countdown_runs_on_a_thread_that_cannot_hold_up_exit(self) -> None:
+        """Why this is not a `threading.Timer`.
+
+        A `Timer` takes its daemon flag from the thread that created it, and
+        every arm site runs on a non-daemon thread, so a pending five-minute
+        countdown would be joined by interpreter finalization -- five minutes of
+        a test suite refusing to exit.
+        """
+        timer = IdleRelease(60, lambda: None, name="murmly-test-thread")
+        self.addCleanup(timer.cancel)
+
+        timer.arm()
+
+        threads = self._threads_named("murmly-test-thread")
+        self.assertEqual(1, len(threads))
+        self.assertTrue(threads[0].daemon)
+
+    @staticmethod
+    def _threads_named(name: str) -> list[threading.Thread]:
+        return [thread for thread in threading.enumerate() if thread.name == name]
+
+
+class IdleModelReleaseTests(unittest.TestCase):
+    """When each model's countdown is armed, abandoned, and allowed to run out."""
+
+    def _daemon(
+        self,
+        temp_dir: str,
+        session=None,
+        speech=None,
+        **overrides: object,
+    ) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+            **overrides,
+        )
+        return MurmlyDaemon(config, session=session or DummySession(), speech=speech)
+
+    def _settle(self, daemon: MurmlyDaemon) -> None:
+        thread = daemon._segment_thread
+        if thread is not None:
+            thread.join(timeout=5)
+
+    def test_the_countdown_expiring_releases_the_transcription_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session, unload_after_idle_s=0.02)
+            self.addCleanup(daemon._transcription_idle.cancel)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+            self.assertTrue(
+                session.release_ran.wait(RELEASE_TIMEOUT_SECONDS),
+                "the transcription model was never released",
+            )
+            self.assertEqual(1, session.released)
+            self.assertFalse(daemon._transcription_idle.armed)
+
+    def test_a_continuous_session_is_never_released_however_long_its_pauses(self) -> None:
+        """The guarantee that keying on the session lifecycle exists to give.
+
+        A "seconds since the last transcription" countdown would fire here: the
+        segments of a continuous session are separated by exactly the silence
+        such a countdown measures, and each pause below is longer than the whole
+        configured period.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["first", "second", "third"])
+            daemon = self._daemon(
+                temp_dir,
+                session,
+                auto_transcribe="continuous",
+                unload_after_idle_s=0.02,
+            )
+            self.addCleanup(daemon._transcription_idle.cancel)
+
+            daemon.handle_command("toggle")
+            for _ in range(2):
+                daemon._on_silence()
+                self._settle(daemon)
+                time.sleep(0.05)
+                self.assertFalse(daemon._transcription_idle.armed)
+                self.assertEqual(0, session.released)
+
+            daemon.handle_command("toggle")
+
+            self.assertTrue(
+                session.release_ran.wait(RELEASE_TIMEOUT_SECONDS),
+                "the model was never released once the session ended",
+            )
+            self.assertEqual(2, session.segments_taken)
+            self.assertEqual(1, session.released)
+
+    def test_the_countdown_restarts_when_capture_begins(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session, unload_after_idle_s=60)
+            self.addCleanup(daemon._transcription_idle.cancel)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+            self.assertTrue(daemon._transcription_idle.armed)
+            abandoned = daemon._transcription_idle._generation
+
+            daemon.handle_command("toggle")
+
+            self.assertFalse(daemon._transcription_idle.armed)
+            # Abandoned, not merely not yet expired: the countdown that was
+            # running reaches its release path and declines.
+            daemon._transcription_idle._fire(abandoned)
+            self.assertEqual(0, session.released)
+
+            daemon.handle_command("toggle")
+
+            self.assertTrue(daemon._transcription_idle.armed)
+            self.assertNotEqual(abandoned, daemon._transcription_idle._generation)
+
+    def test_shutdown_with_a_countdown_pending_leaves_nothing_armed(self) -> None:
+        """Shutdown ends a recording on its way out, which arms a fresh one.
+
+        So this also pins the order: cancelling before `_stop_capture` would
+        leave a five-minute countdown armed with nothing left to cancel it.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+            self.assertTrue(daemon._transcription_idle.armed)
+            pending = daemon._transcription_idle._pending
+
+            daemon.shutdown()
+
+            # Woken rather than left to run out the configured five minutes.
+            self.assertTrue(pending.is_set())
+            self.assertFalse(daemon._transcription_idle.armed)
+            self.assertFalse(daemon._synthesis_idle.armed)
+            self.assertEqual(0, session.released)
+
+    def test_a_recording_that_will_not_stop_still_starts_the_countdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession(stop_error=RuntimeError("the input stream would not close"))
+            daemon = self._daemon(temp_dir, session, unload_after_idle_s=60)
+            self.addCleanup(daemon._transcription_idle.cancel)
+
+            daemon.handle_command("toggle")
+            response = daemon.handle_command("toggle")
+
+            self.assertFalse(response["ok"])
+            # The capture has ended either way, so the model is idle from here.
+            self.assertTrue(daemon._transcription_idle.armed)
+
+    def test_a_capture_that_could_not_start_puts_the_countdown_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession(start_error=RuntimeError("no input device"))
+            daemon = self._daemon(temp_dir, session, unload_after_idle_s=60)
+            self.addCleanup(daemon._transcription_idle.cancel)
+
+            response = daemon.handle_command("toggle")
+
+            self.assertFalse(response["ok"])
+            # Nothing else would put it back: the only other arm site is a
+            # recording ending, and this one never began.
+            self.assertTrue(daemon._transcription_idle.armed)
+
+    def test_each_countdown_takes_its_period_from_its_own_setting(self) -> None:
+        """The reverse of the shipped defaults, which a shared period fails."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(
+                temp_dir,
+                session,
+                unload_after_idle_s=0,
+                tts_unload_after_idle_s=900,
+            )
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+            self.assertFalse(daemon._transcription_idle.armed)
+            self.assertEqual(0, session.released)
+            self.assertEqual(900, daemon._synthesis_idle.period_s)
+
+    def test_the_synthesis_countdown_is_armed_under_the_session_lock(self) -> None:
+        """Armed outside it, a countdown lands on the session that replaced this one.
+
+        `_session_closed` releases the lock before draining the connection, and
+        the drain waits on the writer thread. A declaration arriving in that
+        window registers its own session and cancels the countdown, and the
+        stale arm then runs against a session that has never been idle -- the
+        state the failed-start arm site names and guards against by arming
+        inside its identity branch. Asserting the lock is held is what pins the
+        guard, since the interleaving itself is a race a test cannot schedule.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            daemon = self._daemon(
+                temp_dir, speech=speech, tts_enabled=True, tts_unload_after_idle_s=900
+            )
+            self.addCleanup(daemon._synthesis_idle.cancel)
+            session = StubSessionConnection()
+            daemon._speech_session = session
+            held: list[bool] = []
+
+            with patch.object(
+                daemon._synthesis_idle,
+                "arm",
+                side_effect=lambda: held.append(daemon._speech_session_lock.locked()),
+            ):
+                daemon._session_closed(session)
+
+            self.assertEqual(
+                [True], held, "the countdown was armed after the session lock was released"
+            )
+
+    def test_a_speech_session_ending_starts_the_synthesis_countdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            daemon = self._daemon(
+                temp_dir,
+                speech=speech,
+                tts_enabled=True,
+                tts_unload_after_idle_s=0.02,
+            )
+            self.addCleanup(daemon._synthesis_idle.cancel)
+            session = StubSessionConnection()
+            daemon._speech_session = session
+
+            daemon._session_closed(session)
+
+            self.assertTrue(
+                speech.synthesizer.release_ran.wait(RELEASE_TIMEOUT_SECONDS),
+                "the synthesis session was never released",
+            )
+            self.assertEqual(1, speech.synthesizer.released)
+            self.assertEqual(1, speech.ended)
+
+    def test_synthesis_is_never_released_under_the_shipped_defaults(self) -> None:
+        """`[tts] unload_after_idle_s` defaults to zero, so nothing is armed."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            daemon = self._daemon(temp_dir, speech=speech, tts_enabled=True)
+            session = StubSessionConnection()
+            daemon._speech_session = session
+
+            daemon._session_closed(session)
+
+            self.assertEqual(0, daemon._synthesis_idle.period_s)
+            self.assertFalse(daemon._synthesis_idle.armed)
+            self.assertEqual(0, speech.synthesizer.released)
+
+    def test_declaring_a_speech_session_abandons_the_synthesis_countdown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            daemon = self._daemon(
+                temp_dir,
+                speech=speech,
+                tts_enabled=True,
+                tts_unload_after_idle_s=60,
+            )
+            self.addCleanup(daemon._synthesis_idle.cancel)
+            daemon._synthesis_idle.arm()
+            server, client = socket.socketpair()
+            self.addCleanup(client.close)
+
+            outcome = daemon._declare_session(server)
+            self.addCleanup(daemon._close_speech_session)
+
+            self.assertIs(ADOPT_SESSION, outcome)
+            # Cancelled when the session is declared, not at its first `speak`:
+            # a sender can take seconds to produce its opening words, and a
+            # rebuild in that gap is silence a listener hears.
+            self.assertFalse(daemon._synthesis_idle.armed)
+            self.assertEqual(0, speech.synthesizer.released)
+
+    def test_a_speech_session_that_never_started_puts_the_countdown_back(self) -> None:
+        """The declaration cancelled a countdown for a session that then failed.
+
+        Nothing else would put it back: the other arm site is a session closing,
+        and this one was never open enough to close.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            daemon = self._daemon(
+                temp_dir,
+                speech=speech,
+                tts_enabled=True,
+                tts_unload_after_idle_s=60,
+            )
+            self.addCleanup(daemon._synthesis_idle.cancel)
+            server, client = socket.socketpair()
+            self.addCleanup(client.close)
+            self.addCleanup(server.close)
+
+            with patch.object(
+                SpeechSessionConnection, "start", side_effect=RuntimeError("no thread")
+            ):
+                response = daemon._declare_session(server)
+
+            self.assertFalse(response["ok"])
+            self.assertIsNone(daemon._speech_session)
+            self.assertTrue(daemon._synthesis_idle.armed)
 
 
 def read_frame(client: socket.socket) -> bytes:
