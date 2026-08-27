@@ -15,16 +15,16 @@ Run `openspec list` to see what is active.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s tests
+uv run --no-sync python -m unittest discover -s tests
 ```
 
 The suite is stdlib `unittest` with no external test dependencies. Tests that need a
 live desktop session skip themselves when it is unavailable rather than failing.
 
-Run the interpreter directly rather than through `uv run --extra`. Naming an extra
-resyncs the environment, which reinstalls the CPU build of `onnxruntime` over the
-GPU build on a machine that has had the swap applied. The suite still passes, and
-every synthesis measurement taken afterwards silently reports a CPU session. See
+Pass `--no-sync` rather than naming an extra. `uv run --extra cuda` resyncs the
+environment, which reinstalls the CPU build of `onnxruntime` over the GPU build on a
+machine that has had the swap applied. The suite still passes, and every synthesis
+measurement taken afterwards silently reports a CPU session. See
 `docs/agent-notes/onnxruntime-gpu-cuda-version.md`.
 
 # Commit Comments

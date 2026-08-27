@@ -858,11 +858,13 @@ murmly doctor
 Run the test suite:
 
 ```bash
-uv run --extra cuda python -m unittest discover -s tests
+uv run --no-sync python -m unittest discover -s tests
 ```
 
 The suite is stdlib `unittest` with no external test dependencies. Tests that
-need a live desktop session skip themselves when it is unavailable.
+need a live desktop session skip themselves when it is unavailable. Pass
+`--no-sync` rather than naming an extra: a sync reinstalls the CPU build of
+`onnxruntime` over the GPU build on a machine that has had the swap applied.
 
 Behavioral changes are planned with OpenSpec; see `openspec/specs/` for the
 current capability baseline. Operational preconditions that are not documented
