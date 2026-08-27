@@ -66,7 +66,7 @@
 
 - [x] 8.1 Add the site link near the top of `README.md`
 - [x] 8.2 Write `docs/agent-notes/` entries for whatever the capture and publish work turned up that is not obvious — at minimum the layer-shell screenshot constraint if it bit, and the Pages source setting being manual
-- [ ] 8.3 Set the repository's social preview image to `social-preview.png` and add the site URL to the About field. **Half done:** the About field is set to `https://osirison.github.io/murmly/` (`gh repo edit --homepage`). The social preview image has no REST or GraphQL endpoint — it is Settings → General → Social preview in the web UI, and is the one step of this change that only the repository owner can perform
+- [x] 8.3 Set the repository's social preview image to `social-preview.png` and add the site URL to the About field. About field set via `gh repo edit --homepage`. The social preview image has no REST or GraphQL endpoint, so it was uploaded by the repository owner at Settings → General → Social preview; verified by fetching `og:image` from the repo page, which now resolves to `repository-images.githubusercontent.com` at 1200×630 and is sha256-identical to the committed asset
 
 ## 9. Verification
 
