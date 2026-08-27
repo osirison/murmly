@@ -99,14 +99,15 @@ time there.
 
 ## Do not photograph the installed daemon's `doctor`
 
-The venv at `/home/qp/Cloud/Projects/murmly/.venv` is an **editable** install of
-the main checkout, which is often on a feature branch. Its `murmly doctor`
-reports fields that `main` does not have. Run the worktree's own code, under a
-neutral `HOME` so no personal path is in frame:
+A venv installed editable (`uv sync` / `pip install -e`) against the main
+checkout is often sitting on a feature branch, so its `murmly doctor` reports
+fields that `main` does not have. Run the worktree's own code, under a neutral
+`HOME` so no personal path is in frame:
 
 ```bash
 HOME=/home/user PYTHONPATH=<worktree>/src <venv>/bin/python -m murmly doctor
 ```
 
-Check `git -C /home/qp/Cloud/Projects/murmly rev-parse --abbrev-ref HEAD` before
-trusting anything the installed daemon prints about itself.
+Check `git -C <main checkout> rev-parse --abbrev-ref HEAD` before trusting
+anything the installed daemon prints about itself. The checkout is the one the
+`__editable__.murmly-*.pth` file in the venv's `site-packages` points at.

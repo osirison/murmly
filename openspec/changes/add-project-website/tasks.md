@@ -71,7 +71,7 @@
 ## 9. Verification
 
 - [x] 9.1 Open `site/index.html` from local disk with no network and confirm the logo, screenshots, diagrams, and typography all render — this proves both the relative paths and the no-third-party-requests requirement in one pass
-- [x] 9.2 Grep `site/` for `http://` and `https://` and confirm every hit is either a navigation `href` or one of the two absolute URLs in the head. No subresource may point off origin
+- [x] 9.2 Grep `site/` for `http://` and `https://` and confirm every hit is either a navigation `href` or one of the three absolute URLs in the head (`canonical`, `og:url`, `og:image`). No subresource may point off origin
 - [ ] 9.3 After deploy, load `https://osirison.github.io/murmly/` with the network panel recording, and confirm no request leaves the origin, nothing returns 404, no cookie is set, and no persistent storage entry is written
 - [x] 9.4 Load the page with scripting disabled and confirm every section, image, link, and the install command are present and readable
 - [x] 9.5 Check every text and background pair against 4.5:1, and 3:1 for text at 24 px or larger, in both colour schemes
