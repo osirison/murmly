@@ -380,7 +380,12 @@ def _idle_period(value: object, default: int) -> int:
     """
     if value is not None:
         try:
-            if int(value) == 0:
+            # Compared, not truncated. `int(value)` reads 0.5 and -0.9 as zero,
+            # so a mistyped fractional period switched release off instead of
+            # falling back -- and for `[stt]`, whose default is 300, that
+            # silently disabled a feature that ships on. Only an exact zero
+            # means never; everything else outside the bounds falls through.
+            if float(value) == 0:
                 return 0
         except (TypeError, ValueError):
             pass

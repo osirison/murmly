@@ -1698,6 +1698,38 @@ class IdleModelReleaseTests(unittest.TestCase):
             self.assertEqual(0, session.released)
             self.assertEqual(900, daemon._synthesis_idle.period_s)
 
+    def test_the_synthesis_countdown_is_armed_under_the_session_lock(self) -> None:
+        """Armed outside it, a countdown lands on the session that replaced this one.
+
+        `_session_closed` releases the lock before draining the connection, and
+        the drain waits on the writer thread. A declaration arriving in that
+        window registers its own session and cancels the countdown, and the
+        stale arm then runs against a session that has never been idle -- the
+        state the failed-start arm site names and guards against by arming
+        inside its identity branch. Asserting the lock is held is what pins the
+        guard, since the interleaving itself is a race a test cannot schedule.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            daemon = self._daemon(
+                temp_dir, speech=speech, tts_enabled=True, tts_unload_after_idle_s=900
+            )
+            self.addCleanup(daemon._synthesis_idle.cancel)
+            session = StubSessionConnection()
+            daemon._speech_session = session
+            held: list[bool] = []
+
+            with patch.object(
+                daemon._synthesis_idle,
+                "arm",
+                side_effect=lambda: held.append(daemon._speech_session_lock.locked()),
+            ):
+                daemon._session_closed(session)
+
+            self.assertEqual(
+                [True], held, "the countdown was armed after the session lock was released"
+            )
+
     def test_a_speech_session_ending_starts_the_synthesis_countdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             speech = StubSpeechEngine()

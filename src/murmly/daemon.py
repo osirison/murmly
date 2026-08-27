@@ -1599,6 +1599,16 @@ class MurmlyDaemon:
                 # thread and both socket handles alive for the life of the
                 # daemon -- and the session still registered as connected.
                 logger.warning("Speech output did not stop cleanly: %s", error)
+            # Under the lock and inside this branch, for the reason the failed
+            # start site gives: the session registered here is the one that
+            # ended. Armed after the lock is released, a declaration landing in
+            # the drain below would register its own session, cancel the
+            # countdown, and then be handed this one -- leaving a countdown
+            # running against a session that has never been idle, which is the
+            # state both arm sites exist to avoid. The countdown starting before
+            # the drain rather than after it costs at most the drain's own
+            # bounded wait against a period of at least thirty seconds.
+            self._synthesis_idle.arm()
         # Drained, and outside the lock. A session is sometimes closed by Murmly
         # having just written it a refusal -- a frame that could not be read, or
         # one past the size bound -- and shutting the socket down without
@@ -1609,11 +1619,6 @@ class MurmlyDaemon:
         session.close(drain=True)
         with self._connections_lock:
             self._connections.discard(session.connection)
-        # Reached only when this call is the one that owned the session, since
-        # the early return above covers the other case. The synthesizer is idle
-        # from here: there is no sender left to speak for, and nothing else
-        # opens the output device.
-        self._synthesis_idle.arm()
 
     def _send_to_session(self, frame: dict[str, object]) -> bool:
         """Send one frame to the open session, reporting whether it was taken."""

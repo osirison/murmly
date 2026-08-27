@@ -651,9 +651,9 @@ record speech Murmly has just shown it cannot deliver.
 
 ### Releasing idle model memory
 
-Murmly loads the transcription model on the first recording and the synthesis
-session on the first speech, and each then sits in memory doing nothing between
-uses. `[stt] unload_after_idle_s` and `[tts] unload_after_idle_s` hand that
+Murmly loads the transcription model on the first recording — or at startup, if
+you set `lazy_load_model = false` above — and the synthesis session on the first
+speech, and each then sits in memory doing nothing between uses. `[stt] unload_after_idle_s` and `[tts] unload_after_idle_s` hand that
 memory back once a model has gone unused for its own idle period, in seconds,
 and Murmly loads it again when it is next needed. Each is bounded 30-86400.
 `0` switches release off for that model, leaving it resident once loaded. A

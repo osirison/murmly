@@ -465,6 +465,42 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(DEFAULT_STT_UNLOAD_AFTER_IDLE_S, config.unload_after_idle_s)
             self.assertEqual(DEFAULT_TTS_UNLOAD_AFTER_IDLE_S, config.tts_unload_after_idle_s)
 
+    def test_a_fractional_idle_period_falls_back_rather_than_disabling_release(self) -> None:
+        """Only an exact zero means never.
+
+        The zero check used to truncate, so 0.5 and -0.9 read as zero and
+        switched release off. For `[stt]`, whose default is 300, that turned a
+        mistyped period into a silently disabled feature -- the same inversion
+        the helper exists to prevent, one layer further in. These values are all
+        outside the bounds and are not zero, so each takes its setting's own
+        default.
+        """
+        for value in ("0.5", "0.99", "-0.9", "-0.5", "29.9"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    textwrap.dedent(
+                        f"""
+                        [stt]
+                        unload_after_idle_s = {value}
+
+                        [tts]
+                        unload_after_idle_s = {value}
+                        """
+                    ).strip()
+                )
+
+                config = load_config(config_path)
+
+                self.assertEqual(
+                    DEFAULT_STT_UNLOAD_AFTER_IDLE_S,
+                    config.unload_after_idle_s,
+                    f"{value} disabled transcription release instead of falling back",
+                )
+                self.assertEqual(
+                    DEFAULT_TTS_UNLOAD_AFTER_IDLE_S, config.tts_unload_after_idle_s
+                )
+
     def test_an_idle_period_within_the_bounds_is_used_as_written(self) -> None:
         for value in (MIN_UNLOAD_AFTER_IDLE_S, 300, 3_600, MAX_UNLOAD_AFTER_IDLE_S):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
