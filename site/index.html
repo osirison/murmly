@@ -1,4 +1,222 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<title>murmly</title>
-<p>Placeholder. The real page lands in this change.</p>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>murmly — press a key, speak, press again</title>
+<meta name="description" content="Press a key, speak, press again — your words appear wherever you were typing, transcribed on your own machine. Fedora-first local voice-to-text for Linux desktops.">
+<link rel="canonical" href="https://osirison.github.io/murmly/">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="assets/favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="murmly — press a key, speak, press again">
+<meta property="og:description" content="Your words appear wherever you were typing, transcribed on your own machine. Fedora-first local voice-to-text for Linux desktops.">
+<meta property="og:url" content="https://osirison.github.io/murmly/">
+<meta property="og:image" content="https://osirison.github.io/murmly/assets/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+
+<a class="skip" href="#install">Skip to install</a>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" fill="currentColor" fill-rule="evenodd" aria-hidden="true" focusable="false"><path d="M8,2H24A6,6 0 0 1 30,8V17A6,6 0 0 1 24,23H14.6C14.6,26.1 13.1,28.4 9.6,29.8C10.9,27.9 11.2,25.6 11.2,23H8A6,6 0 0 1 2,17V8A6,6 0 0 1 8,2ZM9.3,7.2H9.3A2,2 0 0 1 11.3,9.2V15.8A2,2 0 0 1 9.3,17.8H9.3A2,2 0 0 1 7.3,15.8V9.2A2,2 0 0 1 9.3,7.2ZM16.9,5.2H16.9A2,2 0 0 1 18.9,7.2V17.8A2,2 0 0 1 16.9,19.8H16.9A2,2 0 0 1 14.9,17.8V7.2A2,2 0 0 1 16.9,5.2ZM23.6,4.2H23.6A1.1,1.1 0 0 1 24.7,5.3V19.7A1.1,1.1 0 0 1 23.6,20.8H23.6A1.1,1.1 0 0 1 22.5,19.7V5.3A1.1,1.1 0 0 1 23.6,4.2Z"/></svg>
+      <svg class="brand-word" viewBox="0 0 132.5 42" fill="none" stroke="currentColor" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="murmly"><path d="M2.5,27.5V18.5A6,6 0 0 1 14.5,18.5V27.5M14.5,18.5A6,6 0 0 1 26.5,18.5V27.5M35,12.5V21.5A6,6 0 0 0 47,21.5V12.5M55.5,27.5V18.5A6,6 0 0 1 61.5,12.5M71.5,27.5V18.5A6,6 0 0 1 83.5,18.5V27.5M83.5,18.5A6,6 0 0 1 95.5,18.5V27.5M105,27.5V4.5M115,12.5L124.3,27.5M130,12.5L116.5,37.5"/></svg>
+    </p>
+
+    <h1>Press a key, speak, press again — your words appear wherever you were typing, transcribed on your own machine.</h1>
+
+    <svg class="loop" viewBox="0 0 720 200" fill="none" role="img" aria-labelledby="loop-title">
+      <title id="loop-title">Three steps: press the hotkey, speak, press it again and the words appear in the window you were already in.</title>
+      <g stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <g transform="translate(16,30)">
+          <rect x="0" y="0" width="176" height="104" rx="14" stroke-width="2" opacity="0.32"/>
+          <rect x="42" y="30" width="42" height="42" rx="9" stroke-width="2.5"/>
+          <rect x="94" y="30" width="42" height="42" rx="9" stroke-width="2.5" fill="currentColor" opacity="0.14"/>
+          <rect x="94" y="30" width="42" height="42" rx="9" stroke-width="2.5"/>
+          <path d="M150 38 q8 13 0 26" stroke-width="2" opacity="0.55"/>
+          <path d="M162 32 q13 19 0 38" stroke-width="2" opacity="0.3"/>
+        </g>
+        <g transform="translate(272,30)">
+          <rect x="0" y="0" width="176" height="104" rx="14" stroke-width="2" opacity="0.32"/>
+          <path d="M30 52 v0 M44 44 v16 M58 32 v40 M72 22 v60 M86 34 v36 M100 26 v52 M114 40 v24 M128 48 v8 M142 51 v2" stroke-width="7" opacity="0.9"/>
+        </g>
+        <g transform="translate(528,30)">
+          <rect x="0" y="0" width="176" height="104" rx="14" stroke-width="2" opacity="0.32"/>
+          <rect x="22" y="20" width="132" height="64" rx="8" stroke-width="2" opacity="0.5"/>
+          <path d="M22 36 h132" stroke-width="2" opacity="0.5"/>
+          <path d="M36 52 h74" stroke-width="5" opacity="0.85"/>
+          <path d="M36 66 h44" stroke-width="5" opacity="0.85"/>
+          <path d="M88 60 v12" stroke-width="3.5"/>
+        </g>
+        <path d="M204 82 h48" stroke-width="2.5" opacity="0.55"/>
+        <path d="M244 74 l8 8 -8 8" stroke-width="2.5" opacity="0.55"/>
+        <path d="M460 82 h48" stroke-width="2.5" opacity="0.55"/>
+        <path d="M500 74 l8 8 -8 8" stroke-width="2.5" opacity="0.55"/>
+      </g>
+      <g fill="currentColor" font-family="system-ui, sans-serif" font-size="15" text-anchor="middle">
+        <text class="lbl" x="104" y="164" opacity="0.95">Press your hotkey</text>
+        <text class="lbl" x="360" y="164" opacity="0.95">Speak</text>
+        <text class="lbl" x="616" y="164" opacity="0.95">Press it again</text>
+        <text class="sub" x="104" y="184" opacity="0.6" font-size="13">the overlay appears</text>
+        <text class="sub" x="360" y="184" opacity="0.6" font-size="13">it follows your voice</text>
+        <text class="sub" x="616" y="184" opacity="0.6" font-size="13">the words are typed in</text>
+      </g>
+    </svg>
+
+    <p class="cta">
+      <a class="button" href="#install">Install it</a>
+      <a class="quiet" href="https://github.com/osirison/murmly">Read the source</a>
+    </p>
+    <p class="runs-on">Fedora · KDE Plasma · Python 3.12+ · Apache-2.0</p>
+  </div>
+</header>
+
+<main>
+
+<section class="wrap">
+  <h2>How it works</h2>
+  <ol class="steps">
+    <li>
+      <h3>Press your hotkey</h3>
+      <p>A small indicator appears at the bottom of the screen and its bars follow your voice. Nothing else moves, and the window you were in keeps your cursor.</p>
+      <figure>
+        <img src="assets/overlay-listening.png" alt="The murmly indicator: a dark rounded bar holding a red microphone symbol and a row of waveform bars at varying heights." width="175" height="67">
+      </figure>
+    </li>
+    <li>
+      <h3>Speak</h3>
+      <p>If you turn on live transcription, what you are saying appears under the indicator as you say it. It is there to show you it is working — it is never what gets typed.</p>
+      <figure>
+        <img src="assets/overlay-partial.png" alt="The same indicator with a panel beneath it reading: Murmly turns what I say into text." width="283" height="89" loading="lazy">
+      </figure>
+    </li>
+    <li>
+      <h3>Press it again</h3>
+      <p>The indicator changes while murmly transcribes, then the finished text is typed into the window you started in and the indicator disappears.</p>
+      <figure>
+        <img src="assets/overlay-processing.png" alt="The indicator in its transcribing state: the microphone symbol is grey rather than red and the bars form a travelling wave." width="175" height="67" loading="lazy">
+      </figure>
+    </li>
+  </ol>
+</section>
+
+<section class="wrap">
+  <h2>What makes it different</h2>
+
+  <div class="point feature">
+    <div>
+      <h3>It runs on your machine</h3>
+      <p>Your microphone, the speech model and the window you are typing into are all on the same computer, and your voice never leaves it. There is no account, no server and no subscription.</p>
+      <p class="detail">The first run downloads the model it will use. After that murmly needs nothing from the network.</p>
+    </div>
+    <svg class="diagram" viewBox="0 0 640 300" fill="none" role="img" aria-labelledby="local-title">
+      <title id="local-title">Your microphone, the speech model and the window you are typing in all sit inside your machine. Nothing crosses out of it. One arrow crosses in, once: the first run downloads the model.</title>
+      <rect x="28" y="64" width="584" height="208" rx="18" stroke="currentColor" stroke-width="2.5" opacity="0.45" fill="currentColor" fill-opacity="0.03"/>
+      <text x="52" y="94" fill="currentColor" font-family="system-ui, sans-serif" font-size="14" opacity="0.62" letter-spacing="0.08em">YOUR MACHINE</text>
+      <g stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <g transform="translate(74,140)">
+          <rect x="0" y="0" width="120" height="88" rx="12" stroke-width="2" opacity="0.4"/>
+          <rect x="50" y="18" width="20" height="30" rx="10" stroke-width="2.5"/>
+          <path d="M44 42 a16 16 0 0 0 32 0" stroke-width="2.5"/>
+          <path d="M60 58 v10" stroke-width="2.5"/>
+        </g>
+        <g transform="translate(260,140)">
+          <rect x="0" y="0" width="120" height="88" rx="12" stroke-width="2" opacity="0.4"/>
+          <rect x="34" y="22" width="52" height="44" rx="8" stroke-width="2.5"/>
+          <path d="M46 36 h28 M46 46 h28 M46 56 h16" stroke-width="2.5" opacity="0.75"/>
+        </g>
+        <g transform="translate(446,140)">
+          <rect x="0" y="0" width="120" height="88" rx="12" stroke-width="2" opacity="0.4"/>
+          <rect x="28" y="20" width="64" height="48" rx="7" stroke-width="2.5"/>
+          <path d="M28 32 h64" stroke-width="2.5"/>
+          <path d="M38 46 h34 M38 56 h20" stroke-width="4" opacity="0.8"/>
+        </g>
+        <path d="M202 184 h46" stroke-width="2.5" opacity="0.6"/>
+        <path d="M240 176 l8 8 -8 8" stroke-width="2.5" opacity="0.6"/>
+        <path d="M388 184 h46" stroke-width="2.5" opacity="0.6"/>
+        <path d="M426 176 l8 8 -8 8" stroke-width="2.5" opacity="0.6"/>
+        <path d="M320 30 v76" stroke-width="2.5" stroke-dasharray="7 7" opacity="0.75"/>
+        <path d="M312 98 l8 10 8 -10" stroke-width="2.5" opacity="0.75"/>
+      </g>
+      <g fill="currentColor" font-family="system-ui, sans-serif" text-anchor="middle">
+        <text x="134" y="252" font-size="14" opacity="0.9">Microphone</text>
+        <text x="320" y="252" font-size="14" opacity="0.9">Speech model</text>
+        <text x="506" y="252" font-size="14" opacity="0.9">Your window</text>
+        <text x="320" y="22" font-size="13" opacity="0.72">first run only: the model is downloaded</text>
+      </g>
+    </svg>
+  </div>
+
+  <div class="grid">
+    <div class="point">
+      <h3>A transcript is not lost to a paste that quietly failed</h3>
+      <p>When murmly cannot confirm the text was delivered, it leaves it on your clipboard rather than putting your previous clipboard back over it. Worst case you press paste yourself. You do not lose what you said.</p>
+    </div>
+    <div class="point">
+      <h3>What you see while speaking is only a preview</h3>
+      <p>Live text is feedback and nothing else. It never reaches your clipboard, is never written to a file, and is thrown away the moment you stop. The text you get is produced by a fresh pass over the whole recording.</p>
+    </div>
+    <div class="point">
+      <h3>It waits for the right window</h3>
+      <p>On an X11 session murmly checks that you are still in the window you dictated into, and refuses to type if you have moved on. Your words do not land in the wrong chat.</p>
+    </div>
+    <div class="point">
+      <h3>Choose speed or accuracy</h3>
+      <p>Three sizes, one setting: <code>fast</code> for the smallest model, <code>balanced</code> for the default, and <code>accurate</code> for the largest. Change your mind whenever you like.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>It can also speak</h2>
+  <p class="lead">murmly can read text out loud, so a program you are running can tell you it has finished while you are looking somewhere else. It ships a hook that announces the end of a coding agent's turn: three rising notes, then one sentence naming the project and branch, then a short summary in the agent's own words.</p>
+  <p>Speech is off until you turn it on, because a machine that starts talking after an upgrade is making noise nobody asked for. On the machine it was measured on — an RTX 3080 Laptop with sixteen cores, across two runs — synthesis runs at roughly five times real time, so each sentence is ready well before the audio in front of it has played out.</p>
+</section>
+
+<section class="wrap" id="install">
+  <h2>Install it</h2>
+
+  <div class="requires">
+    <h3>What it needs</h3>
+    <dl>
+      <dt>Fedora</dt><dd>murmly is Fedora-first. Other distributions are not what it is built and tested against.</dd>
+      <dt>KDE Plasma</dt><dd>The hotkey registers itself and the indicator draws itself on Plasma. On other desktops murmly still installs and prints the command to bind the key yourself.</dd>
+      <dt>Python 3.12 or newer</dt><dd>Older versions are not supported.</dd>
+      <dt>A terminal</dt><dd>Installation is one command that you run yourself. There is no graphical installer.</dd>
+      <dt>X11, for now</dt><dd>murmly is verified end to end on X11. Plasma Wayland uses the same registration path but has not been verified all the way through, and murmly says so while installing.</dd>
+    </dl>
+  </div>
+
+  <p>Clone the repository, then run one command. It installs the system packages for your session after showing you the command and asking, sets up the environment, binds your hotkey and starts the service.</p>
+
+  <pre><code>./setup.sh install Meta+X</code></pre>
+
+  <p>The same script handles upgrading and removal. Pick a combination that suits you — murmly checks before it binds, and tells you who owns a key it will not take.</p>
+
+  <h3>It tells you what it found</h3>
+  <p>One command reports what murmly detected on the machine it is running on, and names what to install for anything it could not find.</p>
+  <pre><code>murmly doctor</code></pre>
+  <figure class="shot">
+    <img src="assets/doctor.png" alt="Terminal output from murmly doctor, listing the configuration file path, the command socket and whether it is private, the session type, the clipboard command, and the paste method it resolved along with the exact command it will run." width="608" height="555" loading="lazy">
+    <figcaption>What murmly detected on one machine. Yours will differ.</figcaption>
+  </figure>
+
+  <p class="lead">The <a href="https://github.com/osirison/murmly#readme">README</a> is the full reference: every configuration option, the speech protocol, and what to do when something does not work.</p>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p><a href="https://github.com/osirison/murmly">Source on GitHub</a> · <a href="https://github.com/osirison/murmly/tree/main/openspec/specs">What it is specified to do</a></p>
+    <p class="quiet">Apache-2.0. No analytics on this page, and nothing loaded from anywhere else.</p>
+  </div>
+</footer>
+
+</body>
+</html>

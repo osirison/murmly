@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 200" fill="none" role="img" aria-labelledby="loop-title">
+  <title id="loop-title">Three steps: press the hotkey, speak, press it again and the words appear in the window you were already in.</title>
+  <g stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+
+    <!-- 1. press the hotkey -->
+    <g transform="translate(16,30)">
+      <rect x="0" y="0" width="176" height="104" rx="14" stroke-width="2" opacity="0.32"/>
+      <rect x="42" y="30" width="42" height="42" rx="9" stroke-width="2.5"/>
+      <rect x="94" y="30" width="42" height="42" rx="9" stroke-width="2.5" fill="currentColor" opacity="0.14"/>
+      <rect x="94" y="30" width="42" height="42" rx="9" stroke-width="2.5"/>
+      <!-- the pressed key, ringed -->
+      <path d="M150 38 q8 13 0 26" stroke-width="2" opacity="0.55"/>
+      <path d="M162 32 q13 19 0 38" stroke-width="2" opacity="0.3"/>
+    </g>
+
+    <!-- 2. speak -->
+    <g transform="translate(272,30)">
+      <rect x="0" y="0" width="176" height="104" rx="14" stroke-width="2" opacity="0.32"/>
+      <!-- a level trace, the shape the overlay draws -->
+      <path d="M30 52 v0 M44 44 v16 M58 32 v40 M72 22 v60 M86 34 v36 M100 26 v52 M114 40 v24 M128 48 v8 M142 51 v2"
+            stroke-width="7" opacity="0.9"/>
+    </g>
+
+    <!-- 3. the words land where you were typing -->
+    <g transform="translate(528,30)">
+      <rect x="0" y="0" width="176" height="104" rx="14" stroke-width="2" opacity="0.32"/>
+      <rect x="22" y="20" width="132" height="64" rx="8" stroke-width="2" opacity="0.5"/>
+      <path d="M22 36 h132" stroke-width="2" opacity="0.5"/>
+      <path d="M36 52 h74" stroke-width="5" opacity="0.85"/>
+      <path d="M36 66 h44" stroke-width="5" opacity="0.85"/>
+      <!-- caret, the same proportion as the one in the mark -->
+      <path d="M88 60 v12" stroke-width="3.5"/>
+    </g>
+
+    <!-- flow between the panels -->
+    <path d="M204 82 h48" stroke-width="2.5" opacity="0.55"/>
+    <path d="M244 74 l8 8 -8 8" stroke-width="2.5" opacity="0.55"/>
+    <path d="M460 82 h48" stroke-width="2.5" opacity="0.55"/>
+    <path d="M500 74 l8 8 -8 8" stroke-width="2.5" opacity="0.55"/>
+  </g>
+
+  <g fill="currentColor" font-family="system-ui, sans-serif" font-size="15" text-anchor="middle">
+    <text x="104" y="164" opacity="0.95">Press your hotkey</text>
+    <text x="360" y="164" opacity="0.95">Speak</text>
+    <text x="616" y="164" opacity="0.95">Press it again</text>
+    <text x="104" y="184" opacity="0.6" font-size="13">the overlay appears</text>
+    <text x="360" y="184" opacity="0.6" font-size="13">it follows your voice</text>
+    <text x="616" y="184" opacity="0.6" font-size="13">the words are typed in</text>
+  </g>
+</svg>

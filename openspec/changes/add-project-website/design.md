@@ -139,9 +139,13 @@ Properties this buys, and which the spec requires:
 - Derivable: the favicon, the apple-touch icon, and the 1200×630 social preview
   are all rendered from this one file rather than drawn separately.
 
-The wordmark is "murmly" set lowercase in the stack's own face with tightened
-tracking, not a lettered logotype. Lowercase because that is how the command is
-typed. No third-party icon set anywhere on the page.
+The wordmark is "murmly", lowercase, constructed from the same stem width and
+arch radius as the bars in the mark, with round terminals to match their ends.
+It is built rather than set in a typeface and traced, for two reasons: no glyph
+tracer is installed here, and a traced glyph is a derivative of whatever font
+drew it, which the spec's requirement that the mark be distributable under this
+repository's licence does not permit. Lowercase because that is how the command
+is typed. No third-party icon set anywhere on the page.
 
 ### Colour, in both schemes, from one accent
 

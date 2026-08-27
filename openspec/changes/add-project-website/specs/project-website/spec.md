@@ -6,7 +6,7 @@ Defines the public page that introduces Murmly to someone who has never seen it:
 
 ### Requirement: The project page is published at a stable public address
 
-Murmly SHALL publish a project page at `https://osirison.github.io/murmly/`. Publication MUST run automatically when the default branch changes and MUST also be startable on demand. A proposed change that has not reached the default branch MUST NOT replace the published page.
+Murmly SHALL publish a project page at `https://osirison.github.io/murmly/`. Publication MUST run automatically when the default branch changes the site's files, and MUST also be startable on demand. A proposed change that has not reached the default branch MUST NOT replace the published page.
 
 #### Scenario: A site change reaches the default branch
 

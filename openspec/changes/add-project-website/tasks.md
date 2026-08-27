@@ -28,59 +28,59 @@
 
 ## 4. Diagrams
 
-- [ ] 4.1 Author `diagram-loop.svg`: three panels — press the hotkey, speak, press again and the text appears in the window you were in. This is the first screen's graphic and it replaces the paragraph the README opens with
-- [ ] 4.2 Author `diagram-local.svg`: a boundary around the machine holding the microphone, the model, and the target window, with nothing crossing outward, and exactly one inward arrow labelled "first run: model download". Omitting that arrow would overstate the local-only claim
-- [ ] 4.3 Keep both files in `site/assets/` as the editable source, and inline their markup into `index.html` rather than referencing them as `<img>`, so they inherit `currentColor` and follow the colour scheme
-- [ ] 4.4 Give each inline SVG a `<title>` and `role="img"` with `aria-labelledby`, so the diagram announces what it shows
+- [x] 4.1 Author `diagram-loop.svg`: three panels — press the hotkey, speak, press again and the text appears in the window you were in. This is the first screen's graphic and it replaces the paragraph the README opens with
+- [x] 4.2 Author `diagram-local.svg`: a boundary around the machine holding the microphone, the model, and the target window, with nothing crossing outward, and exactly one inward arrow labelled "first run: model download". Omitting that arrow would overstate the local-only claim
+- [x] 4.3 Keep both files in `site/assets/` as the editable source, and inline their markup into `index.html` rather than referencing them as `<img>`, so they inherit `currentColor` and follow the colour scheme
+- [x] 4.4 Give each inline SVG a `<title>` and `role="img"` with `aria-labelledby`, so the diagram announces what it shows
 
 ## 5. The page
 
-- [ ] 5.1 Write `site/index.html` in the section order from `design.md` — hero, how it works, what makes it different, it also speaks, install, footer
-- [ ] 5.2 Hero: mark, wordmark, the one-sentence description, the loop diagram, the install link, and a compact "Fedora · KDE Plasma · Python 3.12+" line. Verify at 1280×800 that all of it is above the fold and that nothing visible there names a compositor, protocol, window system, or library
-- [ ] 5.3 "How it works": three steps, each paired with its real screenshot
-- [ ] 5.4 "What makes it different": four points drawn from the claim table in `design.md`, one sentence and one supporting detail each. The local-only point carries `diagram-local.svg`
-- [ ] 5.5 "It also speaks": speech output and the agent-announce hook, stated as optional and off by default
-- [ ] 5.6 "Install": the requirements panel — Fedora target, Plasma for hotkey and overlay, Python 3.12+, terminal install, X11 verified and Plasma Wayland not verified end to end — then the install command, then the link to the README. Style the panel as part of the product, not as a disclaimer
-- [ ] 5.7 Footer: Apache-2.0, the repository link, and a link to `openspec/specs/`
-- [ ] 5.8 Head: `<title>`, `<meta name="description">`, `<link rel="canonical">` and `og:image` as absolute URLs under `https://osirison.github.io/murmly/`, `og:title`/`og:description`/`og:type`, and `twitter:card` set to `summary_large_image`. These two absolute URLs are the only ones in the document
-- [ ] 5.9 Write every other `href` and `src` as a relative path, so the page resolves under the `/murmly/` prefix and also when opened from local disk
-- [ ] 5.10 Ship no JavaScript. If a copy-to-clipboard control is added later, the command must remain selectable and readable with scripting disabled
+- [x] 5.1 Write `site/index.html` in the section order from `design.md` — hero, how it works, what makes it different, it also speaks, install, footer
+- [x] 5.2 Hero: mark, wordmark, the one-sentence description, the loop diagram, the install link, and a compact "Fedora · KDE Plasma · Python 3.12+" line. Verify at 1280×800 that all of it is above the fold and that nothing visible there names a compositor, protocol, window system, or library
+- [x] 5.3 "How it works": three steps, each paired with its real screenshot
+- [x] 5.4 "What makes it different": four points drawn from the claim table in `design.md`, one sentence and one supporting detail each. The local-only point carries `diagram-local.svg`
+- [x] 5.5 "It also speaks": speech output and the agent-announce hook, stated as optional and off by default
+- [x] 5.6 "Install": the requirements panel — Fedora target, Plasma for hotkey and overlay, Python 3.12+, terminal install, X11 verified and Plasma Wayland not verified end to end — then the install command, then the link to the README. Style the panel as part of the product, not as a disclaimer
+- [x] 5.7 Footer: Apache-2.0, the repository link, and a link to `openspec/specs/`
+- [x] 5.8 Head: `<title>`, `<meta name="description">`, `<link rel="canonical">`, `og:url` and `og:image` as absolute URLs under `https://osirison.github.io/murmly/`, `og:title`/`og:description`/`og:type`, and `twitter:card` set to `summary_large_image`. **Three, not two:** Open Graph requires `og:url` to be the absolute canonical address, so it joins `canonical` and `og:image`. They are the only absolute URLs that are not navigation links
+- [x] 5.9 Write every other `href` and `src` as a relative path, so the page resolves under the `/murmly/` prefix and also when opened from local disk
+- [x] 5.10 Ship no JavaScript. If a copy-to-clipboard control is added later, the command must remain selectable and readable with scripting disabled
 
 ## 6. Styling
 
-- [ ] 6.1 Write `site/style.css`: colour, spacing, and radius tokens on `:root`; a `@media (prefers-color-scheme: dark)` block that redefines only the tokens
-- [ ] 6.2 Set the type stack to the platform's own UI and monospace faces. Load no font file and reference no font service
-- [ ] 6.3 Lay the page out so it reads from 360 px upward with no horizontal scrolling of the document body; give code blocks and any table their own `overflow-x: auto` region
-- [ ] 6.4 Give every `<img>` explicit `width` and `height`, and `loading="lazy"` for anything below the first screen, so the page does not reflow as images arrive
-- [ ] 6.5 Suppress every transition and animation under `@media (prefers-reduced-motion: reduce)`, and confirm nothing is conveyed by motion alone
+- [x] 6.1 Write `site/style.css`: colour, spacing, and radius tokens on `:root`; a `@media (prefers-color-scheme: dark)` block that redefines only the tokens
+- [x] 6.2 Set the type stack to the platform's own UI and monospace faces. Load no font file and reference no font service
+- [x] 6.3 Lay the page out so it reads from 360 px upward with no horizontal scrolling of the document body; give code blocks and any table their own `overflow-x: auto` region
+- [x] 6.4 Give every `<img>` explicit `width` and `height`, and `loading="lazy"` for anything below the first screen, so the page does not reflow as images arrive
+- [x] 6.5 Suppress every transition and animation under `@media (prefers-reduced-motion: reduce)`, and confirm nothing is conveyed by motion alone
 
 ## 7. Content review
 
-- [ ] 7.1 Check every factual statement on the page against the claim table in `design.md`, and delete any sentence with no source in `README.md`, `openspec/specs/`, `config.example.toml`, `LICENSE`, or `pyproject.toml`
-- [ ] 7.2 Confirm no figure is sourced from `openspec/changes/` — those describe behaviour that is planned, not shipped, and `unload-idle-gpu-models` in particular carries a memory figure for code that does not exist yet
-- [ ] 7.3 Confirm each measured figure carries the qualification its source gives it, including the machine it was measured on
-- [ ] 7.4 Confirm the page carries no competitor comparison, testimonial, install count, star count, or rating
-- [ ] 7.5 Confirm the page reproduces no configuration reference, no speech-session protocol detail, and no troubleshooting steps — those stay in the README
+- [x] 7.1 Check every factual statement on the page against the claim table in `design.md`, and delete any sentence with no source in `README.md`, `openspec/specs/`, `config.example.toml`, `LICENSE`, or `pyproject.toml`
+- [x] 7.2 Confirm no figure is sourced from `openspec/changes/` — those describe behaviour that is planned, not shipped, and `unload-idle-gpu-models` in particular carries a memory figure for code that does not exist yet
+- [x] 7.3 Confirm each measured figure carries the qualification its source gives it, including the machine it was measured on
+- [x] 7.4 Confirm the page carries no competitor comparison, testimonial, install count, star count, or rating
+- [x] 7.5 Confirm the page reproduces no configuration reference, no speech-session protocol detail, and no troubleshooting steps — those stay in the README
 
 ## 8. Documentation
 
-- [ ] 8.1 Add the site link near the top of `README.md`
-- [ ] 8.2 Write `docs/agent-notes/` entries for whatever the capture and publish work turned up that is not obvious — at minimum the layer-shell screenshot constraint if it bit, and the Pages source setting being manual
+- [x] 8.1 Add the site link near the top of `README.md`
+- [x] 8.2 Write `docs/agent-notes/` entries for whatever the capture and publish work turned up that is not obvious — at minimum the layer-shell screenshot constraint if it bit, and the Pages source setting being manual
 - [ ] 8.3 Set the repository's social preview image to `social-preview.png` and add the site URL to the About field
 
 ## 9. Verification
 
-- [ ] 9.1 Open `site/index.html` from local disk with no network and confirm the logo, screenshots, diagrams, and typography all render — this proves both the relative paths and the no-third-party-requests requirement in one pass
-- [ ] 9.2 Grep `site/` for `http://` and `https://` and confirm every hit is either a navigation `href` or one of the two absolute URLs in the head. No subresource may point off origin
+- [x] 9.1 Open `site/index.html` from local disk with no network and confirm the logo, screenshots, diagrams, and typography all render — this proves both the relative paths and the no-third-party-requests requirement in one pass
+- [x] 9.2 Grep `site/` for `http://` and `https://` and confirm every hit is either a navigation `href` or one of the two absolute URLs in the head. No subresource may point off origin
 - [ ] 9.3 After deploy, load `https://osirison.github.io/murmly/` with the network panel recording, and confirm no request leaves the origin, nothing returns 404, no cookie is set, and no persistent storage entry is written
-- [ ] 9.4 Load the page with scripting disabled and confirm every section, image, link, and the install command are present and readable
-- [ ] 9.5 Check every text and background pair against 4.5:1, and 3:1 for text at 24 px or larger, in both colour schemes
-- [ ] 9.6 Tab through the page and confirm every link and control takes focus in reading order with a visible indicator
-- [ ] 9.7 Confirm every informative image has a text alternative describing what it shows, and that decorative images are marked so a screen reader skips them
-- [ ] 9.8 View the page at 360 px, 768 px, and 1280 px and confirm no horizontal scrolling of the body at any of them
-- [ ] 9.9 Load the page under both `prefers-color-scheme` values and confirm the mark and wordmark are legible in each
+- [x] 9.4 Load the page with scripting disabled and confirm every section, image, link, and the install command are present and readable
+- [x] 9.5 Check every text and background pair against 4.5:1, and 3:1 for text at 24 px or larger, in both colour schemes
+- [x] 9.6 Tab through the page and confirm every link and control takes focus in reading order with a visible indicator
+- [x] 9.7 Confirm every informative image has a text alternative describing what it shows, and that decorative images are marked so a screen reader skips them
+- [x] 9.8 View the page at 360 px, 768 px, and 1280 px and confirm no horizontal scrolling of the body at any of them
+- [x] 9.9 Load the page under both `prefers-color-scheme` values and confirm the mark and wordmark are legible in each
 - [ ] 9.10 Paste the published URL into a link-preview renderer and confirm the title, description, and image come from this origin
 - [ ] 9.11 Open a pull request that changes a file under `site/` and confirm the published page does not change until it merges
 - [ ] 9.12 Run `workflow_dispatch` and confirm the page republishes from the current `main` without a code change
 - [ ] 9.13 Confirm the deploy did not run the Python test matrix
-- [ ] 9.14 Run `openspec validate add-project-website --strict` and the existing suite once, to confirm this change left neither of them worse
+- [x] 9.14 Run `openspec validate add-project-website --strict` and the existing suite once, to confirm this change left neither of them worse
