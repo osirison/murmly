@@ -38,7 +38,7 @@
 - [x] 5.1 Write `site/index.html` in the section order from `design.md` — hero, how it works, what makes it different, it also speaks, install, footer
 - [x] 5.2 Hero: mark, wordmark, the one-sentence description, the loop diagram, the install link, and a compact "Fedora · KDE Plasma · Python 3.12+" line. Verify at 1280×800 that all of it is above the fold and that nothing visible there names a compositor, protocol, window system, or library
 - [x] 5.3 "How it works": three steps, each paired with its real screenshot
-- [x] 5.4 "What makes it different": four points drawn from the claim table in `design.md`, one sentence and one supporting detail each. The local-only point carries `diagram-local.svg`
+- [x] 5.4 "What makes it different": a lead point carrying `diagram-local.svg`, then four supporting points, one sentence and one supporting detail each. **Five, not four:** the plan counted the local-only point among the four; it shipped as a wider lead block with the diagram beside it, and the four that follow are the claim table's remainder
 - [x] 5.5 "It also speaks": speech output and the agent-announce hook, stated as optional and off by default
 - [x] 5.6 "Install": the requirements panel — Fedora target, Plasma for hotkey and overlay, Python 3.12+, terminal install, X11 verified and Plasma Wayland not verified end to end — then the install command, then the link to the README. Style the panel as part of the product, not as a disclaimer
 - [x] 5.7 Footer: Apache-2.0, the repository link, and a link to `openspec/specs/`

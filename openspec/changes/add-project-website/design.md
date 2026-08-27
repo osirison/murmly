@@ -102,17 +102,20 @@ site/
 Not `docs/` (internal notes live there), not `www/` or `public/` (no convention
 in this repo to follow, and `site/` says what it is).
 
-### Relative asset paths, with two deliberate absolute URLs
+### Relative asset paths, with three deliberate absolute URLs
 
 Every `href` and `src` in the document is relative — `assets/…`, `style.css` —
 so the page works under the `/murmly/` prefix and also when opened from local
 disk, which is how it will be reviewed before it is ever published.
 
-Two tags must carry absolute URLs, because the specifications for them require
-it: `<meta property="og:image">` and `<link rel="canonical">`. Link-preview
-crawlers do not resolve a relative `og:image` against the page. These are the
-only two, and the spec's requirement is that references resolve under the prefix
-— an absolute URL to the published address does resolve.
+Three tags must carry absolute URLs, because the specifications for them require
+it: `<link rel="canonical">`, `<meta property="og:url">` and
+`<meta property="og:image">`. Link-preview crawlers do not resolve a relative
+`og:image` against the page, and Open Graph defines `og:url` as the absolute
+canonical address of the page rather than a relative reference. These three are
+the only absolute URLs that are not navigation links, and the spec's requirement
+is that references resolve under the prefix — an absolute URL to the published
+address does resolve.
 
 ### System fonts, no webfont file
 
@@ -160,12 +163,15 @@ in both schemes before the page ships — that check is a task, not an aspiratio
 The overlay is the product's face and a drawing of it would be a lie the spec
 forbids. Capture procedure:
 
-- Take them on an **X11 Plasma session**. On Wayland the overlay is a
-  `gtk4-layer-shell` surface, and not every screenshot tool includes layer-shell
-  surfaces in a region capture. X11 is also the session Murmly is verified on, so
-  the captures show the verified configuration.
-- Use Spectacle's rectangular-region capture over the bottom-centred overlay,
-  against a neutral desktop background with no personal content in frame.
+- Take them on **Plasma Wayland with a full-compositor capture**
+  (`spectacle -b -f -n -o`), then crop with ImageMagick. This corrects the
+  procedure first written here, which called for an X11 session: the layer-shell
+  caveat is real but applies to a *region* capture, and a whole-output grab
+  includes the overlay. Verified on Plasma 6.7.4 Wayland — see
+  `docs/agent-notes/capturing-the-overlay-for-docs.md`, which is the procedure of
+  record.
+- Keep the frame neutral: nothing personal on screen, and crop to the overlay
+  rather than shipping a whole desktop.
 - Capture at the display's native scale and commit one PNG per image, run through
   a lossless optimizer. Each `<img>` carries explicit `width` and `height` so the
   page does not reflow as images arrive, and every image below the first screen
@@ -218,8 +224,9 @@ The claim set the page will draw on, each with its source:
    and a compact "Fedora · KDE Plasma · Python 3.12+" line. The requirements are
    on the first screen, stated as a fact rather than a warning.
 2. **How it works** — three steps, each with its real screenshot.
-3. **What makes it different** — four points from the claim table, each one
-   sentence and one supporting detail. Local-only carries the boundary diagram.
+3. **What makes it different** — a lead point carrying the boundary diagram,
+   then four supporting points, each one sentence and one supporting detail.
+   Five in total; the plan first said four including the local-only one.
 4. **It also speaks** — the speech-output section, including the agent-announce
    hook, marked as optional and off by default.
 5. **Install** — the full requirements panel, the command, and the link to the
@@ -283,7 +290,7 @@ history.
 
 - Whether to register a custom domain later. It does not affect this change:
   adding a `CNAME` file and a DNS record works against the same `site/` directory
-  and the same workflow, and only the two absolute URLs would change.
+  and the same workflow, and only the three absolute URLs above would change.
 - Whether a short screen recording of a dictation belongs on the page. A silent,
   looping capture would be persuasive, but it is a video budget and an
   accessibility surface of its own. Deferred; the still captures are sufficient
