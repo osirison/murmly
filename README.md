@@ -5,6 +5,9 @@ description: Fedora-first local voice-to-text daemon for Linux desktops
 
 ## Overview
 
+**[osirison.github.io/murmly](https://osirison.github.io/murmly/)** — what it is,
+in one page with pictures. This file is the reference.
+
 `murmly` is a Fedora-first, local voice-to-text tool for Linux desktops. Press a
 hotkey, speak, press it again: the transcript is typed into whatever you were
 working in. Everything runs locally.
