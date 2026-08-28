@@ -744,6 +744,32 @@ so a `continuous` session is never released while it is still running, however
 long you pause between utterances. Synthesis counts the same way against speech
 sessions.
 
+**`murmly doctor` reports what the running daemon is holding**, under
+`model_resident` for transcription and `speech_output.resident` for synthesis.
+The models live in the daemon's process, so the report asks it over the command
+socket rather than answering for itself — `murmly doctor` runs in its own
+process and holds neither model, and its own answer would be `false` on a
+machine whose daemon has both loaded.
+
+Each field is `true`, `false`, or `null`. **`null` means the question could not
+be answered, not that the models are idle**: no daemon is running, the daemon
+did not answer, or the daemon that answered predates this reporting. A
+`model_resident_detail` beside it names which, and the synthesis section carries
+its own `resident_detail` for the same reason. A daemon with `[tts] enabled =
+false` never builds a synthesis session, so it reports no synthesis residency
+rather than reporting one as released.
+
+```json
+{
+  "model_resident": null,
+  "model_resident_detail": "No Murmly daemon is running, so what it holds could not be asked: ..."
+}
+```
+
+That is the field to watch to see release working: transcribe once, and
+`model_resident` is `true`; leave the daemon alone for `[stt]
+unload_after_idle_s` and it becomes `false` as the memory goes back.
+
 `[tts] device = "cuda"` together with a non-zero `[tts] unload_after_idle_s` is
 the one combination to think twice about. It is a trade rather than a saving:
 the 528 MiB of GPU memory comes back, but rebuilding the session costs a
@@ -849,6 +875,15 @@ runtime, delivery verification, overlay, and installation state:
 ```bash
 uv run murmly doctor
 ```
+
+`murmly doctor` opens the command socket, which it did not do before: the model
+residency it reports comes from the running daemon rather than from the
+reporting process. Everything else in the report is about this machine and is
+unaffected by whether a daemon answers. With live transcription enabled the
+report also measures a partial pass, which loads the transcription model in the
+reporting process — `live_transcription.partial_pass_loaded_model` says when
+that happened, and the residency above it was read from the daemon before it
+ran.
 
 Service logs:
 

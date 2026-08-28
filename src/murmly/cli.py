@@ -23,6 +23,7 @@ from murmly.audio import (
 )
 from murmly.config import MurmlyConfig, default_config_path, load_config
 from murmly.daemon import (
+    COMMAND_STATUS,
     DaemonNotRespondingError,
     DaemonStartupError,
     MurmlyDaemon,
@@ -423,6 +424,13 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
 
 
 def _run_doctor(config: MurmlyConfig) -> None:
+    # Asked first, before any section runs and long before the report is
+    # assembled. `live_transcription_diagnostics` below loads the model when live
+    # transcription is enabled, and the speech probe opens the output device;
+    # residency is meant to say what the daemon held when the question was put,
+    # not what this report caused on its way past.
+    (model_resident, model_resident_detail), synthesis_residency = daemon_residency(config)
+
     try:
         clipboard_command: list[str] | str = choose_clipboard_copy_command()
     except MissingToolError as error:
@@ -465,24 +473,23 @@ def _run_doctor(config: MurmlyConfig) -> None:
     # Guarded on its own, like every other probe: a speech stack that cannot be
     # inspected must not take the rest of the report with it.
     try:
-        speech = speech_output_diagnostics(config)
+        speech = speech_output_diagnostics(config, residency=synthesis_residency)
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        synthesis_resident, synthesis_resident_detail = synthesis_residency
         speech = {
             "enabled": config.tts_enabled,
             "available": False,
             # Both residency keys survive a failed probe. A section that drops
             # them reads as one the report never asked about, which is the
-            # distinction the residency requirement exists to preserve.
+            # distinction the residency requirement exists to preserve. The
+            # daemon's answer survives it too: it was taken before this probe
+            # ran and nothing about the probe failing makes it less true.
             "unload_after_idle_s": config.tts_unload_after_idle_s,
-            "resident": False,
+            "resident": synthesis_resident,
             "detail": f"Unable to check speech output: {error}",
         }
-
-    # Asked before the report is assembled rather than while it is being
-    # assembled. `live_transcription_diagnostics` below loads the model when
-    # live transcription is enabled, and residency is meant to say what was held
-    # when the question was put, not what this report loaded on its way past.
-    model_resident, model_resident_detail = transcription_residency()
+        if synthesis_resident_detail is not None:
+            speech["resident_detail"] = synthesis_resident_detail
 
     report: dict[str, object] = {
         "config_path": str(config.config_path),
@@ -542,36 +549,103 @@ def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
     return report
 
 
-def transcription_residency(
-    transcriber: FasterWhisperTranscriber | None = None,
-) -> tuple[bool | None, str | None]:
-    """Whether this process holds the transcription model's weights.
+def daemon_residency(
+    config: MurmlyConfig,
+    send: Callable[[str, str], dict[str, object]] | None = None,
+) -> tuple[tuple[bool | None, str | None], tuple[bool | None, str | None]]:
+    """What the running daemon holds, as a value and a reason for each model.
 
-    Answers for this process, which is all `murmly doctor` can observe: it runs
-    in its own process, and the residency of a model inside a running daemon is
-    not reachable from here.
+    Asked of the daemon rather than answered here. `murmly doctor` runs in its
+    own process and holds neither model, so its own residency is a constant
+    `False` that says nothing about the system -- and the models this reports on
+    live in the daemon's process, where the only thing that can see them is the
+    daemon.
 
-    Nothing is constructed to produce the answer. Building a
-    `FasterWhisperTranscriber` loads the model outright whenever
-    `lazy_load_model` is false, and that is precisely the load reporting
-    residency must never perform, so a caller holding no transcriber is reported
-    as holding no weights rather than being given one to ask.
+    `send_command` rather than `send_command_with_recovery`: the recovery path
+    starts the installed service when nothing answers, which would have this
+    report boot a daemon and then say its models are idle, inverting the one
+    distinction it exists to draw. Its timeouts are not extended either. Doctor
+    is what someone runs when things are wrong, and a daemon that will not
+    answer in time is a fact to report rather than one to wait for.
 
-    Guarded like every other probe, and the failure is returned beside the value
-    rather than substituted into it, so a program reading the report never has
-    to tell "not resident" from "could not be asked".
+    Three outcomes per model, in the shape this file already uses for a value it
+    could not determine: True, False, or None beside a detail naming the reason.
+    Nothing is loaded to produce any of them.
     """
-    if transcriber is None:
-        return False, None
+    ask = send if send is not None else send_command
     try:
-        return bool(transcriber.resident), None
+        response = ask(str(config.socket_path), COMMAND_STATUS)
+    except (FileNotFoundError, ConnectionRefusedError) as error:
+        return _residency_unknown(
+            f"No Murmly daemon is running, so what it holds could not be asked: {error}"
+        )
+    except DaemonNotRespondingError as error:
+        return _residency_unknown(f"The Murmly daemon did not answer: {error}")
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
-        return None, f"Unable to determine transcription residency: {error}"
+        return _residency_unknown(f"Unable to ask the Murmly daemon what it holds: {error}")
+
+    if not isinstance(response, dict):
+        return _residency_unknown(
+            "The Murmly daemon answered with something other than a status response."
+        )
+    if "model_resident" not in response:
+        # Absent rather than null, which is how a daemon too old to know the
+        # question answers it. A daemon that knows and cannot answer reports null
+        # beside its own reason, and that reason is carried through below.
+        return _residency_unknown(
+            "The running Murmly daemon does not report residency. Restart the "
+            "service to pick up a version that does."
+        )
+
+    transcription = _residency_field(response, "model_resident", "transcription")
+    if "synthesis_resident" in response:
+        synthesis = _residency_field(response, "synthesis_resident", "synthesis")
+    else:
+        # The daemon answered and left synthesis out, which is how it says it
+        # never built a synthesizer. Reported from the daemon's side rather than
+        # from the configuration read here: the two can disagree after an edit
+        # that nothing has restarted for, and the daemon is the one holding it.
+        synthesis = (
+            None,
+            "The Murmly daemon holds no synthesis session: speech output is not "
+            "enabled in the daemon that is running.",
+        )
+    return transcription, synthesis
+
+
+def _residency_unknown(
+    detail: str,
+) -> tuple[tuple[None, str], tuple[None, str]]:
+    """Both models unanswered for the same reason, which is one reason each."""
+    return (None, detail), (None, detail)
+
+
+def _residency_field(
+    response: dict[str, object],
+    key: str,
+    subject: str,
+) -> tuple[bool | None, str | None]:
+    """One model's residency out of the daemon's answer, with its own reason.
+
+    A null the daemon sent carries the daemon's detail, not one written here: it
+    knows why it could not read its own holder and this process does not.
+    """
+    value = response.get(key)
+    if isinstance(value, bool):
+        return value, None
+    detail = response.get(f"{key}_detail")
+    if isinstance(detail, str) and detail:
+        return None, f"The Murmly daemon could not read {subject} residency: {detail}"
+    return None, (
+        f"The Murmly daemon reported {subject} residency as {value!r}, which is "
+        "not an answer."
+    )
 
 
 def speech_output_diagnostics(
     config: MurmlyConfig,
     synthesizer: KokoroSynthesizer | None = None,
+    residency: tuple[bool | None, str | None] = (None, None),
 ) -> dict[str, object]:
     """What `murmly doctor` says about speech output.
 
@@ -579,7 +653,13 @@ def speech_output_diagnostics(
     honoured, because a setting that silently falls back looks to its owner like
     one that was ignored. Never loads the model: the probe checks that every
     part is present, which is what decides whether a session can be opened.
+
+    Residency is passed in rather than read off the probe. The probe deliberately
+    never builds a session, so its own `resident` is a constant False; the
+    session this section is about lives in the daemon, and `daemon_residency`
+    is what asked it.
     """
+    synthesis_resident, synthesis_resident_detail = residency
     report: dict[str, object] = {
         "enabled": config.tts_enabled,
         "voice": config.tts_voice,
@@ -590,12 +670,16 @@ def speech_output_diagnostics(
         # Carried by the disabled and the unavailable report as well, and carried
         # when the period is zero, which is how synthesis release ships. A reader
         # who cannot see the value cannot tell a release that is switched off
-        # from one this report did not mention. Residency starts False for the
-        # same reason: the early returns below are the cases where no session was
-        # ever built, and a stack that never spoke is holding nothing.
+        # from one this report did not mention. Residency is carried through
+        # every early return below for the same reason, and it is the daemon's
+        # answer on all of them -- including the one for speech output being
+        # disabled here, because a daemon still running from before that edit is
+        # holding whatever it is holding regardless of what this file now reads.
         "unload_after_idle_s": config.tts_unload_after_idle_s,
-        "resident": False,
+        "resident": synthesis_resident,
     }
+    if synthesis_resident_detail is not None:
+        report["resident_detail"] = synthesis_resident_detail
     if config.tts_voice_rejected_value is not None:
         report["voice_rejected_value"] = config.tts_voice_rejected_value
     if config.tts_rate_rejected_value is not None:
@@ -609,15 +693,6 @@ def speech_output_diagnostics(
         return report
 
     probe = synthesizer if synthesizer is not None else KokoroSynthesizer(config)
-    # Read off the probe's own property rather than inferred from the fact that
-    # the probe this function builds has never spoken. `resident` is specified
-    # never to construct a session, and that is the guarantee keeping the report
-    # from building 326 MB of weights in order to say whether they are held.
-    try:
-        report["resident"] = bool(probe.resident)
-    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
-        report["resident"] = None
-        report["resident_detail"] = f"Unable to determine synthesis residency: {error}"
     report["available"] = probe.available
     if not probe.available:
         # The reason is written as the remedy: what to install, or what to place
@@ -800,7 +875,14 @@ def live_transcription_diagnostics(
             report["silence_detection_detail"] = f"Unable to check silence detection: {error}"
 
     report["partial_pass_ceiling_ms"] = None
+    # Declared, not implied. Reporting residency loads nothing, and this section
+    # is the one part of the report that does: `measure_partial_pass_ms`
+    # constructs a transcriber and runs two passes over a full window. A reader
+    # comparing the residency above against what the machine is holding after
+    # the report has to know that this ran.
+    report["partial_pass_loaded_model"] = False
     if config.live_transcribe:
+        report["partial_pass_loaded_model"] = True
         # At the negotiated rate, not the configured one: a session that lands on
         # 48 kHz takes the slower temp-WAV route, and measuring at 16 kHz would
         # report the in-memory path's ceiling for a setup that never uses it.
@@ -818,7 +900,9 @@ def live_transcription_diagnostics(
             report["partial_pass_keeps_pace"] = measured <= config.live_interval_ms
             report["partial_pass_detail"] = (
                 "Worst case: a full window of speech. Real partials are usually faster "
-                "because the voice activity filter trims silence."
+                "because the voice activity filter trims silence. Measuring this "
+                "loaded the transcription model in this process; the residency "
+                "reported above was read from the daemon before it ran."
             )
     else:
         report["partial_pass_detail"] = "Live transcription is disabled."

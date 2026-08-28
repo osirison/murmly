@@ -389,6 +389,19 @@ class SpeechSession:
             raise
         return self._recorder.stop()
 
+    @property
+    def model_resident(self) -> bool:
+        """Whether the transcription model's weights are held right now.
+
+        The same reach from a capture session to its transcriber that
+        `release_model` makes, asked as a question rather than made as a
+        release. The daemon answers `status` with this, so it must neither load
+        nor wait: `resident` is specified to do neither, and deliberately skips
+        the transcriber's model lock so the answer cannot park behind a decode
+        that is already running.
+        """
+        return self._transcriber.resident
+
     def release_model(self) -> None:
         """Give the transcription model's memory back, if it still holds any.
 
@@ -1659,9 +1672,60 @@ class MurmlyDaemon:
             raise
         self._report_interruption(interruption)
 
+    def _residency(self) -> dict[str, object]:
+        """What each model holds right now, for the `status` response to carry.
+
+        Read from the model holders, never inferred from whether an idle
+        countdown is armed. A countdown that has fired says a release was
+        attempted, not that it succeeded -- a runtime whose build cannot be
+        asked reports resident and releases nothing -- so only the holders know.
+
+        Nothing is locked and nothing is constructed. `status` is what a hotkey
+        press and `murmly doctor` both send, and neither may be parked behind a
+        transcription already in flight.
+
+        A holder that cannot be asked is reported as null beside the reason
+        rather than left out, because leaving a field out is how this response
+        says "this daemon does not know the question". Synthesis is left out for
+        exactly that reason when no synthesizer was ever built: a daemon with
+        `[tts] enabled = false` holds nothing and has nothing to hold.
+        """
+        residency: dict[str, object] = {}
+        try:
+            residency["model_resident"] = bool(self._session.model_resident)
+        except Exception as error:  # noqa: BLE001 - status still owes an answer
+            residency["model_resident"] = None
+            residency["model_resident_detail"] = (
+                f"Unable to determine transcription residency: {error}"
+            )
+        try:
+            synthesizer = self._speech.synthesizer
+        except Exception as error:  # noqa: BLE001 - status still owes an answer
+            residency["synthesis_resident"] = None
+            residency["synthesis_resident_detail"] = (
+                f"Unable to determine synthesis residency: {error}"
+            )
+            return residency
+        if synthesizer is None:
+            return residency
+        try:
+            residency["synthesis_resident"] = bool(synthesizer.resident)
+        except Exception as error:  # noqa: BLE001 - status still owes an answer
+            residency["synthesis_resident"] = None
+            residency["synthesis_resident_detail"] = (
+                f"Unable to determine synthesis residency: {error}"
+            )
+        return residency
+
     def handle_command(self, command: str) -> dict[str, object]:
         if command == COMMAND_STATUS:
-            return {"ok": True, "state": self.state}
+            # Residency travels with the state rather than under a command of
+            # its own. `status` already means "what is the daemon doing right
+            # now", a reader that only looks at `state` is unaffected, and a
+            # caller talking to a daemon too old to include the fields sees them
+            # absent -- which is the same case it must handle for a daemon that
+            # does not answer at all.
+            return {"ok": True, "state": self.state, **self._residency()}
         if command not in (COMMAND_TOGGLE, COMMAND_TOGGLE_SESSION):
             return failure_response(
                 CommandCode.UNSUPPORTED_COMMAND, f"Unsupported command: {command}"
