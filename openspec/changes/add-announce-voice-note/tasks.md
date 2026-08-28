@@ -69,4 +69,4 @@ requirement is that the finished turn is what gets announced.
 - [x] 8.4 Tests: the payload wins over a transcript that disagrees; the camelCase alias is read; an absent field falls back to the transcript; an empty field falls back; a marked passage in the payload beats a different one in the transcript; a payload message with no transcript at all is still announced.
 - [x] 8.5 Run the full suite and `openspec validate --strict`.
 - [x] 8.6 Reinstall the fixed build over the live registration, which currently holds the pre-fix script.
-- [ ] 8.7 Correct the PR body, which says this was found and left for a separate change.
+- [x] 8.7 Correct the PR body, which says this was found and left for a separate change.
