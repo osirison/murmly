@@ -272,10 +272,80 @@ class VoiceNoteBoundTests(unittest.TestCase):
         self.assertEqual("The fix is in audio.py and the PR is open.", spoken)
 
 
+class FinishedTurnTests(unittest.TestCase):
+    """Which turn gets announced.
+
+    The transcript lags: when a turn ends it does not yet hold that turn's
+    message, so reading it back to front finds the previous turn's and every
+    announcement is one turn late. Reproduced in a two-turn session before this
+    was fixed, which is where ALPHA and BRAVO come from -- turn two's hook read
+    ALPHA out of the transcript while the payload already held BRAVO.
+    """
+
+    PREVIOUS = "ALPHA\n\n<voice-note>This is turn one, ALPHA.</voice-note>"
+    FINISHED = "BRAVO\n\n<voice-note>This is turn two, BRAVO.</voice-note>"
+
+    def rows(self, *messages: str) -> list[dict]:
+        return [
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": m}]}}
+            for m in messages
+        ]
+
+    def test_the_payload_wins_over_a_transcript_that_disagrees(self) -> None:
+        message = announce.finished_turn_message(
+            {"last_assistant_message": self.FINISHED}, self.rows(self.PREVIOUS)
+        )
+        self.assertEqual(self.FINISHED, message)
+
+    def test_the_finished_turns_passage_is_the_one_announced(self) -> None:
+        spoken, source = announce.announcement(
+            announce.finished_turn_message(
+                {"last_assistant_message": self.FINISHED}, self.rows(self.PREVIOUS)
+            )
+        )
+        self.assertEqual(announce.SOURCE_VOICE_NOTE, source)
+        self.assertEqual("This is turn two, BRAVO.", spoken)
+        self.assertNotIn("ALPHA", spoken)
+
+    def test_the_camel_case_alias_is_read(self) -> None:
+        """Copilot's `agentStop` sends the same fields in camelCase."""
+        message = announce.finished_turn_message(
+            {"lastAssistantMessage": self.FINISHED}, self.rows(self.PREVIOUS)
+        )
+        self.assertEqual(self.FINISHED, message)
+
+    def test_an_absent_field_falls_back_to_the_transcript(self) -> None:
+        """An agent or a version that sends no message still gets announced."""
+        message = announce.finished_turn_message({}, self.rows("First.", self.PREVIOUS))
+        self.assertEqual(self.PREVIOUS, message)
+
+    def test_an_empty_field_falls_back_to_the_transcript(self) -> None:
+        for payload in ({"last_assistant_message": ""}, {"last_assistant_message": None}):
+            with self.subTest(payload=payload):
+                self.assertEqual(self.PREVIOUS, announce.finished_turn_message(payload, self.rows(self.PREVIOUS)))
+
+    def test_nothing_anywhere_is_empty_rather_than_an_error(self) -> None:
+        self.assertEqual("", announce.finished_turn_message({}, []))
+
+    def test_the_first_turn_of_a_session_is_announced(self) -> None:
+        """Before the fix this said nothing: the transcript holds no agent
+        message at all yet, so there was nothing to find."""
+        spoken, source = announce.announcement(
+            announce.finished_turn_message({"last_assistant_message": self.FINISHED}, [])
+        )
+        self.assertEqual(announce.SOURCE_VOICE_NOTE, source)
+        self.assertEqual("This is turn two, BRAVO.", spoken)
+
+
 class AnnouncementLogTests(unittest.TestCase):
     """Which path a turn took has to be visible, or drift is invisible."""
 
-    def run_hook(self, message: str) -> str:
+    def run_hook(self, message: str, *, in_payload: bool = True, transcript_path: bool = True) -> str:
+        """Run the shipped script end to end.
+
+        `in_payload` puts the message where the agent actually hands it over;
+        clearing it leaves only the transcript, which is the fallback path.
+        """
         directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, directory, True)
         transcript = directory / "transcript.jsonl"
@@ -286,7 +356,13 @@ class AnnouncementLogTests(unittest.TestCase):
         log = directory / "announce.log"
         subprocess.run(
             [sys.executable, str(REPO / "hooks" / "murmly-announce.py")],
-            input=json.dumps({"transcript_path": str(transcript), "cwd": str(directory)}),
+            input=json.dumps(
+                {
+                    **({"transcript_path": str(transcript)} if transcript_path else {}),
+                    **({"last_assistant_message": message} if in_payload else {}),
+                    "cwd": str(directory),
+                }
+            ),
             capture_output=True,
             text=True,
             check=True,
@@ -316,6 +392,21 @@ class AnnouncementLogTests(unittest.TestCase):
         entries = self.run_hook("Everything passed.\n\n<voice-note></voice-note>")
         self.assertIn(announce.SOURCE_SUPPRESSED, entries)
         self.assertNotIn("nothing worth saying", entries)
+
+    def test_a_payload_message_is_announced_with_no_transcript_at_all(self) -> None:
+        """The transcript is only needed to name the agent now."""
+        entries = self.run_hook(
+            "<voice-note>No transcript anywhere.</voice-note>", transcript_path=False
+        )
+        self.assertIn(announce.SOURCE_VOICE_NOTE, entries)
+        self.assertIn("No transcript anywhere.", entries)
+
+    def test_the_transcript_still_serves_an_agent_that_sends_no_message(self) -> None:
+        entries = self.run_hook(
+            "Done. The daemon now exits cleanly at logout.", in_payload=False
+        )
+        self.assertIn(announce.SOURCE_SUMMARY, entries)
+        self.assertIn("exits cleanly at logout", entries)
 
 
 class InstructionHookTests(unittest.TestCase):

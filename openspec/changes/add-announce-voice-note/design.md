@@ -6,9 +6,11 @@ in place around the hook:
 - The hook is an ordinary client of the speech session. It gets one session at a
   time, it must exit 0 whatever happens, and it detaches before speaking so the turn
   is never held up. None of that changes.
-- `last_agent_message()` already selects the one message an announcement is made
-  from, reading both Claude Code's and Copilot CLI's transcript row shapes. The
-  marked passage is looked for in that same message; the selection rule is untouched.
+- `last_agent_message()` selects the message an announcement is made from, reading
+  both Claude Code's and Copilot CLI's transcript row shapes. It was to have been left
+  alone. Verifying the change on a live session showed it selects the wrong turn, and
+  the decision below replaces where the message comes from while leaving how it is
+  read as a fallback.
 - `plain_text()` strips markdown but not HTML elements, so a `<voice-note>` element
   reaching the extract path would be spoken with its brackets. That has to be handled
   explicitly rather than assumed away.
@@ -192,6 +194,45 @@ The text, pinned here so it is not re-litigated during implementation:
 > Everything outside the element is for the screen and is not spoken. Leave the
 > element empty to say nothing aloud for a turn that does not need announcing.
 
+### The message comes from the payload, not the transcript
+
+Added after the rest of this design was implemented, because verifying it on a live
+session produced an announcement that did not match what was on screen.
+
+`last_agent_message()` reads the transcript back to front. The transcript does not
+hold the finished turn's message at the moment the turn ends, so reading it back to
+front finds the *previous* turn's. Every announcement was one turn late. It went
+unnoticed because the extract of a previous turn is still plausible English about
+this project, and because the only prior test of it was a single-turn `claude -p`
+run, where there is no previous turn to find and the failure presents as silence.
+
+Reproduced in a two-turn session with a synchronous probe on `Stop`:
+
+| | transcript's last message | payload's `last_assistant_message` |
+| --- | --- | --- |
+| after turn one | *(empty -- no assistant text rows yet)* | `ALPHA ... <voice-note>This is turn one, ALPHA.</voice-note>` |
+| after turn two | `ALPHA ... <voice-note>This is turn one, ALPHA.</voice-note>` | `BRAVO ... <voice-note>This is turn two, BRAVO.</voice-note>` |
+
+The payload was right both times, and carries the message whole -- the element
+verbatim, not a rendering of it. So the message is taken from
+`last_assistant_message` when it is there, and `last_agent_message()` stays as the
+fallback.
+
+The fallback is not ceremony. Copilot CLI's payload has not been verified to carry
+an equivalent field, and neither have older Claude Code versions; a hook that
+required the field would announce nothing at all for either. Reading it through the
+existing `payload_field` helper also covers the camelCase alias, which is how
+Copilot's `agentStop` sends the same fields.
+
+Two things this fixes beyond the misattribution. The first turn of a session, which
+had nothing in its transcript to find and so announced nothing, now announces. And
+the transcript is no longer on the path for anything but `agent_name`, so a message
+that never lands in the JSONL is still announced.
+
+Rejected: waiting or retrying until the transcript catches up. It puts an unbounded
+delay in front of every announcement to recover a message the payload already
+handed over.
+
 ### Both registrations are one unit
 
 `install_hooks.py` grows a second script argument and registers both events in one
@@ -218,6 +259,10 @@ person has placed it, because the extraction is in the shared script.
 - **The instruction costs tokens on every session, including compactions.** → About a
   hundred tokens, against an announcement that is otherwise assembled from text
   written for a different purpose. The opt-out is the mitigation.
+- **The payload field may be absent on an agent or version not tested here.** →
+  Copilot CLI and older Claude Code were not verified to send it. The fallback to the
+  transcript is what makes that a degradation to the previous behaviour, one turn
+  late, rather than silence.
 - **An agent may ignore the instruction, or drift from it over a long session.** →
   The fallback is the current behaviour, so drift degrades to today rather than to
   silence, and the log line names which path each turn took so drift is visible

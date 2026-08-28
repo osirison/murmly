@@ -2,9 +2,12 @@
 """Announce what a coding agent just finished, out loud, through Murmly.
 
 A Stop hook for Claude Code and GitHub Copilot CLI. Both deliver the same thing
-at the end of a turn -- a JSON payload on stdin naming a JSONL transcript -- so
-one script serves both. What differs is the shape of the rows inside the
-transcript, which `last_agent_message` reads either way.
+at the end of a turn -- a JSON payload on stdin carrying the finished turn's
+message and naming a JSONL transcript -- so one script serves both.
+
+The message is taken from the payload. The transcript is a fallback for an agent
+that does not send one, and a lagging fallback: when a turn ends it does not yet
+hold that turn's message, so reading it finds the previous turn's.
 
 The announcement is three parts, in this order:
 
@@ -182,6 +185,29 @@ def last_agent_message(rows: list[dict]) -> str:
                 return content
 
     return ""
+
+
+def finished_turn_message(payload: dict, rows: list[dict]) -> str:
+    """The message of the turn that just ended.
+
+    Taken from the payload, which carries it directly, and only from the
+    transcript when the payload does not.
+
+    The transcript is a lagging record, which is the whole reason for the
+    preference. At the moment a turn ends it has not been written with that
+    turn's final message yet, so reading it back to front finds the *previous*
+    turn's, and every announcement is one turn late. In a session's first turn
+    it finds nothing at all. Neither failure is loud: an extract of the previous
+    turn is still plausible English about the same project, and the first turn
+    just goes quiet.
+
+    Reading through `payload_field` covers the camelCase alias, which is how
+    Copilot's `agentStop` sends the same fields. The fallback covers an agent or
+    a version that does not send the message at all -- for those this behaves
+    exactly as it did before, rather than not at all.
+    """
+    handed_over = payload_field(payload, "last_assistant_message", "lastAssistantMessage")
+    return handed_over or last_agent_message(rows)
 
 
 def agent_name(rows: list[dict]) -> str:
@@ -594,13 +620,18 @@ def main() -> int:
     if not isinstance(payload, dict):
         payload = {}
 
+    # The transcript is no longer what the announcement is made from, so its
+    # absence is empty rows rather than a reason to say nothing. `agent_name`
+    # is the only thing still reading it.
     transcript = payload_field(payload, "transcript_path", "transcriptPath")
-    if not transcript:
-        note("no transcript path in the payload")
+    rows = transcript_rows(transcript) if transcript else []
+
+    message = finished_turn_message(payload, rows)
+    if not message:
+        note("no message in the payload and none in the transcript")
         return 0
 
-    rows = transcript_rows(transcript)
-    spoken, source = announcement(last_agent_message(rows))
+    spoken, source = announcement(message)
     if source == SOURCE_SUPPRESSED:
         note("suppressed by the agent: an empty voice note")
         return 0

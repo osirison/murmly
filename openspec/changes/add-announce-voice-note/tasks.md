@@ -54,3 +54,19 @@
 - [x] 7.2 Confirm an empty element announces nothing and that a turn with no element still announces as it did before. Both confirmed, and the empty case was also produced unprompted by the live agent on a trivial turn.
 - [x] 7.3 Run `./setup.sh hooks off` and confirm `~/.claude/settings.json` is left with no Murmly entry under either event and unrelated hooks intact. Run against a copy of the live settings rather than the live file, which is not this change's to modify: the Murmly `Stop` entry went, an existing `SessionStart` hook and a `StopFailure` hook survived both directions, and no non-hook setting moved.
 - [x] 7.4 Run `openspec validate add-announce-voice-note --strict`.
+
+## 8. The announcement was of the previous turn
+
+Found by testing the finished change on a live session: the announcement did not
+match the message on screen. The transcript does not hold the finished turn's
+message when the turn ends, so reading it back to front found the turn before.
+Scope was widened into this change by decision, because the capability's own
+requirement is that the finished turn is what gets announced.
+
+- [x] 8.1 Add `finished_turn_message(payload, rows)`: `payload_field(payload, "last_assistant_message", "lastAssistantMessage")` when it is non-empty, otherwise `last_agent_message(rows)`. Use the existing helper so the camelCase alias is read too.
+- [x] 8.2 Call it from `main()` in place of `last_agent_message(rows)`.
+- [x] 8.3 Stop returning early when the payload names no transcript. The transcript is now only needed for `agent_name`, so an absent one is empty rows rather than a reason to say nothing; return early only when neither source yields a message, and log which it was.
+- [x] 8.4 Tests: the payload wins over a transcript that disagrees; the camelCase alias is read; an absent field falls back to the transcript; an empty field falls back; a marked passage in the payload beats a different one in the transcript; a payload message with no transcript at all is still announced.
+- [x] 8.5 Run the full suite and `openspec validate --strict`.
+- [x] 8.6 Reinstall the fixed build over the live registration, which currently holds the pre-fix script.
+- [ ] 8.7 Correct the PR body, which says this was found and left for a separate change.

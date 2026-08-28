@@ -71,9 +71,11 @@ path or an identifier it slipped in anyway audible rather than punctuation read 
 ### Requirement: A message with no marked passage is announced as it is today
 
 When an agent's final message contains no `<voice-note>` passage, Murmly SHALL
-announce it exactly as it did before marked passages existed. An installation that is
-upgraded and whose agent has not been told the convention MUST hear no change at all,
-in what is announced, in when it is announced, and in when nothing is.
+extract what it announces from that message exactly as it did before marked passages
+existed. An installation that is upgraded and whose agent has not been told the
+convention MUST hear the same extract, taken the same way, at the same moment, and
+MUST hear nothing on the same occasions — subject only to that message being the
+finished turn's, which the requirement below governs and which an upgrade corrects.
 
 #### Scenario: No marked passage
 
@@ -85,12 +87,53 @@ in what is announced, in when it is announced, and in when nothing is.
 
 - **GIVEN** an agent that has not been told the convention
 - **WHEN** it finishes a turn after Murmly is upgraded
-- **THEN** what is announced is identical to what was announced before the upgrade
+- **THEN** what is announced is the same extract, of that turn's message, that Murmly
+  would have produced before the upgrade
+- **AND** the upgrade changes which turn's message that is, and nothing else
 
 #### Scenario: A passage that was never closed
 
 - **WHEN** a message opens a `<voice-note>` element and never closes it
 - **THEN** Murmly announces the message as it would one with no marked passage
+
+### Requirement: The announcement is of the turn that just finished
+
+Murmly SHALL announce the agent's message from the turn whose ending caused the
+announcement, and MUST NOT announce a message from any earlier turn. Where the agent
+hands Murmly that message along with the announcement, Murmly SHALL take it from
+there in preference to any record written alongside the conversation, because such a
+record is not guaranteed to contain the finished turn's message at the moment that
+turn ends.
+
+Where no message is handed over, Murmly SHALL fall back to that record. The fallback
+is what keeps an agent that supplies no message announced at all, and it is the only
+circumstance in which an announcement may be of whatever the record last holds.
+
+#### Scenario: The record lags behind the turn
+
+- **WHEN** the announcement is made and the conversation's record does not yet contain
+  the finished turn's message
+- **THEN** Murmly announces the finished turn's message
+- **AND** Murmly does not announce the previous turn's message
+
+#### Scenario: A marked passage in the finished turn
+
+- **WHEN** the finished turn's message contains a marked passage and the previous
+  turn's message contains a different one
+- **THEN** the passage from the finished turn is announced
+
+#### Scenario: The first turn of a session
+
+- **WHEN** the announcement is made for the first turn of a session, before the record
+  holds any agent message at all
+- **THEN** that turn's message is announced
+- **AND** the announcement is not skipped for want of anything to say
+
+#### Scenario: No message is handed over
+
+- **WHEN** the agent supplies no message alongside the announcement
+- **THEN** Murmly falls back to the conversation's record
+- **AND** announces the last agent message that record holds
 
 ### Requirement: An empty marked passage suppresses the announcement
 
