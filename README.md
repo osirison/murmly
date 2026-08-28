@@ -327,9 +327,14 @@ providers it reports say so and the log names the remedy.
 ### Announcing a finished agent turn
 
 Speech output is a protocol, so anything can drive it. Murmly ships one thing
-that does: a Stop hook that speaks a summary when a coding agent finishes a
-turn, so you can look away from the terminal and still know when it is done and
-roughly what happened.
+that does: a Stop hook that speaks when a coding agent finishes a turn, so you
+can look away from the terminal and still know when it is done and what
+happened.
+
+What it speaks is written by the agent. Murmly asks it to end each turn with a
+`<voice-note>` element holding a few sentences of plain spoken English, and
+speaks that. An agent that writes nothing of the sort is summarised from its
+message instead, which is what this did before and what it still falls back to.
 
 ```bash
 ./setup.sh hooks            # offers whichever agents are installed
@@ -349,34 +354,82 @@ What you hear, in order:
 | --- | --- |
 | three rising notes | so you know a message is arriving before any words start |
 | one short sentence | the agent, the project, and the branch: "Claude Code in murmly, on branch main." |
-| an executive summary | whole sentences from the end of the agent's message, capped at about twenty seconds |
+| the agent's `<voice-note>` | as it wrote it, up to about a minute |
+| — or a summary of its message | when it wrote no voice note: whole sentences from the opening, capped at about twenty seconds |
 
 Code fences, tables, links, and headings are stripped before anything is spoken;
-they read as noise out loud. The summary is extractive — it is the agent's own
-opening sentences, not a second model's paraphrase — so nothing is invented and
-no tokens are spent producing it.
+they read as noise out loud. A voice note is spoken as written otherwise — the
+agent wrote it to be heard, so there is nothing to extract from it. A summary is
+extractive, the message's own opening sentences rather than a second model's
+paraphrase, so nothing is invented and no tokens are spent producing it.
+
+An empty `<voice-note>` announces nothing at all. That is how an agent says a
+turn was not worth interrupting you for, and it is the one case that does not
+fall back to a summary.
 
 The hook stays silent, and exits 0, for every ordinary reason it cannot speak:
 speech output disabled or unavailable, another client already holding the
-session, a capture running, or nothing worth saying in the last message. It
-never fails a turn. It detaches into its own process before speaking, so an
-announcement never holds the agent up.
+session, a capture running, an empty voice note, or nothing worth saying in the
+last message. It never fails a turn. It detaches into its own process before
+speaking, so an announcement never holds the agent up.
 
 | Variable | Effect |
 | --- | --- |
 | `MURMLY_ANNOUNCE_CHIME=0` | speak without the notes |
-| `MURMLY_ANNOUNCE_LOG=<path>` | append a line per turn explaining what it did or why it stayed quiet |
+| `MURMLY_ANNOUNCE_LOG=<path>` | append a line per turn naming what it said — the agent's own voice note, an extract, or suppressed — or why it stayed quiet |
 | `MURMLY_ANNOUNCE_AGENT=<name>` | name the agent yourself rather than inferring it from the transcript |
+| `MURMLY_ANNOUNCE_INSTRUCT=0` | stop asking the agent for a voice note, leaving every announcement a summary |
+
+#### Asking the agent for a voice note
+
+Claude Code is told automatically. `./setup.sh hooks claude` registers a second
+hook, on `SessionStart`, that prints the convention into the session's context.
+It runs for every source — startup, resume, clear, compact, fork — because a
+session that lost the convention at a compaction would go back to summaries
+halfway through the day without saying so. It is registered synchronously, and
+that is deliberate: an async hook runs in the background, where its output never
+reaches the context, so it would instruct nobody while appearing to work.
+
+Copilot CLI documents no hook whose output reaches the model, so it cannot be
+told this way. `./setup.sh hooks copilot` prints the text; put it in your
+`AGENTS.md`:
+
+```
+Murmly speaks the end of your turn aloud, for a person who is not looking at the
+terminal.
+
+End each turn with one <voice-note> element holding what that person needs to
+hear: two or three sentences of plain spoken English saying what you did,
+whether it worked, and anything they have to decide. Lead with the outcome. No
+file paths, no identifiers, no code, no markdown -- it is read out, not
+displayed.
+
+Everything outside the element is for the screen and is not spoken. Leave the
+element empty to say nothing aloud for a turn that does not need announcing.
+```
+
+The element stays visible in your terminal. The hook reads the turn's transcript
+after the agent has already displayed it, so there is nothing it could strip;
+what it can do is ask for the note at the end of the message, where it is
+easiest to ignore. `MURMLY_ANNOUNCE_INSTRUCT=0` turns the whole convention off
+and leaves you with the summary.
+
+An element inside a code fence is an example rather than a note, and is not
+spoken — otherwise every turn that discusses this section would announce the
+block above instead of what it did.
 
 The notes are generated rather than shipped. To use your own, put a WAV at
 `~/.local/share/murmly/announce-chime.wav` and it is played instead. They go to
 the default output device through `pw-play`, `paplay`, or `aplay` — whichever is
 present — rather than through `[tts] output_device`, which is the speech path.
 
-Registration is written to `~/.claude/settings.json` (merged, with the previous
-file kept beside it as `settings.json.murmly-backup`) and to
-`~/.copilot/hooks/murmly-announce.json` (a file of its own). Running it twice
-leaves one registration, and `./setup.sh uninstall` takes both out.
+Registration is written to `~/.claude/settings.json` under both `Stop` and
+`SessionStart` (merged, with the previous file kept beside it as
+`settings.json.murmly-backup`) and to `~/.copilot/hooks/murmly-announce.json` (a
+file of its own, `Stop` only). Nothing is written into your `CLAUDE.md` or any
+other file holding your own instructions. Running it twice leaves one of each,
+and `./setup.sh hooks off` or `./setup.sh uninstall` takes every registration
+out.
 
 ### The two hotkeys
 

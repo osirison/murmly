@@ -11,15 +11,21 @@ The announcement is three parts, in this order:
   1. Three rising notes, so a person who is not looking at the terminal knows a
      message is arriving before any words start.
   2. One short sentence naming the agent, the project, and the branch.
-  3. An executive summary of what the agent said, in whole sentences.
+  3. What the agent wrote to be heard.
 
-Exits 0 whatever happens. A summary nobody hears is a small loss; a hook that
-fails a turn is not. Every reason to stay quiet is silent by design:
+For the third part the agent is asked to mark a passage of its message with a
+<voice-note> element, which is announced as it wrote it. A message with no such
+element is announced as it always was: an executive summary extracted from its
+opening sentences. An element left empty announces nothing at all, which is how
+an agent says this turn was not worth interrupting for.
+
+Exits 0 whatever happens. An announcement nobody hears is a small loss; a hook
+that fails a turn is not. Every reason to stay quiet is silent by design:
 
   - speech output disabled, or the daemon too old to know the command
   - another client already holds the session (one is open at a time)
   - the microphone is open, so speaking would be talking over the person
-  - nothing worth saying in the last message
+  - an empty voice note, or nothing worth saying in the last message
 
 Set MURMLY_ANNOUNCE_LOG to a path to see which of those it took.
 
@@ -57,6 +63,24 @@ MAX_SUMMARY_CHARACTERS = 400
 MAX_SUMMARY_SENTENCES = 4
 # Below this an opening sentence is a fragment rather than an outcome.
 MIN_OPENER_CHARACTERS = 45
+# A marked passage is not shaped by this bound, only stopped by it. The caps
+# above exist because an extract stops being informative; a passage written to
+# be heard has no such point, so all this is here to do is stop an agent that
+# emits a runaway passage from holding the session against the person, who can
+# take it back only by pressing a capture hotkey. Roughly a minute of speech.
+MAX_VOICE_NOTE_CHARACTERS = 1200
+#: What was announced, and so what the second `speak` frame is named. An
+#: interruption event names the piece it cut off and, by the speech output
+#: specification, may not carry the text itself, so the name is the only place
+#: the distinction can appear in a signal.
+SOURCE_VOICE_NOTE = "voice_note"
+SOURCE_SUMMARY = "summary"
+SOURCE_SUPPRESSED = "suppressed"
+SOURCE_LABELS = {
+    SOURCE_VOICE_NOTE: "voice_note (the agent's own)",
+    SOURCE_SUMMARY: "summary (an extract)",
+}
+
 HEARD_ALL_TIMEOUT_SECONDS = 90.0
 CONNECT_TIMEOUT_SECONDS = 2.0
 GIT_TIMEOUT_SECONDS = 1.0
@@ -176,6 +200,20 @@ def agent_name(rows: list[dict]) -> str:
 # ------------------------------------------------------------ what to say ---
 
 
+#: A fenced block, matched exactly as `plain_text` matches it so that what is
+#: hidden from the search is what would have been stripped from the speech.
+FENCED_BLOCK = re.compile(r"```.*?```", re.DOTALL)
+#: A marked passage: an opening element with no attributes, its content, and a
+#: closing element. Non-greedy, so two passages are two matches rather than one
+#: spanning both.
+VOICE_NOTE = re.compile(r"<voice-note>(.*?)</voice-note>", re.IGNORECASE | re.DOTALL)
+#: Either half of the element on its own, for the opener that was never closed.
+VOICE_NOTE_MARKER = re.compile(r"</?voice-note>", re.IGNORECASE)
+#: A sentence terminator that ends a sentence, rather than one inside "e.g.".
+#: The same test `executive_summary` splits on.
+SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
 def plain_text(text: str) -> str:
     """Strip what is noise once spoken.
 
@@ -224,6 +262,67 @@ def executive_summary(text: str) -> str:
     if len(spoken) > MAX_SUMMARY_CHARACTERS:
         spoken = spoken[:MAX_SUMMARY_CHARACTERS].rsplit(" ", 1)[0].rstrip(",;:") + "."
     return spoken
+
+
+def voice_notes(text: str) -> list[str]:
+    """Every passage the agent marked to be heard, in the order it wrote them.
+
+    Fenced code is removed before the search. Without that, a turn spent
+    discussing this convention announces its own example instead of its note,
+    which is not a corner case: it is every turn that builds or documents it.
+    The cost is that a marked passage cannot contain a fence, which it should
+    not anyway -- `plain_text` would drop the fence a moment later.
+
+    A list rather than a joined string, because a message with one empty element
+    and a message with no element mean opposite things.
+    """
+    return VOICE_NOTE.findall(FENCED_BLOCK.sub(" ", text))
+
+
+def spoken_voice_note(text: str) -> str:
+    """A marked passage as the agent wrote it, stopped rather than shaped.
+
+    No sentence count and no joining of a short opener: those are an extract's
+    heuristics for where an opening ends, and a passage authored to be heard has
+    no such point. The bound is only a stop, so over it the passage ends at the
+    last sentence terminator that fits, and with none to end at it falls back to
+    the word boundary an over-long extract already uses.
+    """
+    text = plain_text(text)
+    if len(text) <= MAX_VOICE_NOTE_CHARACTERS:
+        return text
+
+    head = text[:MAX_VOICE_NOTE_CHARACTERS]
+    terminators = [match.end() for match in SENTENCE_END.finditer(head)]
+    if terminators:
+        return head[: terminators[-1]]
+    return head.rsplit(" ", 1)[0].rstrip(",;:") + "."
+
+
+def announcement(text: str) -> tuple[str, str]:
+    """What to announce for this message, and which of the three it is.
+
+    Three outcomes rather than two:
+
+    A marked passage with text in it is announced as written. Several are
+    announced as one, in the order they appear -- an agent that wrote two of
+    them meant both, and announcing one silently discards what it said.
+
+    A marked passage with nothing in it announces nothing, and does not fall
+    back. An agent that wrote the element knows the convention, so an empty one
+    is a decision that the turn is not worth interrupting for; extracting
+    instead would override the only instruction it gave.
+
+    No element -- or an opener that was never closed, which is a truncated
+    message rather than a decision -- is extracted exactly as it was before
+    marked passages existed. The stray markers go first: `plain_text` strips
+    markdown, not elements, so they would otherwise be read out as words.
+    """
+    passages = voice_notes(text)
+    if passages:
+        spoken = spoken_voice_note("\n\n".join(passages))
+        return (spoken, SOURCE_VOICE_NOTE) if spoken else ("", SOURCE_SUPPRESSED)
+    return executive_summary(VOICE_NOTE_MARKER.sub(" ", text)), SOURCE_SUMMARY
 
 
 def git_branch(directory: str) -> str:
@@ -427,12 +526,16 @@ class Session:
         return "gave up waiting to be heard"
 
 
-def announce(context: str, summary: str) -> str:
+def announce(context: str, spoken: str, source: str) -> str:
     """Chime, then speak, and wait for it. Returns why it stopped.
 
     The session is declared before the notes sound. Speech is refused for
     several ordinary reasons -- disabled, in use, a capture running -- and a
     chime with no announcement behind it is worse than silence.
+
+    `source` names the second frame. An interruption event names the piece it
+    cut off and may not carry the text, so the name is where the difference
+    between a passage the agent wrote and an extract of its message shows up.
     """
     with Session() as session:
         refusal = session.declare()
@@ -443,7 +546,7 @@ def announce(context: str, summary: str) -> str:
 
         try:
             session.speak("context", context)
-            session.speak("summary", summary)
+            session.speak(source, spoken)
             session.end()
         except OSError as error:
             return f"connection lost: {error}"
@@ -497,8 +600,11 @@ def main() -> int:
         return 0
 
     rows = transcript_rows(transcript)
-    summary = executive_summary(last_agent_message(rows))
-    if not summary:
+    spoken, source = announcement(last_agent_message(rows))
+    if source == SOURCE_SUPPRESSED:
+        note("suppressed by the agent: an empty voice note")
+        return 0
+    if not spoken:
         note("nothing worth saying")
         return 0
 
@@ -508,8 +614,8 @@ def main() -> int:
     if not detach():
         return 0
 
-    note(f"saying: {context} | {summary}")
-    note(f"  -> {announce(context, summary)}")
+    note(f"saying {SOURCE_LABELS[source]}: {context} | {spoken}")
+    note(f"  -> {announce(context, spoken, source)}")
     return 0
 
 

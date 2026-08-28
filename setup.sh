@@ -400,9 +400,11 @@ agent_label() {
 install_announce_hook() {
     local agents="$1"
     local source="$REPO/hooks/murmly-announce.py"
+    local instruction_source="$REPO/hooks/murmly-voice-note.py"
     local installer="$REPO/hooks/install_hooks.py"
-    local target
+    local target instruction_target
     target="$(hook_dir)/murmly-announce.py"
+    instruction_target="$(hook_dir)/murmly-voice-note.py"
 
     if [ ! -f "$source" ] || [ ! -f "$installer" ]; then
         warn "This checkout has no announcement hook to install."
@@ -416,11 +418,46 @@ install_announce_hook() {
     # without saying so.
     install -m 0755 "$source" "$target"
     info "Installed $target"
-    python3 "$installer" --script "$target" --agents "$agents" | while IFS= read -r line; do
+
+    # The script that tells the agent to write a voice note in the first place.
+    # A checkout without it still installs the announcement, which then reads
+    # whatever the agent wrote for the screen, exactly as it did before.
+    local instruction_flag=()
+    if [ -f "$instruction_source" ]; then
+        install -m 0755 "$instruction_source" "$instruction_target"
+        info "Installed $instruction_target"
+        instruction_flag=(--instruction-script "$instruction_target")
+    fi
+
+    python3 "$installer" --script "$target" "${instruction_flag[@]}" \
+        --agents "$agents" | while IFS= read -r line; do
         info "$line"
     done
-    note "A finished turn now plays three notes, names the project, and speaks a summary."
-    note "Silence the notes with MURMLY_ANNOUNCE_CHIME=0; remove it with ./setup.sh hooks off."
+    note "A finished turn now plays three notes, names the project, and speaks the"
+    note "agent's own <voice-note> when it writes one, or a summary of its message"
+    note "when it does not."
+    note "Silence the notes with MURMLY_ANNOUNCE_CHIME=0, stop asking the agent for a"
+    note "voice note with MURMLY_ANNOUNCE_INSTRUCT=0; remove it all with"
+    note "./setup.sh hooks off."
+
+    case ",$agents," in
+        *,copilot,*) announce_copilot_instruction ;;
+    esac
+}
+
+announce_copilot_instruction() {
+    # Copilot CLI documents no hook whose output reaches the model, so nothing
+    # can install this for the person. Printing it is the whole of what Murmly
+    # can do; until it is placed, Copilot's turns are announced from a summary.
+    local instruction_source="$REPO/hooks/murmly-voice-note.py"
+    [ -f "$instruction_source" ] || return 0
+    note ""
+    note "Copilot CLI cannot be told this automatically. Put the following in your"
+    note "AGENTS.md to have it write voice notes too:"
+    note ""
+    MURMLY_ANNOUNCE_INSTRUCT=1 python3 "$instruction_source" | while IFS= read -r line; do
+        note "    $line"
+    done
 }
 
 remove_announce_hook() {
@@ -435,6 +472,7 @@ remove_announce_hook() {
         warn "This checkout has no hook installer, so any registration was left in place."
     fi
     rm -f -- "$(hook_dir)/murmly-announce.py"
+    rm -f -- "$(hook_dir)/murmly-voice-note.py"
     rmdir -- "$(hook_dir)" 2>/dev/null || true
 }
 
