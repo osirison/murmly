@@ -49,6 +49,11 @@ class DummySession:
         # Set by every release, so a test can wait for one that runs on the
         # countdown's own thread instead of sleeping for longer than its period.
         self.release_ran = threading.Event()
+        # The real session reaches through to its transcriber to answer this.
+        # Present rather than absent because the daemon reports a holder it
+        # cannot ask as null beside a reason, and a stand-in without the
+        # property would send every status query down that path.
+        self.model_resident = False
         self.targets_captured = 0
         self.received_targets: list[WindowIdentity | None] = []
         self.target = WindowIdentity(window_id=1, pid=10, window_class="editor")
@@ -74,6 +79,9 @@ class DummySession:
     def release_model(self) -> None:
         self.released += 1
         self.release_ran.set()
+        # A released model is not held, which is the whole of what the status
+        # response has to be able to say after a countdown has run.
+        self.model_resident = False
 
     def process_recording(
         self,
@@ -141,6 +149,12 @@ class FakeOverlay:
         self.closed = True
 
 
+# What `status` answers from a daemon that has done nothing yet: idle, holding no
+# transcription model, and with no synthesis residency at all, because a daemon
+# with speech output off never builds a synthesizer to hold a session.
+IDLE_STATUS = {"ok": True, "state": "IDLE", "model_resident": False}
+
+
 def wait_until_served(
     test: unittest.TestCase,
     daemon: MurmlyDaemon,
@@ -202,7 +216,7 @@ class DaemonTests(unittest.TestCase):
             first = send_command(str(socket_path), "toggle")
             second = send_command(str(socket_path), "toggle")
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, status)
+        self.assertEqual(IDLE_STATUS, status)
         self.assertEqual("LISTENING", first["state"])
         self.assertEqual("DONE", second["state"])
         self.assertEqual("hello world", second["text"])
@@ -958,7 +972,7 @@ class AutoTranscribeTests(unittest.TestCase):
             daemon = self._daemon(temp_dir, session, auto_transcribe="continuous", live_transcribe=True)
 
             self.assertEqual("IDLE", daemon.state)
-            self.assertEqual({"ok": True, "state": "IDLE"}, daemon.handle_command("status"))
+            self.assertEqual(IDLE_STATUS, daemon.handle_command("status"))
             daemon.handle_command("toggle")
             self.assertEqual("LISTENING", daemon.state)
             daemon._on_silence()
@@ -2036,7 +2050,7 @@ class RequestShapeTests(ServedDaemonTests):
             self.assertFalse(response["ok"])
             self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
             self.assertEqual("Request is not a JSON object.", response["error"])
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_command_name_that_is_not_text_is_answered(self) -> None:
         _daemon, socket_path = self.serve()
@@ -2045,14 +2059,14 @@ class RequestShapeTests(ServedDaemonTests):
 
         self.assertFalse(response["ok"])
         self.assertEqual(CommandCode.UNSUPPORTED_COMMAND, response["code"])
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_request_carrying_extra_fields_runs_its_command(self) -> None:
         _daemon, socket_path = self.serve()
 
         response = json.loads(send_payload(socket_path, b'{"command": "status", "extra": 1}\n'))
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, response)
+        self.assertEqual(IDLE_STATUS, response)
 
 
 class AnsweredConnectionTests(ServedDaemonTests):
@@ -2064,7 +2078,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         self.assertFalse(response["ok"])
         self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
         self.assertIn("not valid JSON", response["error"])
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_invalid_text_is_answered(self) -> None:
         _daemon, socket_path = self.serve()
@@ -2074,7 +2088,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         self.assertFalse(response["ok"])
         self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
         self.assertEqual("Request is not valid UTF-8 text.", response["error"])
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_request_that_never_arrives_is_answered(self) -> None:
         with patch("murmly.daemon.COMMAND_TIMEOUT_SECONDS", 0.2):
@@ -2085,7 +2099,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
             self.assertFalse(response["ok"])
             self.assertEqual(CommandCode.MALFORMED_REQUEST, response["code"])
             self.assertIn("No request arrived within", response["error"])
-            self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+            self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_an_unexpected_failure_in_command_handling_is_answered(self) -> None:
         daemon, socket_path = self.serve()
@@ -2101,7 +2115,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         self.assertFalse(response["ok"])
         self.assertEqual(CommandCode.COMMAND_FAILED, response["code"])
         self.assertIn("nothing divides", response["error"])
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_connection_over_capacity_is_answered(self) -> None:
         daemon, socket_path = self.serve()
@@ -2242,7 +2256,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         silent.connect(str(socket_path))
         silent.sendall(b'{"command": "status"}\n')
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_client_that_receives_nothing_raises_a_named_type(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2312,7 +2326,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         self.assertEqual(1, len(frames))
         received = frames[0]
         self.assertEqual(1, received.count(b"\n"), f"expected one response, got {received!r}")
-        self.assertEqual({"ok": True, "state": "IDLE"}, json.loads(received))
+        self.assertEqual(IDLE_STATUS, json.loads(received))
 
     def test_shutdown_waits_for_a_write_that_outlives_the_drain(self) -> None:
         # The drain expires while the worker holds the claim. Shutdown cannot
@@ -2361,7 +2375,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         self.assertEqual(1, len(frames))
         received = frames[0]
         self.assertEqual(1, received.count(b"\n"), f"expected one response, got {received!r}")
-        self.assertEqual({"ok": True, "state": "IDLE"}, json.loads(received))
+        self.assertEqual(IDLE_STATUS, json.loads(received))
 
     def test_a_peer_that_closes_before_the_response_does_not_stop_the_daemon(self) -> None:
         # One of the two connections that cannot be answered. Murmly discards the
@@ -2372,7 +2386,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         early.sendall(b'{"command": "status"}\n')
         early.close()
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_peer_that_never_reads_is_given_up_on_within_the_bound(self) -> None:
         # A response small enough to fit the socket buffer never waits on anyone,
@@ -2398,7 +2412,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
 
             self.assertLess(elapsed, 2.0)
             self.assertEqual(
-                {"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status")
+                IDLE_STATUS, send_command(str(socket_path), "status")
             )
 
     def test_a_daemon_that_holds_the_connection_open_is_reported_not_waited_on(self) -> None:
@@ -2476,7 +2490,7 @@ class SocketAccessTests(ServedDaemonTests):
     def test_a_peer_from_the_same_account_is_served(self) -> None:
         _daemon, socket_path = self.serve()
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_peer_from_another_account_is_refused_and_takes_no_capacity(self) -> None:
         # A genuine cross-account connection needs a second account and root,
@@ -2497,7 +2511,7 @@ class SocketAccessTests(ServedDaemonTests):
             self.assertFalse(response["ok"])
             self.assertEqual(CommandCode.NOT_PERMITTED, response["code"])
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_refused_peer_runs_no_command(self) -> None:
         session = DummySession()
@@ -2561,7 +2575,7 @@ class SocketAccessTests(ServedDaemonTests):
 
         _daemon, socket_path = self.serve_config(config)
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(socket_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_the_default_socket_path_is_served(self) -> None:
         runtime_dir = tempfile.TemporaryDirectory()
@@ -2576,7 +2590,7 @@ class SocketAccessTests(ServedDaemonTests):
         _daemon, served_path = self.serve_config(config)
 
         self.assertEqual(Path(runtime_dir.name) / "murmly.sock", served_path)
-        self.assertEqual({"ok": True, "state": "IDLE"}, send_command(str(served_path), "status"))
+        self.assertEqual(IDLE_STATUS, send_command(str(served_path), "status"))
 
     def test_the_daemon_refuses_a_private_directory_under_one_others_can_write(self) -> None:
         # The exposure is above the directory that holds the socket. Renaming
@@ -2732,8 +2746,197 @@ class SocketAccessTests(ServedDaemonTests):
                 _daemon, socket_path = self.serve(peer_identity=lambda _connection: None)
                 response = send_command(str(socket_path), "status")
 
-        self.assertEqual({"ok": True, "state": "IDLE"}, response)
+        self.assertEqual(IDLE_STATUS, response)
         self.assertTrue(
             any("cannot report the account" in line for line in logs.output),
             f"expected the startup warning, got {logs.output!r}",
         )
+
+
+class UnaskableTranscriber:
+    """A capture session whose transcriber's build cannot report residency.
+
+    The real case is a CTranslate2 build that does not expose what `resident`
+    is read from. `status` is the response a hotkey press waits on, so such a
+    build must cost the residency field and nothing else.
+
+    Written out rather than derived from `DummySession`, which sets residency as
+    an instance attribute and so cannot carry a property that refuses to answer.
+    Enough of the surface is here for the daemon's shutdown to close it without
+    logging a second failure over the one being tested.
+    """
+
+    def __init__(self) -> None:
+        self.started = 0
+        self.stopped = 0
+        self.released = 0
+
+    @property
+    def model_resident(self) -> bool:
+        raise RuntimeError("this build cannot report residency")
+
+    def capture_delivery_target(self) -> WindowIdentity | None:
+        return None
+
+    def start_recording(self) -> None:
+        self.started += 1
+
+    def stop_recording(self) -> bytes:
+        self.stopped += 1
+        return b"recording"
+
+    def release_model(self) -> None:
+        self.released += 1
+
+
+class StatusResidencyTests(ServedDaemonTests):
+    """`status` says what the daemon holds, because only the daemon knows.
+
+    `murmly doctor` runs in its own process and holds neither model. Every
+    answer it can give about residency comes from here.
+    """
+
+    def _serve(self, session: object | None = None, **overrides: object):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir.name) / "murmly.sock",
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+            **overrides,
+        )
+        return self.serve_config(config, session)
+
+    def test_status_carries_the_residency_of_both_models(self) -> None:
+        session = DummySession()
+        session.model_resident = True
+        speech = StubSpeechEngine()
+        speech.synthesizer.resident = True
+        _daemon, socket_path = self.serve_config(
+            MurmlyConfig(
+                socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+                config_path=Path(tempfile.mkdtemp()) / "config.toml",
+                overlay_enabled=False,
+                tts_enabled=True,
+            ),
+            session,
+            speech=speech,
+        )
+
+        response = send_command(str(socket_path), "status")
+
+        self.assertEqual(
+            {"ok": True, "state": "IDLE", "model_resident": True, "synthesis_resident": True},
+            response,
+        )
+
+    def test_the_answer_follows_a_release_and_a_reload(self) -> None:
+        # The point of the whole change: a constant cannot show a model going
+        # away and coming back, and that is the only observable behaviour idle
+        # release has.
+        session = DummySession()
+        session.model_resident = True
+        speech = StubSpeechEngine()
+        daemon = MurmlyDaemon(
+            MurmlyConfig(
+                socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+                config_path=Path(tempfile.mkdtemp()) / "config.toml",
+                overlay_enabled=False,
+                tts_enabled=True,
+            ),
+            session=session,
+            speech=speech,
+        )
+
+        held = daemon.handle_command("status")
+        daemon._release_transcription()
+        daemon._release_synthesis()
+        released = daemon.handle_command("status")
+        # Loaded again, as the next capture and the next speech session would.
+        session.model_resident = True
+        speech.synthesizer.resident = True
+        reloaded = daemon.handle_command("status")
+
+        self.assertEqual((True, True), (held["model_resident"], held["synthesis_resident"]))
+        self.assertEqual(
+            (False, False), (released["model_resident"], released["synthesis_resident"])
+        )
+        self.assertEqual(
+            (True, True), (reloaded["model_resident"], reloaded["synthesis_resident"])
+        )
+
+    def test_a_daemon_holding_no_synthesizer_leaves_synthesis_out(self) -> None:
+        # Absent, not false. A daemon with speech output off holds nothing and
+        # has nothing to hold, and "released" would claim it once had a session.
+        _daemon, socket_path = self._serve()
+
+        response = send_command(str(socket_path), "status")
+
+        self.assertIn("model_resident", response)
+        self.assertNotIn("synthesis_resident", response)
+
+    def test_answering_loads_neither_model(self) -> None:
+        # A `status` that loaded the model it was asked about would answer the
+        # question by changing the answer.
+        session = DummySession()
+        speech = StubSpeechEngine()
+        speech.synthesizer.resident = False
+        _daemon, socket_path = self.serve_config(
+            MurmlyConfig(
+                socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+                config_path=Path(tempfile.mkdtemp()) / "config.toml",
+                overlay_enabled=False,
+                tts_enabled=True,
+            ),
+            session,
+            speech=speech,
+        )
+
+        response = send_command(str(socket_path), "status")
+
+        self.assertIs(False, response["model_resident"])
+        self.assertIs(False, response["synthesis_resident"])
+        # Nothing that builds weights ran: the transcriber loads on a capture,
+        # and the synthesis session on the first request for audio.
+        self.assertEqual(0, session.started)
+        self.assertEqual(0, session.processed)
+        self.assertEqual(0, speech.begun)
+
+    def test_a_holder_that_cannot_be_asked_costs_the_field_and_nothing_else(self) -> None:
+        _daemon, socket_path = self._serve(session=UnaskableTranscriber())
+
+        response = send_command(str(socket_path), "status")
+
+        # Null beside the reason, never absent: absent is how this response says
+        # the daemon does not know the question at all.
+        self.assertIsNone(response["model_resident"])
+        self.assertIn("cannot report residency", response["model_resident_detail"])
+        self.assertEqual("IDLE", response["state"])
+        self.assertTrue(response["ok"])
+
+    def test_answering_is_not_delayed_by_a_transcription_in_flight(self) -> None:
+        # `resident` skips the transcriber's model lock for exactly this, and the
+        # daemon takes no lock of its own to read it. A status query that queued
+        # behind a decode would make `murmly doctor` hang for as long as the
+        # audio deserved.
+        session = BlockingSession()
+        session.model_resident = True
+        _daemon, socket_path = self.serve(session)
+        send_command(str(socket_path), "toggle")
+        stopper = threading.Thread(
+            target=send_command, args=(str(socket_path), "toggle"), daemon=True
+        )
+        stopper.start()
+        self.addCleanup(stopper.join, 3)
+        self.addCleanup(session.release.set)
+        self.assertTrue(session.processing.wait(timeout=3))
+
+        started = time.monotonic()
+        response = send_command(str(socket_path), "status")
+        elapsed = time.monotonic() - started
+
+        self.assertIs(True, response["model_resident"])
+        self.assertEqual("THINKING", response["state"])
+        # The transcription is still parked. Anything approaching its length
+        # would mean the answer waited for it.
+        self.assertLess(elapsed, 1.0)
