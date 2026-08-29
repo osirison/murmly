@@ -85,26 +85,27 @@ text_size_px = 13       # Live transcript panel text size, 8-48
 # is producing sound its owner did not ask for. An agent opens a speech session
 # on the command socket and sends text; nothing here starts playback on its own.
 #
-# Needs the synthesis extra and espeak-ng from your distribution:
+# Needs espeak-ng from your distribution, and the model files named under
+# model_dir below:
 #
-#     uv sync --extra tts
+#     uv sync
 #     sudo dnf install espeak-ng
 #
-# `uv sync` makes the environment match exactly the extras it is given, so name
-# every extra you want on one line: on a CUDA install the first line is
-# `uv sync --extra cuda --extra tts`.
+# The synthesizer itself is installed by default -- it is a dependency group
+# named in `[tool.uv] default-groups`, not an extra, so no sync drops it by not
+# mentioning it. On a CUDA install `uv sync --extra cuda` keeps it too. To leave
+# it out, ask for that: `uv sync --no-group tts`.
 #
 # That runs synthesis on the CPU, at roughly five times real time, which is
 # where `device` below leaves it. Moving synthesis to the GPU takes that
 # setting and the GPU build of ONNX Runtime, which replaces the CPU one rather
 # than joining it, because both install into the same package namespace:
 #
-#     uv sync --extra cuda --extra tts
+#     uv sync --extra cuda
 #     uv pip uninstall onnxruntime
 #     uv pip install "onnxruntime-gpu==1.24.4"
 #
-# Both extras on the first line: `uv sync` makes the environment match exactly
-# what it is given, so `--extra cuda` alone would remove kokoro-onnx.
+# Every sync puts the CPU build back, so the swap is reapplied after each one.
 #
 # `murmly doctor` reports what is missing under `speech_output`.
 enabled = false

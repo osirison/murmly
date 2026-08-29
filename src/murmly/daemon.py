@@ -1478,6 +1478,20 @@ class MurmlyDaemon:
                 f"Speech output is unavailable: {self._speech.unavailable_reason}",
             )
 
+        # That answered for the moment this daemon started. Asked again here for
+        # now, because the environment can have lost the synthesizer since --
+        # this is the same rule `begin` applies to the output device a few lines
+        # below, and for the same reason: a session that cannot be served is
+        # refused before anyone commits to it, not failed once somebody is
+        # listening. Skipped when a synthesizer is resident, which is proof.
+        reason = self._speech.unavailable_reason_now()
+        if reason is not None:
+            logger.warning("Speech output is no longer available: %s", reason)
+            return failure_response(
+                CommandCode.SPEECH_UNAVAILABLE,
+                f"Speech output is unavailable: {reason}",
+            )
+
         # The state lock first, and held across `begin`. Declaring a session
         # opens the output device and clears the barge-in hold, so one arriving
         # while the microphone is open put speech and capture back into the room

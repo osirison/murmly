@@ -523,6 +523,60 @@ class ChimeTests(unittest.TestCase):
         self.assertLess(max(abs(sample) for sample in samples), 32_768)
 
 
+class SilenceWhenRefusedTests(unittest.TestCase):
+    """A refusal makes no sound at all, attention notes included.
+
+    The notes exist to tell someone who is not looking at the terminal that
+    words are arriving. Played in front of a refusal they promise an
+    announcement that never comes, and at one per turn they teach the person to
+    ignore the signal -- which costs the announcements that do work.
+
+    The session is therefore opened first and the notes played only after it is
+    accepted, which is also why the daemon has to answer the declaration from
+    what is true now rather than from what was true when it started.
+    """
+
+    def _announce(self, refusal: str) -> tuple[str, list[str]]:
+        played: list[str] = []
+
+        def chime() -> str:
+            played.append("chime")
+            return "chime"
+
+        original_declare = announce.Session.declare
+        original_chime = announce.play_chime
+        announce.Session.declare = lambda self: refusal
+        announce.play_chime = chime
+        announce.Session.speak = lambda self, name, text: None
+        announce.Session.end = lambda self: None
+        announce.Session.wait_until_heard = lambda self: "spoken"
+        try:
+            outcome = announce.announce("context", "spoken", announce.SOURCE_VOICE_NOTE)
+        finally:
+            announce.Session.declare = original_declare
+            announce.play_chime = original_chime
+        return outcome, played
+
+    def test_speech_output_unavailable_produces_no_notes(self) -> None:
+        outcome, played = self._announce("refused: speech_unavailable")
+
+        self.assertEqual([], played, "the notes played in front of a refusal")
+        self.assertIn("speech_unavailable", outcome)
+
+    def test_a_session_already_held_produces_no_notes(self) -> None:
+        outcome, played = self._announce("refused: speech_session_in_use")
+
+        self.assertEqual([], played)
+        self.assertIn("speech_session_in_use", outcome)
+
+    def test_an_accepted_session_does_play_them(self) -> None:
+        """Pins the tests above, which would pass with the notes deleted."""
+        outcome, played = self._announce("")
+
+        self.assertEqual(["chime"], played)
+        self.assertEqual("spoken", outcome)
+
+
 class InstallHooksTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = Path(tempfile.mkdtemp())

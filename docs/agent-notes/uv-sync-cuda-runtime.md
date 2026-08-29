@@ -5,6 +5,7 @@ trigger: uv add --optional cuda, uv sync --extra cuda, uv run murmly daemon
 
 depends_on: pyproject.toml, uv.lock, src/murmly/stt.py
 recorded: 2026-08-15
+updated: 2026-08-30
 ---
 
 ## Symptom
@@ -44,12 +45,12 @@ Then install it explicitly:
 
 ```bash
 uv lock
-uv sync --extra cuda --extra tts
+uv sync --extra cuda
 ```
 
-Both extras on the sync line if speech output is installed. `uv sync` makes the
-environment match exactly the extras it is given, so `--extra cuda` alone
-removes `kokoro-onnx` and leaves speech output unavailable.
+Speech output (`kokoro-onnx`) installs by default and does not need naming here
+— see `docs/agent-notes/onnxruntime-gpu-cuda-version.md` for why it is a
+dependency group rather than a second extra.
 
 The resolved wheels are the seven NVIDIA distributions the `cuda` extra now
 names -- cuBLAS, cuDNN, NVRTC, the CUDA runtime, cuFFT, cuRAND and nvJitLink --

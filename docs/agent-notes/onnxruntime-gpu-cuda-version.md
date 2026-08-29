@@ -1,11 +1,11 @@
 ---
 title: Pin onnxruntime-gpu to 1.24.4 so ONNX and CTranslate2 share one CUDA stack
 description: onnxruntime-gpu 1.25+ moved to CUDA 13, which conflicts with the cu12 wheels Murmly's cuda extra installs for faster-whisper
-trigger: uv pip install onnxruntime-gpu, uv add onnxruntime-gpu, uv sync --extra cuda, pip install kokoro-onnx, uv run --extra tts, uv run --extra cuda, uv pip uninstall onnxruntime
+trigger: uv pip install onnxruntime-gpu, uv add onnxruntime-gpu, uv sync --extra cuda, pip install kokoro-onnx, uv sync --no-group tts, uv run --extra cuda, uv pip uninstall onnxruntime
 
 depends_on: pyproject.toml, uv.lock, docs/agent-notes/uv-sync-cuda-runtime.md
 recorded: 2026-08-20
-updated: 2026-08-23
+updated: 2026-08-30
 ---
 
 ## Symptom
@@ -69,12 +69,15 @@ the same provenance checks any ONNX path should reuse rather than duplicate.
 ## `uv run --extra` undoes the swap, silently
 
 The GPU build is a swap, not an addition (`pyproject.toml` says so), which means
-nothing in the project metadata records that it happened. Any command that
-resolves the `tts` extra pulls `kokoro-onnx` -> `onnxruntime` (the CPU build) and
-installs it *alongside* `onnxruntime-gpu`, whose libraries it then shadows:
+nothing in the project metadata records that it happened. `kokoro-onnx` installs
+by default now — it is a `[dependency-groups]` group listed in
+`[tool.uv] default-groups`, not something a sync has to be told to fetch — and it
+needs the CPU `onnxruntime`, the same as `faster-whisper` does. Either dependency
+pulls `onnxruntime` back in and installs it *alongside* `onnxruntime-gpu`, whose
+libraries it then shadows:
 
 ```console
-$ uv run --extra cuda --extra tts python bench.py
+$ uv run --extra cuda python bench.py
 Installed 1 package in 35ms
 Speech output falling back to the CPU: ...
 provider: CPUExecutionProvider
@@ -85,9 +88,10 @@ There is no error. The run completes and reports numbers for a CPU session.
 **Run one-off scripts and benchmarks with `uv run --no-sync`.** A bare `uv run`
 syncs the environment before it runs anything, so it repairs the "missing" CPU
 package every time. `--no-sync` skips that step and leaves the swap in place; it
-is what `.github/workflows/tests.yml` and `setup.sh` already use. Naming no extra
-is not a substitute — the CPU `onnxruntime` arrives as a dependency of
-`faster-whisper`, which is a base dependency, so every sync reinstalls it.
+is what `.github/workflows/tests.yml` and `setup.sh` already use. Passing
+`--no-group tts` is not a substitute — the CPU `onnxruntime` arrives as a
+dependency of `faster-whisper`, which is a base dependency, so every sync still
+reinstalls it.
 
 `.venv/bin/python` also works and skips `uv` entirely, but it resolves only from
 the repository root. From a worktree under `.worktrees/` it fails outright, and
@@ -191,23 +195,54 @@ has been reintroduced on top of it — the case you are in whenever `uv run` or
 own metadata intact and restores nothing the uninstall deleted. Use
 `--reinstall`; see "Repairing it needs `--reinstall`" above.
 
-## `uv sync` is exact, so name every extra every time
+## `uv sync --extra cuda` used to remove speech output — history
 
-`uv sync --extra cuda` does not add the CUDA extra to what is installed. It
-makes the environment match exactly what it was given, and removes everything
-else — including the speech synthesizer:
+`uv sync` matches the environment exactly to the extras it is given, and until
+2026-08-30 `tts` was one of those extras. `uv sync --extra cuda` on its own did
+not add the CUDA extra to what was installed; it made the environment match
+exactly what it was given, and removed everything else not named — including
+the speech synthesizer:
 
 ```console
-$ uv sync --extra cuda --dry-run          # in an environment that has [tts]
+$ uv sync --extra cuda --dry-run          # old behaviour, in an environment that has [tts]
 Would uninstall 2 packages
  - kokoro-onnx==0.6.1
  + onnxruntime==1.28.0
 ```
 
-Confirmed on 2026-08-21. The GPU recipe therefore has to start
+Confirmed on 2026-08-21, back when the GPU recipe had to start
 `uv sync --extra cuda --extra tts`; starting it with `--extra cuda` alone
-removes `kokoro-onnx` and leaves speech output unavailable for a reason that
-looks nothing like the command that caused it.
+removed `kokoro-onnx` and left speech output unavailable for a reason that
+looked nothing like the command that caused it. That was the incident: someone
+typed exactly the command above to add CUDA support and lost speech output as a
+side effect, with nothing in the output naming what was lost.
+
+**Fixed on 2026-08-30** by moving `tts` out of
+`[project.optional-dependencies]` into `[dependency-groups]`, listed in
+`[tool.uv] default-groups`. Extras and dependency groups are matched
+independently, so naming `cuda` no longer touches `tts` at all. Confirmed with
+uv 0.12.3:
+
+```console
+$ uv sync                    # installs kokoro-onnx: tts is a default group
+$ uv sync --extra cuda       # installs the seven nvidia cu12 wheels, uninstalls nothing
+$ uv sync --no-group tts     # uninstalls 6 packages, including kokoro-onnx
+$ uv sync --locked           # what CI runs; installs kokoro-onnx
+```
+
+`uv sync --extra cuda` is the command that caused the incident above, and it is
+now harmless — it neither installs nor removes `kokoro-onnx`. `--no-group tts`
+is the only way left to remove speech output, and typing it is deliberate: a
+real "I don't want this" rather than a side effect of asking for something
+else.
+
+A `[tool.uv] default-extras` setting would have kept `tts` as an extra while
+making it install by default, but it does not exist in uv 0.12.3 — uv rejects it
+as an unknown field. A dependency group was the only mechanism available.
+
+`uv sync --extra cuda` is still exact with respect to *extras*: there is only
+one now (`cuda`), so the "name every extra every time" hazard is gone for speech
+output, but naming extras is still exact for whatever extras exist.
 
 ## Synthesis is not gated on `[stt] device`
 
@@ -216,7 +251,8 @@ there is no separate one for synthesis. It is read as a preference: a person who
 pinned transcription to the GPU has not asked for GPU synthesis, so a missing
 `onnxruntime-gpu` falls back to the CPU and logs the remedy rather than raising.
 Raising made `device = "cuda"` refuse every speech session on the documented
-`--extra cuda --extra tts` install, which deliberately carries the CPU runtime.
+`--extra cuda` install, which carries the CPU runtime regardless — `kokoro-onnx`
+installs by default now, and `faster-whisper` always did.
 
 ## Also
 

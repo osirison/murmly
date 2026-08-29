@@ -1,10 +1,11 @@
 ---
-title: Notes but no speech means the daemon lost kokoro-onnx after it started
-description: The announcement chime plays only after the speech session is open, so hearing it narrows the fault to synthesis; a running daemon keeps advertising speech output that a later sync removed
-trigger: hooks/murmly-announce.py, murmly-announce.py, MURMLY_ANNOUNCE_LOG, MURMLY_ANNOUNCE_FOREGROUND, announcement not spoken, chime but no speech, uv sync --extra cuda
+title: Notes but no speech means synthesis failed after the session was accepted
+description: The announcement chime plays only once the speech session is open, so hearing it and then silence narrows the fault to synthesis; the packaging and startup-probe causes are both closed now, which makes the symptom evidence of something else
+trigger: hooks/murmly-announce.py, murmly-announce.py, MURMLY_ANNOUNCE_LOG, MURMLY_ANNOUNCE_FOREGROUND, announcement not spoken, chime but no speech, uv sync --no-group tts
 
 depends_on: hooks/murmly-announce.py, src/murmly/tts.py, src/murmly/daemon.py, pyproject.toml
 recorded: 2026-08-29
+updated: 2026-08-30
 ---
 
 # Notes but no speech means the daemon lost `kokoro-onnx` after it started
@@ -61,7 +62,9 @@ run hides the faults that need a previous turn to exist.
 The log line for this failure names its own remedy:
 
 ```
-  -> failed: kokoro-onnx is required for speech output. Run `uv sync --extra tts` ...
+  -> failed: kokoro-onnx is required for speech output. Run `uv sync` before
+     enabling it; speech output is installed by default and only
+     `--no-group tts` leaves it out.
 ```
 
 ## Why a running daemon does not notice
@@ -69,38 +72,64 @@ The log line for this failure names its own remedy:
 `SpeechEngine.__init__` probes once with `importlib.util.find_spec("kokoro_onnx")`
 and stores the result in `_unavailable_reason` for the life of the process. The
 model itself is built lazily — `_load_model()` is reached only from
-`synthesize()`. So a `uv sync` that drops the `tts` extra after the daemon started
-leaves it advertising a capability it can no longer deliver: `speech_session` is
-accepted on the startup probe, the chime plays, and the first import happens far
-too late to refuse.
+`synthesize()`.
 
-`uv sync --extra cuda` on its own is the usual cause. It is exact, so it
-uninstalls `kokoro-onnx`; see the "name every extra every time" section of
-`docs/agent-notes/onnxruntime-gpu-cuda-version.md`, which describes the same
-hazard reached through the `onnxruntime` swap.
+**The packaging hole that made this common is closed.** `tts` moved from an
+extra to a `[dependency-groups]` group listed in `[tool.uv] default-groups`, so
+`uv sync --extra cuda` no longer touches it — see the "`uv sync --extra cuda`
+used to remove speech output" section of
+`docs/agent-notes/onnxruntime-gpu-cuda-version.md`. `kokoro-onnx` now survives
+every sync that does not name `--no-group tts`.
+
+**The daemon also re-probes.** Declaring a `speech_session` calls
+`unavailable_reason_now()`, which asks the synthesizer again instead of trusting
+the startup probe — unless it is already resident, in which case holding its
+weights is stronger evidence than a probe and none is paid. A runtime lost since
+startup is therefore caught here, before the session is accepted and before the
+chime plays: the hook gets a refusal and makes no sound at all, rather than the
+notes-then-silence this note is named for. On a current build the specific
+pattern this note describes — a daemon advertising a capability a background
+sync quietly removed, while never having built the model even once — is closed.
+
+A synthesizer that is already resident still skips this check, because
+residency is the proof. Something that breaks the runtime underneath an
+already-loaded model — deleted model files, an undone `onnxruntime` swap, a
+manual uninstall — still reaches `synthesize()` unchecked and still produces
+chime-then-silence. Hearing that symptom on a current build is evidence of one
+of those, not of the packaging hole; the table under "Read the chime as a
+probe" is still the right first move.
 
 **Fix:**
 
 ```bash
 cd /path/to/murmly          # the repository root: the daemon's venv lives there
-uv sync --extra cuda --extra tts
+uv sync                     # or: uv sync --extra cuda, on a CUDA install
 ```
 
 **No restart is needed.** `_load_model` leaves `self._model` as `None` when
 construction raises and hands the error to the caller, keeping a failed rebuild
 retryable on purpose, and that failure is deliberately never written into
 `_unavailable_reason`. A daemon that has been failing for a day picks the package
-up on the next request.
+up on the next request. The same statelessness is why the re-probe above
+recovers immediately too: `unavailable_reason_now()` calls `_probe()` fresh every
+time the synthesizer is not resident, so the very first `speech_session` request
+after the fix lands succeeds.
 
 **Why it was not obvious:** the daemon's own error text is exact and names the
 command that fixes it, but the hook writes it nowhere unless `MURMLY_ANNOUNCE_LOG`
-is set, and the sync that caused it succeeded quietly hours earlier. Date it from
-the package metadata rather than guessing:
+is set, and the sync that caused it succeeded quietly hours earlier.
+
+**Dating it is still the fastest move**, whatever removed the package. Compare
+the package metadata against when the daemon started, rather than guessing:
 
 ```bash
 find .venv/lib/python3.*/site-packages -maxdepth 1 -name '*.dist-info' \
   -printf '%T+ %f\n' | sort | tail
+systemctl --user show -p ActiveEnterTimestamp murmly
 ```
 
-`nvidia_*_cu12` directories written after the daemon's `systemctl --user show -p
-ActiveEnterTimestamp murmly` are a `--extra cuda` sync that ran underneath it.
+Anything written after that timestamp changed the environment under the running
+process. On 2026-08-28 it was seven `nvidia_*_cu12` directories three minutes
+after the start -- a `uv sync --extra cuda` from the days when that also removed
+`kokoro-onnx`. That particular cause is closed; the comparison is not specific to
+it.

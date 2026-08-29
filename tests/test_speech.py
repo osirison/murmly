@@ -973,5 +973,38 @@ class ProducedAudioTests(EngineHarness):
             self.assertEqual(24_000, rate)
 
 
+class AvailabilityNowTests(EngineHarness):
+    """What the engine answers when asked again, rather than from startup."""
+
+    def test_the_question_is_passed_to_the_synthesizer(self) -> None:
+        synthesizer = FakeSynthesizer()
+        synthesizer.reason_now = "kokoro-onnx is not installed."
+        engine, _player, _events = self.engine(synthesizer=synthesizer)
+
+        self.assertEqual("kokoro-onnx is not installed.", engine.unavailable_reason_now())
+        # The startup answer is untouched: it describes a different moment, and
+        # overwriting it would need a restart to clear.
+        self.assertTrue(engine.available)
+        self.assertIsNone(engine.unavailable_reason)
+
+    def test_a_runtime_still_there_answers_that_it_can_run(self) -> None:
+        engine, _player, _events = self.engine()
+
+        self.assertIsNone(engine.unavailable_reason_now())
+
+    def test_speech_output_off_answers_without_a_synthesizer_to_ask(self) -> None:
+        """`__init__` builds none when speech is off, and this may not build one."""
+        temp_dir = tempfile.mkdtemp()
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            tts_enabled=False,
+        )
+        engine = SpeechEngine(config, player=RecordingPlayer())
+
+        self.assertIsNone(engine.synthesizer)
+        self.assertIn("not enabled", engine.unavailable_reason_now())
+
+
 if __name__ == "__main__":
     unittest.main()

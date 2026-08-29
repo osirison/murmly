@@ -595,17 +595,23 @@ class ExampleConfigTests(unittest.TestCase):
             option_keys(block.group(1)),
         )
 
-    def test_the_speech_instructions_never_sync_the_speech_extra_away(self) -> None:
-        """`uv sync` is exact: an extra left off a line is an extra removed.
+    def test_the_speech_instructions_never_name_a_command_that_breaks_them(self) -> None:
+        """The install prose is read and then run, so a stale command is a bug.
 
-        The GPU recipe once began `uv sync --extra cuda`, which uninstalls
-        kokoro-onnx, so following the speech instructions literally produced an
-        environment with no synthesizer. Nothing else in the suite reads prose,
-        and the same recipe is mirrored in three files.
+        This guarded the opposite rule until speech output became a default
+        dependency group. `uv sync` is exact about extras, so while the
+        synthesizer was one, every recipe had to name `--extra tts` alongside
+        `--extra cuda` or following it literally produced an environment with no
+        synthesizer. That is what happened in the field, three minutes after a
+        daemon started, and it is why the packaging changed.
 
-        Scoped to where a reader is installing speech. The transcription section
-        names `--extra cuda` alone on purpose: someone who has not enabled
-        speech should not be made to install it.
+        The two failure modes now. `--extra tts` names an extra that no longer
+        exists, so a reader who runs it gets an error rather than a synthesizer.
+        `--no-group tts` is the one command that removes speech output, so an
+        install recipe naming it installs nothing.
+
+        Nothing else in the suite reads prose, and the same instructions are
+        mirrored in three files.
         """
         project_root = Path(murmly.config.__file__).parent.parent.parent
         sections = {
@@ -616,7 +622,7 @@ class ExampleConfigTests(unittest.TestCase):
                 r"^\[tts\]\n(.*)", EXAMPLE_CONFIG_PATH.read_text(), re.DOTALL | re.MULTILINE
             ),
             "pyproject.toml": re.search(
-                r"^tts = \[|^# Speech output(.*?)^tts = \[",
+                r"^# Installed by default(.*?)^default-groups",
                 (project_root / "pyproject.toml").read_text(),
                 re.DOTALL | re.MULTILINE,
             ),
@@ -625,16 +631,21 @@ class ExampleConfigTests(unittest.TestCase):
             self.assertIsNotNone(section, f"no speech section found in {name}")
             body = section.group(0)
             for line in re.findall(r"^[#\s]*(uv sync [^\n]*)$", body, re.MULTILINE):
-                if "--extra cuda" in line and "--extra tts" not in line:
+                self.assertNotIn(
+                    "--extra tts",
+                    line,
+                    f"{name}: {line.strip()!r} names an extra that no longer exists",
+                )
+                if "--no-group tts" in line:
                     self.fail(
-                        f"{name}: {line.strip()!r} syncs the speech extra away. "
-                        "Name --extra tts alongside --extra cuda."
+                        f"{name}: {line.strip()!r} is the command that removes speech "
+                        "output, not one that installs it"
                     )
             # And the rule itself, not only the commands that obey it. Someone
-            # adapting an example needs to know why every extra is named, or the
-            # next command they write is the destructive one.
+            # adapting an example needs to know the synthesizer arrives without
+            # being asked for, or they will add a flag to ask for it.
             self.assertIn(
-                "match exactly the extras",
-                body,
-                f"{name}: the speech section never states that `uv sync` is exact",
+                "installed by default",
+                body.lower(),
+                f"{name}: the speech section never states that speech output is a default",
             )

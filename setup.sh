@@ -94,16 +94,18 @@ Options:
       --cuda       Install the GPU runtime extra. Default: offered when an
                    NVIDIA driver is present.
       --no-cuda    Leave the GPU runtime extra out.
-      --tts        Install speech output, including the synthesis models.
-      --no-tts     Leave speech output out.
+      --tts        Fetch the synthesis models without asking. The synthesizer
+                   itself is installed by default.
+      --no-tts     Leave speech output out entirely, models and synthesizer.
       --hooks      With install: register the announcement hook without asking.
       --no-hooks   With install: do not offer it at all.
       --purge      With uninstall: also remove the environment, models, and
                    configuration.
   -h, --help       This message.
 
-Unless --no-cuda or --no-tts says otherwise, every sync keeps the extras already
-installed, so upgrading never removes a feature you had.
+Unless --no-cuda says otherwise, every sync keeps the extras already installed,
+so upgrading never removes a feature you had. Speech output needs no such care:
+it is a default dependency group, so only --no-tts leaves it out.
 USAGE
 }
 
@@ -159,7 +161,7 @@ wanted_system_packages() {
         packages+=(xclip xdotool)
     fi
 
-    if [ "$WANT_TTS" = "yes" ]; then
+    if wants_speech_output; then
         packages+=(espeak-ng)
     fi
 
@@ -201,12 +203,31 @@ install_system_packages() {
 
 #: Extras already present in the environment, so a sync never removes a feature
 #: that was installed. This is the rule the manual instructions keep tripping on.
+#:
+#: Speech output is not among them any more. It is a default dependency group,
+#: which every sync keeps without being told to, and the reading it needed here
+#: is the one below -- whether somebody has deliberately turned it off.
 current_extras() {
     if installed_package nvidia-cublas-cu12; then
         printf 'cuda\n'
     fi
-    if installed_package kokoro-onnx; then
-        printf 'tts\n'
+    return 0
+}
+
+#: Whether the next sync should carry speech output. Yes by default, because the
+#: synthesizer is a default dependency group and arrives without being asked for.
+#:
+#: An environment that exists and has no synthesizer in it was opted out of one,
+#: so an upgrade leaves it that way. Undoing that decision silently is the same
+#: fault in the other direction as the sync that removed speech output from a
+#: running daemon.
+wants_speech_output() {
+    case "$WANT_TTS" in
+        yes) return 0 ;;
+        no) return 1 ;;
+    esac
+    if [ -d "$REPO/.venv" ] && ! installed_package kokoro-onnx; then
+        return 1
     fi
     return 0
 }
@@ -214,12 +235,11 @@ current_extras() {
 #: The extras the next sync should be given: what is installed, plus what the
 #: flags or the answers add, minus what the flags remove.
 resolve_extras() {
-    local wants_cuda=0 wants_tts=0
+    local wants_cuda=0
     local extra
     while IFS= read -r extra; do
         case "$extra" in
             cuda) wants_cuda=1 ;;
-            tts) wants_tts=1 ;;
         esac
     done < <(current_extras)
 
@@ -236,25 +256,8 @@ resolve_extras() {
             ;;
     esac
 
-    case "$WANT_TTS" in
-        yes) wants_tts=1 ;;
-        no) wants_tts=0 ;;
-        auto)
-            if [ "$wants_tts" -eq 0 ]; then
-                info "Speech output lets Murmly speak text an agent sends it. It stays off in"
-                info "configuration until you enable it, and needs about 340 MB of model files."
-                if confirm "Install speech output?"; then
-                    wants_tts=1
-                fi
-            fi
-            ;;
-    esac
-
     if [ "$wants_cuda" -eq 1 ]; then
         printf 'cuda\n'
-    fi
-    if [ "$wants_tts" -eq 1 ]; then
-        printf 'tts\n'
     fi
     return 0
 }
@@ -276,19 +279,30 @@ sync_environment() {
 
     step "Python environment"
     local -a arguments=(sync --locked)
-    local has_cuda=0 has_tts=0
+    local has_cuda=0 has_tts=1
     for extra in "${extras[@]}"; do
         arguments+=(--extra "$extra")
         case "$extra" in
             cuda) has_cuda=1 ;;
-            tts) has_tts=1 ;;
         esac
     done
+
+    # Named only to leave it out. The group is a default, so the sync carries
+    # the synthesizer unless this says otherwise -- which is the whole point of
+    # it being a group: nothing removes speech output by forgetting to mention
+    # it, only by asking.
+    if ! wants_speech_output; then
+        has_tts=0
+        arguments+=(--no-group tts)
+    fi
 
     if [ ${#extras[@]} -eq 0 ]; then
         info "Syncing with no extras."
     else
         info "Syncing with: ${extras[*]}"
+    fi
+    if [ "$has_tts" -eq 0 ]; then
+        info "Leaving speech output out."
     fi
     ( cd "$REPO" && uv "${arguments[@]}" )
 
@@ -354,6 +368,20 @@ install_models() {
     if [ ${#needed[@]} -eq 0 ]; then
         info "Already in $directory."
         return 0
+    fi
+
+    # The one thing left to decide. The synthesizer package arrives with every
+    # sync now, so the question this step used to ask -- whether to install
+    # speech output at all -- is no longer a question. 340 MB still is, and
+    # speech output stays off in configuration either way.
+    if [ "$WANT_TTS" = "auto" ]; then
+        info "Speech output lets Murmly speak text an agent sends it. The synthesizer is"
+        info "installed; what is missing is about 340 MB of model files. It stays off in"
+        info "configuration until you enable it."
+        if ! confirm "Download the synthesis models?"; then
+            note "Skipped. Place ${needed[*]} in $directory when you want them."
+            return 0
+        fi
     fi
 
     if ! have curl; then

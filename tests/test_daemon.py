@@ -1402,9 +1402,17 @@ class StubSpeechEngine:
         self.synthesizer = StubSynthesizer()
         self.available = True
         self.unavailable_reason = None
+        # What the declaration asks for now, as opposed to what startup found.
+        # None means it can still run; a string is the refusal it produces.
+        self.reason_now: str | None = None
+        self.reason_now_asked = 0
         self.speaking = False
         self.begun = 0
         self.ended = 0
+
+    def unavailable_reason_now(self) -> str | None:
+        self.reason_now_asked += 1
+        return self.reason_now
 
     def begin(self, sink) -> None:
         self.begun += 1
@@ -1831,6 +1839,113 @@ class IdleModelReleaseTests(unittest.TestCase):
             self.assertFalse(response["ok"])
             self.assertIsNone(daemon._speech_session)
             self.assertTrue(daemon._synthesis_idle.armed)
+
+
+class SpeechLostSinceStartupTests(unittest.TestCase):
+    """A declaration is answered from what is true now, not from startup.
+
+    The failure these cover was 24 hours long and inaudible. The daemon started
+    with the synthesizer installed, a sync three minutes later removed it, and
+    every declaration after that was accepted on the startup probe -- so the
+    announcement hook, which opens the session before it makes any sound, played
+    its notes and then had nothing to say.
+    """
+
+    def _daemon(self, temp_dir: str, speech) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+            tts_enabled=True,
+        )
+        return MurmlyDaemon(config, session=DummySession(), speech=speech)
+
+    def test_a_runtime_lost_since_startup_is_refused_rather_than_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            speech.reason_now = "kokoro-onnx is not installed. Run `uv sync`."
+            daemon = self._daemon(temp_dir, speech)
+            server, client = socket.socketpair()
+            self.addCleanup(client.close)
+            self.addCleanup(server.close)
+
+            response = daemon._declare_session(server)
+
+            self.assertFalse(response["ok"])
+            self.assertEqual(CommandCode.SPEECH_UNAVAILABLE, response["code"])
+            self.assertIn("kokoro-onnx is not installed", response["error"])
+            # Nothing was opened, so nothing has to be taken back. A caller that
+            # is refused here has still made no sound.
+            self.assertEqual(0, speech.begun)
+            self.assertIsNone(daemon._speech_session)
+
+    def test_the_refusal_is_not_recorded_as_the_permanent_reason(self) -> None:
+        """The trap `_load_model` names: one transient failure, silent for life."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            speech.reason_now = "kokoro-onnx is not installed. Run `uv sync`."
+            daemon = self._daemon(temp_dir, speech)
+            server, client = socket.socketpair()
+            self.addCleanup(client.close)
+            self.addCleanup(server.close)
+
+            daemon._declare_session(server)
+
+            self.assertTrue(speech.available)
+            self.assertIsNone(speech.unavailable_reason)
+
+    def test_a_reinstall_is_picked_up_without_restarting_the_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            speech.reason_now = "kokoro-onnx is not installed. Run `uv sync`."
+            daemon = self._daemon(temp_dir, speech)
+            refused_server, refused_client = socket.socketpair()
+            self.addCleanup(refused_client.close)
+            self.addCleanup(refused_server.close)
+            self.assertFalse(daemon._declare_session(refused_server)["ok"])
+
+            speech.reason_now = None
+            server, client = socket.socketpair()
+            self.addCleanup(client.close)
+
+            outcome = daemon._declare_session(server)
+            self.addCleanup(daemon._close_speech_session)
+
+            self.assertIs(ADOPT_SESSION, outcome)
+            self.assertEqual(1, speech.begun)
+
+    def test_a_refused_declaration_leaves_every_other_command_working(self) -> None:
+        """Speech going missing is not a reason to stop transcribing."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            speech.reason_now = "kokoro-onnx is not installed. Run `uv sync`."
+            daemon = self._daemon(temp_dir, speech)
+            server, client = socket.socketpair()
+            self.addCleanup(client.close)
+            self.addCleanup(server.close)
+
+            daemon._declare_session(server)
+
+            self.assertTrue(daemon.handle_command("status")["ok"])
+            self.assertTrue(daemon.handle_command("toggle")["ok"])
+            self.assertTrue(daemon.handle_command("toggle")["ok"])
+
+    def test_the_startup_answer_still_refuses_before_anything_is_asked_again(self) -> None:
+        """A daemon that never had a synthesizer does not probe once per turn."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            speech.available = False
+            speech.unavailable_reason = "kokoro-onnx is not installed."
+            daemon = self._daemon(temp_dir, speech)
+            server, client = socket.socketpair()
+            self.addCleanup(client.close)
+            self.addCleanup(server.close)
+
+            response = daemon._declare_session(server)
+
+            self.assertFalse(response["ok"])
+            self.assertEqual(CommandCode.SPEECH_UNAVAILABLE, response["code"])
+            self.assertEqual(0, speech.reason_now_asked)
 
 
 def read_frame(client: socket.socket) -> bytes:
