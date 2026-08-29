@@ -263,6 +263,21 @@ class SpeechEngine:
             return "Speech output is not enabled."
         return self._synthesizer.unavailable_reason
 
+    def unavailable_reason_now(self) -> str | None:
+        """Why speech output cannot run at this moment, or None when it can.
+
+        The property above answers for the moment this daemon started; this one
+        asks the synthesizer again. See `KokoroSynthesizer.unavailable_reason_now`
+        for why the difference matters and why the answer is not stored.
+
+        A daemon with speech output off has no synthesizer to ask and no reason
+        to acquire one, so it answers from configuration exactly as the property
+        does. Nothing here builds what `__init__` deliberately did not.
+        """
+        if not self._config.tts_enabled or self._synthesizer is None:
+            return "Speech output is not enabled."
+        return self._synthesizer.unavailable_reason_now()
+
     @property
     def synthesizer(self):
         return self._synthesizer

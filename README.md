@@ -112,11 +112,13 @@ asking. With nothing attached to the terminal and no `--yes`, every prompt is
 declined rather than assumed.
 
 What it exists to get right is the sync. `uv sync` makes the environment match
-exactly the extras it is given, so a plain sync removes the CUDA wheels or
-speech output; the GPU build of ONNX Runtime replaces the CPU one and every sync
-puts the CPU one back. The script reads what is installed before each sync,
-names all of it, and reapplies the swap afterwards, so an upgrade never removes
-a feature you had.
+exactly the extras it is given, so a plain sync removes the CUDA wheels; the GPU
+build of ONNX Runtime replaces the CPU one and every sync puts the CPU one back.
+The script reads what is installed before each sync, names all of it, and
+reapplies the swap afterwards, so an upgrade never removes a feature you had.
+Speech output needs none of that care: it is installed by default, as a
+dependency group rather than an extra, and only `--no-group tts` leaves it
+out.
 
 ### Installing by hand
 
@@ -150,9 +152,9 @@ uv sync --extra cuda
 uv run --extra cuda murmly install Meta+X
 ```
 
-`uv sync` makes the environment match exactly the extras it is given, so name
-every extra you want on one line. If speech output is already installed, this is
-`uv sync --extra cuda --extra tts` — the shorter form would remove it.
+`uv sync --extra cuda` is the whole command. It was not always: speech output
+used to be an extra too, and this line then uninstalled it, which is why the
+synthesizer is a default dependency group now.
 
 Check everything was detected correctly:
 
@@ -237,14 +239,17 @@ pasted into whatever window has focus.
 ### Turning it on
 
 ```bash
-uv sync --extra tts
+uv sync
 sudo dnf install espeak-ng
 ```
 
-`uv sync` makes the environment match exactly the extras it is given, so name
-every extra you want on one line. On a CUDA install this is
-`uv sync --extra cuda --extra tts` — the shorter form would remove the CUDA
-wheels, exactly as the CUDA line alone would remove this one.
+The synthesizer is installed by default — it is a dependency group named in
+`[tool.uv] default-groups`, so no sync drops it by not mentioning it, and on a
+CUDA install `uv sync --extra cuda` keeps it too. To leave it out, ask:
+`uv sync --no-group tts`.
+
+What is not installed by default is the 340 MB of model files below, which is
+the part worth deciding about.
 
 Then place the model files in `~/.local/share/murmly`:
 
@@ -309,14 +314,15 @@ both install into the same `onnxruntime` package namespace, and an environment
 holding both leaves the survivor of any later uninstall broken:
 
 ```bash
-uv sync --extra cuda --extra tts
+uv sync --extra cuda
 uv pip uninstall onnxruntime
 uv pip install "onnxruntime-gpu==1.24.4"
 ```
 
-Both extras on the first line, every time. `uv sync` makes the environment match
-exactly what it is given, so `uv sync --extra cuda` alone removes `kokoro-onnx`
-and leaves speech output unavailable.
+The first line keeps the synthesizer, which is installed by default as a
+dependency group. It did not always: while speech output was an extra, that same
+command removed `kokoro-onnx` and left speech output unavailable, which is the
+reason it is a group now.
 
 `murmly doctor` reports which execution providers speech output resolved, and
 Murmly reads the provider back off the session it constructed rather than off

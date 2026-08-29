@@ -20,6 +20,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 import wave
 
 
@@ -521,6 +522,62 @@ class ChimeTests(unittest.TestCase):
         self.assertEqual(0, samples[0])
         self.assertLess(abs(samples[-1]), 1_000)
         self.assertLess(max(abs(sample) for sample in samples), 32_768)
+
+
+class SilenceWhenRefusedTests(unittest.TestCase):
+    """A refusal makes no sound at all, attention notes included.
+
+    The notes exist to tell someone who is not looking at the terminal that
+    words are arriving. Played in front of a refusal they promise an
+    announcement that never comes, and at one per turn they teach the person to
+    ignore the signal -- which costs the announcements that do work.
+
+    The session is therefore opened first and the notes played only after it is
+    accepted, which is also why the daemon has to answer the declaration from
+    what is true now rather than from what was true when it started.
+    """
+
+    def _announce(self, refusal: str) -> tuple[str, list[str]]:
+        played: list[str] = []
+
+        def chime() -> str:
+            played.append("chime")
+            return "chime"
+
+        # `patch.object` rather than assignment: these are class attributes on a
+        # module every other test in this file shares, and restoring them by
+        # hand is exactly the kind of thing that gets one name short. It did --
+        # `speak`, `end` and `wait_until_heard` stayed stubbed for the rest of
+        # the process, so any later test on the Session path would have run
+        # against the lambdas instead of the code.
+        with (
+            patch.object(announce.Session, "declare", lambda self: refusal),
+            patch.object(announce, "play_chime", chime),
+            patch.object(announce.Session, "speak", lambda self, name, text: None),
+            patch.object(announce.Session, "end", lambda self: None),
+            patch.object(announce.Session, "wait_until_heard", lambda self: "spoken"),
+        ):
+            outcome = announce.announce("context", "spoken", announce.SOURCE_VOICE_NOTE)
+        return outcome, played
+
+    def test_speech_output_unavailable_produces_no_notes(self) -> None:
+        outcome, played = self._announce("refused: speech_unavailable")
+
+        self.assertEqual([], played, "the notes played in front of a refusal")
+        self.assertIn("speech_unavailable", outcome)
+
+    def test_a_session_already_held_produces_no_notes(self) -> None:
+        outcome, played = self._announce("refused: speech_session_in_use")
+
+        self.assertEqual([], played)
+        self.assertIn("speech_session_in_use", outcome)
+
+    def test_an_accepted_session_does_play_them(self) -> None:
+        """Pins the tests above, which would pass with the notes deleted."""
+        outcome, played = self._announce("")
+
+        self.assertEqual(["chime"], played)
+        self.assertEqual("spoken", outcome)
 
 
 class InstallHooksTests(unittest.TestCase):

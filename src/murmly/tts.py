@@ -59,22 +59,19 @@ GPU_RUNTIME_REMEDY = (
     "`--reinstall` matters: the uninstall deletes files both distributions own, "
     "and a plain install sees its own metadata intact and restores nothing."
 )
-# States the rule rather than a literal command, because the literal command is
-# destructive half the time: `uv sync` makes the environment match exactly the
-# extras it is given, so `--extra cuda` alone removes kokoro-onnx and the very
-# feature this message is about. A remedy that undoes the thing it is fixing is
-# worse than no remedy, because it is followed.
+# A literal command, which it could not be while speech output was an extra:
+# `uv sync --extra cuda` then removed kokoro-onnx and the very feature this
+# message is about, so the message had to state a rule and hope. Speech output
+# is a default dependency group now and this sync keeps it.
 CUDA_EXTRA_REMEDY = (
-    "synthesis on CUDA needs the Murmly CUDA extra. Run `uv sync --extra cuda "
-    "--extra tts`, naming every extra you already have on the same line, then "
-    "reapply the ONNX Runtime swap -- the sync restores the CPU build."
+    "synthesis on CUDA needs the Murmly CUDA extra. Run `uv sync --extra cuda`, "
+    "then reapply the ONNX Runtime swap -- the sync restores the CPU build."
 )
 RUNTIME_UNUSABLE_REMEDY = (
     "the ONNX Runtime is missing or unusable. Reinstall it with `uv sync "
-    "--reinstall --extra tts`, naming every extra you already have on the same "
-    "line, and reapply the GPU runtime swap if you want GPU synthesis. A plain "
-    "sync does not repair a half-installed runtime: the metadata still says it "
-    "is there, so there is nothing for the sync to do."
+    "--reinstall`, and reapply the GPU runtime swap if you want GPU synthesis. "
+    "A plain sync does not repair a half-installed runtime: the metadata still "
+    "says it is there, so there is nothing for the sync to do."
 )
 
 # Anything below this counts as silence when the pause between sentences is
@@ -268,6 +265,33 @@ class KokoroSynthesizer:
     def unavailable_reason(self) -> str | None:
         return self._unavailable_reason
 
+    def unavailable_reason_now(self) -> str | None:
+        """Why speech output cannot run at this moment, or None when it can.
+
+        The property above answers for the moment this daemon started, and that
+        answer goes stale. A sync that does not name speech output removes the
+        synthesizer from under a running daemon, which then goes on accepting
+        sessions on a probe that stopped being true -- and a caller that was
+        accepted has already made the sound announcing words it will never get
+        to say. Asked here, at the declaration, the answer is about now.
+
+        A resident synthesizer answers without probing. It is holding its
+        weights, which is stronger evidence than any probe could produce, and a
+        check on that path would be paid by every session for a condition that
+        cannot hold.
+
+        The result is returned and not stored. `_unavailable_reason` means
+        speech output could not run when this daemon started, and may be
+        permanent because it describes a fixed moment; this describes now, and
+        now changes. A reinstall makes a daemon that has been refusing speak
+        again on its next request, and writing a refusal into that field would
+        take that away for the rest of its life -- the same trap `_load_model`
+        is careful to stay out of.
+        """
+        if self.resident:
+            return None
+        return self._probe()
+
     @property
     def voice(self) -> str:
         return self._voice
@@ -445,9 +469,9 @@ class KokoroSynthesizer:
                 raise ModuleNotFoundError(name="kokoro_onnx")
         except ModuleNotFoundError:
             return (
-                f"{SYNTHESIS_PACKAGE} is not installed. Run "
-                f"`uv sync --extra tts`, naming every extra you already have on "
-                f"the same line -- a sync removes whatever it is not given."
+                f"{SYNTHESIS_PACKAGE} is not installed. Run `uv sync`, which "
+                f"installs speech output by default; only `--no-group tts` "
+                f"leaves it out."
             )
         except ImportError as error:
             return f"{SYNTHESIS_PACKAGE} could not be inspected: {error}"
@@ -511,8 +535,8 @@ class KokoroSynthesizer:
         except ModuleNotFoundError as error:
             raise RuntimeError(
                 f"{SYNTHESIS_PACKAGE} is required for speech output. Run "
-                f"`uv sync --extra tts` before enabling it, naming every extra you "
-                f"already have on the same line."
+                f"`uv sync` before enabling it; speech output is installed by "
+                f"default and only `--no-group tts` leaves it out."
             ) from error
 
         library_path, data_path = resolve_espeak()

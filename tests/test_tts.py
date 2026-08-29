@@ -271,7 +271,12 @@ class AvailabilityTests(unittest.TestCase):
 
         self.assertFalse(synthesizer.available)
         self.assertIn("kokoro-onnx", synthesizer.unavailable_reason)
-        self.assertIn("--extra tts", synthesizer.unavailable_reason)
+        # The remedy is the plain sync, because speech output is a default
+        # dependency group. `--extra tts` was the answer while it was an extra
+        # and now names one that does not exist, so a reader who follows it gets
+        # an error instead of a synthesizer.
+        self.assertIn("uv sync", synthesizer.unavailable_reason)
+        self.assertNotIn("--extra tts", synthesizer.unavailable_reason)
 
     def test_an_absent_phoneme_library_is_reported_rather_than_raised(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -317,6 +322,91 @@ class AvailabilityTests(unittest.TestCase):
 
         self.assertTrue(synthesizer.available)
         self.assertIsNone(synthesizer.unavailable_reason)
+
+
+class AvailabilityNowTests(unittest.TestCase):
+    """The startup answer goes stale; this is the one asked at the declaration."""
+
+    def _installed(self, temp_dir: str) -> KokoroSynthesizer:
+        """A synthesizer whose probe passed, as one built on a good day is."""
+        model_dir = Path(temp_dir) / "models"
+        model_dir.mkdir()
+        for name in (MODEL_FILE_NAME, VOICES_FILE_NAME):
+            (model_dir / name).write_bytes(b"stand-in")
+        with (
+            patch("importlib.util.find_spec", return_value=object()),
+            patch("murmly.tts.resolve_espeak", return_value=("lib", "data")),
+            patch("murmly.tts.resolve_providers", return_value=[CPU_PROVIDER]),
+        ):
+            synthesizer = KokoroSynthesizer(make_config(temp_dir))
+        assert synthesizer.available
+        return synthesizer
+
+    def test_a_package_removed_since_startup_is_reported_now(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            synthesizer = self._installed(temp_dir)
+
+            with patch("importlib.util.find_spec", return_value=None):
+                reason = synthesizer.unavailable_reason_now()
+
+        self.assertIsNotNone(reason)
+        self.assertIn("kokoro-onnx", reason)
+
+    def test_model_files_removed_since_startup_are_reported_now(self) -> None:
+        """Not only the package. A probe is the whole check or it is a new one."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            synthesizer = self._installed(temp_dir)
+            for name in (MODEL_FILE_NAME, VOICES_FILE_NAME):
+                (Path(temp_dir) / "models" / name).unlink()
+
+            with (
+                patch("importlib.util.find_spec", return_value=object()),
+                patch("murmly.tts.resolve_espeak", return_value=("lib", "data")),
+                patch("murmly.tts.resolve_providers", return_value=[CPU_PROVIDER]),
+            ):
+                reason = synthesizer.unavailable_reason_now()
+
+        self.assertIsNotNone(reason)
+        self.assertIn("model files are missing", reason)
+
+    def test_a_still_installed_runtime_answers_that_it_can_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            synthesizer = self._installed(temp_dir)
+
+            with (
+                patch("importlib.util.find_spec", return_value=object()),
+                patch("murmly.tts.resolve_espeak", return_value=("lib", "data")),
+                patch("murmly.tts.resolve_providers", return_value=[CPU_PROVIDER]),
+            ):
+                self.assertIsNone(synthesizer.unavailable_reason_now())
+
+    def test_the_answer_is_never_written_into_the_startup_one(self) -> None:
+        """A stored refusal would need a restart to clear. See `_load_model`."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            synthesizer = self._installed(temp_dir)
+
+            with patch("importlib.util.find_spec", return_value=None):
+                synthesizer.unavailable_reason_now()
+
+            self.assertTrue(synthesizer.available)
+            self.assertIsNone(synthesizer.unavailable_reason)
+
+            with (
+                patch("importlib.util.find_spec", return_value=object()),
+                patch("murmly.tts.resolve_espeak", return_value=("lib", "data")),
+                patch("murmly.tts.resolve_providers", return_value=[CPU_PROVIDER]),
+            ):
+                self.assertIsNone(synthesizer.unavailable_reason_now())
+
+    def test_a_resident_synthesizer_is_never_probed(self) -> None:
+        """It is holding its weights, which no probe could better as evidence."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            synthesizer = KokoroSynthesizer(make_config(temp_dir), model=FakeKokoroModel())
+
+            with patch.object(
+                KokoroSynthesizer, "_probe", side_effect=AssertionError("probed")
+            ):
+                self.assertIsNone(synthesizer.unavailable_reason_now())
 
 
 class RuntimeResolutionTests(unittest.TestCase):
@@ -481,11 +571,18 @@ class RuntimeResolutionTests(unittest.TestCase):
         self.assertIn("uv sync", str(raised.exception))
 
     def test_no_remedy_names_a_command_that_removes_speech_output(self) -> None:
-        """`uv sync` is exact, so a bare single-extra command is destructive.
+        """These strings are printed as the thing to do next, so they get run.
 
-        These strings are printed to the person as the thing to do next. One
-        that names `--extra cuda` alone tells someone whose speech output is
-        broken to run the command that removes it.
+        Two ways one can be wrong. `--no-group tts` is the command that removes
+        speech output now, so a remedy naming it tells someone whose speech is
+        broken to break it further. `--extra tts` is worse than destructive: the
+        extra no longer exists, so following it fails outright and the reader is
+        left believing the instructions are wrong rather than stale.
+
+        The old form of this test guarded the opposite rule -- that every
+        `uv sync` name `--extra tts` alongside `--extra cuda`, because a sync
+        was exact and dropped whatever it was not given. Making speech output a
+        default group is what makes that rule obsolete and this one necessary.
         """
         # Parsed rather than grepped: adjacent string literals are joined by the
         # parser, and a line-wrapped remedy read as a bare command on the source
@@ -505,13 +602,19 @@ class RuntimeResolutionTests(unittest.TestCase):
                 )
 
         for literal in literals:
-            for command in re.findall(r"`(uv sync [^`]*)`", literal):
-                self.assertNotEqual(
-                    "uv sync --extra cuda",
-                    " ".join(command.split()),
-                    f"a remedy names a command that uninstalls speech output: {literal!r}",
+            for command in re.findall(r"`(uv [^`]*)`", literal):
+                collapsed = " ".join(command.split())
+                self.assertNotIn(
+                    "--no-group tts",
+                    collapsed,
+                    f"a remedy names the command that uninstalls speech output: {literal!r}",
                 )
-        self.assertIn("--extra cuda --extra tts", " ".join(CUDA_EXTRA_REMEDY.split()))
+                self.assertNotIn(
+                    "--extra tts",
+                    collapsed,
+                    f"a remedy names an extra that no longer exists: {literal!r}",
+                )
+        self.assertIn("uv sync --extra cuda", " ".join(CUDA_EXTRA_REMEDY.split()))
 
     def test_the_cuda_extra_missing_falls_back_and_logs_the_remedy(self) -> None:
         """An accelerator asked for and unusable falls back rather than refusing.

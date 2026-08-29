@@ -451,8 +451,8 @@ class FasterWhisperTranscriber:
         elif device == "cuda" and not cls._load_cuda_runtime():
             raise RuntimeError(
                 "CUDA requires the Murmly CUDA extra. Run `uv sync --extra cuda`, "
-                "naming every extra you already have on the same line -- a sync "
-                "removes whatever it is not given."
+                "which is the whole command -- speech output is a default "
+                "dependency group and the sync keeps it."
             )
 
         compute_type = config.compute_type

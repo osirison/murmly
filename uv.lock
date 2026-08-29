@@ -393,6 +393,8 @@ cuda = [
     { name = "nvidia-curand-cu12" },
     { name = "nvidia-nvjitlink-cu12" },
 ]
+
+[package.dev-dependencies]
 tts = [
     { name = "kokoro-onnx" },
 ]
@@ -400,7 +402,6 @@ tts = [
 [package.metadata]
 requires-dist = [
     { name = "faster-whisper", specifier = ">=1.2.1" },
-    { name = "kokoro-onnx", marker = "extra == 'tts'", specifier = ">=0.6.1" },
     { name = "nvidia-cublas-cu12", marker = "extra == 'cuda'", specifier = ">=12,<13" },
     { name = "nvidia-cuda-runtime-cu12", marker = "extra == 'cuda'", specifier = ">=12,<13" },
     { name = "nvidia-cudnn-cu12", marker = "extra == 'cuda'", specifier = ">=9,<10" },
@@ -409,7 +410,10 @@ requires-dist = [
     { name = "nvidia-nvjitlink-cu12", marker = "extra == 'cuda'", specifier = ">=12,<13" },
     { name = "sounddevice", specifier = ">=0.5.5" },
 ]
-provides-extras = ["cuda", "tts"]
+provides-extras = ["cuda"]
+
+[package.metadata.requires-dev]
+tts = [{ name = "kokoro-onnx", specifier = ">=0.6.1" }]
 
 [[package]]
 name = "numpy"

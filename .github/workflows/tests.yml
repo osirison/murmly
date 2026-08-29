@@ -46,6 +46,14 @@ jobs:
       # pyproject.toml is a failure worth seeing here rather than at someone's
       # next sync. No extras are named -- the suite passes without them, and
       # the cuda extra is gigabytes of wheels for a GPU no runner has.
+      #
+      # The tts dependency group is a default, so this does install the
+      # synthesizer: kokoro-onnx and four small dependencies, no large wheels.
+      # That is deliberate. It is what a person's plain `uv sync` now produces,
+      # and CI running a different environment from the documented one is how a
+      # dependency stops being exercised without anyone noticing. espeak-ng and
+      # the model files are still absent here, and the suite injects both rather
+      # than reading the environment for them.
       - name: Sync the environment
         run: uv sync --locked
 

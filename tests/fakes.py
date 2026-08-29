@@ -51,6 +51,9 @@ class FakeSynthesizer:
     ) -> None:
         self._available = available
         self._unavailable_reason = unavailable_reason
+        # None means "answer as startup did". A string is a runtime that has
+        # gone missing since, which is what the declaration re-probe is for.
+        self.reason_now: str | None = None
         self.voice = voice
         self.rejected_voice: str | None = None
         self.rate_percent = rate_percent
@@ -81,6 +84,16 @@ class FakeSynthesizer:
     @property
     def unavailable_reason(self) -> str | None:
         return self._unavailable_reason
+
+    def unavailable_reason_now(self) -> str | None:
+        """What the declaration asks, as opposed to what startup found.
+
+        `reason_now` is separate from `_unavailable_reason` because the two mean
+        different things and the whole point of the second answer is that it can
+        differ from the first. Defaults to the startup one, so a fake set up the
+        old way behaves as it did.
+        """
+        return self.reason_now if self.reason_now is not None else self._unavailable_reason
 
     def release(self) -> bool:
         """Drop the session, reporting whether there was one to drop.

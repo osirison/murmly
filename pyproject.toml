@@ -26,13 +26,17 @@ cuda = [
     "nvidia-curand-cu12>=10,<11",
     "nvidia-nvjitlink-cu12>=12,<13",
 ]
+
 # Speech output on the CPU. Also needs espeak-ng from the distribution, and the
 # model files in $XDG_DATA_HOME/murmly; `murmly doctor` names whichever is
 # missing.
 #
-# `uv sync` makes the environment match exactly the extras it is given, so an
-# install wanting both names both: `uv sync --extra cuda --extra tts`. Either
-# extra alone removes the other's packages.
+# Installed by default, as a group rather than an extra, because `uv sync`
+# matches the extras it is given exactly: an install that named only
+# `--extra cuda` removed the synthesizer, and a daemon already running kept
+# accepting speech sessions it could no longer serve. A default group is
+# included unless it is excluded by name, so nothing drops it by omission.
+# Leaving it out is `--no-group tts`.
 #
 # onnxruntime-gpu is deliberately not listed. It installs into the same
 # `onnxruntime` package namespace as the CPU build that faster-whisper and
@@ -45,15 +49,22 @@ cuda = [
 #
 # `--reinstall` is not optional when the GPU build is already present: the
 # uninstall deletes files both distributions own, and a plain install sees its
-# own metadata intact and restores nothing. Any `uv run`/`uv sync` naming the
-# tts extra reintroduces the CPU build and puts you in exactly that state.
+# own metadata intact and restores nothing. Every `uv run`/`uv sync` reintroduces
+# the CPU build and puts you in exactly that state, because it arrives as a
+# dependency of faster-whisper, which nothing here is optional about.
 #
 # The version is pinned by docs/agent-notes/onnxruntime-gpu-cuda-version.md:
 # 1.25+ moved to CUDA 13, whose wheels are not on PyPI yet, while the `cuda`
 # extra above pins the CUDA 12 line for CTranslate2.
+[dependency-groups]
 tts = [
     "kokoro-onnx>=0.6.1",
 ]
+
+[tool.uv]
+# What makes speech output survive a sync that does not mention it. See the
+# comment on the group itself for why it is not an extra.
+default-groups = ["tts"]
 
 [project.scripts]
 murmly = "murmly.cli:main"
