@@ -20,6 +20,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 import wave
 
 
@@ -543,18 +544,20 @@ class SilenceWhenRefusedTests(unittest.TestCase):
             played.append("chime")
             return "chime"
 
-        original_declare = announce.Session.declare
-        original_chime = announce.play_chime
-        announce.Session.declare = lambda self: refusal
-        announce.play_chime = chime
-        announce.Session.speak = lambda self, name, text: None
-        announce.Session.end = lambda self: None
-        announce.Session.wait_until_heard = lambda self: "spoken"
-        try:
+        # `patch.object` rather than assignment: these are class attributes on a
+        # module every other test in this file shares, and restoring them by
+        # hand is exactly the kind of thing that gets one name short. It did --
+        # `speak`, `end` and `wait_until_heard` stayed stubbed for the rest of
+        # the process, so any later test on the Session path would have run
+        # against the lambdas instead of the code.
+        with (
+            patch.object(announce.Session, "declare", lambda self: refusal),
+            patch.object(announce, "play_chime", chime),
+            patch.object(announce.Session, "speak", lambda self, name, text: None),
+            patch.object(announce.Session, "end", lambda self: None),
+            patch.object(announce.Session, "wait_until_heard", lambda self: "spoken"),
+        ):
             outcome = announce.announce("context", "spoken", announce.SOURCE_VOICE_NOTE)
-        finally:
-            announce.Session.declare = original_declare
-            announce.play_chime = original_chime
         return outcome, played
 
     def test_speech_output_unavailable_produces_no_notes(self) -> None:
