@@ -91,13 +91,19 @@ notes-then-silence this note is named for. On a current build the specific
 pattern this note describes — a daemon advertising a capability a background
 sync quietly removed, while never having built the model even once — is closed.
 
-A synthesizer that is already resident still skips this check, because
-residency is the proof. Something that breaks the runtime underneath an
-already-loaded model — deleted model files, an undone `onnxruntime` swap, a
-manual uninstall — still reaches `synthesize()` unchecked and still produces
-chime-then-silence. Hearing that symptom on a current build is evidence of one
-of those, not of the packaging hole; the table under "Read the chime as a
-probe" is still the right first move.
+A synthesizer that is already resident skips this check, because residency is
+the proof — and a resident one keeps speaking through the very breakage this
+note is about. Measured on 2026-08-30: with the model loaded, uninstalling
+`kokoro-onnx` out from under the daemon changed nothing, and the next
+announcement was spoken normally. The package is needed to construct the
+session, not to run it. Deleting the model files or undoing the `onnxruntime`
+swap behave the same way, for the same reason.
+
+So chime-then-silence on a current build is a much narrower signal than it was:
+it means synthesis failed *after* a probe passed at the declaration, which the
+packaging hole and the stale startup probe no longer explain. The table under
+"Read the chime as a probe" is still the right first move; what it points at now
+is a synthesis failure inside `synthesize()` rather than a missing install.
 
 **Fix:**
 
