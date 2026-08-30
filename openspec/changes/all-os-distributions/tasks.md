@@ -4,22 +4,22 @@ shippable on their own. See `design.md` — Migration Plan.
 
 ## 1. The platform layer
 
-- [ ] 1.1 Add `src/murmly/platform/__init__.py` with a `PlatformProfile` value carrying the operating system, processor architecture, C library where it is determinable, and — on Linux — the session type and desktop
-- [ ] 1.2 Resolve it from `sys.platform` plus a supplied environment mapping, defaulting to `os.environ`, so a test can construct any platform from any machine, matching the `env=` parameter every existing detector already takes
-- [ ] 1.3 Resolve it once per process and pass it, rather than re-resolving at each call site — this is the thing whose absence lets subsystems disagree
-- [ ] 1.4 Add a per-concern backend registry for each of: command channel, service management, hotkey registration, clipboard, paste injection, focus observation, overlay, and speech synthesis. Keep them separate registries: a hotkey is chosen by desktop on Linux and by operating system elsewhere, and one shared axis cannot express that
-- [ ] 1.5 Re-express `is_wayland_session`, `is_plasma_desktop`, `detect_overlay_backend` and `detect_desktop_session` as readings of the resolved profile rather than as independent detectors, keeping their existing signatures so nothing calling them changes yet
-- [ ] 1.6 Register every backend that exists today — Plasma hotkeys, systemd service, X11 focus, GTK4 overlay, the Wayland and X11 clipboard and injector lists — behind the registries, unchanged
-- [ ] 1.7 Refuse an unsupported operating system from `cli.main` before any command runs, naming the platform found and the platforms supported, and writing nothing
-- [ ] 1.8 Add the machine-capability check: refuse at startup, naming the runtime and the characteristic that has no build, where transcription's runtime is unavailable for this operating system, processor, or C library
+- [x] 1.1 Add `src/murmly/platform/__init__.py` with a `PlatformProfile` value carrying the operating system, processor architecture, C library where it is determinable, and — on Linux — the session type and desktop
+- [x] 1.2 Resolve it from `sys.platform` plus a supplied environment mapping, defaulting to `os.environ`, so a test can construct any platform from any machine, matching the `env=` parameter every existing detector already takes
+- [x] 1.3 Resolve it once per process and pass it, rather than re-resolving at each call site — this is the thing whose absence lets subsystems disagree
+- [x] 1.4 Add a per-concern backend registry for each of: command channel, service management, hotkey registration, clipboard, paste injection, focus observation, overlay, and speech synthesis. Keep them separate registries: a hotkey is chosen by desktop on Linux and by operating system elsewhere, and one shared axis cannot express that
+- [x] 1.5 Re-express `is_wayland_session`, `is_plasma_desktop`, `detect_overlay_backend` and `detect_desktop_session` as readings of the resolved profile rather than as independent detectors, keeping their existing signatures so nothing calling them changes yet
+- [x] 1.6 Register every backend that exists today — Plasma hotkeys, systemd service, X11 focus, GTK4 overlay, the Wayland and X11 clipboard and injector lists — behind the registries, unchanged
+- [x] 1.7 Refuse an unsupported operating system from `cli.main` before any command runs, naming the platform found and the platforms supported, and writing nothing
+- [x] 1.8 Add the machine-capability check: refuse at startup, naming the runtime and the characteristic that has no build, where transcription's runtime is unavailable for this operating system, processor, or C library
 
 ## 2. Paths, and the end of `os.getuid` on the import path
 
-- [ ] 2.1 Give `default_config_path`, `default_tts_model_dir` and `default_runtime_dir` a branch per platform, keeping the Linux answers byte-identical to what `config.py:139-166` produces today — an existing install must not see its configuration move
-- [ ] 2.2 Move `os.getuid()` inside the Linux branch, so importing `config` on Windows no longer raises
-- [ ] 2.3 Honour each platform's own environment override — `XDG_*` on Linux, and the platform equivalents elsewhere — and report the path actually in use rather than the default
-- [ ] 2.4 Report a location Murmly needs but cannot create or write by naming that location and what failed, rather than failing later somewhere that does not mention it
-- [ ] 2.5 Leave the transcription model cache where `huggingface_hub` puts it, and report the resolved path in diagnostics — moving it would strand the 1.6 GB already cached on every existing install
+- [x] 2.1 Give `default_config_path`, `default_tts_model_dir` and `default_runtime_dir` a branch per platform, keeping the Linux answers byte-identical to what `config.py:139-166` produces today — an existing install must not see its configuration move
+- [x] 2.2 Move `os.getuid()` inside the Linux branch, so importing `config` on Windows no longer raises
+- [x] 2.3 Honour each platform's own environment override — `XDG_*` on Linux, and the platform equivalents elsewhere — and report the path actually in use rather than the default
+- [x] 2.4 Report a location Murmly needs but cannot create or write by naming that location and what failed, rather than failing later somewhere that does not mention it
+- [x] 2.5 Leave the transcription model cache where `huggingface_hub` puts it, and report the resolved path in diagnostics — moving it would strand the 1.6 GB already cached on every existing install
 - [ ] 2.6 Resolve the announce hook's socket path through the same platform resolution instead of its own copy of the `XDG_RUNTIME_DIR` fallback (`hooks/murmly-announce.py:58-60`)
 
 ## 3. Linux stops being Fedora
@@ -156,11 +156,11 @@ shippable on their own. See `design.md` — Migration Plan.
 
 ## 18. Tests
 
-- [ ] 18.1 Make `PlatformProfile` a value tests construct, and exercise every backend registry for every platform from any machine — the suite has no `sys.platform` check anywhere today because it never needed one
-- [ ] 18.2 Test that the resolution answers for a supplied environment rather than the process's own
-- [ ] 18.3 Test that an unsupported operating system is refused before any file is written
-- [ ] 18.4 Test that a machine with no transcription runtime is refused at startup naming the runtime and the characteristic, and that a machine missing anything else starts with that capability reported unavailable
-- [ ] 18.5 Test that the Linux configuration, data and runtime paths are byte-identical to what they are today, for every combination of `XDG_*` set and unset
+- [x] 18.1 Make `PlatformProfile` a value tests construct, and exercise every backend registry for every platform from any machine — the suite has no `sys.platform` check anywhere today because it never needed one
+- [x] 18.2 Test that the resolution answers for a supplied environment rather than the process's own
+- [x] 18.3 Test that an unsupported operating system is refused before any file is written
+- [x] 18.4 Test that a machine with no transcription runtime is refused at startup naming the runtime and the characteristic, and that a machine missing anything else starts with that capability reported unavailable
+- [x] 18.5 Test that the Linux configuration, data and runtime paths are byte-identical to what they are today, for every combination of `XDG_*` set and unset
 - [ ] 18.6 Test the Windows pipe's security descriptor by reading back its DACL and asserting it names only the creating user's SID — a second account is not available in CI
 - [ ] 18.7 Test that peer identity is read by the resolved platform's mechanism and that the same rule is applied to the result
 - [ ] 18.8 Test the GNOME backend against a fake command runner: binding written, read back, conflict refused, and removal taking out exactly what was added

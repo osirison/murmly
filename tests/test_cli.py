@@ -29,11 +29,13 @@ from murmly.cli import (
     measure_partial_pass_ms,
     overlay_diagnostics,
     paste_injection_diagnostics,
+    transcription_model_cache_path,
 )
 from murmly.config import MurmlyConfig
 from murmly.daemon import DaemonNotRespondingError, DaemonStartupError, MurmlyDaemon
 from murmly.integrations import PasteInjection
 from murmly.overlay import OverlayBackend, OverlayHealth, renderer_environment
+from murmly.platform import OperatingSystem, PlatformProfile, RuntimeGap
 from murmly.stt import FasterWhisperTranscriber
 
 
@@ -101,6 +103,70 @@ class CliTests(unittest.TestCase):
         self.assertEqual("auto", report["compute_type"])
         self.assertEqual("cuda", report["runtime_device"])
         self.assertEqual("float16", report["runtime_compute_type"])
+
+    def test_doctor_reports_the_transcription_model_cache_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "auto")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
+                patch(
+                    "murmly.cli.transcription_model_cache_path",
+                    return_value=("/tmp/hf-cache/hub", None),
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertEqual("/tmp/hf-cache/hub", report["model_cache_path"])
+        self.assertNotIn("model_cache_detail", report)
+
+    def test_an_unresolvable_model_cache_is_named_rather_than_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "auto")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
+                patch(
+                    "murmly.cli.transcription_model_cache_path",
+                    return_value=(None, "Unable to determine the transcription model cache: boom"),
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIsNone(report["model_cache_path"])
+        self.assertIn("boom", report["model_cache_detail"])
+
+    def test_the_transcription_model_cache_path_asks_huggingface_hub(self) -> None:
+        """2.5: the cache stays wherever `huggingface_hub` itself resolves it,
+
+        not somewhere `murmly` derives on its own -- moving it would strand
+        the 1.6 GB an existing install already has cached under the Hub's own
+        answer.
+        """
+        import huggingface_hub.constants as hf_constants
+
+        path, detail = transcription_model_cache_path()
+
+        self.assertIsNone(detail)
+        self.assertEqual(hf_constants.HF_HUB_CACHE, path)
 
     def test_paste_injection_diagnostics_names_the_method_when_it_can_inject(self) -> None:
         report = paste_injection_diagnostics(
@@ -996,6 +1062,171 @@ class UnhandledFailureTests(unittest.TestCase):
             main(["not-a-command"])
 
 
+class UnsupportedPlatformTests(unittest.TestCase):
+    """An operating system Murmly does not support is refused before anything runs (1.7, 18.3)."""
+
+    def _unsupported_profile(self) -> PlatformProfile:
+        return PlatformProfile(operating_system=OperatingSystem.OTHER, architecture="x86_64")
+
+    def test_install_is_refused_naming_the_platform_and_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Never created: a refusal that ran must not have to create the
+            # directory a config file would live in before it can be missing.
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                patch("murmly.cli.Installer") as installer,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "install", "Meta+X"])
+
+            self.assertEqual(1, exit_code)
+            reported = errors.getvalue()
+            self.assertIn("other", reported)
+            self.assertIn("linux", reported)
+            installer.assert_not_called()
+            self.assertEqual([], os.listdir(temp_dir), "a refused platform must write nothing")
+
+    def test_daemon_is_refused_before_the_config_is_even_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                patch("murmly.cli.MurmlyDaemon") as daemon,
+                patch("murmly.cli.leave_without_finalizing") as leave,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "daemon"])
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("other", errors.getvalue())
+            daemon.assert_not_called()
+            leave.assert_called_once_with(1)
+            self.assertEqual([], os.listdir(temp_dir))
+
+    def test_doctor_is_refused_too(self) -> None:
+        """Every command is refused, not only the ones that write files.
+
+        Pins spec.md's "An unsupported operating system" scenario literally:
+        it says every command, doctor included. If a later diagnostics change
+        wants doctor to run anyway and explain the refusal itself, that is a
+        spec change, not a fix to this test.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "doctor"])
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("other", errors.getvalue())
+            self.assertEqual([], os.listdir(temp_dir))
+
+    def test_toggle_is_refused_without_starting_the_service(self) -> None:
+        """The command most likely to run unattended: a hotkey press.
+
+        `toggle` reaches `send_command_with_recovery`, which can start the
+        installed systemd service when nothing answers on the socket. An
+        unsupported platform must be refused before that recovery path ever
+        runs, not merely before the commands that obviously write files.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                patch("murmly.cli.send_command_with_recovery") as send,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "toggle"])
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("other", errors.getvalue())
+            send.assert_not_called()
+            self.assertEqual([], os.listdir(temp_dir))
+
+    def test_a_supported_platform_is_not_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            supported = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+            with (
+                patch("murmly.cli.resolve_platform", return_value=supported),
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
+                redirect_stdout(StringIO()),
+            ):
+                exit_code = main(["--config", str(config_path), "doctor"])
+
+            self.assertEqual(0, exit_code)
+
+
+class TranscriptionRuntimeGapTests(unittest.TestCase):
+    """The machine-capability check refuses the daemon before it is constructed (1.8, 18.4)."""
+
+    def _config(self, temp_dir: str) -> MurmlyConfig:
+        return MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+
+    def test_a_missing_transcription_runtime_refuses_before_the_daemon_is_built(self) -> None:
+        from murmly.cli import _serve_daemon
+
+        gap = RuntimeGap(
+            runtime="ctranslate2",
+            characteristic="a musl C library",
+            capability="transcription",
+            matches=lambda profile: True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("murmly.cli.transcription_runtime_gap", return_value=gap),
+                patch("murmly.cli.MurmlyDaemon") as daemon,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = _serve_daemon(
+                    self._config(temp_dir),
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                )
+
+        self.assertEqual(1, exit_code)
+        daemon.assert_not_called()
+        reported = errors.getvalue()
+        self.assertIn("ctranslate2", reported)
+        self.assertIn("musl", reported)
+
+    def test_a_gap_outside_transcription_starts_and_reports_the_capability_unavailable(self) -> None:
+        from murmly.cli import _serve_daemon
+
+        other_gap = RuntimeGap(
+            runtime="onnxruntime",
+            characteristic="a fictional architecture",
+            capability="speech synthesis",
+            matches=lambda profile: True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_daemon = Mock()
+            fake_daemon.serve_forever.return_value = None
+            with (
+                patch("murmly.cli.transcription_runtime_gap", return_value=None),
+                patch("murmly.cli.runtime_gaps_for", return_value=(other_gap,)),
+                patch("murmly.cli.MurmlyDaemon", return_value=fake_daemon) as daemon,
+                self.assertLogs("murmly.cli", level="WARNING") as logs,
+            ):
+                exit_code = _serve_daemon(
+                    self._config(temp_dir),
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                )
+
+        self.assertEqual(0, exit_code)
+        daemon.assert_called_once()
+        fake_daemon.serve_forever.assert_called_once()
+        joined = " ".join(logs.output)
+        self.assertIn("speech synthesis", joined)
+        self.assertIn("onnxruntime", joined)
+        self.assertIn("unavailable", joined)
+
+
 class DoctorCompletenessTests(unittest.TestCase):
     """`murmly doctor` reports every section it can and explains the ones it cannot."""
 
@@ -1008,6 +1239,7 @@ class DoctorCompletenessTests(unittest.TestCase):
         "paste_injection",
         "model_profile",
         "model_name",
+        "model_cache_path",
         "device",
         "compute_type",
         "runtime_device",

@@ -2808,6 +2808,36 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIn(str(socket_path), str(refusal.exception))
         self.assertTrue(overlay.closed)
 
+    @unittest.skipIf(os.getuid() == 0, "root is not bound by directory permissions")
+    def test_an_uncreatable_runtime_directory_names_the_location_and_the_cause(self) -> None:
+        """2.4: a location Murmly needs and cannot create names itself and why.
+
+        `create_socket_directory` raises a bare `OSError` naming the directory
+        it tried and failed to make; `serve_forever` is what turns that into a
+        `DaemonStartupError` that also names the socket path Murmly was asked
+        to serve at, so the refusal is legible without reading `daemon.py`.
+        """
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        parent = Path(temp_dir.name) / "murmly"
+        parent.mkdir()
+        parent.chmod(0o500)
+        self.addCleanup(parent.chmod, 0o700)
+        socket_path = parent / "nested" / "murmly.sock"
+        config = MurmlyConfig(
+            socket_path=socket_path,
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+        daemon = MurmlyDaemon(config, session=DummySession())
+
+        with self.assertRaises(DaemonStartupError) as refusal:
+            daemon.serve_forever()
+
+        message = str(refusal.exception)
+        self.assertIn(str(socket_path), message)
+        self.assertIn("could not be created", message)
+
     def test_a_symlink_does_not_hide_the_directory_it_is_reached_through(self) -> None:
         # A caller opens the configured path, so the link is what it reaches
         # through. Judging only what the path resolves to leaves the directory

@@ -19,7 +19,8 @@ import json
 import os
 import subprocess
 
-from murmly.overlay import OverlayBackend, detect_overlay_backend, is_plasma_desktop
+from murmly.overlay import OverlayBackend, detect_overlay_backend
+from murmly.platform import Desktop, resolve_platform
 
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
@@ -79,8 +80,9 @@ class DesktopSession:
 
 def detect_desktop_session(environment: dict[str, str] | None = None) -> DesktopSession:
     source = environment if environment is not None else os.environ
-    session_type = source.get("XDG_SESSION_TYPE", "").casefold() or "unknown"
-    plasma = is_plasma_desktop(source)
+    profile = resolve_platform(source)
+    session_type = profile.session_type or "unknown"
+    plasma = profile.desktop is Desktop.PLASMA
     backend = detect_overlay_backend(source)
 
     if not plasma:

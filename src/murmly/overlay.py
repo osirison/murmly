@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Protocol
 
+from murmly.platform import Desktop, resolve_platform
+
 
 logger = logging.getLogger(__name__)
 
@@ -151,22 +153,21 @@ def encode_overlay_message(message: dict[str, object]) -> bytes:
 
 def is_plasma_desktop(environment: dict[str, str] | None = None) -> bool:
     source = environment if environment is not None else os.environ
-    desktop = f"{source.get('XDG_CURRENT_DESKTOP', '')}:{source.get('XDG_SESSION_DESKTOP', '')}"
-    return any(name in desktop.casefold() for name in ("kde", "plasma"))
+    return resolve_platform(source).desktop is Desktop.PLASMA
 
 
 def detect_overlay_backend(environment: dict[str, str] | None = None) -> OverlayBackend | None:
     source = environment if environment is not None else os.environ
-    if not is_plasma_desktop(source):
+    profile = resolve_platform(source)
+    if profile.desktop is not Desktop.PLASMA:
         return None
-    session_type = source.get("XDG_SESSION_TYPE", "").casefold()
-    if session_type == "wayland":
-        return OverlayBackend.WAYLAND if source.get("WAYLAND_DISPLAY") else None
-    if session_type == "x11":
-        return OverlayBackend.X11 if source.get("DISPLAY") else None
-    if not session_type and source.get("WAYLAND_DISPLAY"):
+    if profile.session_type == "wayland":
+        return OverlayBackend.WAYLAND if profile.wayland_display else None
+    if profile.session_type == "x11":
+        return OverlayBackend.X11 if profile.x11_display else None
+    if not profile.session_type and profile.wayland_display:
         return OverlayBackend.WAYLAND
-    if not session_type and source.get("DISPLAY"):
+    if not profile.session_type and profile.x11_display:
         return OverlayBackend.X11
     return None
 

@@ -55,6 +55,15 @@ import sys
 import tempfile
 import wave
 
+#: Deliberately its own copy of `murmly.config.default_socket_path`'s Linux
+#: branch rather than an import of it: `install_hooks.py` copies this script
+#: out of the checkout and registers it to run under the system Python with no
+#: virtual environment (see `setup.sh`'s `install_announce_hook`), so `murmly`
+#: is not on its import path -- and may not even exist on disk any more by the
+#: time this runs, since the checkout it was copied from is not required to
+#: survive the install. `openspec/changes/all-os-distributions/tasks.md` task
+#: 2.6 asked for this to resolve through the platform layer instead; it stays
+#: this way because there is no import path from here to reach it.
 SOCKET_PATH = os.environ.get(
     "MURMLY_SOCKET", f"{os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/murmly.sock"
 )

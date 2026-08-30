@@ -9,6 +9,8 @@ from shutil import which as shutil_which
 import subprocess
 import time
 
+from murmly.platform import resolve_platform
+
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +94,8 @@ X11_INJECTORS = (InjectorCandidate("xdotool", ("xdotool", "key", "--clearmodifie
 
 def is_wayland_session(env: dict[str, str] | None = None) -> bool:
     environment = env or os.environ
-    session_type = environment.get("XDG_SESSION_TYPE", "").lower()
-    return bool(environment.get("WAYLAND_DISPLAY")) or session_type == "wayland"
+    profile = resolve_platform(environment)
+    return profile.wayland_display or profile.session_type == "wayland"
 
 
 def choose_clipboard_copy_command(

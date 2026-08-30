@@ -48,10 +48,20 @@ from murmly.integrations import (
 )
 from murmly.focus import FocusObserver, create_focus_observer, record_target, should_deliver
 from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend, renderer_environment
+from murmly.platform import (
+    PlatformProfile,
+    SUPPORTED_OPERATING_SYSTEMS,
+    resolve_platform,
+    transcription_runtime_gap,
+    runtime_gaps_for,
+    TRANSCRIPTION_CAPABILITY,
+)
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
 from murmly.tts import CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
 
+
+logger = logging.getLogger(__name__)
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -203,7 +213,36 @@ def main(argv: list[str] | None = None) -> int:
     return exit_code
 
 
+def _unsupported_platform_message(profile: PlatformProfile) -> str | None:
+    """None when `profile` is one Murmly supports; otherwise the refusal text.
+
+    Checked before any command touches a config path, a socket, or a file: a
+    partial install on a platform Murmly cannot run on is worse than none,
+    because the uninstaller for that platform does not exist to remove it.
+    """
+    if profile.supported:
+        return None
+    supported = ", ".join(supported_os.value for supported_os in SUPPORTED_OPERATING_SYSTEMS)
+    return (
+        f"murmly: unsupported platform: {profile.operating_system.value}. "
+        f"Murmly supports: {supported}."
+    )
+
+
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    # Resolved once and passed on from here, rather than re-resolved at each
+    # command below: this is the one call site in `cli.py` written for the
+    # platform layer, and it is what lets the refusal below run before
+    # `load_config()` touches a config path, a socket, or a file on a platform
+    # Murmly does not support. `default_runtime_dir`'s `os.getuid()` no longer
+    # raises there -- it sits behind a Linux branch now -- but a partial run on
+    # an unsupported platform is still worth refusing before it starts.
+    profile = resolve_platform()
+    unsupported = _unsupported_platform_message(profile)
+    if unsupported is not None:
+        print(unsupported, file=sys.stderr)
+        return 1
+
     config_path = Path(args.config) if args.config else default_config_path()
     try:
         config = load_config(args.config)
@@ -212,7 +251,7 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return 1
 
     if args.command == "daemon":
-        return _run_daemon(config)
+        return _run_daemon(config, profile)
     if args.command in {"toggle", "status", "toggle-session"}:
         # The daemon's command vocabulary is not the CLI's: argparse spells a
         # subcommand with a hyphen and the wire protocol does not.
@@ -360,18 +399,50 @@ def _run_uninstall() -> int:
     return 0
 
 
-def _run_daemon(config: MurmlyConfig) -> int:
+def _run_daemon(config: MurmlyConfig, profile: PlatformProfile | None = None) -> int:
     # Wrapped rather than placed in the inner unwinding below, because every
     # return from here is the daemon process on its way out: a clean stop, a
     # startup refusal, and an exception climbing to the top all reach the exit
     # where PortAudio's teardown would otherwise run.
     try:
-        return _serve_daemon(config)
+        return _serve_daemon(config, profile)
     finally:
         disable_portaudio_exit_teardown()
 
 
-def _serve_daemon(config: MurmlyConfig) -> int:
+def _serve_daemon(config: MurmlyConfig, profile: PlatformProfile | None = None) -> int:
+    # Resolved here rather than only in `_dispatch`, so a caller that reaches
+    # `_run_daemon` directly -- every existing test does -- still gets the
+    # check without having to supply a profile of its own.
+    resolved = profile if profile is not None else resolve_platform()
+
+    gap = transcription_runtime_gap(resolved)
+    if gap is not None:
+        # The runtime's own load error is never what is shown here: it would
+        # name a missing package rather than the machine characteristic that
+        # has no build of it, and a person reading it cannot act on a loader
+        # error the way they can act on "no build exists for a musl C
+        # library".
+        print(
+            f"murmly: refusing to start. No {gap.runtime} build exists for "
+            f"{gap.characteristic}, and transcription is what Murmly is.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Everything else missing a runtime build degrades rather than refusing:
+    # the daemon still starts and serves capture, transcription and delivery,
+    # and each such capability is only logged here. `murmly doctor` is where
+    # this becomes a report a person reads (section 6), not built yet.
+    for other_gap in runtime_gaps_for(resolved):
+        if other_gap.capability != TRANSCRIPTION_CAPABILITY:
+            logger.warning(
+                "%s is unavailable: no %s build exists for %s.",
+                other_gap.capability,
+                other_gap.runtime,
+                other_gap.characteristic,
+            )
+
     try:
         daemon = MurmlyDaemon(config)
     except DaemonStartupError as error:
@@ -446,6 +517,8 @@ def _run_doctor(config: MurmlyConfig) -> None:
             "remedy": [],
         }
 
+    model_cache_path, model_cache_detail = transcription_model_cache_path()
+
     # Guarded like every other probe: this is the exact misconfiguration the
     # command exists to explain, and a report that stops here withholds it.
     runtime_detail: str | None = None
@@ -500,6 +573,7 @@ def _run_doctor(config: MurmlyConfig) -> None:
         "paste_injection": injection_report,
         "model_profile": config.model_profile,
         "model_name": config.model_name,
+        "model_cache_path": model_cache_path,
         "device": config.device,
         "compute_type": config.compute_type,
         "runtime_device": runtime_device,
@@ -523,7 +597,30 @@ def _run_doctor(config: MurmlyConfig) -> None:
         report["runtime_detail"] = runtime_detail
     if model_resident_detail is not None:
         report["model_resident_detail"] = model_resident_detail
+    if model_cache_detail is not None:
+        report["model_cache_detail"] = model_cache_detail
     print(json.dumps(report, indent=2))
+
+
+def transcription_model_cache_path() -> tuple[str | None, str | None]:
+    """Where `huggingface_hub` resolves its cache, and nothing this reports could
+    have moved.
+
+    Deliberately not one of Murmly's own locations: `faster-whisper` downloads
+    the transcription model through `huggingface_hub`, whose own default --
+    `~/.cache/huggingface/hub` on every operating system, not
+    `~/Library/Caches` and not `%LOCALAPPDATA%` -- would be re-derived wrongly by
+    guessing at it here, and moving it with `WhisperModel(download_root=)` would
+    strand the 1.6 GB an existing install already has cached under the Hub's own
+    answer. So this asks `huggingface_hub` for the path it actually resolved to,
+    through a deferred import: `murmly doctor` should not pay to import it on a
+    machine where transcription never runs.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return None, f"Unable to determine the transcription model cache: {error}"
+    return HF_HUB_CACHE, None
 
 
 def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:

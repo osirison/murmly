@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import os
 import re
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import murmly.config
 
@@ -29,7 +32,11 @@ from murmly.config import (
     MIN_OVERLAY_TEXT_SIZE_PX,
     MIN_SILENCE_MS,
     MIN_UNLOAD_AFTER_IDLE_S,
+    WINDOWS_PIPE_NAME,
+    default_config_path,
+    default_runtime_dir,
     default_socket_path,
+    default_tts_model_dir,
     load_config,
 )
 
@@ -534,6 +541,105 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(0, config.unload_after_idle_s)
         self.assertEqual(900, config.tts_unload_after_idle_s)
+
+
+class LinuxPathsAreUnmovedTests(unittest.TestCase):
+    """18.5: the platform branches must not move an existing Linux install.
+
+    Every expected path is written as a literal here, not derived by calling
+    the functions under test, so a change to those functions cannot make this
+    test agree with whatever they now say.
+    """
+
+    def test_every_xdg_combination_resolves_exactly_as_it_did_before(self) -> None:
+        home = Path.home()
+        uid_runtime_dir = Path(f"/run/user/{os.getuid()}")
+
+        # Each of the three overrides is independently set or unset, for every
+        # one of the eight combinations. `env` always carries an unrelated key
+        # so an "unset" combination is never the empty dict: `default_*`'s
+        # `env or os.environ` treats `{}` as falsy and would silently read the
+        # real process environment instead of the combination under test.
+        for config_home, data_home, runtime_dir in itertools.product(
+            ("/tmp/murmly-test-config", None),
+            ("/tmp/murmly-test-data", None),
+            ("/tmp/murmly-test-runtime", None),
+        ):
+            env = {"MURMLY_TEST_UNRELATED": "1"}
+            if config_home is not None:
+                env["XDG_CONFIG_HOME"] = config_home
+            if data_home is not None:
+                env["XDG_DATA_HOME"] = data_home
+            if runtime_dir is not None:
+                env["XDG_RUNTIME_DIR"] = runtime_dir
+
+            expected_config_path = (
+                Path(config_home) / "murmly" / "config.toml"
+                if config_home is not None
+                else home / ".config" / "murmly" / "config.toml"
+            )
+            expected_data_dir = (
+                Path(data_home) / "murmly" if data_home is not None else home / ".local" / "share" / "murmly"
+            )
+            expected_runtime_dir = Path(runtime_dir) if runtime_dir is not None else uid_runtime_dir
+            expected_socket_path = expected_runtime_dir / "murmly.sock"
+
+            with self.subTest(config_home=config_home, data_home=data_home, runtime_dir=runtime_dir):
+                self.assertEqual(expected_config_path, default_config_path(env))
+                self.assertEqual(expected_data_dir, default_tts_model_dir(env))
+                self.assertEqual(expected_runtime_dir, default_runtime_dir(env))
+                self.assertEqual(expected_socket_path, default_socket_path(env))
+
+
+class WindowsAndMacOSPathTests(unittest.TestCase):
+    """2.1, 2.2: the other two branches, and that Windows never reaches getuid."""
+
+    def test_windows_paths_use_appdata_and_never_call_getuid(self) -> None:
+        env = {
+            "APPDATA": r"C:\Users\a\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\a\AppData\Local",
+        }
+        with (
+            patch("sys.platform", "win32"),
+            patch(
+                "murmly.config.os.getuid",
+                side_effect=AssertionError("os.getuid() must not run on Windows"),
+            ),
+        ):
+            self.assertEqual(
+                Path(r"C:\Users\a\AppData\Roaming") / "murmly" / "config.toml",
+                default_config_path(env),
+            )
+            self.assertEqual(
+                Path(r"C:\Users\a\AppData\Local") / "murmly",
+                default_tts_model_dir(env),
+            )
+            self.assertIsNone(default_runtime_dir(env))
+            self.assertEqual(Path(WINDOWS_PIPE_NAME), default_socket_path(env))
+
+            # The whole read path, not only the functions in isolation: this is
+            # the failure task 2.2 exists to prevent, reached through the entry
+            # point a Windows invocation actually uses.
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config = load_config(Path(temp_dir) / "missing.toml", env)
+            self.assertEqual(Path(WINDOWS_PIPE_NAME), config.socket_path)
+
+    def test_macos_paths_use_the_library_directories(self) -> None:
+        with patch("sys.platform", "darwin"):
+            home = Path.home()
+            self.assertEqual(
+                home / "Library" / "Application Support" / "murmly" / "config.toml",
+                default_config_path({}),
+            )
+            self.assertEqual(
+                home / "Library" / "Application Support" / "murmly",
+                default_tts_model_dir({}),
+            )
+            self.assertEqual(home / "Library" / "Caches" / "murmly", default_runtime_dir({}))
+            self.assertEqual(
+                home / "Library" / "Caches" / "murmly" / "murmly.sock",
+                default_socket_path({}),
+            )
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
