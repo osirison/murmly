@@ -61,6 +61,21 @@ tts = [
     "kokoro-onnx>=0.6.1",
 ]
 
+# The documentation site generator. Deliberately not a default group: a
+# developer's plain `uv sync` and the CI test matrix must be unchanged by it,
+# so it is installed only by `uv sync --only-group docs`, which is what the
+# Pages workflow runs. Every package it pulls in is a pure-Python wheel.
+#
+# mkdocs is pinned below 2 on purpose. Material prints a warning on every build
+# that MkDocs 2.0 removes the plugin system, rewrites theming, offers no
+# migration path, and is currently unlicensed. Until that settles, crossing
+# that major version should be a deliberate uv.lock diff rather than a
+# resolver's choice.
+docs = [
+    "mkdocs>=1.6.1,<2",
+    "mkdocs-material>=9.7,<10",
+]
+
 [tool.uv]
 # What makes speech output survive a sync that does not mention it. See the
 # comment on the group itself for why it is not an extra.

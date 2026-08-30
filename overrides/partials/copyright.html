@@ -1,0 +1,16 @@
+{#-
+  Replaces the theme's own footer credit.
+
+  Material's shipped partial ends with a link to squidfunk.github.io, which is
+  the only off-origin href the built HTML would otherwise carry. Every page of
+  this site must reference nothing but the host serving it, so the credit goes
+  and the licence Material is used under is carried in the repository instead,
+  under licenses/.
+-#}
+<div class="md-copyright">
+  {% if config.copyright %}
+    <div class="md-copyright__highlight">
+      {{ config.copyright }}
+    </div>
+  {% endif %}
+</div>

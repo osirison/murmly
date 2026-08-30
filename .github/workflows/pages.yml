@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - "site/**"
+      - "manual/**"
+      - "overrides/**"
+      - "mkdocs.yml"
+      - "pyproject.toml"
+      - "uv.lock"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -35,14 +40,158 @@ jobs:
       - name: Configure Pages
         uses: actions/configure-pages@v5
 
-      # site/ is published exactly as committed. There is no generator and
-      # nothing to install: the page is hand-authored HTML, CSS and SVG, so a
-      # build step would only give the published bytes a chance to differ from
-      # the reviewed ones.
-      - name: Upload site/
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      # --only-group docs is what keeps this runner small: 29 pure-Python
+      # wheels, no faster-whisper, no onnxruntime, no CUDA, and not the project
+      # itself. --locked fails if pyproject.toml and uv.lock have drifted, so
+      # the toolchain that renders the manual is the one that was reviewed.
+      - name: Install the documentation toolchain
+        run: uv sync --locked --only-group docs
+
+      # --no-sync, not a bare `uv run`. `uv run` syncs first, and a plain sync
+      # installs the whole ML runtime -- faster-whisper, onnxruntime, the
+      # synthesizer -- into a runner that is here to render Markdown.
+      #
+      # strict: true in mkdocs.yml turns a link to a page that does not exist,
+      # or a configuration key MkDocs does not recognise, into a failed build,
+      # and a failed build never reaches the deploy step below.
+      - name: Build the manual
+        run: uv run --no-sync mkdocs build
+
+      # site/ is still published exactly as committed: the landing page is
+      # hand-authored HTML, CSS and SVG with no generator between the reviewed
+      # bytes and the served ones. It is copied over the generated manual here,
+      # and the diff at the end of this step proves the copy changed nothing.
+      #
+      # The mark and the favicon are copied out of site/assets/ rather than
+      # duplicated in the repository, so there is exactly one of each to keep
+      # in step. mkdocs.yml names them under theme.logo and theme.favicon.
+      #
+      # Material writes its own assets/images/favicon.png even when
+      # theme.favicon names another file. Nothing links to it, but the artifact
+      # must carry no mark belonging to the theme, so it goes.
+      - name: Assemble the artifact
+        run: |
+          set -euo pipefail
+          cp -r site/. _pages/
+          cp site/assets/murmly-mark.svg site/assets/favicon.ico _pages/manual/assets/
+          cp _pages/manual/404.html _pages/404.html
+          rm -f _pages/manual/assets/images/favicon.png
+          # Every file outside the generated manual must be byte-identical to
+          # its committed source. 404.html is excluded because it is generated
+          # and then placed at the root, where site/ has no counterpart.
+          diff -r site _pages --exclude=manual --exclude=404.html
+
+      # docs/agent-notes/ is internal. mkdocs.yml points the generator at
+      # manual/, so a note cannot be published by being added to a directory
+      # the build happens to read -- but the artifact is what is served, so the
+      # assertion runs against the artifact rather than against the sources.
+      - name: Assert no internal notes were published
+        run: |
+          set -euo pipefail
+          if find _pages -name '*agent-note*' | grep -q .; then
+            echo "A file named after an internal note reached the artifact:" >&2
+            find _pages -name '*agent-note*' >&2
+            exit 1
+          fi
+          if grep -rql 'agent-notes' _pages; then
+            echo "The artifact references docs/agent-notes/:" >&2
+            grep -rl 'agent-notes' _pages >&2
+            exit 1
+          fi
+
+      # A one-line typo in mkdocs.yml is the whole failure mode for two
+      # separate guarantees, so both are asserted here rather than trusted.
+      #
+      # Comments are stripped before the search: mkdocs.yml names every
+      # forbidden key in a comment block explaining what each one breaks, and
+      # that block must not trip the check that enforces it.
+      - name: Assert the generator configuration is still safe
+        run: |
+          set -euo pipefail
+          sed 's/[[:space:]]*#.*$//' mkdocs.yml > /tmp/mkdocs.nocomments.yml
+
+          if ! grep -q '^docs_dir: manual$' /tmp/mkdocs.nocomments.yml; then
+            echo "docs_dir is no longer manual/. docs/agent-notes/ could be published." >&2
+            exit 1
+          fi
+
+          # Each of these writes to persistent browser storage or fetches from
+          # a third-party host at view time. See the comment block in
+          # mkdocs.yml for what each one breaks.
+          #   repo_url            -- api.github.com at view time, and a star count
+          #   palette with toggle -- writes __palette
+          #   content.tabs.link   -- writes __tabs
+          #   announce.dismiss    -- writes __announce
+          #   extra.version       -- writes __outdated
+          #   extra.consent       -- writes __consent
+          for forbidden in 'docs_dir: docs' 'repo_url' 'palette' 'content\.tabs\.link' \
+                           'announce\.dismiss' 'version:' 'consent:'; do
+            if grep -qE "$forbidden" /tmp/mkdocs.nocomments.yml; then
+              echo "mkdocs.yml contains a forbidden key: $forbidden" >&2
+              exit 1
+            fi
+          done
+
+      # Every page must request nothing from any host but the one serving it.
+      # This checks resource references -- what the browser fetches -- rather
+      # than every href: the manual's navigation links out to the landing page
+      # and to the source repository on purpose, and a link a reader chooses to
+      # follow is not a request the page makes.
+      #
+      # CSS is checked as well as HTML. Material embeds its icons as data: URIs
+      # inside its stylesheet, which is where an off-origin font or image would
+      # hide from a check that only read the markup.
+      - name: Assert every page loads from this origin alone
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          ORIGIN = "osirison.github.io"
+          root = pathlib.Path("_pages")
+
+          # src=, srcset= and <link href= in HTML; url() and @import in CSS.
+          html_res = re.compile(r'(?:src|srcset)\s*=\s*"([^"]*)"|<link\b[^>]*?href\s*=\s*"([^"]*)"', re.I)
+          css_res = re.compile(r'url\(\s*["\']?([^)"\']*)|@import\s+["\']([^"\']*)', re.I)
+
+          offenders = []
+          for path in sorted(root.rglob("*")):
+              if not path.is_file():
+                  continue
+              if path.suffix.lower() == ".html":
+                  pattern = html_res
+              elif path.suffix.lower() == ".css":
+                  pattern = css_res
+              else:
+                  continue
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for match in pattern.finditer(text):
+                  ref = next(g for g in match.groups() if g is not None)
+                  ref = ref.strip()
+                  if not ref.startswith(("http://", "https://", "//")):
+                      continue
+                  host = ref.split("//", 1)[1].split("/", 1)[0]
+                  if host != ORIGIN:
+                      offenders.append(f"{path}: {ref}")
+
+          if offenders:
+              print("Resource references naming another host:", file=sys.stderr)
+              for line in offenders:
+                  print("  " + line, file=sys.stderr)
+              sys.exit(1)
+          print("No resource on any page names a host other than " + ORIGIN + ".")
+          PY
+
+      - name: Upload the artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site/
+          path: _pages/
 
       - name: Deploy
         id: deployment

@@ -10,3 +10,7 @@ dist/
 # branch, not content of this one, and `git add -A` otherwise commits it as a
 # stray submodule reference.
 .worktrees/
+
+# The assembled Pages artifact: site/ copied over the generated manual. Built in
+# CI from committed sources, never committed itself.
+_pages/

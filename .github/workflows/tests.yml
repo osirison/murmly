@@ -60,6 +60,33 @@ jobs:
       - name: Run the suite
         run: uv run --no-sync python -m unittest discover -s tests
 
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      # The same two commands the Pages workflow runs, so a broken cross-link
+      # or an unrecognised configuration key fails on the pull request rather
+      # than on the deploy that follows the merge -- strict: true in mkdocs.yml
+      # is what turns either into a failure.
+      #
+      # This job builds the manual and throws it away. Publication runs only
+      # from the default branch, in pages.yml, and does not wait on this job or
+      # on the Python matrix above.
+      - name: Build the manual
+        run: |
+          uv sync --locked --only-group docs
+          uv run --no-sync mkdocs build
+
   specs:
     name: openspec
     runs-on: ubuntu-latest
