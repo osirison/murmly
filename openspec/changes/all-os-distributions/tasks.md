@@ -179,13 +179,15 @@ shippable on their own. See `design.md` — Migration Plan.
 ## 19. Documentation and the project page
 
 - [ ] 19.1 Edit the `recording-overlay` capability's `## Purpose` line in `openspec/specs/recording-overlay/spec.md` directly — a delta's Purpose is ignored for an existing capability, so it does not change at archive time
-- [ ] 19.2 Rewrite the README's Requirements, Install and Scope sections to describe three platforms rather than one distribution, keeping the KDE and Wayland detail as one platform's entry rather than the whole story
-- [ ] 19.3 State the three machines that cannot run Murmly — musl Linux, Windows on ARM, Intel macOS — with the runtime and the reason for each, and state macOS support as Apple Silicon on macOS 14 or newer
-- [ ] 19.4 Document each platform's permissions: the macOS Accessibility grant for pasting, the macOS microphone grant, and the Windows microphone privacy settings
-- [ ] 19.5 Document that pasting into an elevated window on Windows silently does nothing, in the same place the KDE input-consent dialog is documented, since it is the same class of failure
-- [ ] 19.6 Update `pyproject.toml`'s description and the README's opening: Murmly is no longer Fedora-first
-- [ ] 19.7 Update the project page to state what it now has to state: the supported operating systems, the permissions each asks for, the per-platform hotkey and overlay status, and which platforms each capability is verified on
-- [ ] 19.8 Record a field note for anything that turns out to need an undocumented precondition on Windows or macOS
+- [ ] 19.2 Rewrite `manual/what-you-need.md` to describe three platforms rather than one distribution, keeping the KDE and Wayland detail as one platform's entry rather than the whole story
+- [ ] 19.3 State the three machines that cannot run Murmly — musl Linux, Windows on ARM, Intel macOS — with the runtime and the reason for each, and state macOS support as Apple Silicon on macOS 14 or newer, in `manual/what-you-need.md`
+- [ ] 19.4 Document each platform's permissions in `manual/what-you-need.md` and `manual/install.md`: the macOS Accessibility grant for pasting, the macOS microphone grant, and the Windows microphone privacy settings
+- [ ] 19.5 Document in `manual/where-your-words-go.md` that pasting into an elevated window on Windows silently does nothing, in the same place the KDE input-consent dialog is documented, since it is the same class of failure
+- [ ] 19.6 Give `manual/install.md` the per-platform install path, and `manual/changing-your-hotkey.md` the per-platform hotkey story, including the desktops where the binding is not automatic
+- [ ] 19.7 Carry the same disclosures onto every page that shows an install command, since the requirement binds each such page and not only the landing page
+- [ ] 19.8 Update `pyproject.toml`'s description, `README.md`'s opening and its requirements paragraph, and the landing page in `site/`: Murmly is no longer Fedora-first
+- [ ] 19.9 Give `manual/troubleshooting.md` the per-platform failures: a silent macOS microphone, an ungranted Accessibility paste, a hotkey the frontmost macOS application consumes, and a Windows paste discarded by UIPI
+- [ ] 19.10 Record a field note for anything that turns out to need an undocumented precondition on Windows or macOS
 
 ## 20. Verification
 
