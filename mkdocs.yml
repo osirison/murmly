@@ -92,6 +92,14 @@ theme:
 #       Writes __announce to localStorage to remember a dismissed banner.
 # ---------------------------------------------------------------------------
 
+# Rendered into every page's footer by overrides/partials/copyright.html.
+#
+# It is here because a reader can arrive on any page directly from a search
+# engine, and must be able to tell from that page alone what Murmly is. The
+# site name says "murmly" and nothing else on a reference page says what that
+# means; the description exists only in a meta tag, which nobody reads.
+copyright: murmly — press a key, speak, press again. Local voice-to-text for Linux desktops, running entirely on your own machine.
+
 extra:
   # Makes the header logo link to the landing page rather than to the manual's
   # own index, so every page of the manual routes back to the site root.

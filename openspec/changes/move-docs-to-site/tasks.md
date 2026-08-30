@@ -65,7 +65,7 @@ Write each page from the section map in `design.md`. Titles and order come from 
 - [x] 4.8 Keep Development at six lines: `uv run --no-sync python -m unittest discover -s tests`, half a line on why `--no-sync` is required, one sentence on OpenSpec, one link. Everything else in the current 36 lines goes
 - [x] 4.9 Confirm `README.md` contains no configuration reference, no protocol, no socket rules and no troubleshooting steps, and that no link in it addresses a heading anchor inside itself
 - [x] 4.10 Change the one line in `site/index.html`: the README link becomes a relative link to `manual/`. Change nothing else on that page
-- [ ] 4.11 Note in the PR that `pyproject.toml` sets `readme = "README.md"`, so the package long description shrinks with it
+- [x] 4.11 Note in the PR that `pyproject.toml` sets `readme = "README.md"`, so the package long description shrinks with it
 
 ## 5. Nothing is lost — content survival checklist
 
