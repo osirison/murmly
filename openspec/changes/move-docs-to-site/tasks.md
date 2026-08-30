@@ -55,41 +55,41 @@ Write each page from the section map in `design.md`. Titles and order come from 
 
 ## 4. README and the landing page
 
-- [ ] 4.1 Cut `README.md` to about 62 lines: `murmly` (12), What you need (10), Install (14), Use it (8), It can also speak (6), Documentation (6), Development (6)
-- [ ] 4.2 Keep the pitch (current lines 11-13) and the three-step loop (current 185-195) **verbatim**. They are the only two passages already written in the register a non-technical reader needs
-- [ ] 4.3 Delete "This file is the reference" and put the link to the site in its place, near the top
-- [ ] 4.4 Do not carry the Wayland-hotkey paragraph (current 15-17) into the new README. Three unexplained terms in the third paragraph a new reader meets is the single worst thing about the current file
-- [ ] 4.5 List five requirement bullets, not four: Fedora, KDE Plasma, Python 3.12+, a terminal, **and** the X11-verified/Wayland-unverified status
-- [ ] 4.6 Keep in Install: `./setup.sh install Meta+X`, `./setup.sh upgrade`, `./setup.sh uninstall`, `uv run murmly doctor`, and the `--yes` with `--purge` warning as one sentence. Send the two-hotkey form and `./setup.sh hooks` to the install page
-- [ ] 4.7 Keep the `---` frontmatter at lines 1-4
-- [ ] 4.8 Keep Development at six lines: `uv run --no-sync python -m unittest discover -s tests`, half a line on why `--no-sync` is required, one sentence on OpenSpec, one link. Everything else in the current 36 lines goes
-- [ ] 4.9 Confirm `README.md` contains no configuration reference, no protocol, no socket rules and no troubleshooting steps, and that no link in it addresses a heading anchor inside itself
-- [ ] 4.10 Change the one line in `site/index.html`: the README link becomes a relative link to `manual/`. Change nothing else on that page
+- [x] 4.1 Cut `README.md` to about 62 lines: `murmly` (12), What you need (10), Install (14), Use it (8), It can also speak (6), Documentation (6), Development (6)
+- [x] 4.2 Keep the pitch (current lines 11-13) and the three-step loop (current 185-195) **verbatim**. They are the only two passages already written in the register a non-technical reader needs
+- [x] 4.3 Delete "This file is the reference" and put the link to the site in its place, near the top
+- [x] 4.4 Do not carry the Wayland-hotkey paragraph (current 15-17) into the new README. Three unexplained terms in the third paragraph a new reader meets is the single worst thing about the current file
+- [x] 4.5 List five requirement bullets, not four: Fedora, KDE Plasma, Python 3.12+, a terminal, **and** the X11-verified/Wayland-unverified status
+- [x] 4.6 Keep in Install: `./setup.sh install Meta+X`, `./setup.sh upgrade`, `./setup.sh uninstall`, `uv run murmly doctor`, and the `--yes` with `--purge` warning as one sentence. Send the two-hotkey form and `./setup.sh hooks` to the install page
+- [x] 4.7 Keep the `---` frontmatter at lines 1-4
+- [x] 4.8 Keep Development at six lines: `uv run --no-sync python -m unittest discover -s tests`, half a line on why `--no-sync` is required, one sentence on OpenSpec, one link. Everything else in the current 36 lines goes
+- [x] 4.9 Confirm `README.md` contains no configuration reference, no protocol, no socket rules and no troubleshooting steps, and that no link in it addresses a heading anchor inside itself
+- [x] 4.10 Change the one line in `site/index.html`: the README link becomes a relative link to `manual/`. Change nothing else on that page
 - [ ] 4.11 Note in the PR that `pyproject.toml` sets `readme = "README.md"`, so the package long description shrinks with it
 
 ## 5. Nothing is lost — content survival checklist
 
 Verify each item appears on the manual page named in the section map, unaltered. Tables and measured figures keep the sentence naming the machine they were measured on.
 
-- [ ] 5.1 Tables: what installation writes (176-180) with the "nothing else" promise (182-183); the speech model files (256-259); synthesis memory by device (275-278) with its qualification at 272-273; the five-row upgrade matrix (298-304)
-- [ ] 5.2 Tables: what an announcement sounds like (359-364); the four announcement environment variables (382-387); the two hotkeys (442-445)
-- [ ] 5.3 Tables: frames a sender may send (486-490) including the 65536-byte limit; frames Murmly sends (494-501) including `playing` null and `name` null
-- [ ] 5.4 Tables: partial-pass ceilings (668-673) with the 15-second-window qualification at 666; idle-release returns and costs (728-732) with its qualification at 726; per-session verification and clipboard preservation (827-832)
-- [ ] 5.5 Commands, byte-for-byte: the ydotool udev rule and its three lines (56-59); the overlay `dnf` lines (71-72); every `uv` and `setup.sh` invocation at 91, 99-103, 126-127, 134, 151-152, 162, 201, 208, 217-218, 242-243, 249, 346-349
-- [ ] 5.6 The ONNX Runtime swap (316-320) with the pin `onnxruntime-gpu==1.24.4` unrounded and undropped
-- [ ] 5.7 The `AGENTS.md` instruction block (403-415) reproduced exactly, including the sentence about leaving the element empty. A reader copies this into their own file
-- [ ] 5.8 Announcement paths and files (427-438): the chime WAV path, `pw-play`/`paplay`/`aplay`, that the chime does not use `[tts] output_device`, `~/.claude/settings.json` under `Stop` and `SessionStart`, `settings.json.murmly-backup`, `~/.copilot/hooks/murmly-announce.json`, and the assurance that nothing is written into `CLAUDE.md`
-- [ ] 5.9 Protocol detail: the declaration and acknowledgement JSON (464-468); every refusal code (`speech_disabled`, `speech_unavailable`, `speech_session_in_use`, `command_failed`, `over_capacity`, `shutting_down`, `busy`, `malformed_request`, `unsupported_command`); the rule that any `"ok": false` frame is a refusal; the 65536-byte frame limit and the 64-frame backpressure disconnect
-- [ ] 5.10 Every configuration key from 558-603 at its default with its documented range. The range comments are the only place the bounds are written down in prose
-- [ ] 5.11 Configuration file locations and the fall-back-rather-than-refuse rule (548-556), and the restart command (794-795)
-- [ ] 5.12 Socket security rules (610-641): `0600` socket, `0700` directories, cross-account refusal, the whole-path permission rule, the symlink consequence, the sticky-bit carve-out with the `/tmp/murmly-yours` worked example, and the `chmod go-w` remedy
-- [ ] 5.13 Profile mapping (645-647) and `auto` resolution with the 1.8 GB / 1.6 GB figures and the pinned model revision (649-654)
-- [ ] 5.14 Live transcription guarantees (658-662, 680-684) and auto-transcribe behaviour (691-712) including the bolded "delivers without printing"
-- [ ] 5.15 Idle-release defaults and the upgrade-behaviour warning (734-745, 779-790), and the `model_resident: null` example with the rule that `null` means unanswerable, not idle (760-773)
-- [ ] 5.16 Delivery honesty rules (38-45, 838-843) and the `"delivered": false` JSON example (810-818) with the note about `murmly spike --paste`
-- [ ] 5.17 Every `murmly doctor` field name a user is told to look up: `paste_injection`, `paste_injection.confirms_delivery`, `speech_output` with `available`/`detail`/`output_device_in_use`, `command_socket`, `delivery`, `partial_pass_ceiling_ms`, `live_transcription.partial_pass_loaded_model`, `model_resident`, `model_resident_detail`, `speech_output.resident`, `resident_detail`, `installation.hotkey_held`, `installation.hotkey_holder`, `installation.hotkeys` with `purpose`/`hotkey`/`held`/`holder`
-- [ ] 5.18 Hotkey grammar (167-171) including `Meta+V` as Plasma's clipboard history; overlay dimensions and behaviour (865-874); the service log commands (896-898); the overlay `--check` invocations (919-924); scope caveats (526-539); announcement behaviour guarantees (366-380); the 340 MB model figure (251) and the synthesis speed figures (282-286)
-- [ ] 5.19 Contributor commands (935-955) — `murmly daemon`, `toggle`, `toggle-session`, `status`, `spike --seconds 5`, venv activation, and the `--no-sync` reasoning. These leave the site; confirm they are not simply deleted
+- [x] 5.1 Tables: what installation writes (176-180) with the "nothing else" promise (182-183); the speech model files (256-259); synthesis memory by device (275-278) with its qualification at 272-273; the five-row upgrade matrix (298-304)
+- [x] 5.2 Tables: what an announcement sounds like (359-364); the four announcement environment variables (382-387); the two hotkeys (442-445)
+- [x] 5.3 Tables: frames a sender may send (486-490) including the 65536-byte limit; frames Murmly sends (494-501) including `playing` null and `name` null
+- [x] 5.4 Tables: partial-pass ceilings (668-673) with the 15-second-window qualification at 666; idle-release returns and costs (728-732) with its qualification at 726; per-session verification and clipboard preservation (827-832)
+- [x] 5.5 Commands, byte-for-byte: the ydotool udev rule and its three lines (56-59); the overlay `dnf` lines (71-72); every `uv` and `setup.sh` invocation at 91, 99-103, 126-127, 134, 151-152, 162, 201, 208, 217-218, 242-243, 249, 346-349
+- [x] 5.6 The ONNX Runtime swap (316-320) with the pin `onnxruntime-gpu==1.24.4` unrounded and undropped
+- [x] 5.7 The `AGENTS.md` instruction block (403-415) reproduced exactly, including the sentence about leaving the element empty. A reader copies this into their own file
+- [x] 5.8 Announcement paths and files (427-438): the chime WAV path, `pw-play`/`paplay`/`aplay`, that the chime does not use `[tts] output_device`, `~/.claude/settings.json` under `Stop` and `SessionStart`, `settings.json.murmly-backup`, `~/.copilot/hooks/murmly-announce.json`, and the assurance that nothing is written into `CLAUDE.md`
+- [x] 5.9 Protocol detail: the declaration and acknowledgement JSON (464-468); every refusal code (`speech_disabled`, `speech_unavailable`, `speech_session_in_use`, `command_failed`, `over_capacity`, `shutting_down`, `busy`, `malformed_request`, `unsupported_command`); the rule that any `"ok": false` frame is a refusal; the 65536-byte frame limit and the 64-frame backpressure disconnect
+- [x] 5.10 Every configuration key from 558-603 at its default with its documented range. The range comments are the only place the bounds are written down in prose
+- [x] 5.11 Configuration file locations and the fall-back-rather-than-refuse rule (548-556), and the restart command (794-795)
+- [x] 5.12 Socket security rules (610-641): `0600` socket, `0700` directories, cross-account refusal, the whole-path permission rule, the symlink consequence, the sticky-bit carve-out with the `/tmp/murmly-yours` worked example, and the `chmod go-w` remedy
+- [x] 5.13 Profile mapping (645-647) and `auto` resolution with the 1.8 GB / 1.6 GB figures and the pinned model revision (649-654)
+- [x] 5.14 Live transcription guarantees (658-662, 680-684) and auto-transcribe behaviour (691-712) including the bolded "delivers without printing"
+- [x] 5.15 Idle-release defaults and the upgrade-behaviour warning (734-745, 779-790), and the `model_resident: null` example with the rule that `null` means unanswerable, not idle (760-773)
+- [x] 5.16 Delivery honesty rules (38-45, 838-843) and the `"delivered": false` JSON example (810-818) with the note about `murmly spike --paste`
+- [x] 5.17 Every `murmly doctor` field name a user is told to look up: `paste_injection`, `paste_injection.confirms_delivery`, `speech_output` with `available`/`detail`/`output_device_in_use`, `command_socket`, `delivery`, `partial_pass_ceiling_ms`, `live_transcription.partial_pass_loaded_model`, `model_resident`, `model_resident_detail`, `speech_output.resident`, `resident_detail`, `installation.hotkey_held`, `installation.hotkey_holder`, `installation.hotkeys` with `purpose`/`hotkey`/`held`/`holder`
+- [x] 5.18 Hotkey grammar (167-171) including `Meta+V` as Plasma's clipboard history; overlay dimensions and behaviour (865-874); the service log commands (896-898); the overlay `--check` invocations (919-924); scope caveats (526-539); announcement behaviour guarantees (366-380); the 340 MB model figure (251) and the synthesis speed figures (282-286)
+- [x] 5.19 Contributor commands (935-955) — `murmly daemon`, `toggle`, `toggle-session`, `status`, `spike --seconds 5`, venv activation, and the `--no-sync` reasoning. These leave the site; confirm they are not simply deleted
 
 ## 6. Verification against the spec
 
@@ -97,13 +97,13 @@ Verify each item appears on the manual page named in the section map, unaltered.
 - [x] 6.2 Exercise every interactive control on a documentation page, then inspect cookies and localStorage. Nothing written. Grep the inline `<head>` script as well as the bundle: `__md_set` is defined in the head, so grepping the bundle alone cannot see a localStorage write
 - [x] 6.3 Load every page with scripting disabled: all content present, navigation works, no search control visible
 - [x] 6.4 View every page at 360 px, with scripting on and again with it off. The body never scrolls sideways; wide tables and code blocks scroll inside themselves in both states
-- [ ] 6.5 Serve the assembled `_pages/` with `python -m http.server` and no external network. Every page renders with logo, screenshots, diagrams, navigation and typography intact
+- [x] 6.5 Serve the assembled `_pages/` with `python -m http.server` and no external network. Every page renders with logo, screenshots, diagrams, navigation and typography intact
 - [x] 6.6 Tab through `settings` and `speed-and-memory` — the two densest pages — with the keyboard alone. Every control, including every generated navigation control, takes focus in reading order with a visible indicator
 - [x] 6.7 Measure contrast on those two pages under both colour schemes, including code and its syntax highlighting
 - [ ] 6.8 Traverse two pages with a screen reader: informative images announce, decorative ones are skipped, headings form a navigable structure
 - [ ] 6.9 Paste a documentation page URL into a link-preview renderer and confirm the card shows Murmly's own image, title and description
-- [ ] 6.10 Follow every cross-link between documentation pages on the published site under the `/murmly/` prefix. `strict: true` covers internal links at build time; add a `lychee` run or a manual pass for external links, since nothing checks those
-- [ ] 6.11 Search the published site for text that appears only under `docs/agent-notes/`, including in the search index
+- [x] 6.10 Follow every cross-link between documentation pages on the published site under the `/murmly/` prefix. `strict: true` covers internal links at build time; add a `lychee` run or a manual pass for external links, since nothing checks those
+- [x] 6.11 Search the published site for text that appears only under `docs/agent-notes/`, including in the search index
 - [x] 6.12 Build twice from the same commit and confirm the outputs match
 - [ ] 6.13 Push a commit that breaks the build and confirm the previously published pages continue to serve
 
