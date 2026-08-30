@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{#-
+  Material emits description, canonical, prev/next, icon and generator, and no
+  Open Graph tags at all, so a documentation page pasted into anything that
+  renders link previews shows a bare URL. Its social plugin would fix that and
+  is not used: it downloads fonts at build time, and every byte this site
+  publishes has to come from this repository or the pinned toolchain.
+
+  Eight tags, matching the ones site/index.html carries by hand. The image is
+  the landing page's own social preview, addressed absolutely because it lives
+  at the site root rather than under the manual.
+-#}
+{% block extrahead %}
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="murmly">
+  <meta property="og:title" content="{{ page.title | striptags }} — murmly">
+  <meta property="og:description" content="{% if page.meta and page.meta.description %}{{ page.meta.description }}{% else %}{{ config.site_description }}{% endif %}">
+  {% if page.canonical_url %}
+    <meta property="og:url" content="{{ page.canonical_url }}">
+  {% endif %}
+  <meta property="og:image" content="https://osirison.github.io/murmly/assets/social-preview.png">
+  <meta property="og:image:alt" content="murmly — press a key, speak, press again">
+  <meta name="twitter:card" content="summary_large_image">
+{% endblock %}

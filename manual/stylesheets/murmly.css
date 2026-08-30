@@ -1,0 +1,150 @@
+/* The manual, wearing the landing page's colours.
+ *
+ * Every value here is copied from site/style.css so the two halves of the site
+ * are one site. Material's own components keep their shapes; only the tokens
+ * they read are redefined.
+ *
+ * Dark mode is CSS, not JavaScript. mkdocs.yml sets no theme.palette, so
+ * Material never writes data-md-color-scheme onto <html> and its palette
+ * stylesheet is emitted but never linked. The prefers-color-scheme block below
+ * is the whole mechanism, which is why it has to redefine the syntax
+ * highlighting tokens too: those are defined for the light scheme in main.css
+ * and redefined only under [data-md-color-scheme=slate], which never matches
+ * here. */
+
+:root {
+  /* site/style.css --sans and --mono. mkdocs.yml sets theme.font to false, so
+   * nothing is fetched from a font service and these are what is used. */
+  --md-text-font-family: system-ui, -apple-system, "Segoe UI", Cantarell, "Noto Sans", sans-serif;
+  --md-code-font-family: ui-monospace, "Cascadia Mono", "JetBrains Mono", "Source Code Pro", "DejaVu Sans Mono", monospace;
+
+  --md-default-bg-color: #ffffff;          /* --bg */
+  --md-default-bg-color--light: #f5f6f8;   /* --surface */
+  --md-default-fg-color: #111318;          /* --ink */
+  --md-default-fg-color--light: #4a4f5a;   /* --ink-muted */
+  --md-default-fg-color--lighter: #e2e5ea; /* --line */
+  --md-default-fg-color--lightest: #f5f6f8;
+
+  --md-code-bg-color: #f5f6f8;             /* --surface, as the landing page's pre */
+  --md-code-fg-color: #111318;
+
+  --md-primary-fg-color: #5b3df5;          /* --accent */
+  --md-primary-bg-color: #ffffff;          /* --accent-ink */
+  --md-primary-bg-color--light: #ffffffb3;
+  --md-accent-fg-color: #5b3df5;
+  --md-typeset-a-color: #5b3df5;
+
+  --md-typeset-color: #111318;
+  --md-footer-bg-color: #f5f6f8;
+  --md-footer-bg-color--dark: #e2e5ea;
+  --md-footer-fg-color: #111318;
+  --md-footer-fg-color--light: #4a4f5a;
+  --md-footer-fg-color--lighter: #4a4f5a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --md-default-bg-color: #0d0f14;          /* --bg */
+    --md-default-bg-color--light: #161a22;   /* --surface */
+    --md-default-fg-color: #eef0f4;          /* --ink */
+    --md-default-fg-color--light: #a8b0be;   /* --ink-muted */
+    --md-default-fg-color--lighter: #262c38; /* --line */
+    --md-default-fg-color--lightest: #161a22;
+
+    --md-code-bg-color: #161a22;             /* --surface */
+    --md-code-fg-color: #eef0f4;
+
+    --md-primary-fg-color: #a78bfa;          /* --accent */
+    --md-primary-bg-color: #14101f;          /* --accent-ink */
+    --md-primary-bg-color--light: #14101fb3;
+    --md-accent-fg-color: #a78bfa;
+    --md-typeset-a-color: #a78bfa;
+
+    --md-typeset-color: #eef0f4;
+    --md-footer-bg-color: #161a22;
+    --md-footer-bg-color--dark: #0d0f14;
+    --md-footer-fg-color: #eef0f4;
+    --md-footer-fg-color--light: #a8b0be;
+    --md-footer-fg-color--lighter: #a8b0be;
+
+    --md-shadow-z1: 0 0 0.2rem #0000004d;
+    --md-shadow-z2: 0 0 0.2rem #00000059, 0 0.2rem 0.4rem #0000004d;
+
+    /* The fourteen syntax tokens, taken from Material's own slate palette so
+     * they are the theme's colours rather than invented ones. Without this
+     * block the light-scheme values stay in force over a dark code background,
+     * which is a contrast failure and not a cosmetic one. */
+    --md-code-hl-color: #2977ff;
+    --md-code-hl-color--light: #2977ff1a;
+    --md-code-hl-number-color: #e6695b;
+    --md-code-hl-special-color: #f06090;
+    --md-code-hl-function-color: #c973d9;
+    --md-code-hl-constant-color: #9383e2;
+    --md-code-hl-keyword-color: #6791e0;
+    --md-code-hl-string-color: #2fb170;
+    --md-code-hl-name-color: var(--md-code-fg-color);
+    --md-code-hl-operator-color: var(--md-default-fg-color--light);
+    --md-code-hl-punctuation-color: var(--md-default-fg-color--light);
+    --md-code-hl-comment-color: var(--md-default-fg-color--light);
+    --md-code-hl-generic-color: var(--md-default-fg-color--light);
+    --md-code-hl-variable-color: var(--md-default-fg-color--light);
+  }
+}
+
+/* site/style.css, verbatim. Material draws its own focus ring on some controls
+ * and none on others; this makes every focusable thing on the manual show the
+ * same indicator the landing page shows. */
+
+:focus-visible {
+  outline: 3px solid var(--md-primary-fg-color);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* Code blocks scroll inside themselves rather than widening the page, matching
+ * the landing page's pre rule. Material already does this; stated here so the
+ * behaviour does not depend on a theme detail. */
+.md-typeset pre > code {
+  overflow-x: auto;
+}
+
+/* Wide tables scroll inside themselves when no script will wrap them.
+ *
+ * Material's md-typeset__scrollwrap container is built by its bundle at load
+ * time; the HTML the server sends carries a bare <table>. With scripting off a
+ * six-column table would scroll the document body sideways instead. The no-js
+ * class sits on <html> in every generated page and is removed by the bundle,
+ * so this rule applies exactly when the wrapper will not arrive. */
+.no-js .md-typeset table:not([class]) {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* The header title cannot widen the page when no script will manage it.
+ *
+ * Material's header carries two topics: the site name, and the page title that
+ * slides in on scroll. The second is absolutely positioned and its width is
+ * whatever its text needs, because with the bundle running it is never laid
+ * out at full width. With scripting off it simply sits there, and on the two
+ * pages with the longest titles it reached 13 px past a 360 px viewport and
+ * scrolled the whole document sideways. Clipping the title container leaves
+ * the site name visible and the body unscrollable. */
+.no-js .md-header__title {
+  overflow: hidden;
+}
+
+/* site/style.css, verbatim.
+ *
+ * Material stops transitions under reduced motion but leaves animations
+ * running. Nothing in the manual is conveyed by movement, so everything can
+ * simply stop. */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

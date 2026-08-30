@@ -538,7 +538,11 @@ class ConfigTests(unittest.TestCase):
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG_PATH = REPO_ROOT / "config.example.toml"
-README_PATH = REPO_ROOT / "README.md"
+# The configuration reference and the speech instructions now live on the
+# site rather than in README.md. These tests follow the prose, because what
+# they guard is that a reader who runs what is written gets what it says.
+MANUAL_SETTINGS_PATH = REPO_ROOT / "manual" / "settings.md"
+MANUAL_SPEECH_PATH = REPO_ROOT / "manual" / "making-murmly-speak.md"
 
 
 def option_keys(text: str) -> set[tuple[str, str]]:
@@ -582,14 +586,16 @@ class ExampleConfigTests(unittest.TestCase):
         self.assertTrue(read_keys, "no option lookups found in config.py")
         self.assertEqual(read_keys, option_keys(EXAMPLE_CONFIG_PATH.read_text()))
 
-    def test_readme_sample_covers_the_same_options(self) -> None:
+    def test_the_manual_sample_covers_the_same_options(self) -> None:
         block = re.search(
-            r"## Configuration\b.*?```toml\n(.*?)```",
-            README_PATH.read_text(),
+            r"## The whole file, at its defaults\b.*?```toml\n(.*?)```",
+            MANUAL_SETTINGS_PATH.read_text(),
             re.DOTALL,
         )
 
-        self.assertIsNotNone(block, "no TOML sample under README's Configuration heading")
+        self.assertIsNotNone(
+            block, "no TOML sample under the settings page's whole-file heading"
+        )
         self.assertEqual(
             option_keys(EXAMPLE_CONFIG_PATH.read_text()),
             option_keys(block.group(1)),
@@ -615,8 +621,9 @@ class ExampleConfigTests(unittest.TestCase):
         """
         project_root = Path(murmly.config.__file__).parent.parent.parent
         sections = {
-            "README.md": re.search(
-                r"^## Speech output\b(.*?)(?=^## )", README_PATH.read_text(), re.DOTALL | re.MULTILINE
+            "manual/making-murmly-speak.md": re.search(
+                r"(^# Making murmly speak\b.*)", MANUAL_SPEECH_PATH.read_text(),
+                re.DOTALL | re.MULTILINE,
             ),
             "config.example.toml": re.search(
                 r"^\[tts\]\n(.*)", EXAMPLE_CONFIG_PATH.read_text(), re.DOTALL | re.MULTILINE

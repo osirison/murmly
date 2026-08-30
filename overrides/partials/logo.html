@@ -1,0 +1,11 @@
+{#-
+  Replaces the theme's alt="logo", which describes the element rather than the
+  project and reads as the word "logo" to a screen reader on every page. The
+  mark is a link to the landing page, so its alternative names the destination.
+-#}
+{% if config.theme.logo %}
+  <img src="{{ config.theme.logo | url }}" alt="murmly">
+{% else %}
+  {% set icon = config.theme.icon.logo or "material/library" %}
+  {% include ".icons/" ~ icon ~ ".svg" %}
+{% endif %}

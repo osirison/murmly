@@ -1,0 +1,153 @@
+# The manual at https://osirison.github.io/murmly/manual/.
+#
+# The landing page at the site root is hand-authored HTML in site/ and is not
+# built by this file. The Pages workflow builds the manual into _pages/manual/
+# and then copies site/ over the top of it, so the two live under one origin
+# without either generating the other.
+
+site_name: murmly
+site_description: How to install and use murmly, the local voice-to-text tool for Linux desktops.
+site_url: https://osirison.github.io/murmly/manual/
+
+# Not docs/. That directory already holds docs/agent-notes/, which is internal
+# and must never be published, and a one-character typo here is the whole
+# failure mode. Pointing the generator at a directory that holds nothing else
+# makes publishing a note impossible rather than merely unlikely.
+docs_dir: manual
+
+# Assembled, not committed: .gitignore excludes _pages/. The workflow copies
+# site/ over this tree and asserts the copy is byte-identical to what is in the
+# repository before it uploads anything.
+site_dir: _pages/manual
+
+# The site is served from a path prefix, /murmly/, not a domain root. Directory
+# URLs keep every generated reference relative, so nothing depends on being at
+# the root of a host.
+use_directory_urls: true
+
+# A link to a page that does not exist, or a configuration key MkDocs does not
+# recognise, fails the build and therefore the deploy. The hand-authored
+# landing page never had this check.
+strict: true
+
+# strict escalates warnings to errors; this decides what counts as a warning.
+# anchors in particular: a link to a heading that no longer exists is silent by
+# default, and the manual's index links to headings on thirteen other pages.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  custom_dir: overrides
+
+  # false, not a font name. Material's default fetches Roboto from
+  # fonts.google.com at view time, which the site's own-origin requirement
+  # forbids. With fonts off, Material falls back to the system stack, and
+  # manual/stylesheets/murmly.css sets the same families the landing page uses.
+  font: false
+
+  # Murmly's own mark. manual/assets is a symlink to site/assets, so the
+  # repository holds one copy of every image and MkDocs resolves, validates
+  # and copies these the same way it does anything else under docs_dir.
+  logo: assets/murmly-mark.svg
+  favicon: assets/favicon.ico
+
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.footer
+    - navigation.top
+    - toc.follow
+    - content.code.copy
+
+# ---------------------------------------------------------------------------
+# Four keys that must not be added to this file.
+#
+# Each is convenient, and each silently breaks a requirement in
+# openspec/specs/project-website/spec.md. They are named here so that whoever
+# reaches for one meets the reason first.
+#
+#   repo_url
+#       Material's repository widget fetches api.github.com at view time for
+#       star and fork counts. That is an off-origin request on every page load,
+#       and a star count is social proof, which the claims requirement forbids
+#       outright.
+#
+#   theme.palette with any toggle: entry
+#       The light/dark switch writes __palette to localStorage. No page may
+#       write to persistent browser storage. Dark mode here is a
+#       prefers-color-scheme block in manual/stylesheets/murmly.css and needs
+#       no script and no stored preference.
+#
+#   features: content.tabs.link
+#       Writes __tabs to localStorage the first time a reader clicks a linked
+#       tab. pymdownx.tabbed with alternate_style: true still renders tabs as
+#       radio inputs with no script and no storage; only cross-block linking is
+#       lost.
+#
+#   features: announce.dismiss
+#       Writes __announce to localStorage to remember a dismissed banner.
+# ---------------------------------------------------------------------------
+
+# Rendered into every page's footer by overrides/partials/copyright.html.
+#
+# It is here because a reader can arrive on any page directly from a search
+# engine, and must be able to tell from that page alone what Murmly is. The
+# site name says "murmly" and nothing else on a reference page says what that
+# means; the description exists only in a meta tag, which nobody reads.
+copyright: murmly — press a key, speak, press again. Local voice-to-text for Linux desktops, running entirely on your own machine.
+
+extra:
+  # Makes the header logo link to the landing page rather than to the manual's
+  # own index, so every page of the manual routes back to the site root.
+  homepage: https://osirison.github.io/murmly/
+
+extra_css:
+  - stylesheets/murmly.css
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  # alternate_style renders each tab set as radio inputs and labels. No script
+  # runs and nothing is stored. See the forbidden-key note on content.tabs.link.
+  - pymdownx.tabbed:
+      alternate_style: true
+
+# Titles say what the reader wants to do, not what Murmly calls its parts.
+# Installing and first use come before the reference; the developer page is
+# last.
+nav:
+  - The murmly manual: index.md
+  - Getting started:
+      - What you need before you start: what-you-need.md
+      - Installing murmly: install.md
+      - Using murmly: using-murmly.md
+  - Everyday use:
+      - Changing your hotkey: changing-your-hotkey.md
+      - Where your words go: where-your-words-go.md
+      - Seeing your words as you speak: words-as-you-speak.md
+      - Finishing a recording by pausing: pause-to-finish.md
+  - When murmly speaks:
+      - Making murmly speak: making-murmly-speak.md
+      - Hearing when your coding assistant finishes: announcements.md
+  - Reference:
+      - All the settings: settings.md
+      - Speed, memory, and your graphics card: speed-and-memory.md
+      - When something goes wrong: troubleshooting.md
+      - For developers: for-developers.md
+  - Murmly home: https://osirison.github.io/murmly/
+  - Source on GitHub: https://github.com/osirison/murmly
