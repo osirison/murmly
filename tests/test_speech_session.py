@@ -957,20 +957,25 @@ class TranscriptBindingTests(SpeechSessionHarness):
 
 
 class ProtocolDocumentationTests(unittest.TestCase):
-    def test_the_readme_documents_every_event_the_daemon_can_send(self) -> None:
+    def test_the_manual_documents_every_event_the_daemon_can_send(self) -> None:
         """A sender writes its handler from this table.
 
         An event missing from it is one nobody handles: `failed` is the one that
         says a piece of the reply is never coming, so a sender that does not
         know about it waits for audio that will not arrive.
         """
-        readme = (Path(__file__).parents[1] / "README.md").read_text()
-        # Anchored on the sentence above it: there are two "| Frame | Meaning |"
-        # tables in this section, and the first lists what a sender may send.
+        page = (
+            Path(__file__).parents[1] / "manual" / "for-developers.md"
+        ).read_text()
+        # Anchored on the heading above it: the page carries two
+        # "| Frame | Meaning |" tables, and the first lists what a sender may
+        # send rather than what it will receive.
         table = re.search(
-            r"Frames Murmly sends, without being asked:\n\n(.*?)\n\n", readme, re.DOTALL
+            r"^## Frames murmly sends\b(.*?)^## ", page, re.DOTALL | re.MULTILINE
         )
-        self.assertIsNotNone(table, "no session event table found in README")
+        self.assertIsNotNone(
+            table, "no session event table found on the developer page"
+        )
 
         for event in (
             EVENT_STARTED,
