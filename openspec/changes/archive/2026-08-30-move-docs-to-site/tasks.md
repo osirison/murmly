@@ -17,7 +17,7 @@
 - [x] 1.15 Add the origin guard over built output: no `href`/`src` naming a host other than the publishing origin, checked in HTML **and** in CSS
 - [x] 1.16 Point `upload-pages-artifact` at `_pages/`. Leave `permissions`, `concurrency` and `environment` unchanged
 - [x] 1.17 Add a `docs` job to `.github/workflows/tests.yml` running `uv sync --locked --only-group docs && uv run --no-sync mkdocs build`, so a broken internal link fails at review rather than at deploy. Confirm `pages.yml` still neither runs nor waits on the Python matrix
-- [ ] 1.18 Deploy with only `manual/index.md` present. Open `https://osirison.github.io/murmly/` and `https://osirison.github.io/murmly/manual/` and read the network log — a green badge is not evidence
+- [x] 1.18 Deploy with only `manual/index.md` present. Open `https://osirison.github.io/murmly/` and `https://osirison.github.io/murmly/manual/` and read the network log — a green badge is not evidence
 
 ## 2. Identity, and the three things Material gets wrong
 
@@ -111,4 +111,28 @@ Verify each item appears on the manual page named in the section map, unaltered.
 
 - [x] 7.1 Write `docs/agent-notes/building-the-manual.md`: preview with `uvx --from "mkdocs-material==<pinned>" mkdocs serve`, never a bare `uv run mkdocs serve` (it syncs first and reinstalls the CPU `onnxruntime` over a GPU swap) and never `uv sync --only-group docs` locally (uv prunes and strips the runtime out of `.venv`); `_pages/` is assembled, not committed; the four forbidden `mkdocs.yml` keys; and that the landing page can no longer be reviewed over `file://`
 - [x] 7.2 Record in that note that `python -m http.server` serves at the host root, so `404.html`'s absolute references are only verifiable against the published prefix
-- [ ] 7.3 After archive, edit `openspec/specs/project-website/spec.md`'s `## Purpose` by hand — it is written in the singular ("the public page that introduces Murmly") and no delta mechanism exists to change it
+- [x] 7.3 After archive, edit `openspec/specs/project-website/spec.md`'s `## Purpose` by hand — it is written in the singular ("the public page that introduces Murmly") and no delta mechanism exists to change it
+
+## 8. What was not verified, and why
+
+Three checks in section 6 need something this repository cannot provide. They are
+left unticked rather than assumed, so the record says what was actually done.
+
+- **6.8** needs a person with a screen reader. The heading structure, the image
+  alternatives and the keyboard order were all checked mechanically; how it
+  actually sounds was not.
+- **6.9** needs a documentation URL pasted into a third-party link-preview
+  renderer. The Open Graph tags such a renderer would read were verified in the
+  built output and on the published page, and the image they name returns 200.
+- **6.13** needs a commit that breaks the build pushed to the default branch.
+  Publication is guarded so that a failed build never reaches the deploy step,
+  and every guard was shown to fail on the defect it exists to catch, but the
+  end-to-end behaviour was not exercised against the live site.
+
+**1.18 deviates from what it says.** It asks for a deploy carrying only
+`manual/index.md`. The change landed as one merge, so the deploy carried the
+whole manual. What the task exists to check was done against the published site:
+both addresses were opened in a browser and every network request read. All of
+them go to the publishing origin, no page writes to storage, and `404.html`
+resolves its absolute references under the prefix, which is the one thing a
+local server cannot show.
