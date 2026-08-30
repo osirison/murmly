@@ -30,6 +30,15 @@ use_directory_urls: true
 # landing page never had this check.
 strict: true
 
+# strict escalates warnings to errors; this decides what counts as a warning.
+# anchors in particular: a link to a heading that no longer exists is silent by
+# default, and the manual's index links to headings on thirteen other pages.
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
 theme:
   name: material
   custom_dir: overrides
@@ -40,8 +49,9 @@ theme:
   # manual/stylesheets/murmly.css sets the same families the landing page uses.
   font: false
 
-  # Murmly's own mark, copied into the built tree during assembly so the
-  # repository holds exactly one copy of it, in site/assets/.
+  # Murmly's own mark. manual/assets is a symlink to site/assets, so the
+  # repository holds one copy of every image and MkDocs resolves, validates
+  # and copies these the same way it does anything else under docs_dir.
   logo: assets/murmly-mark.svg
   favicon: assets/favicon.ico
 
@@ -114,5 +124,22 @@ markdown_extensions:
 # last.
 nav:
   - The murmly manual: index.md
+  - Getting started:
+      - What you need before you start: what-you-need.md
+      - Installing murmly: install.md
+      - Using murmly: using-murmly.md
+  - Everyday use:
+      - Changing your hotkey: changing-your-hotkey.md
+      - Where your words go: where-your-words-go.md
+      - Seeing your words as you speak: words-as-you-speak.md
+      - Finishing a recording by pausing: pause-to-finish.md
+  - When murmly speaks:
+      - Making murmly speak: making-murmly-speak.md
+      - Hearing when your coding assistant finishes: announcements.md
+  - Reference:
+      - All the settings: settings.md
+      - Speed, memory, and your graphics card: speed-and-memory.md
+      - When something goes wrong: troubleshooting.md
+      - For developers: for-developers.md
   - Murmly home: https://osirison.github.io/murmly/
   - Source on GitHub: https://github.com/osirison/murmly

@@ -8,7 +8,7 @@
 - [x] 1.6 Set `theme.features` to `navigation.sections`, `navigation.expand`, `navigation.footer`, `navigation.top`, `toc.follow`, `content.code.copy`. Add nothing else without checking it against 1.7
 - [x] 1.7 Write the forbidden-key comment block into `mkdocs.yml`, naming all four and what each breaks: `repo_url` (fetches `api.github.com` at view time and publishes a star count), `theme.palette` with any `toggle:` entry (writes `__palette` to localStorage), `features: content.tabs.link` (writes `__tabs`), `features: announce.dismiss` (writes `__announce`)
 - [x] 1.8 Add `markdown_extensions`: `admonition`, `attr_list`, `md_in_html`, `tables`, `toc` with `permalink: true`, `pymdownx.details`, `pymdownx.highlight` with `anchor_linenums: true`, `pymdownx.superfences`, and `pymdownx.tabbed` with `alternate_style: true` (radio-input tabs, no script, no storage)
-- [ ] 1.9 Write the `nav:` block using the titles from `design.md`'s page tree, not the README's headings. End it with absolute-URL entries for the landing page and the GitHub source
+- [x] 1.9 Write the `nav:` block using the titles from `design.md`'s page tree, not the README's headings. End it with absolute-URL entries for the landing page and the GitHub source
 - [x] 1.10 Edit `.github/workflows/pages.yml`: add `manual/**`, `overrides/**`, `mkdocs.yml`, `pyproject.toml` and `uv.lock` to the `paths` trigger
 - [x] 1.11 Replace the upload step with: `astral-sh/setup-uv@v6` (python 3.12, cache on), `uv sync --locked --only-group docs`, `uv run --no-sync mkdocs build`. Keep the `--no-sync` comment explaining that a plain `uv run` would drag the whole ML runtime into a runner that is here to render Markdown
 - [x] 1.12 Add the assembly step: `cp -r site/. _pages/`; copy `murmly-mark.svg` and `favicon.ico` from `site/assets/` into `_pages/manual/assets/`; `cp _pages/manual/404.html _pages/404.html`; `rm -f _pages/manual/assets/images/favicon.png` (Material emits its own favicon even when `theme.favicon` is set); then `diff -r site _pages --exclude=manual --exclude=404.html`, which must produce no output
@@ -36,22 +36,22 @@
 
 Write each page from the section map in `design.md`. Titles and order come from that map, not from the README's headings.
 
-- [ ] 3.1 `manual/index.md` — what the manual covers, where to start, and the "where things moved" table mapping every `README.md` heading removed by this change to the page that now holds it
-- [ ] 3.2 `manual/what-you-need.md` — Fedora, Plasma, Python 3.12+, a terminal, and the X11-verified/Wayland-unverified status first. The paste-injector matrix and the KDE permission dialog below, under a heading phrased by symptom ("If murmly says it cannot paste"). Rewrite the KDE dialog paragraph as an instruction, not an explanation
-- [ ] 3.3 `manual/install.md` — open with the five disclosures (Fedora, Plasma, Python 3.12+, terminal, X11-verified) **before** the first command; the spec requires them on any page that invites an install. Then one command, `murmly doctor`, choosing a hotkey, what installation writes. Below that: installing by hand, the GPU runtime, the overlay's system packages, and the ydotool fallback under "If murmly cannot paste on your desktop"
-- [ ] 3.4 `manual/using-murmly.md` — the three-step loop, the three overlay screenshots already in `site/assets/`, that the overlay takes neither keyboard nor pointer, and how to switch it off
-- [ ] 3.5 `manual/changing-your-hotkey.md` — rebinding, moving both keys at once, removing, and repairing after moving the project folder under its own heading phrased by symptom ("If you moved the murmly folder")
-- [ ] 3.6 `manual/where-your-words-go.md` — answer "why did nothing get pasted?" first, then the per-session capability matrix and clipboard restoration
-- [ ] 3.7 `manual/words-as-you-speak.md` — one setting, the guarantee that partials can never change what gets typed, the shared-screen warning, and the honest note that `balanced` on CPU cannot keep pace
-- [ ] 3.8 `manual/pause-to-finish.md` — the three modes described by what the user experiences, plus the two surprises: a muted microphone will not end a recording, and an auto-stopped recording pastes without printing
-- [ ] 3.9 `manual/making-murmly-speak.md` — turning it on, the two hotkeys, and what speech output does not do. Link to `speed-and-memory` for the processor choice and to `announcements` for the hook
-- [ ] 3.10 `manual/announcements.md` — open with what it sounds like. `./setup.sh hooks` for both agents, the voice-note convention including the exact `AGENTS.md` text, the four environment variables, replacing the chime, and every file registration touches with how to undo it
-- [ ] 3.11 `manual/settings.md` — where the file lives, that copying the example changes nothing, that an out-of-range value falls back rather than refusing to start, then every key at its default with its range and a one-line plain-language gloss. Give each key an anchor so task pages can link straight to it. End with the restart command
-- [ ] 3.12 `manual/speed-and-memory.md` — the three profiles and their models, how `auto` resolves, download sizes, why speech uses the CPU by default with the measured table, the ONNX Runtime GPU swap, idle release and what it costs, and the upgrade note. Every figure keeps the sentence naming the machine
-- [ ] 3.13 `manual/troubleshooting.md` — symptom-first, starting with `murmly doctor`. Restate the Intel SOF microphone fix **in the documentation's own words**; do not reproduce text from `docs/agent-notes/murmly-spike-sof-dmic.md` and do not link to it
-- [ ] 3.14 `manual/for-developers.md` — the session protocol in full and the command socket's ownership and permission rules. Last in the nav
-- [ ] 3.15 Confirm no `manual/*.md` file opens with a `---` frontmatter block; MkDocs would consume it as page metadata
-- [ ] 3.16 Read the nav aloud and check that no entry is titled only with an internal component name
+- [x] 3.1 `manual/index.md` — what the manual covers, where to start, and the "where things moved" table mapping every `README.md` heading removed by this change to the page that now holds it
+- [x] 3.2 `manual/what-you-need.md` — Fedora, Plasma, Python 3.12+, a terminal, and the X11-verified/Wayland-unverified status first. The paste-injector matrix and the KDE permission dialog below, under a heading phrased by symptom ("If murmly says it cannot paste"). Rewrite the KDE dialog paragraph as an instruction, not an explanation
+- [x] 3.3 `manual/install.md` — open with the five disclosures (Fedora, Plasma, Python 3.12+, terminal, X11-verified) **before** the first command; the spec requires them on any page that invites an install. Then one command, `murmly doctor`, choosing a hotkey, what installation writes. Below that: installing by hand, the GPU runtime, the overlay's system packages, and the ydotool fallback under "If murmly cannot paste on your desktop"
+- [x] 3.4 `manual/using-murmly.md` — the three-step loop, the three overlay screenshots already in `site/assets/`, that the overlay takes neither keyboard nor pointer, and how to switch it off
+- [x] 3.5 `manual/changing-your-hotkey.md` — rebinding, moving both keys at once, removing, and repairing after moving the project folder under its own heading phrased by symptom ("If you moved the murmly folder")
+- [x] 3.6 `manual/where-your-words-go.md` — answer "why did nothing get pasted?" first, then the per-session capability matrix and clipboard restoration
+- [x] 3.7 `manual/words-as-you-speak.md` — one setting, the guarantee that partials can never change what gets typed, the shared-screen warning, and the honest note that `balanced` on CPU cannot keep pace
+- [x] 3.8 `manual/pause-to-finish.md` — the three modes described by what the user experiences, plus the two surprises: a muted microphone will not end a recording, and an auto-stopped recording pastes without printing
+- [x] 3.9 `manual/making-murmly-speak.md` — turning it on, the two hotkeys, and what speech output does not do. Link to `speed-and-memory` for the processor choice and to `announcements` for the hook
+- [x] 3.10 `manual/announcements.md` — open with what it sounds like. `./setup.sh hooks` for both agents, the voice-note convention including the exact `AGENTS.md` text, the four environment variables, replacing the chime, and every file registration touches with how to undo it
+- [x] 3.11 `manual/settings.md` — where the file lives, that copying the example changes nothing, that an out-of-range value falls back rather than refusing to start, then every key at its default with its range and a one-line plain-language gloss. Give each key an anchor so task pages can link straight to it. End with the restart command
+- [x] 3.12 `manual/speed-and-memory.md` — the three profiles and their models, how `auto` resolves, download sizes, why speech uses the CPU by default with the measured table, the ONNX Runtime GPU swap, idle release and what it costs, and the upgrade note. Every figure keeps the sentence naming the machine
+- [x] 3.13 `manual/troubleshooting.md` — symptom-first, starting with `murmly doctor`. Restate the Intel SOF microphone fix **in the documentation's own words**; do not reproduce text from `docs/agent-notes/murmly-spike-sof-dmic.md` and do not link to it
+- [x] 3.14 `manual/for-developers.md` — the session protocol in full and the command socket's ownership and permission rules. Last in the nav
+- [x] 3.15 Confirm no `manual/*.md` file opens with a `---` frontmatter block; MkDocs would consume it as page metadata
+- [x] 3.16 Read the nav aloud and check that no entry is titled only with an internal component name
 
 ## 4. README and the landing page
 
@@ -93,13 +93,13 @@ Verify each item appears on the manual page named in the section map, unaltered.
 
 ## 6. Verification against the spec
 
-- [ ] 6.1 Load every page with network requests recorded. Every request goes to the publishing origin — check CSS-embedded references, not just `href`/`src`
-- [ ] 6.2 Exercise every interactive control on a documentation page, then inspect cookies and localStorage. Nothing written. Grep the inline `<head>` script as well as the bundle: `__md_set` is defined in the head, so grepping the bundle alone cannot see a localStorage write
-- [ ] 6.3 Load every page with scripting disabled: all content present, navigation works, no search control visible
-- [ ] 6.4 View every page at 360 px, with scripting on and again with it off. The body never scrolls sideways; wide tables and code blocks scroll inside themselves in both states
+- [x] 6.1 Load every page with network requests recorded. Every request goes to the publishing origin — check CSS-embedded references, not just `href`/`src`
+- [x] 6.2 Exercise every interactive control on a documentation page, then inspect cookies and localStorage. Nothing written. Grep the inline `<head>` script as well as the bundle: `__md_set` is defined in the head, so grepping the bundle alone cannot see a localStorage write
+- [x] 6.3 Load every page with scripting disabled: all content present, navigation works, no search control visible
+- [x] 6.4 View every page at 360 px, with scripting on and again with it off. The body never scrolls sideways; wide tables and code blocks scroll inside themselves in both states
 - [ ] 6.5 Serve the assembled `_pages/` with `python -m http.server` and no external network. Every page renders with logo, screenshots, diagrams, navigation and typography intact
-- [ ] 6.6 Tab through `settings` and `speed-and-memory` — the two densest pages — with the keyboard alone. Every control, including every generated navigation control, takes focus in reading order with a visible indicator
-- [ ] 6.7 Measure contrast on those two pages under both colour schemes, including code and its syntax highlighting
+- [x] 6.6 Tab through `settings` and `speed-and-memory` — the two densest pages — with the keyboard alone. Every control, including every generated navigation control, takes focus in reading order with a visible indicator
+- [x] 6.7 Measure contrast on those two pages under both colour schemes, including code and its syntax highlighting
 - [ ] 6.8 Traverse two pages with a screen reader: informative images announce, decorative ones are skipped, headings form a navigable structure
 - [ ] 6.9 Paste a documentation page URL into a link-preview renderer and confirm the card shows Murmly's own image, title and description
 - [ ] 6.10 Follow every cross-link between documentation pages on the published site under the `/murmly/` prefix. `strict: true` covers internal links at build time; add a `lychee` run or a manual pass for external links, since nothing checks those
@@ -109,6 +109,6 @@ Verify each item appears on the manual page named in the section map, unaltered.
 
 ## 7. Notes and follow-up
 
-- [ ] 7.1 Write `docs/agent-notes/building-the-manual.md`: preview with `uvx --from "mkdocs-material==<pinned>" mkdocs serve`, never a bare `uv run mkdocs serve` (it syncs first and reinstalls the CPU `onnxruntime` over a GPU swap) and never `uv sync --only-group docs` locally (uv prunes and strips the runtime out of `.venv`); `_pages/` is assembled, not committed; the four forbidden `mkdocs.yml` keys; and that the landing page can no longer be reviewed over `file://`
-- [ ] 7.2 Record in that note that `python -m http.server` serves at the host root, so `404.html`'s absolute references are only verifiable against the published prefix
+- [x] 7.1 Write `docs/agent-notes/building-the-manual.md`: preview with `uvx --from "mkdocs-material==<pinned>" mkdocs serve`, never a bare `uv run mkdocs serve` (it syncs first and reinstalls the CPU `onnxruntime` over a GPU swap) and never `uv sync --only-group docs` locally (uv prunes and strips the runtime out of `.venv`); `_pages/` is assembled, not committed; the four forbidden `mkdocs.yml` keys; and that the landing page can no longer be reviewed over `file://`
+- [x] 7.2 Record in that note that `python -m http.server` serves at the host root, so `404.html`'s absolute references are only verifiable against the published prefix
 - [ ] 7.3 After archive, edit `openspec/specs/project-website/spec.md`'s `## Purpose` by hand — it is written in the singular ("the public page that introduces Murmly") and no delta mechanism exists to change it

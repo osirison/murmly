@@ -68,9 +68,10 @@ jobs:
       # bytes and the served ones. It is copied over the generated manual here,
       # and the diff at the end of this step proves the copy changed nothing.
       #
-      # The mark and the favicon are copied out of site/assets/ rather than
-      # duplicated in the repository, so there is exactly one of each to keep
-      # in step. mkdocs.yml names them under theme.logo and theme.favicon.
+      # The mark, the favicon and the screenshots reach the manual through
+      # manual/assets, which is a symlink to site/assets. The repository holds
+      # exactly one copy of each, MkDocs validates every reference to them as
+      # it would any other file, and there is nothing to copy here.
       #
       # Material writes its own assets/images/favicon.png even when
       # theme.favicon names another file. Nothing links to it, but the artifact
@@ -79,7 +80,6 @@ jobs:
         run: |
           set -euo pipefail
           cp -r site/. _pages/
-          cp site/assets/murmly-mark.svg site/assets/favicon.ico _pages/manual/assets/
           cp _pages/manual/404.html _pages/404.html
           rm -f _pages/manual/assets/images/favicon.png
           # Every file outside the generated manual must be byte-identical to
@@ -186,6 +186,66 @@ jobs:
                   print("  " + line, file=sys.stderr)
               sys.exit(1)
           print("No resource on any page names a host other than " + ORIGIN + ".")
+          PY
+
+      # Every reference a page makes to a file in the artifact must land on
+      # one. MkDocs checks links between Markdown pages, and it leaves a
+      # relative path that climbs out of the docs directory alone -- so an
+      # image addressed one level too shallow builds clean and 404s in the
+      # browser. This walks the built HTML instead and resolves each reference
+      # against the tree that is about to be uploaded.
+      - name: Assert every asset a page references exists
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, re, sys
+          from urllib.parse import urljoin, unquote
+
+          root = pathlib.Path("_pages")
+          # The site is served from a path prefix, and 404.html is served by
+          # Pages from any unmatched path, so its references have to be
+          # absolute and carry that prefix. Stripping it here is what makes
+          # 404.html checkable at all -- a local server has no prefix, so
+          # nothing else verifies those references before they are published.
+          PREFIX = "/murmly/"
+          ref_re = re.compile(
+              r'(?:src|href)\s*=\s*"([^"]+)"|url\(\s*["\']?([^)"\']+)', re.I)
+
+          missing = []
+          for path in sorted(root.rglob("*")):
+              if path.suffix.lower() not in (".html", ".css") or not path.is_file():
+                  continue
+              # The URL this file is served at, so relative references resolve
+              # the way a browser would resolve them.
+              base = "/" + path.relative_to(root).as_posix()
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for match in ref_re.finditer(text):
+                  ref = (match.group(1) or match.group(2)).strip()
+                  if (not ref or ref.startswith(("http://", "https://", "//",
+                                                 "#", "data:", "mailto:"))):
+                      continue
+                  # A reference written from the host root resolves outside
+                  # the project's prefix unless it carries it. Relative ones
+                  # are fine and are simply resolved against the page's URL.
+                  if ref.startswith("/") and not ref.startswith(PREFIX):
+                      missing.append(f"{path.relative_to(root)} -> {ref} "
+                                     f"(host-root reference without {PREFIX})")
+                      continue
+                  resolved = unquote(urljoin(base, ref).split("#")[0].split("?")[0])
+                  if resolved.startswith(PREFIX):
+                      resolved = "/" + resolved[len(PREFIX):]
+                  target = root / resolved.lstrip("/")
+                  if target.is_dir():
+                      target = target / "index.html"
+                  if not target.exists():
+                      missing.append(f"{path.relative_to(root)} -> {ref}")
+
+          if missing:
+              print("References that do not resolve inside the artifact:", file=sys.stderr)
+              for line in sorted(set(missing)):
+                  print("  " + line, file=sys.stderr)
+              sys.exit(1)
+          print("Every internal reference in the artifact resolves to a file.")
           PY
 
       - name: Upload the artifact

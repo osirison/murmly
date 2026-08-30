@@ -121,6 +121,19 @@
   max-width: 100%;
 }
 
+/* The header title cannot widen the page when no script will manage it.
+ *
+ * Material's header carries two topics: the site name, and the page title that
+ * slides in on scroll. The second is absolutely positioned and its width is
+ * whatever its text needs, because with the bundle running it is never laid
+ * out at full width. With scripting off it simply sits there, and on the two
+ * pages with the longest titles it reached 13 px past a 360 px viewport and
+ * scrolled the whole document sideways. Clipping the title container leaves
+ * the site name visible and the body unscrollable. */
+.no-js .md-header__title {
+  overflow: hidden;
+}
+
 /* site/style.css, verbatim.
  *
  * Material stops transitions under reduced motion but leaves animations
