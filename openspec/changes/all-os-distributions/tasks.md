@@ -68,21 +68,21 @@ shippable on their own. See `design.md` — Migration Plan.
 
 ## 8. Windows: desktop integration
 
-- [ ] 8.1 Add a service backend driving Task Scheduler with a logon trigger — the only per-user autostart of the three with CLI verbs for start, stop, status, enable and disable, which `UserService.is_active()` and `status()` have to answer
-- [ ] 8.2 Confirm it registers and starts without administrative rights
-- [ ] 8.3 Add a hotkey backend calling `RegisterHotKey` on a message-loop thread inside the daemon, pumping `GetMessageW`
+- [x] 8.1 Add a service backend driving Task Scheduler with a logon trigger — the only per-user autostart of the three with CLI verbs for start, stop, status, enable and disable, which `UserService.is_active()` and `status()` have to answer
+- [x] 8.2 Confirm it registers and starts without administrative rights
+- [x] 8.3 Add a hotkey backend calling `RegisterHotKey` on a message-loop thread inside the daemon, pumping `GetMessageW`
 - [ ] 8.4 Treat the platform's own refusal to register a key another application holds as the collision, rather than querying first
-- [ ] 8.5 Release the hotkey when the daemon stops, so it is not left claimed against another application
+- [x] 8.5 Release the hotkey when the daemon stops, so it is not left claimed against another application
 - [x] 8.6 Have installation start the daemon before reporting a hotkey bound, and report the binding as held by the running daemon
 - [x] 8.7 Report a hotkey as not currently held, naming the daemon as why, when the daemon is not running
 
 ## 9. Windows: clipboard, injection, focus
 
-- [ ] 9.1 Copy and read through the Win32 clipboard API with `CF_UNICODETEXT`, not `clip.exe`, which encodes through the console codepage and mangles anything outside it
-- [ ] 9.2 Inject the paste with `SendInput`
+- [x] 9.1 Copy and read through the Win32 clipboard API with `CF_UNICODETEXT`, not `clip.exe`, which encodes through the console codepage and mangles anything outside it
+- [x] 9.2 Inject the paste with `SendInput`
 - [x] 9.3 Register `SendInput` as a method whose success cannot be observed, because UIPI silently discards synthetic input aimed at a higher-integrity window — so the transcript stays on the clipboard and the previous contents are not restored over it
-- [ ] 9.4 Add a focus observer using `GetForegroundWindow`, `GetWindowThreadProcessId` and `QueryFullProcessImageName`, behind the existing `FocusObserver` protocol
-- [ ] 9.5 Report the microphone privacy setting's state where it can be read, and distinguish a blocked microphone from an absent device — both present as no audio
+- [x] 9.4 Add a focus observer using `GetForegroundWindow`, `GetWindowThreadProcessId` and `QueryFullProcessImageName`, behind the existing `FocusObserver` protocol
+- [x] 9.5 Report the microphone privacy setting's state where it can be read, and distinguish a blocked microphone from an absent device — both present as no audio
 
 ## 10. Windows: overlay
 
