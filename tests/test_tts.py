@@ -24,6 +24,7 @@ from murmly.config import (
     MurmlyConfig,
     load_config,
 )
+from murmly.platform import OperatingSystem, PlatformProfile
 from murmly.tts import (
     CALIBRATION_TEXT,
     CPU_PROVIDER,
@@ -330,6 +331,16 @@ class AvailabilityTests(unittest.TestCase):
         soname, so a `library_path == soname` pass could not happen by
         accident -- it would only happen if `dlinfo` were consulted and
         returned this exact, distinguishable value.
+
+        A stub module injected under `dlinfo`'s own name, not `patch("dlinfo.
+        DLInfo", ...)`: that spelling still has to import the real package
+        first to find the attribute to patch, and the real `dlinfo` has no
+        Windows backend at all (`_loaded_library_path`'s own docstring) --
+        `dlinfo._glibc` runs glibc `link.h` field offsets against a loader
+        that does not have them, on the one platform this suite also runs on.
+        The explicit Linux profile is what still exercises the branch that
+        reaches this stub, on every host, the way `_loaded_library_path`
+        itself would only do it for real on Linux or macOS.
         """
         fake_handle = object()
 
@@ -342,30 +353,44 @@ class AvailabilityTests(unittest.TestCase):
                 assert self.handle is fake_handle
                 return "/run/loader-resolved/libespeak-ng.so.1"
 
+        fake_dlinfo_module = ModuleType("dlinfo")
+        fake_dlinfo_module.DLInfo = FakeDLInfo
+
         with (
             patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
             patch("ctypes.CDLL", return_value=fake_handle),
-            patch("dlinfo.DLInfo", FakeDLInfo),
+            injected_module("dlinfo", fake_dlinfo_module),
             patch(
                 "murmly.tts._espeak_data_path", return_value="/usr/share/espeak-ng-data"
             ),
         ):
-            library_path, data_path = resolve_espeak()
+            library_path, data_path = resolve_espeak(
+                PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+            )
 
         self.assertEqual("/run/loader-resolved/libespeak-ng.so.1", library_path)
         self.assertEqual("/usr/share/espeak-ng-data", data_path)
 
     def test_dlinfo_failing_falls_back_to_the_bare_soname(self) -> None:
         """Cosmetic-only: a loader that will not answer costs a nicer path, not a refusal."""
+
+        def _raise_dlinfo_failed(_handle: object) -> None:
+            raise RuntimeError("dlinfo failed")
+
+        fake_dlinfo_module = ModuleType("dlinfo")
+        fake_dlinfo_module.DLInfo = _raise_dlinfo_failed
+
         with (
             patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
             patch("ctypes.CDLL", return_value=object()),
-            patch("dlinfo.DLInfo", side_effect=RuntimeError("dlinfo failed")),
+            injected_module("dlinfo", fake_dlinfo_module),
             patch(
                 "murmly.tts._espeak_data_path", return_value="/usr/share/espeak-ng-data"
             ),
         ):
-            library_path, data_path = resolve_espeak()
+            library_path, data_path = resolve_espeak(
+                PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+            )
 
         self.assertEqual("libespeak-ng.so.1", library_path)
         self.assertEqual("/usr/share/espeak-ng-data", data_path)

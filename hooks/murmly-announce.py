@@ -72,9 +72,29 @@ import wave
 #: tasks.md` task 2.6 is about this: closed by moving the resolution to
 #: install time rather than by ever reaching it from here, which stays
 #: impossible for the reason above.
-SOCKET_PATH = os.environ.get(
-    "MURMLY_SOCKET", f"{os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/murmly.sock"
-)
+def _default_socket_path() -> str:
+    """The fallback answer when nothing set `MURMLY_SOCKET` -- see above for
+    why its actual value should never matter on an install this hook shipped
+    behind. `os.getuid()` does not exist on Windows, which has no comparable
+    per-user runtime directory to fall back to anyway (the command channel
+    there is a named pipe, not a filesystem path -- `config.WINDOWS_PIPE_NAME`,
+    not repeated here since this script has no import path to `murmly`).
+    """
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return f"{runtime_dir}/murmly.sock"
+    if hasattr(os, "getuid"):
+        return f"/run/user/{os.getuid()}/murmly.sock"
+    return r"\\.\pipe\murmly"
+
+
+# `or`, not a default argument: `os.environ.get(key, _default_socket_path())`
+# would call `_default_socket_path()` regardless of whether `MURMLY_SOCKET` is
+# set, because Python evaluates a call's arguments before making the call --
+# which is exactly how task 2.6 stayed broken while marked done. `MURMLY_SOCKET`
+# empty is treated the same as unset; nothing sets it to the empty string on
+# purpose.
+SOCKET_PATH = os.environ.get("MURMLY_SOCKET") or _default_socket_path()
 LOG_PATH = os.environ.get("MURMLY_ANNOUNCE_LOG")
 
 # Long enough to be an account of what happened, short enough that nobody waits
@@ -488,16 +508,28 @@ def _run_player(player: tuple[str, ...], path: str, label: str) -> str:
 
 
 class Session:
-    """One speech session on the command socket."""
+    """One speech session on the command socket.
+
+    The UNIX socket is created lazily, in `declare()`, not here: this script
+    has no import path to `murmly.win_pipe` (see `SOCKET_PATH` above for why),
+    so it has no Windows named-pipe client of its own to fall back to either.
+    Deferring construction is what lets a caller that never actually opens a
+    session -- every existing test in this file patches `declare()` itself
+    out -- go on doing that without needing `socket.AF_UNIX`, an attribute
+    Windows' `socket` module does not have at all, to exist just to be
+    constructed and immediately discarded.
+    """
 
     def __init__(self) -> None:
-        self._connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._connection: socket.socket | None = None
         self._payload = b""
 
     def __enter__(self) -> "Session":
         return self
 
     def __exit__(self, *_exception: object) -> None:
+        if self._connection is None:
+            return
         try:
             self._connection.close()
         except OSError:
@@ -505,6 +537,15 @@ class Session:
 
     def declare(self) -> str:
         """Open the session, or say why not. Empty means it is open."""
+        if not hasattr(socket, "AF_UNIX"):
+            # Honest rather than a crash: `SOCKET_PATH` already resolves to a
+            # named-pipe name on Windows (`_default_socket_path` above), but
+            # nothing here can dial it without `pywin32`, which this script,
+            # running under the system Python with no virtual environment,
+            # has no path to import from `murmly.win_pipe` even if it were
+            # installed.
+            return "no daemon: this hook has no Windows named-pipe client yet"
+        self._connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._connection.settimeout(CONNECT_TIMEOUT_SECONDS)
         try:
             self._connection.connect(SOCKET_PATH)

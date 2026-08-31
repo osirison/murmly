@@ -47,7 +47,18 @@ class ReturnFreeHeapTests(unittest.TestCase):
 
 class SystemMemoryReturnableTests(unittest.TestCase):
     def test_returnable_when_the_allocator_can_be_asked(self) -> None:
-        with patch.object(idle, "_MALLOC_TRIM", Mock()):
+        # `_SYSTEM_MEMORY_UNRETURNABLE_REASON` is set once, at import time,
+        # by whatever the real `_malloc_trim()` found on the real host --
+        # "No C library could be located on this platform." on a real
+        # Windows host, which has no `_MALLOC_TRIM` for real. Patching only
+        # `_MALLOC_TRIM` leaves that stale reason in place there, simulating
+        # a platform that can both be asked and still carries a leftover
+        # refusal, which is not a real platform this pair of functions
+        # otherwise ever describes together.
+        with (
+            patch.object(idle, "_MALLOC_TRIM", Mock()),
+            patch.object(idle, "_SYSTEM_MEMORY_UNRETURNABLE_REASON", None),
+        ):
             self.assertTrue(system_memory_returnable())
             self.assertIsNone(system_memory_unreturnable_reason())
 

@@ -985,12 +985,18 @@ class MurmlyDaemon:
         # it later to decide whether the channel is a UNIX socket or a named
         # pipe, and must agree with what was decided here.
         self._profile = profile if profile is not None else resolve_platform()
+        # Before anything else, peer-identity mechanism dispatch included: a
+        # daemon that refuses to run must not start anything first, and on a
+        # deliberately mismatched profile/host pair -- a non-Windows profile
+        # constructed on a real Windows interpreter, which only a test does,
+        # to keep asserting the shape refusal on every host -- resolving a
+        # mechanism it will never use would reference `os.getuid`, an
+        # attribute that interpreter does not have, before ever reaching the
+        # refusal this mismatch is actually here to produce.
+        self._require_private_channel()
         mechanism = peer_identity_mechanism_for(self._profile)
         self._peer_identity = peer_identity if peer_identity is not None else mechanism.read
         self._local_identity = local_identity if local_identity is not None else mechanism.local
-        # Before the overlay, which spawns a renderer from its constructor: a
-        # daemon that refuses to run must not start anything first.
-        self._require_private_channel()
         self._overlay = overlay or self._create_overlay(config)
         self._session = session or SpeechSession(
             config,
@@ -1039,6 +1045,15 @@ class MurmlyDaemon:
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
         self._server: socket.socket | None = None
+        # Set once the channel is actually accepting, not merely assigned to
+        # `_server` -- `wait_until_served` (tests/test_daemon.py) waits on this
+        # rather than polling `getsockopt(SO_ACCEPTCONN)`, which macOS refuses
+        # for an AF_UNIX socket with `OSError: [Errno 42] Protocol not
+        # available`; a probe connection is not a substitute either, since the
+        # daemon counts every accepted connection through its peer-identity
+        # check, and a test that answers that check differently per
+        # connection would be answering one of these probes.
+        self._listening = threading.Event()
         self._worker_slots = threading.BoundedSemaphore(MAX_COMMAND_WORKERS)
         self._connections_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
@@ -1154,11 +1169,13 @@ class MurmlyDaemon:
                         f"Refusing to serve at {self._config.socket_path}. Its socket "
                         f"could not be created: {error}."
                     ) from error
+                self._listening.set()
                 logger.debug("Hotkey rebind at startup: %s", self._rebind_hotkeys())
                 server.settimeout(0.2)
                 self._accept_loop(server)
         finally:
             self._server = None
+            self._listening.clear()
             try:
                 self._config.socket_path.unlink(missing_ok=True)
             except OSError as error:
@@ -1192,6 +1209,11 @@ class MurmlyDaemon:
                 f"could not be created: {error}."
             ) from error
         self._server = server
+        # Already connectable: `NamedPipeServer.__init__` builds its one
+        # waiting pipe instance before returning (see its own docstring), so
+        # there is no separate listen() call whose completion `_listening`
+        # would otherwise need to wait for.
+        self._listening.set()
         try:
             with server:
                 logger.debug("Hotkey rebind at startup: %s", self._rebind_hotkeys())
@@ -1199,6 +1221,7 @@ class MurmlyDaemon:
                 self._accept_loop(server)
         finally:
             self._server = None
+            self._listening.clear()
 
     def _accept_loop(self, server) -> None:
         """Accept connections until shutdown, against either transport.

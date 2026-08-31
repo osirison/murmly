@@ -16,6 +16,8 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from channel_helpers import command_channel_address
+
 from murmly.cli import (
     _measurement_clip,
     _run_daemon,
@@ -33,7 +35,7 @@ from murmly.cli import (
     transcription_model_cache_path,
 )
 from murmly.config import MurmlyConfig
-from murmly.daemon import DaemonNotRespondingError, DaemonStartupError, MurmlyDaemon
+from murmly.daemon import DaemonNotRespondingError, DaemonStartupError, MurmlyDaemon, send_command
 from murmly.integrations import PasteInjection
 from murmly.overlay import (
     SYSTEM_PYTHON,
@@ -50,12 +52,31 @@ from murmly.platform import (
     PermissionState,
     PlatformProfile,
     RuntimeGap,
+    resolve_platform,
 )
 from murmly.stt import FasterWhisperTranscriber
 
 
 class CliTests(unittest.TestCase):
     def test_daemon_exits_cleanly_on_sigterm(self) -> None:
+        if not hasattr(os, "getuid") or not resolve_platform().supported:
+            # A real subprocess running the real `python -m murmly`, so there
+            # is no profile to inject the way every other test in this file
+            # injects one into `main()` in-process: on a real Windows host,
+            # `resolve_platform()` genuinely resolves Windows, which Murmly
+            # does not yet claim to support (see `test_platform.py`'s
+            # `test_supported_reports_only_the_operating_systems_murmly_
+            # claims_today`), so the daemon here would exit immediately,
+            # before ever creating a socket, for reasons this test is not
+            # about. `SIGTERM` itself is also not the same signal there:
+            # `Popen.send_signal` maps it to `TerminateProcess`, not a
+            # catchable signal a clean-exit handler could run for. macOS has
+            # `os.getuid` and a real SIGTERM, but is not in
+            # `SUPPORTED_OPERATING_SYSTEMS` yet either, so the real,
+            # unresolved `resolve_platform()` this subprocess actually runs
+            # under is checked directly rather than hardcoding the one
+            # platform name that gap happens to be today.
+            self.skipTest("needs a real subprocess on a Murmly-supported operating system")
         with tempfile.TemporaryDirectory() as temp_dir:
             socket_path = Path(temp_dir) / "murmly.sock"
             config_path = Path(temp_dir) / "config.toml"
@@ -1112,6 +1133,14 @@ class UnhandledFailureTests(unittest.TestCase):
     """No Murmly command terminates with an unhandled error."""
 
     def test_a_daemon_that_answers_nothing_is_reported_and_exits_non_zero(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            # Builds its own bare UNIX-socket server by hand to simulate a
+            # daemon that accepts and then closes without responding -- the
+            # same pattern `test_daemon.py`'s equivalent tests skip on
+            # Windows for, and for the same reason: no comparably bare way to
+            # fake this against a real named-pipe server without
+            # reimplementing `win_pipe.NamedPipeServer` here a second time.
+            self.skipTest("needs a real UNIX socket to build a bare server for")
         with tempfile.TemporaryDirectory() as temp_dir:
             socket_path = Path(temp_dir) / "murmly.sock"
             config_path = Path(temp_dir) / "config.toml"
@@ -1141,7 +1170,16 @@ class UnhandledFailureTests(unittest.TestCase):
             thread = threading.Thread(target=accept_and_close, daemon=True)
             thread.start()
             try:
-                with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+                with (
+                    patch(
+                        "murmly.cli.resolve_platform",
+                        return_value=PlatformProfile(
+                            operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                        ),
+                    ),
+                    redirect_stdout(StringIO()),
+                    redirect_stderr(StringIO()) as errors,
+                ):
                     exit_code = main(["--config", str(config_path), "status"])
             finally:
                 stop.set()
@@ -1155,7 +1193,14 @@ class UnhandledFailureTests(unittest.TestCase):
             config_path = Path(temp_dir) / "config.toml"
             config_path.write_text("[daemon\nsocket_path = \n", encoding="utf-8")
 
-            with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+            with (
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()) as errors,
+            ):
                 exit_code = main(["--config", str(config_path), "doctor"])
 
         self.assertEqual(1, exit_code)
@@ -1163,6 +1208,8 @@ class UnhandledFailureTests(unittest.TestCase):
         self.assertIn("Unable to read the configuration", errors.getvalue())
 
     def test_a_daemon_that_refuses_to_start_is_reported_and_exits_non_zero(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir) / "shared"
             directory.mkdir()
@@ -1184,6 +1231,10 @@ class UnhandledFailureTests(unittest.TestCase):
                 # The daemon branch ends in os._exit; performing that here would
                 # take the test runner with it.
                 patch("murmly.cli.leave_without_finalizing"),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -1200,6 +1251,10 @@ class UnhandledFailureTests(unittest.TestCase):
 
             with (
                 patch("murmly.cli._run_doctor", side_effect=RuntimeError("probe exploded")),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -1222,6 +1277,10 @@ class UnhandledFailureTests(unittest.TestCase):
             with (
                 patch("murmly.cli._run_daemon", side_effect=RuntimeError("worker exploded")),
                 patch("murmly.cli.leave_without_finalizing"),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -1445,6 +1504,14 @@ class DoctorCompletenessTests(unittest.TestCase):
                 "murmly.cli.select_paste_injection",
                 return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
             ),
+            # Pinned like every other host fact this helper already fixes:
+            # `system_memory_returnable` reads the real C library linked into
+            # this interpreter, not `profile`, so a musl or macOS host would
+            # otherwise add `system_memory_returnable_detail` to the report
+            # and fail every shape assertion below that expects `SECTIONS`
+            # exactly -- a host difference the True/False behaviour itself
+            # already has its own dedicated tests for, elsewhere in this file.
+            patch("murmly.cli.system_memory_returnable", return_value=True),
             redirect_stdout(StringIO()) as output,
         ):
             _run_doctor(config, profile)
@@ -1473,6 +1540,16 @@ class DoctorCompletenessTests(unittest.TestCase):
         # A daemon that answers, so this is the shape when nothing failed. The
         # `*_detail` keys are what the report adds when something did, and one
         # appearing here would mean a probe was reported as unanswerable.
+        if not hasattr(os, "getuid"):
+            # `command_socket.path_private` below needs a real POSIX
+            # directory's real permissions to come back true, the same as
+            # `test_a_private_socket_path_is_reported_as_private`; the
+            # `linux_profile` injection keeps the rest of this Linux-shaped
+            # report (session, platform.operating_system) exercised on macOS
+            # too, but cannot substitute for the POSIX host this one field
+            # still needs.
+            self.skipTest("needs a POSIX host: command_socket.path_private reads real POSIX permissions")
+        linux_profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
         answered = {"ok": True, "state": "IDLE", "model_resident": False}
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
@@ -1480,7 +1557,7 @@ class DoctorCompletenessTests(unittest.TestCase):
                 config_path=Path(temp_dir) / "config.toml",
             )
             with patch("murmly.cli.send_command", return_value=answered):
-                report = self._report(config, Mock(return_value=("cuda", "float16")))
+                report = self._report(config, Mock(return_value=("cuda", "float16")), profile=linux_profile)
 
         self.assertEqual(set(self.SECTIONS), set(report))
         self.assertEqual("cuda", report["runtime_device"])
@@ -1645,6 +1722,13 @@ class DoctorCompletenessTests(unittest.TestCase):
         self.assertIn("access control alone", report["peer_identity_detail"])
 
     def test_a_private_socket_path_is_reported_as_private(self) -> None:
+        if not hasattr(os, "getuid"):
+            # A filesystem path resolves to Windows' own named-pipe mismatch
+            # branch there instead (correctly, and differently) -- this test
+            # is about the POSIX directory-privacy analysis specifically,
+            # which needs a real POSIX host's own permissions to mean
+            # anything, the same as `test_daemon.py`'s `SocketAccessTests`.
+            self.skipTest("needs a POSIX host: private-directory reporting reads real POSIX permissions")
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
                 socket_path=Path(temp_dir) / "murmly.sock",
@@ -1655,6 +1739,28 @@ class DoctorCompletenessTests(unittest.TestCase):
 
         self.assertTrue(report["path_private"])
         self.assertNotIn("detail", report)
+
+    def test_a_private_socket_path_reports_peer_identity_support(self) -> None:
+        """Split out of `test_a_private_socket_path_is_reported_as_private`:
+        `peer_identity_supported` ignores the `profile` it is handed and
+        answers from `hasattr(socket, "SO_PEERCRED")` on the real interpreter
+        (task 13 -- macOS's own `getpeereid` mechanism is not built yet), so
+        there is no profile this test could inject to make the real answer
+        True on a host where it genuinely is not, unlike every other
+        Linux-shaped field `command_socket_diagnostics` reports. Kept as its
+        own test, rather than folded back with a conditional assertion, so
+        Linux keeps proving `SO_PEERCRED` is actually detected rather than
+        merely echoed back."""
+        if not hasattr(socket, "SO_PEERCRED"):
+            self.skipTest("needs a real SO_PEERCRED socket option")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+            report = command_socket_diagnostics(config)
+
         self.assertTrue(report["peer_identity_supported"])
 
     def test_a_pipe_shaped_path_is_reported_private_on_windows(self) -> None:
@@ -1684,7 +1790,14 @@ class DoctorCompletenessTests(unittest.TestCase):
             config_path=Path("/nonexistent/config.toml"),
         )
 
-        report = command_socket_diagnostics(config)
+        # "Off Windows" is the scenario under test, not merely whichever
+        # platform happens to run the suite -- an explicit non-Windows
+        # profile is what keeps this exercised even on a real Windows
+        # runner, where the unresolved default would agree with a
+        # pipe-shaped path instead of calling it out as the mismatch it is.
+        report = command_socket_diagnostics(
+            config, PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+        )
 
         self.assertFalse(report["path_private"])
         self.assertIn("filesystem socket", report["detail"])
@@ -1890,6 +2003,10 @@ class SecondHotkeyCommandTests(unittest.TestCase):
             config_path.write_text("")
             with (
                 patch("murmly.cli.send_command_with_recovery", fake_send),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
             ):
                 main(["--config", str(config_path), "toggle-session"])
@@ -1911,6 +2028,10 @@ class SecondHotkeyCommandTests(unittest.TestCase):
             config_path.write_text("")
             with (
                 patch("murmly.cli.send_command_with_recovery", fake_send),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
             ):
                 main(["--config", str(config_path), "toggle"])
@@ -2336,7 +2457,12 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
         temp_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
         return MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            # Host-appropriate: most callers below patch `send_command`
+            # outright and never touch this address at all, but the two that
+            # don't -- the real "no daemon answers" and "a daemon really is
+            # there" cases -- need the transport this host actually has, not
+            # a filesystem path Windows would refuse before ever reaching it.
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             tts_model_dir=Path(temp_dir) / "models",
             **overrides,
@@ -2565,9 +2691,19 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
         thread.start()
         self.addCleanup(thread.join, 3)
         self.addCleanup(daemon.shutdown)
+        # `.exists()` alone only ever proves the UNIX transport is ready: a
+        # named pipe is never a filesystem node to begin with, so it would
+        # never become true and this would just spin out the deadline. A
+        # whole exchange is what both transports can prove readiness with.
         deadline = time.time() + 3
-        while not config.socket_path.exists() and time.time() < deadline:
-            time.sleep(0.01)
+        while True:
+            try:
+                send_command(str(config.socket_path), "status")
+                break
+            except Exception:  # noqa: BLE001 - not up yet is the ordinary case here
+                if time.time() >= deadline:
+                    self.fail("daemon socket was not accepting connections")
+                time.sleep(0.01)
 
         transcription, synthesis = daemon_residency(config)
 
@@ -2799,6 +2935,10 @@ class DaemonExitTeardownTests(unittest.TestCase):
                     "resolve_runtime",
                     return_value=("cpu", "int8"),
                 ),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
             ):
                 self.assertEqual(0, main(["--config", str(config_path), "doctor"]))
@@ -2812,6 +2952,20 @@ class DaemonExitWithoutFinalizeTests(unittest.TestCase):
     running, and `Py_Finalize` unloads the extension libraries underneath them.
     The daemon dumped core exactly that way on 2026-08-22. See issue #27.
     """
+
+    def setUp(self) -> None:
+        # Every test below but the two exercising `leave_without_finalizing`
+        # directly goes through `main()`, which resolves the real platform
+        # before any of the mocked-out daemon behaviour below ever runs.
+        # Pinned to Linux so that gate keeps agreeing to run this suite's own
+        # daemon-exit tests on every host, exactly as it already does when
+        # this suite happens to run on Linux for real.
+        patcher = patch(
+            "murmly.cli.resolve_platform",
+            return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _config_file(self, temp_dir: str) -> Path:
         config_path = Path(temp_dir) / "config.toml"

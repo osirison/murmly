@@ -50,10 +50,23 @@ def _fake_x11(display: int = 1, atom: int = 0) -> object:
 
 
 class SessionClassificationTests(unittest.TestCase):
+    """Every case here is the X11/Wayland classification specifically, which
+    `create_focus_observer` only reaches for a non-Windows profile -- pinned
+    to Linux explicitly (matching `WindowsClassificationTests` below), rather
+    than left to resolve the real host, so it keeps running on a Windows
+    runner instead of that host's own resolution sending every case here into
+    the Windows branch none of them set up a `windows_focus_observer` for."""
+
+    def _linux_profile(self):
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        return PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+
     def test_wayland_session_is_unverified_without_touching_x11(self) -> None:
         observer = create_focus_observer(
             env={"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"},
             x11_loader=lambda: self.fail("X11 must not be loaded on a Wayland session"),
+            profile=self._linux_profile(),
         )
 
         self.assertFalse(observer.supported)
@@ -64,7 +77,9 @@ class SessionClassificationTests(unittest.TestCase):
         def missing() -> object:
             raise OSError("libX11 is required to verify the transcript delivery target.")
 
-        observer = create_focus_observer(env={"XDG_SESSION_TYPE": "x11"}, x11_loader=missing)
+        observer = create_focus_observer(
+            env={"XDG_SESSION_TYPE": "x11"}, x11_loader=missing, profile=self._linux_profile()
+        )
 
         self.assertFalse(observer.supported)
         self.assertIn("libX11", observer.detail)
@@ -73,6 +88,7 @@ class SessionClassificationTests(unittest.TestCase):
         observer = create_focus_observer(
             env={"XDG_SESSION_TYPE": "x11"},
             x11_loader=lambda: _fake_x11(display=0),
+            profile=self._linux_profile(),
         )
 
         self.assertFalse(observer.supported)
@@ -82,6 +98,7 @@ class SessionClassificationTests(unittest.TestCase):
         observer = create_focus_observer(
             env={"XDG_SESSION_TYPE": "x11"},
             x11_loader=lambda: _fake_x11(display=1, atom=0),
+            profile=self._linux_profile(),
         )
 
         self.assertFalse(observer.supported)

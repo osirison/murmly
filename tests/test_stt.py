@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import shutil
 import tempfile
 import threading
@@ -220,6 +221,17 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 FasterWhisperTranscriber.resolve_runtime(config)
 
     def test_cuda_runtime_loads_libraries_from_installed_distributions(self) -> None:
+        if not hasattr(ctypes, "RTLD_GLOBAL"):
+            # `load_cuda_libraries` calls `ctypes.CDLL(..., mode=ctypes.
+            # RTLD_GLOBAL)` unconditionally -- a POSIX dlopen flag Windows'
+            # `ctypes` does not define at all, since Windows DLLs have no
+            # comparable flat, process-wide symbol namespace to load
+            # globally into. `os.add_dll_directory` is task 11.1's own,
+            # not-yet-built Windows answer to this same loading problem
+            # (still unchecked in tasks.md); this test is the current,
+            # POSIX-only implementation specifically, with no Windows branch
+            # to redirect it to yet.
+            self.skipTest("needs ctypes.RTLD_GLOBAL, which Windows does not define")
         relative_paths = [
             "nvidia/cublas/lib/libcublasLt.so.12",
             "nvidia/cublas/lib/libcublas.so.12",
@@ -244,8 +256,14 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 loaded = FasterWhisperTranscriber._load_cuda_runtime()
 
         self.assertTrue(loaded)
+        # `trusted_library_path` loads `unresolved_path.resolve(strict=True)`,
+        # not the literal joined path: on macOS, `tempfile.TemporaryDirectory`
+        # lands under `/var/folders/...`, itself a symlink to
+        # `/private/var/folders/...`, so the path actually handed to
+        # `ctypes.CDLL` is the resolved one. Resolving the expected paths the
+        # same way is a no-op on Linux, where no such symlink sits in the way.
         self.assertEqual(
-            [str(environment_path / path) for path in relative_paths],
+            [str((environment_path / path).resolve()) for path in relative_paths],
             [call.args[0] for call in load_library.call_args_list],
         )
 

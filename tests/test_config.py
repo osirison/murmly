@@ -43,7 +43,14 @@ from murmly.config import (
 
 class ConfigTests(unittest.TestCase):
     def test_default_socket_path_uses_runtime_dir(self) -> None:
-        socket_path = default_socket_path({"XDG_RUNTIME_DIR": "/tmp/runtime"})
+        # `default_socket_path` takes no `profile=` of its own -- only `env`,
+        # which carries no operating system -- so the Linux/XDG answer this
+        # asserts needs `sys.platform` itself pinned, the same as `test_
+        # config.LinuxPathsAreUnmovedTests` pins it for the same reason:
+        # left to the real host, a Windows runner's own resolution answers
+        # the named pipe instead, regardless of `XDG_RUNTIME_DIR`.
+        with patch("sys.platform", "linux"):
+            socket_path = default_socket_path({"XDG_RUNTIME_DIR": "/tmp/runtime"})
         self.assertEqual(Path("/tmp/runtime/murmly.sock"), socket_path)
 
     def test_load_config_reads_overrides(self) -> None:
@@ -552,43 +559,57 @@ class LinuxPathsAreUnmovedTests(unittest.TestCase):
     """
 
     def test_every_xdg_combination_resolves_exactly_as_it_did_before(self) -> None:
-        home = Path.home()
-        uid_runtime_dir = Path(f"/run/user/{os.getuid()}")
+        if os.name != "posix":
+            # `Path.home()` and `os.getuid()` are both POSIX facts a Windows
+            # host cannot supply at all -- unlike the operating system
+            # decision itself, which the `patch("sys.platform", "linux")`
+            # below can inject on any POSIX host, this one has no fake to
+            # inject: pathlib picks `WindowsPath` from `os.name`, not from
+            # `sys.platform`, so there is no way to make it hand back a
+            # POSIX-shaped path here to compare a Linux install's literal
+            # answer against. Runs unchanged, still asserting the same
+            # literals, on Linux and on macOS -- both real POSIX hosts.
+            self.skipTest("needs a POSIX host: Path.home() and os.getuid() have no Windows equivalent")
+        with patch("sys.platform", "linux"):
+            home = Path.home()
+            uid_runtime_dir = Path(f"/run/user/{os.getuid()}")
 
-        # Each of the three overrides is independently set or unset, for every
-        # one of the eight combinations. `env` always carries an unrelated key
-        # so an "unset" combination is never the empty dict: `default_*`'s
-        # `env or os.environ` treats `{}` as falsy and would silently read the
-        # real process environment instead of the combination under test.
-        for config_home, data_home, runtime_dir in itertools.product(
-            ("/tmp/murmly-test-config", None),
-            ("/tmp/murmly-test-data", None),
-            ("/tmp/murmly-test-runtime", None),
-        ):
-            env = {"MURMLY_TEST_UNRELATED": "1"}
-            if config_home is not None:
-                env["XDG_CONFIG_HOME"] = config_home
-            if data_home is not None:
-                env["XDG_DATA_HOME"] = data_home
-            if runtime_dir is not None:
-                env["XDG_RUNTIME_DIR"] = runtime_dir
+            # Each of the three overrides is independently set or unset, for every
+            # one of the eight combinations. `env` always carries an unrelated key
+            # so an "unset" combination is never the empty dict: `default_*`'s
+            # `env or os.environ` treats `{}` as falsy and would silently read the
+            # real process environment instead of the combination under test.
+            for config_home, data_home, runtime_dir in itertools.product(
+                ("/tmp/murmly-test-config", None),
+                ("/tmp/murmly-test-data", None),
+                ("/tmp/murmly-test-runtime", None),
+            ):
+                env = {"MURMLY_TEST_UNRELATED": "1"}
+                if config_home is not None:
+                    env["XDG_CONFIG_HOME"] = config_home
+                if data_home is not None:
+                    env["XDG_DATA_HOME"] = data_home
+                if runtime_dir is not None:
+                    env["XDG_RUNTIME_DIR"] = runtime_dir
 
-            expected_config_path = (
-                Path(config_home) / "murmly" / "config.toml"
-                if config_home is not None
-                else home / ".config" / "murmly" / "config.toml"
-            )
-            expected_data_dir = (
-                Path(data_home) / "murmly" if data_home is not None else home / ".local" / "share" / "murmly"
-            )
-            expected_runtime_dir = Path(runtime_dir) if runtime_dir is not None else uid_runtime_dir
-            expected_socket_path = expected_runtime_dir / "murmly.sock"
+                expected_config_path = (
+                    Path(config_home) / "murmly" / "config.toml"
+                    if config_home is not None
+                    else home / ".config" / "murmly" / "config.toml"
+                )
+                expected_data_dir = (
+                    Path(data_home) / "murmly"
+                    if data_home is not None
+                    else home / ".local" / "share" / "murmly"
+                )
+                expected_runtime_dir = Path(runtime_dir) if runtime_dir is not None else uid_runtime_dir
+                expected_socket_path = expected_runtime_dir / "murmly.sock"
 
-            with self.subTest(config_home=config_home, data_home=data_home, runtime_dir=runtime_dir):
-                self.assertEqual(expected_config_path, default_config_path(env))
-                self.assertEqual(expected_data_dir, default_tts_model_dir(env))
-                self.assertEqual(expected_runtime_dir, default_runtime_dir(env))
-                self.assertEqual(expected_socket_path, default_socket_path(env))
+                with self.subTest(config_home=config_home, data_home=data_home, runtime_dir=runtime_dir):
+                    self.assertEqual(expected_config_path, default_config_path(env))
+                    self.assertEqual(expected_data_dir, default_tts_model_dir(env))
+                    self.assertEqual(expected_runtime_dir, default_runtime_dir(env))
+                    self.assertEqual(expected_socket_path, default_socket_path(env))
 
 
 class WindowsAndMacOSPathTests(unittest.TestCase):
@@ -601,8 +622,13 @@ class WindowsAndMacOSPathTests(unittest.TestCase):
         }
         with (
             patch("sys.platform", "win32"),
+            # `create=True`: a Windows host has no `os.getuid` to patch over in
+            # the first place, and that absence is exactly the fact this test
+            # exists to pin -- `patch` would otherwise refuse to patch an
+            # attribute that is not there to begin with.
             patch(
                 "murmly.config.os.getuid",
+                create=True,
                 side_effect=AssertionError("os.getuid() must not run on Windows"),
             ),
         ):

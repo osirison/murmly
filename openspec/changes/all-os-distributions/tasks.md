@@ -24,7 +24,7 @@ shippable on their own. See `design.md` — Migration Plan.
 
 ## 3. Linux stops being Fedora
 
-- [x] 3.1 Replace `_loaded_library_path`'s `/proc/self/maps` read (`src/murmly/tts.py:135`) with `dlinfo`, already in the lock as a transitive dependency, which answers the same question on every platform
+- [x] 3.1 Replace `_loaded_library_path`'s `/proc/self/maps` read (`src/murmly/tts.py:135`) with `dlinfo`, already in the lock as a transitive dependency, which answers the same question on Linux and macOS; Windows has no `dlinfo` backend, so it reports the name that was loaded
 - [x] 3.2 Make `_malloc_trim` (`src/murmly/idle.py:22-44`) report that the platform's allocator cannot be asked to return memory, rather than silently doing nothing, and surface that in the residency diagnostics
 - [x] 3.3 Turn `SYSTEM_PYTHON` (`src/murmly/overlay.py:27`) into the interpreter the selected renderer needs, keeping `/usr/bin/python3` for the GTK4 renderer and its reason with it
 - [ ] 3.4 Detect the package manager — `dnf`, `apt`, `pacman`, `zypper`, `apk` — and name the packages for it, printing the list plainly where none is recognised, which is what the script already does without `dnf`

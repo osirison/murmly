@@ -27,7 +27,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import time
@@ -179,8 +179,14 @@ def service_unit_text(entrypoint: Path) -> str:
     ``PartOf`` stops the daemon at logout, ``After`` orders it behind the
     session, and ``WantedBy`` is what actually activates it. The unit shipped
     before this change had only the ordering, which is why it never started.
+
+    ``entrypoint.as_posix()``, not ``str(entrypoint)``: a systemd unit is a
+    Linux artifact regardless of which host renders its text, and `Path`
+    renders in whatever flavour the *host* is -- backslashes on a Windows
+    runner exercising this Linux-only code path in the test suite, which
+    would spell a path systemd itself would never accept.
     """
-    return SERVICE_UNIT_TEMPLATE.format(exec_start=entrypoint)
+    return SERVICE_UNIT_TEMPLATE.format(exec_start=entrypoint.as_posix())
 
 
 def write_atomically(path: Path, content: str, mode: int = 0o644) -> None:
@@ -262,8 +268,13 @@ def launcher_text(
 
     A literal ``%`` is doubled, matching how the desktop's own shortcut editor
     escapes an Exec value.
+
+    ``entrypoint.as_posix()``, not ``str(entrypoint)``, for the same reason
+    `service_unit_text` renders it that way: a `.desktop` launcher is a Linux
+    artifact, and `Path` otherwise renders in the host's own flavour rather
+    than the target's.
     """
-    exec_line = f"{entrypoint} {command}".replace("%", "%%")
+    exec_line = f"{entrypoint.as_posix()} {command}".replace("%", "%%")
     return LAUNCHER_TEMPLATE.format(name=name, exec_line=exec_line, shortcut=hotkey.portable)
 
 
@@ -394,6 +405,23 @@ def _quoted_for_schtasks(value: str) -> str:
     return f'"{value}"' if " " in value else value
 
 
+def _windows_path_text(path: Path) -> str:
+    """`path` rendered the way `schtasks` itself expects: backslashes,
+    always -- never whatever separator the *host* building this string
+    happens to spell paths with.
+
+    `str(path)` alone renders in `Path`'s own flavour, which follows the host
+    (`os.name`), not the platform this text is destined for: a `WindowsPath`
+    on a real Windows machine already renders this way, but the very same
+    entrypoint constructed as a `PosixPath` -- every one of this class's own
+    tests, run on the Linux and macOS CI runners this suite also runs on --
+    renders with forward slashes instead, which is not a command `schtasks`
+    would accept. Routing the string through `PureWindowsPath` first is what
+    makes the two agree on every host.
+    """
+    return str(PureWindowsPath(str(path)))
+
+
 class WindowsUserService:
     """The Murmly Task Scheduler task (task 8.1).
 
@@ -448,7 +476,7 @@ class WindowsUserService:
         `write_atomically` + `daemon-reload` -- both are "make it look like
         this from now on", not "fail if it already existed".
         """
-        run_line = f"{_quoted_for_schtasks(str(entrypoint))} daemon"
+        run_line = f"{_quoted_for_schtasks(_windows_path_text(entrypoint))} daemon"
         self._schtasks_checked(
             "/create", "/tn", self._task_name, "/tr", run_line, "/sc", "onlogon", "/f"
         )

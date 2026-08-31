@@ -312,14 +312,25 @@ class ClipboardPaster:
         which: Which = shutil_which,
         restore_clipboard: bool = True,
         restore_delay_ms: int = 200,
+        profile: PlatformProfile | None = None,
     ) -> None:
         self._env = env or os.environ
         self._which = which
+        # Threaded through to `select_paste_injection` below, not re-resolved
+        # independently: this class is `create_clipboard_paster`'s Linux
+        # branch (its own docstring: "must not change what it returns"), so
+        # its own injector choice must agree with whichever profile decided
+        # to construct it here, rather than asking `resolve_platform` a
+        # second time and risking a different, real-host answer -- the one
+        # case that can disagree is a caller exercising this branch from a
+        # non-Linux machine via `profile=`, exactly as `create_clipboard_
+        # paster`'s own docstring says that parameter is for.
+        self._profile = profile
         self._copy_command = choose_clipboard_copy_command(self._env, which)
         self._read_command = choose_clipboard_read_command(self._env, which)
         # Resolved but not required: a session that cannot inject a paste can still
         # copy, and a transcript on the clipboard is one the user still has.
-        self._injection = select_paste_injection(self._env, which)
+        self._injection = select_paste_injection(self._env, which, profile=self._profile)
         self._failed_methods: set[str] = set()
         self._restore_clipboard = restore_clipboard
         self._restore_delay_ms = restore_delay_ms
@@ -360,6 +371,7 @@ class ClipboardPaster:
             self._env,
             self._which,
             excluded=self._failed_methods,
+            profile=self._profile,
         )
 
     def copy(self, text: str) -> None:
@@ -422,4 +434,5 @@ def create_clipboard_paster(
         which=which,
         restore_clipboard=restore_clipboard,
         restore_delay_ms=restore_delay_ms,
+        profile=resolved,
     )

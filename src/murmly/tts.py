@@ -15,10 +15,17 @@ import logging
 from pathlib import Path
 import re
 import subprocess
+import sys
 import threading
 
 from murmly.config import MurmlyConfig
 from murmly.idle import return_free_heap
+from murmly.platform import (
+    OperatingSystem,
+    PlatformProfile,
+    operating_system_for,
+    resolve_platform,
+)
 from murmly.stt import (
     CTRANSLATE2_CUDA_LIBRARIES,
     cuda_device_count_available,
@@ -27,6 +34,29 @@ from murmly.stt import (
 
 
 logger = logging.getLogger(__name__)
+
+# `dlinfo` (see `_loaded_library_path` below) executes real loader code the
+# moment it is imported, using the *real* `ctypes.util.find_library` -- and a
+# module is only ever executed once; every import after the first is a
+# `sys.modules` lookup. Triggered here, at `murmly.tts` import time, that first
+# real execution happens before any test's `with patch("ctypes.util.find_library",
+# ...)` is active, because a test module imports `murmly.tts` at collection
+# time, ahead of every test body. Left lazy (inside `_loaded_library_path`),
+# the same first import instead happens lazily, at whatever moment a test
+# first reaches it -- which was inside another test's own patched context,
+# so `dlinfo._glibc`'s `find_library('dl')` call returned that patch's answer
+# instead of libdl's real name, and failed to load it. Gated to the two
+# platforms `dlinfo` has a real backend for (see `_loaded_library_path`), and
+# using the pure `operating_system_for(sys.platform)` rather than
+# `resolve_platform()`, so this reads no environment at import time. Any
+# failure here is silent and permanent for this process: `_loaded_library_path`
+# below re-imports the name every call regardless, which is what lets a test
+# still substitute `dlinfo.DLInfo` after this ran.
+if operating_system_for(sys.platform) in (OperatingSystem.LINUX, OperatingSystem.MACOS):
+    try:
+        import dlinfo  # noqa: F401 - imported for its module-level side effect, not used by name
+    except Exception:  # noqa: BLE001 - exactly as forgiving as the lazy import this pre-warms
+        pass
 
 MODEL_FILE_NAME = "kokoro-v1.0.onnx"
 VOICES_FILE_NAME = "voices-v1.0.bin"
@@ -97,7 +127,31 @@ def split_sentences(text: str) -> list[str]:
     return [part.strip() for part in _SENTENCE_BOUNDARY.split(text.strip()) if part.strip()]
 
 
-def resolve_espeak() -> tuple[str, str]:
+def _espeak_library_name(profile: PlatformProfile) -> str | None:
+    """The name to ask the loader for, resolved for `profile`.
+
+    `ctypes.util.find_library` turns a bare package name into a platform's own
+    naming convention -- but only on the platforms where its guess matches
+    what espeak-ng actually ships. On Linux that guess is `libespeak-ng.so.1`,
+    which is exactly right. It is not right anywhere else: Windows' loader
+    does not add a `lib` prefix at all, so asking `find_library` for
+    `espeak-ng` there never finds `libespeak-ng.dll`; and macOS's Homebrew
+    build ships only the versioned `libespeak-ng.1.dylib`, which `find_library`
+    would also miss since it guesses the unversioned name. So only Linux (and
+    anything `resolve_platform` could not name) asks `find_library`; Windows
+    and macOS name the file `ctypes.CDLL` should try directly. A name that does
+    not exist on this machine is not a bug in this function -- `resolve_espeak`
+    turns the resulting `OSError` into the same "not found" report a `None`
+    soname already produces.
+    """
+    if profile.operating_system is OperatingSystem.WINDOWS:
+        return "libespeak-ng.dll"
+    if profile.operating_system is OperatingSystem.MACOS:
+        return "libespeak-ng.1.dylib"
+    return ctypes.util.find_library(ESPEAK_LIBRARY_NAME)
+
+
+def resolve_espeak(profile: PlatformProfile | None = None) -> tuple[str, str]:
     """The phoneme library and its data directory, or why they cannot be found.
 
     Neither path is written down here. The wheel that bundles espeak-ng compiles
@@ -105,7 +159,8 @@ def resolve_espeak() -> tuple[str, str]:
     to override it, so the system install is the one that works -- but naming
     `/usr/lib64` would only move the problem to the next distribution.
     """
-    soname = ctypes.util.find_library(ESPEAK_LIBRARY_NAME)
+    resolved = profile if profile is not None else resolve_platform()
+    soname = _espeak_library_name(resolved)
     if soname is None:
         raise RuntimeError(
             "espeak-ng is required for speech output and was not found. Install "
@@ -116,7 +171,7 @@ def resolve_espeak() -> tuple[str, str]:
     except OSError as error:
         raise RuntimeError(f"espeak-ng ({soname}) could not be loaded: {error}") from error
 
-    library_path = _loaded_library_path(handle) or soname
+    library_path = _loaded_library_path(handle, resolved) or soname
     data_path = _espeak_data_path()
     if data_path is None:
         raise RuntimeError(
@@ -127,7 +182,7 @@ def resolve_espeak() -> tuple[str, str]:
     return library_path, data_path
 
 
-def _loaded_library_path(handle: ctypes.CDLL) -> str | None:
+def _loaded_library_path(handle: ctypes.CDLL, profile: PlatformProfile) -> str | None:
     """Where the loader actually found a library it has already opened.
 
     Asked through `dlinfo` (a `phonemizer` dependency already in the lock, not
@@ -135,14 +190,27 @@ def _loaded_library_path(handle: ctypes.CDLL) -> str | None:
     for a line whose path ends in the library's name: that file is Linux-only,
     and matching on a name fragment can pick up an unrelated library that
     happens to share it. `dlinfo` asks the dynamic linker that resolved
-    `handle` directly, which is exact and answers on every platform the
-    `dlinfo` package supports (glibc and macOS both have their own backend
-    inside it).
+    `handle` directly, which is exact where it answers at all.
 
-    None on any failure -- a handle patched out in a test, a platform `dlinfo`
-    has no backend for, a loader that refuses the question -- because the only
-    use of this is cosmetic: the caller already has a name to fall back to.
+    It does not answer everywhere. `dlinfo` ships exactly two backends --
+    `dlinfo._macosx` on `sys.platform == "darwin"`, `dlinfo._glibc` for every
+    other platform, unconditionally -- so importing it on Windows runs glibc's
+    `link.h` field offsets against a loader they do not describe. That import
+    also has a cost that is not this call's to pay even where it is aimed
+    correctly: `dlinfo._glibc` loads `libdl` at module import time, as a
+    process-wide side effect the first caller to reach here pays for every
+    caller after it. So this is attempted only on the two platforms `dlinfo`
+    actually has a backend for; every other resolved platform returns `None`
+    without ever importing it, the same answer a failed attempt would have
+    produced, honestly rather than by getting lucky that the failure was
+    harmless.
+
+    None on any failure even where it is attempted -- a handle patched out in
+    a test, a loader that refuses the question -- because the only use of this
+    is cosmetic: the caller already has a name to fall back to.
     """
+    if profile.operating_system not in (OperatingSystem.LINUX, OperatingSystem.MACOS):
+        return None
     try:
         from dlinfo import DLInfo
 

@@ -206,7 +206,12 @@ def create_named_pipe_server(pipe_name: str, *, first_instance: bool) -> object:
 
     open_mode = win32pipe.PIPE_ACCESS_DUPLEX | win32con.FILE_FLAG_OVERLAPPED
     if first_instance:
-        open_mode |= win32con.FILE_FLAG_FIRST_PIPE_INSTANCE
+        # `win32con` does not export this constant in every `pywin32`
+        # release, unlike `FILE_FLAG_OVERLAPPED` above -- the literal is
+        # `winbase.h`'s own value, unlikely to ever change now, and `getattr`
+        # prefers whatever the installed `pywin32` does define whenever it
+        # has it.
+        open_mode |= getattr(win32con, "FILE_FLAG_FIRST_PIPE_INSTANCE", 0x00080000)
     pipe_mode = win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT
     try:
         return win32pipe.CreateNamedPipe(

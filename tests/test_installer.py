@@ -76,6 +76,12 @@ class EntrypointResolutionTests(unittest.TestCase):
             self.assertIn(temp_dir, str(raised.exception))
 
     def test_non_executable_entrypoint_is_refused(self) -> None:
+        if not hasattr(os, "getuid"):
+            # `os.access(path, os.X_OK)` -- what `resolve_entrypoint` refuses
+            # on -- treats every file as executable on Windows, which has no
+            # POSIX execute bit for `chmod(0o644)` to clear in the first
+            # place.
+            self.skipTest("needs a POSIX execute bit, which os.access(X_OK) does not check on Windows")
         with tempfile.TemporaryDirectory() as temp_dir:
             interpreter = Path(temp_dir) / "python3"
             interpreter.write_text("", encoding="utf-8")
@@ -203,6 +209,8 @@ class AtomicWriteTests(unittest.TestCase):
             self.assertEqual("new\n", target.read_text(encoding="utf-8"))
 
     def test_applies_requested_mode(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX mode bits, which Windows does not enforce this way")
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "unit.service"
 
@@ -431,6 +439,11 @@ class WindowsServiceInstallTests(unittest.TestCase):
             self.assertNotIn("/rl", call)
 
     def test_the_run_line_ends_with_the_daemon_subcommand(self) -> None:
+        # Asserted in backslash form -- the canonical Windows spelling
+        # `_windows_path_text` renders on every host, not the forward-slash
+        # form `Path("C:/...")` happens to keep unchanged when the suite runs
+        # on Linux or macOS, where `Path` never recognises "C:" as a drive
+        # letter to begin with.
         schtasks = FakeSchtasks()
         service = WindowsUserService(run_command=schtasks)
 
@@ -438,8 +451,8 @@ class WindowsServiceInstallTests(unittest.TestCase):
 
         create_call = schtasks.calls[0]
         run_line = create_call[create_call.index("/tr") + 1]
-        self.assertEqual("C:/murmly/murmly.exe daemon", run_line)
-        self.assertEqual("C:/murmly/murmly.exe", service.recorded_entrypoint())
+        self.assertEqual("C:\\murmly\\murmly.exe daemon", run_line)
+        self.assertEqual("C:\\murmly\\murmly.exe", service.recorded_entrypoint())
 
     def test_an_entrypoint_containing_a_space_is_quoted(self) -> None:
         schtasks = FakeSchtasks()
@@ -449,7 +462,7 @@ class WindowsServiceInstallTests(unittest.TestCase):
 
         create_call = schtasks.calls[0]
         run_line = create_call[create_call.index("/tr") + 1]
-        self.assertEqual('"C:/Program Files/murmly/murmly.exe" daemon', run_line)
+        self.assertEqual('"C:\\Program Files\\murmly\\murmly.exe" daemon', run_line)
 
     def test_reinstall_repairs_a_stale_path(self) -> None:
         schtasks = FakeSchtasks()
@@ -458,7 +471,7 @@ class WindowsServiceInstallTests(unittest.TestCase):
 
         service.install(Path("C:/new/murmly.exe"))
 
-        self.assertEqual("C:/new/murmly.exe", service.recorded_entrypoint())
+        self.assertEqual("C:\\new\\murmly.exe", service.recorded_entrypoint())
 
     def test_failing_schtasks_raises_with_its_error(self) -> None:
         schtasks = FakeSchtasks(failures={"/create": 1})
@@ -558,7 +571,8 @@ class WindowsServiceLifecycleTests(unittest.TestCase):
 
         self.assertTrue(status.installed)
         self.assertTrue(status.active)
-        self.assertEqual("C:/murmly/murmly.exe", status.entrypoint)
+        # Backslash form -- see test_the_run_line_ends_with_the_daemon_subcommand.
+        self.assertEqual("C:\\murmly\\murmly.exe", status.entrypoint)
 
     def test_status_reports_installed_but_inactive(self) -> None:
         schtasks = FakeSchtasks()
@@ -1488,8 +1502,10 @@ def make_installer(
     injection=None,
     session_launcher=None,
     record_store=None,
+    profile=None,
 ):
     from murmly.installer import DESKTOP_ID, SESSION_HOTKEY, Installer
+    from murmly.platform import OperatingSystem, PlatformProfile
 
     hotkey_code = 268435544
     # Pinned so the tests never depend on what this machine has installed.
@@ -1502,6 +1518,18 @@ def make_installer(
         session_launcher=session_launcher or FakeLauncher(purpose=SESSION_HOTKEY),
         shortcuts=shortcuts or OwnerRegistry(keys={DESKTOP_ID: [hotkey_code]}, owners={hotkey_code: [owner(DESKTOP_ID, "murmly")]}),
         session=session or FakeSession(),
+        # A Linux profile every one of this helper's callers gets by default,
+        # regardless of which host runs the suite: every fake above (service,
+        # launcher, shortcuts) stands in for the GNOME/Plasma desktop flow
+        # `Installer.install` only reaches when `hotkey_mechanism_is_in_process
+        # (self._profile)` is false. Left to the real host's own
+        # `resolve_platform()`, a Windows runner would answer true instead and
+        # send every one of these tests into the in-process branch the fakes
+        # were never built for -- see `_windows_installer` above for the
+        # deliberately-Windows counterpart of this same seam.
+        profile=profile
+        if profile is not None
+        else PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
         entrypoint_resolver=lambda: Path(entrypoint),
         injection_selector=lambda: selected,
         record_store=record_store or FakeRecordStore(),
@@ -2246,6 +2274,7 @@ class PasteInjectionReportTests(unittest.TestCase):
     def test_a_failing_selector_never_fails_the_install(self) -> None:
         from murmly.hotkey import parse_hotkey
         from murmly.installer import Installer, DESKTOP_ID
+        from murmly.platform import OperatingSystem, PlatformProfile
 
         def explode() -> PasteInjection:
             raise OSError("selection blew up")
@@ -2259,6 +2288,9 @@ class PasteInjectionReportTests(unittest.TestCase):
             entrypoint_resolver=lambda: Path("/bin/murmly"),
             injection_selector=explode,
             record_store=FakeRecordStore(),
+            # See `make_installer`'s own default: unpinned, this would
+            # otherwise resolve to the real host's platform.
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
         )
 
         outcome = installer.install(parse_hotkey("Meta+X"))
@@ -2752,6 +2784,7 @@ class EndToEndBackendSelectionTests(unittest.TestCase):
         from murmly.desktop import Desktop, DesktopSession, GnomeShortcutLauncher, GnomeShortcuts, OverlayBackend
         from murmly.hotkey import parse_hotkey
         from murmly.installer import Installer
+        from murmly.platform import OperatingSystem, PlatformProfile
         from test_desktop_gnome import FakeGsettings
 
         fake = FakeGsettings()
@@ -2772,6 +2805,11 @@ class EndToEndBackendSelectionTests(unittest.TestCase):
             injection_selector=lambda: PasteInjection("xdotool", ("xdotool",)),
             record_store=record_store,
             run_command=fake,
+            # Left to the real host's own `resolve_platform()`, a Windows
+            # runner would send `install()` into the in-process branch
+            # instead of the GNOME desktop flow this test means to drive --
+            # see `make_installer`'s own default above for the same seam.
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
         )
 
         # Resolved through `_backend_for`'s GNOME branch, not pinned.
@@ -2803,6 +2841,7 @@ class EndToEndBackendSelectionTests(unittest.TestCase):
         from murmly.desktop import Desktop, DesktopSession, OverlayBackend, PlasmaShortcuts
         from murmly.hotkey import parse_hotkey
         from murmly.installer import DESKTOP_ID, Installer, SESSION_DESKTOP_ID, ShortcutLauncher, default_applications_dir
+        from murmly.platform import OperatingSystem, PlatformProfile
 
         with tempfile.TemporaryDirectory() as temp_dir:
             env = {
@@ -2829,6 +2868,10 @@ class EndToEndBackendSelectionTests(unittest.TestCase):
                 record_store=record_store,
                 run_command=bus,
                 env=env,
+                # See the GNOME test above: the real host's own resolution
+                # would otherwise send this into the in-process branch on a
+                # Windows runner instead of the Plasma desktop flow.
+                profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
             )
 
             # Resolved through `_backend_for`'s default (Plasma) branch, not

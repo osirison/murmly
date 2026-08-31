@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import murmly.integrations
 from murmly.integrations import (
     ClipboardPaster,
     MissingToolError,
@@ -43,6 +44,32 @@ def probe_factory(*usable: str):
 class IntegrationSelectionTests(unittest.TestCase):
     WAYLAND = {"WAYLAND_DISPLAY": "wayland-0", "XDG_SESSION_TYPE": "wayland"}
     X11 = {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"}
+
+    def setUp(self) -> None:
+        # None of these calls pass `profile=`, so every one of them would
+        # otherwise resolve the real host's own platform (`resolve_platform`
+        # reads `sys.platform`, not `env`, for the operating system):
+        # `select_paste_injection` only reaches the Wayland/X11 candidate
+        # lists these tests are about when the resolved platform is not
+        # Windows, which a Windows runner's own resolution would not be.
+        # Pinned to Linux here rather than at each call site, since every
+        # test in this class needs the same one -- but only the operating
+        # system: the real `resolve_platform(env)` is still what has to
+        # decide `session_type`/`wayland_display`/`x11_display` from each
+        # test's own `env`, which every candidate list in this class also
+        # dispatches on, so a bare `return_value=` replacing the whole
+        # profile would answer every one of those from an unrelated default
+        # instead of from the environment each test actually built.
+        import dataclasses
+
+        real_resolve_platform = murmly.integrations.resolve_platform
+
+        def resolve_as_linux(env=None):
+            return dataclasses.replace(real_resolve_platform(env), operating_system=OperatingSystem.LINUX)
+
+        patcher = patch("murmly.integrations.resolve_platform", side_effect=resolve_as_linux)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_wayland_prefers_wl_copy_and_a_usable_wtype(self) -> None:
         which = fake_which_factory("wl-copy", "wtype", "xdotool")
@@ -136,7 +163,17 @@ class ClipboardRestoreTests(unittest.TestCase):
     ENV = {"XDG_SESSION_TYPE": "x11"}
 
     def _paster(self, **kwargs) -> ClipboardPaster:
-        return ClipboardPaster(env=dict(self.ENV), which=lambda name: f"/usr/bin/{name}", **kwargs)
+        return ClipboardPaster(
+            env=dict(self.ENV),
+            which=lambda name: f"/usr/bin/{name}",
+            # `ClipboardPaster` is the Linux implementation specifically
+            # (`ClipboardPasterFactoryTests`'s own docstring); constructed
+            # directly here rather than through `create_clipboard_paster`,
+            # so nothing else pins its own injector selection to Linux the
+            # way that factory's dispatch otherwise would.
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+            **kwargs,
+        )
 
     def _capture(self):
         calls: list[tuple[tuple, str | None]] = []
@@ -408,6 +445,7 @@ class ClipboardPasterFactoryTests(unittest.TestCase):
         paster = create_clipboard_paster(
             env={"XDG_SESSION_TYPE": "x11"},
             which=lambda name: f"/usr/bin/{name}",
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
         )
 
         self.assertIsInstance(paster, ClipboardPaster)

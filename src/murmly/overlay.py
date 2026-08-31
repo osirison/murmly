@@ -394,8 +394,13 @@ class OverlayController:
         try:
             parent_transport, child_transport = self._socket_pair_factory()
             command = [
-                str(renderer_python(self._backend)),
-                str(self._helper_path),
+                # `.as_posix()`, not `str(...)`: this renderer is launched only
+                # on Linux (X11/Wayland) in real use, so its command line is a
+                # POSIX path regardless of which host's flavour `Path` would
+                # otherwise render -- a Windows runner exercising this same
+                # Linux-only launch logic would otherwise get backslashes here.
+                renderer_python(self._backend).as_posix(),
+                self._helper_path.as_posix(),
                 "--fd",
                 str(child_transport.fileno()),
                 "--bottom-margin-px",

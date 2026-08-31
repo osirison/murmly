@@ -11,6 +11,7 @@ import unittest.mock
 from pathlib import Path
 from types import ModuleType
 
+from channel_helpers import command_channel_address, connect_command_channel
 from fakes import FakeSynthesizer, fake_amplitude
 from module_stubs import injected_module
 from murmly.audio import SoundDeviceRecorder, SoundDevicePlayer, pcm16_from_float32
@@ -92,10 +93,8 @@ class SessionClient:
     """
 
     def __init__(self, socket_path: Path, timeout: float = 5.0) -> None:
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._timeout = timeout
-        self._socket.settimeout(timeout)
-        self._socket.connect(str(socket_path))
+        self._socket = connect_command_channel(socket_path, timeout)
         self._payload = b""
 
     def declare(self) -> dict:
@@ -162,7 +161,7 @@ class SpeechSessionHarness(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
             tts_enabled=enabled,
@@ -260,7 +259,7 @@ class SessionDeclarationTests(SpeechSessionHarness):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
             tts_enabled=True,
@@ -282,7 +281,7 @@ class SessionDeclarationTests(SpeechSessionHarness):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
             tts_enabled=True,
@@ -452,9 +451,8 @@ class OneShotCommandTests(SpeechSessionHarness):
         _daemon, socket_path, _engine, _player, _capture = self.serve()
         self.client(socket_path).declare()
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(3)
-            client.connect(str(socket_path))
+        client = connect_command_channel(socket_path, 3)
+        try:
             client.sendall(b'{"command": "status"}\n')
             payload = b""
             while not payload.endswith(b"\n"):
@@ -464,6 +462,8 @@ class OneShotCommandTests(SpeechSessionHarness):
                 payload += chunk
             self.assertTrue(json.loads(payload)["ok"])
             self.assertEqual(b"", client.recv(4096), "a second frame reached a one-shot caller")
+        finally:
+            client.close()
 
     def test_status_reports_the_state_that_means_output_is_active(self) -> None:
         _daemon, socket_path, _engine, player, _capture = self.serve()
@@ -1314,7 +1314,7 @@ class CaptureNeverHearsSpeechTests(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             sample_rate_hz=24_000,
             tts_enabled=True,

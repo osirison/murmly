@@ -334,7 +334,13 @@ class OverlayTests(unittest.TestCase):
         self.assertEqual(["LISTENING", "THINKING"], [decoded[0]["value"], decoded[1]["value"]])
         self.assertEqual({"type": "level", "value": 0.3}, decoded[2])
         self.assertEqual("/usr/bin/python3", launches[0][0][0])
-        self.assertEqual("/tmp/renderer.py", launches[0][0][1])
+        # `OverlayController` stores `helper_path.resolve()`, not the literal
+        # value passed in: on macOS `/tmp` is itself a symlink to
+        # `/private/tmp`, so the launched command names the resolved path
+        # (`/private/tmp/renderer.py` there), not the string this test
+        # constructed the controller with. Comparing against the same
+        # `.resolve()` is a no-op on Linux, where `/tmp` is not a symlink.
+        self.assertEqual(str(Path("/tmp/renderer.py").resolve()), launches[0][0][1])
         self.assertIn("--reduced-motion", launches[0][0])
         self.assertIn("wayland", launches[0][0])
         self.assertFalse(launches[0][1]["shell"])

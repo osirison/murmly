@@ -357,7 +357,22 @@ compiled in as the path on the machine that built it, ignores
 audio — recorded in `docs/agent-notes/espeakng-loader-data-path.md`.
 
 `/proc/self/maps` is Linux-only and has to go regardless; `dlinfo`, already in the
-lock as a transitive dependency, answers the same question portably.
+lock as a transitive dependency, answers the same question on Linux and macOS.
+
+It does not answer it everywhere, which this design originally claimed. `dlinfo`
+ships two backends — `dlinfo._macosx` and `dlinfo._glibc` — and selects `_glibc`
+for every platform that is not Darwin, including Windows, where its `link_map`
+read cannot work. Windows' own mechanism is `GetModuleFileNameW` against the
+handle, and it is not built here: the loaded path is a diagnostic that
+`resolve_espeak()` already falls back to the bare loaded name for, so Windows
+reports that name rather than gaining a third implementation for a cosmetic
+field.
+
+`dlinfo._glibc` also resolves libdl at its own module import time, so that import
+must happen once against a clean environment rather than lazily inside a call a
+test may have patched `ctypes.util.find_library` underneath. That is a real
+constraint on where the import goes, and it is why the import is made eagerly
+under a platform guard rather than on first use.
 
 The larger question is whether the bundled wheel can be made to work through
 espeak-ng's `ESPEAK_DATA_PATH` environment variable, which the library reads when

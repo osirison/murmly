@@ -340,9 +340,23 @@ def _has_overlay_display(profile: PlatformProfile) -> bool:
 
 
 def _load_unix_socket_family() -> object:
+    """The socket family the UNIX-socket command channel is built on.
+
+    Read from the live `socket` module where it has the attribute at all --
+    Linux and macOS both do, and that is the value actually used wherever this
+    candidate is genuinely selected. It falls back to the POSIX address-family
+    enumeration's own constant (`AF_UNIX` has been `1` there since long before
+    either platform existed) only where the running interpreter's `socket`
+    module has no such attribute -- Windows', which is exactly why task 18.1's
+    exhaustive sweep can reach this loader while running there: that test
+    constructs every (concern, operating system) pair `from any machine` and
+    requires every candidate's `load()` to answer rather than raise, the same
+    contract `_load_named_pipe_server` already meets on Linux by never
+    touching a `pywin32` name outside the function that runs on Windows.
+    """
     import socket
 
-    return socket.AF_UNIX
+    return getattr(socket, "AF_UNIX", 1)
 
 
 def _is_windows(profile: PlatformProfile) -> bool:

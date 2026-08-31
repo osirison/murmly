@@ -106,15 +106,34 @@ class OperatingSystemMappingTests(unittest.TestCase):
         self.assertEqual(OperatingSystem.OTHER, operating_system_for("freebsd13"))
 
 
+#: The literal answer this test's own assertion needs, independent of
+#: `operating_system_for` -- the very function `test_resolves_the_real_
+#: operating_system_and_architecture` exists to check resolves `sys.platform`
+#: through. Deriving the expectation from that same function would make the
+#: assertion true by construction on every host, never wrong, which is not a
+#: test of the resolution at all.
+_REAL_HOST_OPERATING_SYSTEM = {
+    "linux": OperatingSystem.LINUX,
+    "win32": OperatingSystem.WINDOWS,
+    "darwin": OperatingSystem.MACOS,
+}
+
+
 class ResolvePlatformTests(unittest.TestCase):
     """Resolution answers for a supplied environment, not the process's own (18.2)."""
 
     def test_resolves_the_real_operating_system_and_architecture(self) -> None:
-        # This suite runs on Linux; resolving with no environment override
-        # must still name the operating system this process is actually on,
-        # confirming resolve_platform reads sys.platform rather than a stub.
+        # Runs on every host this suite's CI matrix has (Linux, Windows,
+        # macOS): resolving with no environment override must still name
+        # *this* process's own operating system, confirming resolve_platform
+        # reads sys.platform rather than a stub -- whichever one that is.
+        expected = _REAL_HOST_OPERATING_SYSTEM.get(sys.platform)
+        if expected is None:
+            self.skipTest(f"no expected operating system on file for sys.platform {sys.platform!r}")
+
         profile = resolve_platform({})
-        self.assertEqual(OperatingSystem.LINUX, profile.operating_system)
+
+        self.assertEqual(expected, profile.operating_system)
         self.assertTrue(profile.architecture)
 
     def test_a_supplied_environment_decides_the_session_reading(self) -> None:
@@ -229,8 +248,17 @@ class DetectedLibcTests(unittest.TestCase):
 
     def test_resolve_platform_reports_musl_for_a_musl_machine(self) -> None:
         """End to end: a musl machine's own resolution -- not a profile a test
-        built by hand -- is what `transcription_runtime_gap` has to see."""
+        built by hand -- is what `transcription_runtime_gap` has to see.
+
+        `sys.platform` pinned to Linux, not left to the real host's own:
+        `resolve_platform` only ever asks `_detected_libc` at all when the
+        resolved operating system is Linux (musl is a Linux/libc concept, not
+        a Windows or macOS one), so this stays the Linux scenario it is on
+        every runner, rather than silently resolving Windows or macOS and
+        never reaching the two patches below at all.
+        """
         with (
+            patch("sys.platform", "linux"),
             patch("murmly.platform.stdlib_platform.libc_ver", return_value=("", "")),
             patch("murmly.platform._musl_loader_present", return_value=True),
         ):
@@ -266,7 +294,11 @@ class BackendRegistryTests(unittest.TestCase):
 
         self.assertEqual("unix-socket", choice.mechanism)
         self.assertTrue(choice.available)
-        self.assertIs(socket.AF_UNIX, choice.load())
+        # `getattr(..., 1)`, matching `_load_unix_socket_family` itself: the
+        # loader reads *this* interpreter's own `socket` module regardless of
+        # which profile was asked for, and Windows' has no `AF_UNIX`
+        # attribute for a bare reference here to find either.
+        self.assertIs(getattr(socket, "AF_UNIX", 1), choice.load())
 
     def test_command_channel_has_no_backend_on_macos(self) -> None:
         # Not Windows too (task 7.1): a named-pipe transport now exists there.

@@ -21,7 +21,7 @@ from murmly.audio import (
     SoundDevicePlayer,
     disable_portaudio_exit_teardown,
 )
-from murmly.config import MurmlyConfig, default_config_path, load_config
+from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, default_config_path, load_config
 from murmly.daemon import (
     COMMAND_REBIND_HOTKEYS,
     COMMAND_STATUS,
@@ -796,7 +796,14 @@ def command_socket_diagnostics(
 
     Task 7.5: `socket_path_detail`'s directory-privacy analysis presumes a
     filesystem object, which a pipe name is not, so a pipe-shaped configured
-    value skips it entirely rather than being walked as a filesystem path.
+    value skips it entirely rather than being walked as a filesystem path. The
+    same presumption runs the other way on Windows: `socket_path_detail` reads
+    `os.stat().st_uid` through `os.getuid()`, an attribute Windows' `os` module
+    does not have at all, so a filesystem-shaped value configured on a Windows
+    resolution -- the mismatch `MurmlyDaemon._require_private_channel` refuses
+    at startup -- is reported here rather than walked, the same way the
+    reverse mismatch already is. This function reports and never refuses, so
+    it cannot let that mismatch reach `socket_path_detail` and crash instead.
     """
     resolved = profile if profile is not None else resolve_platform()
     path = str(config.socket_path)
@@ -816,8 +823,27 @@ def command_socket_diagnostics(
                 f"{resolved.operating_system.value} serves its command channel as "
                 "a filesystem socket."
             )
+    elif resolved.operating_system is OperatingSystem.WINDOWS:
+        report["path_private"] = False
+        report["detail"] = (
+            f"{path} is a filesystem path, but Windows serves its command "
+            "channel as a named pipe, so this daemon cannot create it "
+            f"privately. Configure daemon.socket_path as a pipe name such as "
+            f"{WINDOWS_PIPE_NAME}."
+        )
     else:
-        detail = socket_path_detail(config.socket_path)
+        try:
+            detail = socket_path_detail(config.socket_path)
+        except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+            # `socket_path_detail` reads `os.stat().st_uid` through
+            # `os.getuid()` for a resolved profile the caller says is Linux or
+            # macOS -- true of every real machine that profile could name,
+            # but a test may deliberately resolve one of those profiles on a
+            # real Windows interpreter, to keep this section's Linux/macOS
+            # behaviour exercised on every host, which has no `os.getuid` for
+            # it to find at all. This function reports and never refuses, so
+            # that mismatch is named rather than left to crash the report.
+            detail = f"Unable to determine whether {path} is private: {error}"
         report["path_private"] = detail is None
         if detail is not None:
             report["detail"] = detail
