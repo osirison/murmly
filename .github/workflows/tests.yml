@@ -14,8 +14,8 @@ permissions:
 
 jobs:
   unittest:
-    name: unittest (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: unittest (${{ matrix.name }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -23,6 +23,29 @@ jobs:
         # The floor declared in pyproject.toml, and the version development
         # happens on. A break confined to one of them is worth telling apart.
         python-version: ["3.12", "3.14"]
+        # Every platform Murmly supports. The platform-dependent backends are
+        # selected from an injected profile, so their selection is exercised
+        # everywhere -- but the Win32 and AppKit calls behind them run only on
+        # the machine that has them, and this matrix is the only place that
+        # happens. A backend that imports something absent, or a lockfile that
+        # cannot resolve for a platform, fails here rather than on the first
+        # person to try it.
+        #
+        # macos-14 rather than macos-13: onnxruntime stopped publishing an
+        # Intel wheel at 1.24.1, so Apple Silicon on macOS 14 is the floor and
+        # an Intel runner could not install the transcription stack at all.
+        os: ["ubuntu-latest", "windows-latest", "macos-14"]
+        # Each of these names an `os` the matrix already declares, so it adds
+        # the label to those combinations rather than creating new ones. An
+        # include entry sharing no key with the matrix would overwrite the
+        # earlier entries instead of expanding them.
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+          - os: macos-14
+            name: macOS
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +54,12 @@ jobs:
       # exercise the real module skip themselves rather than fail -- including
       # the one pinning the private symbol Murmly unregisters at daemon exit,
       # which is the whole point of running them here.
+      #
+      # Linux only: the sounddevice wheel bundles PortAudio on Windows and
+      # macOS and ships as pure Python on Linux, which is the same asymmetry
+      # the installer has to name in its system-package list.
       - name: Install PortAudio
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libportaudio2

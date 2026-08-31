@@ -174,7 +174,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 18.16 Test that releasing a model reports system memory as not returned where the allocator cannot be asked, and still drops the model on schedule
 - [x] 18.17 Test that the diagnostics report carries the same field names on every platform, with an unserviceable concern reported unavailable rather than absent
 - [ ] 18.18 Keep the runtime `self.skipTest(...)` pattern for anything needing a live session, extending it to skip on the wrong operating system, as `X11RuntimeIntegrationTests` already does for a missing display
-- [ ] 18.19 Add Windows and macOS CI runners running everything that does not need a session
+- [x] 18.19 Add Windows and macOS CI runners running everything that does not need a session
 
 ## 19. Documentation and the project page
 
