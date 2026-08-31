@@ -3441,6 +3441,27 @@ class ServiceBackendDispatchTests(unittest.TestCase):
 
         self.assertIsInstance(installer._service, WindowsUserService)
 
+    def test_an_unpinned_installer_on_macos_gets_a_working_launchd_instance(self) -> None:
+        """The macOS sibling of the two tests above: `Installer.__init__` calls
+        `_default_service()` eagerly, the instant a macOS profile is
+        supplied, which is what makes this reachable on any host regardless
+        of which operating system actually resolved the profile -- exactly
+        the shape `test_macos_dispatches_to_getpeereid` (`test_daemon.py`)
+        exercises for peer identity. `getattr(os, "getuid", None)`, not the
+        bare name: on a real Windows interpreter, which only a test resolves
+        a macOS profile on to keep this dispatch exercised on every host,
+        `os.getuid` does not exist at all, and building the object here must
+        not raise for that reason -- only actually reaching `launchctl` may."""
+        from murmly.installer import Installer, LaunchdUserService
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        installer = Installer(profile=profile)
+
+        self.assertIsInstance(installer._service, LaunchdUserService)
+        expected_uid = os.getuid() if hasattr(os, "getuid") else None
+        self.assertEqual(expected_uid, installer._service._uid)
+
 
 class EndToEndBackendSelectionTests(unittest.TestCase):
     """Task 4's other declared-but-unfixed gap: every test above either pins

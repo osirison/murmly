@@ -566,14 +566,29 @@ class LaunchdUserService:
         self._agents_dir = agents_dir if agents_dir is not None else default_launch_agents_dir(env)
         self._binary = launchctl
         self._label = label
-        # `os.getuid()`, not a hardcoded fallback: this class is only ever
-        # constructed for a resolved macOS profile, where `os.getuid` always
-        # exists (`installer.Installer._default_service`'s own dispatch), and
-        # a test names a `uid` directly rather than needing a real one.
-        self._uid = uid if uid is not None else os.getuid()
+        # `getattr(os, "getuid", None)`, called only where it exists, not the
+        # bare name: this class is only ever *meaningfully* constructed for a
+        # resolved macOS profile, where `os.getuid` always exists, but
+        # `Installer.__init__` calls `_default_service()` -- and so this
+        # constructor -- eagerly, the instant `SERVICE_MANAGEMENT` selects
+        # `launchd` for `self._profile`, which only requires the *profile* to
+        # say macOS, not the host. A test that resolves a macOS profile on a
+        # real Windows interpreter (to keep `Installer`'s dispatch exercised
+        # on every host, the same reason `peer_identity_mechanism_for` keeps
+        # a macOS branch exercised there) would otherwise hit a bare
+        # `AttributeError` while merely building the object, before ever
+        # calling `launchctl`. `_domain_target` below is what actually needs
+        # a real uid, and raises there instead.
+        local_getuid = getattr(os, "getuid", None)
+        self._uid = uid if uid is not None else (local_getuid() if local_getuid is not None else None)
 
     @property
     def _domain_target(self) -> str:
+        if self._uid is None:
+            raise InstallError(
+                "launchd is only usable on macOS, which always provides os.getuid(); "
+                "this interpreter does not."
+            )
         return f"gui/{self._uid}"
 
     @property

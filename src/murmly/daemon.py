@@ -450,11 +450,18 @@ def peer_identity_mechanism_for(profile: PlatformProfile) -> PeerIdentityMechani
     is *called* -- not merely referenced -- for a non-Windows profile on a
     real Windows interpreter, which only a test deliberately does (see
     `MurmlyDaemon.__init__`'s own comment on this same hazard). `None`
-    reaches `PeerIdentityMechanism.local` there instead, and is never
-    called: `_peer_permitted` only calls it once `self._peer_identity`
-    -- `read_peer_identity` for this branch -- has already answered with a
-    real identity, and `read_peer_identity` itself answers `None` on a host
-    with no `SO_PEERCRED`, which every real Windows host is.
+    reaches `PeerIdentityMechanism.local` there instead, and `.supported`
+    reports `False` alongside it -- `hasattr`, the same idiom
+    `peer_identity_supported` and `_directory_exposure` both already use to
+    ask what a platform can do rather than assume it, instead of the bare
+    `AttributeError` that reaching this branch used to raise for exactly
+    that host/profile pair. `local` is never called there regardless:
+    `_peer_permitted` only calls it once `self._peer_identity` -- the
+    platform's `read` -- has already answered with a real identity, and on a
+    host missing `os.getuid` altogether that never happens: `read_peer_
+    identity` answers `None` with no `SO_PEERCRED` (every real Windows
+    host), and `read_peer_identity_macos` is never reachable on a
+    non-Darwin host in the first place.
     """
     if profile.operating_system is OperatingSystem.WINDOWS:
         from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
@@ -465,8 +472,13 @@ def peer_identity_mechanism_for(profile: PlatformProfile) -> PeerIdentityMechani
         # `os.getuid()` the Linux branch below uses: `getpeereid` answers a
         # uid, exactly what the UID-only comparison `_peer_permitted` already
         # makes needs, so macOS shares the Linux branch's `local` callable
-        # rather than needing one of its own.
-        return PeerIdentityMechanism(True, read_peer_identity_macos, os.getuid)
+        # rather than needing one of its own. `getattr(os, "getuid", None)`,
+        # not the bare name -- see this function's own docstring: a real
+        # Windows interpreter has no `os.getuid` at all, and a macOS profile
+        # resolved there (only a test does this) must report the mechanism
+        # unsupported rather than raise while building it.
+        local = getattr(os, "getuid", None)
+        return PeerIdentityMechanism(local is not None, read_peer_identity_macos, local)
     return PeerIdentityMechanism(
         peer_identity_supported(profile), read_peer_identity, getattr(os, "getuid", None)
     )
@@ -1093,10 +1105,12 @@ class MurmlyDaemon:
         # daemon that refuses to run must not start anything first, and on a
         # deliberately mismatched profile/host pair -- a non-Windows profile
         # constructed on a real Windows interpreter, which only a test does,
-        # to keep asserting the shape refusal on every host -- resolving a
-        # mechanism it will never use would reference `os.getuid`, an
-        # attribute that interpreter does not have, before ever reaching the
-        # refusal this mismatch is actually here to produce.
+        # to keep asserting the shape refusal on every host -- a refusal
+        # this mismatch is here to produce must still run before anything
+        # else does. `peer_identity_mechanism_for` itself no longer raises
+        # for that pair (it answers an unsupported mechanism instead, see
+        # its own docstring), but the ordering stays: nothing else should
+        # start before a refusal that applies has had its chance to fire.
         self._require_private_channel()
         mechanism = peer_identity_mechanism_for(self._profile)
         self._peer_identity = peer_identity if peer_identity is not None else mechanism.read

@@ -560,13 +560,22 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     # not what this report caused on its way past.
     (model_resident, model_resident_detail), synthesis_residency = daemon_residency(config)
 
-    # `choose_clipboard_copy_command` has no Windows branch of its own (task
-    # 9.1's clipboard is a Win32 API call, not a command to name), so this
-    # reports the mechanism directly rather than asking a Linux-only chooser
-    # about a platform it was never taught, which would otherwise surface a
-    # misleading "install xclip" on a machine that never needed it.
+    # `choose_clipboard_copy_command` has no Windows or macOS branch of its
+    # own (task 9.1's clipboard is a Win32 API call, task 14.1's an
+    # `NSPasteboard` call, neither a command to name), so this reports each
+    # platform's mechanism directly rather than asking a Linux-only chooser
+    # about a platform it was never taught. Left to fall through to the
+    # `else` branch below, a macOS profile would reach `choose_clipboard_
+    # copy_command()` with no argument -- reading this process's own
+    # environment and `PATH`, never `resolved_profile` -- find no Wayland
+    # session and no `xclip` on a real Mac, and report "unavailable: No X11
+    # clipboard command found; install xclip.", which is false: `CLIPBOARD`
+    # (`platform.py`) already resolves macOS to a working `NSPasteboard`
+    # mechanism that this field would otherwise never name.
     if resolved_profile.operating_system is OperatingSystem.WINDOWS:
         clipboard_command = "Win32 clipboard API (CF_UNICODETEXT)"
+    elif resolved_profile.operating_system is OperatingSystem.MACOS:
+        clipboard_command = "NSPasteboard"
     else:
         try:
             clipboard_command = choose_clipboard_copy_command()

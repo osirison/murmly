@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import patch
 
 from murmly.integrations import DeliveryOutcome, PasteInjection, select_paste_injection
 from murmly.mac_clipboard import CGEVENT_POST_METHOD, MacosClipboardPaster, request_accessibility_permission
@@ -219,12 +220,24 @@ class RequestAccessibilityPermissionTests(unittest.TestCase):
 
         self.assertFalse(result)
 
-    def test_not_trusted_attempts_the_real_request_and_does_not_raise_on_linux(self) -> None:
-        """The default `is_trusted` (`_real_is_process_trusted`) fails to
-        load `ApplicationServices` on this machine -- proving the whole
-        function absorbs that failure without needing a fake for the second
-        half too."""
-        result = request_accessibility_permission(is_trusted=lambda: False)
+    def test_not_trusted_falls_back_to_false_when_applicationservices_will_not_load(self) -> None:
+        """A host with no `ApplicationServices` framework at all -- every
+        real Linux machine -- reaches `request_accessibility_permission`'s
+        own `except (OSError, ValueError, AttributeError)` clause the moment
+        it tries to load the library that would make the real request, not
+        merely a failing `is_trusted()` (already pinned above). Injected
+        through `_applicationservices` directly, the same seam a real Linux
+        machine fails at, rather than relied on the machine actually lacking
+        the framework: this used to be named `..._on_linux` and pass only
+        because this suite happened to run on Linux, where the real load
+        already failed for the same reason -- the exact same assertion now
+        holds on any host, macOS included, once the load is forced to fail
+        here instead of trusted to fail on its own."""
+        with patch(
+            "murmly.mac_clipboard._applicationservices",
+            side_effect=OSError("ApplicationServices.framework not found"),
+        ):
+            result = request_accessibility_permission(is_trusted=lambda: False)
 
         self.assertFalse(result)
 
@@ -308,6 +321,23 @@ class MacosClipboardRuntimeIntegrationTests(unittest.TestCase):
         from murmly.mac_clipboard import _real_is_process_trusted
 
         result = _real_is_process_trusted()
+
+        self.assertIsInstance(result, bool)
+
+    def test_not_trusted_attempts_the_real_request_and_does_not_raise(self) -> None:
+        """Task 14.5, against the real `AXIsProcessTrustedWithOptions` call:
+        `RequestAccessibilityPermissionTests` above proves the function's own
+        catch-and-log-`False` policy against an injected framework-load
+        failure -- the only thing provable from Linux. This proves the other
+        half: bypassing the `is_trusted` short-circuit (`is_trusted=lambda:
+        False`) and letting the real Accessibility request run on a real
+        kernel must not raise and must answer a plain `bool`, whatever this
+        runner's own grant state and the dialog's own presence or absence
+        turn out to be -- both are the runner's, not this test's, to assert.
+        A prior version of this test assumed the answer must be `False`,
+        which does not hold: the request can genuinely return `True` on a
+        runner where Accessibility is already granted."""
+        result = request_accessibility_permission(is_trusted=lambda: False)
 
         self.assertIsInstance(result, bool)
 

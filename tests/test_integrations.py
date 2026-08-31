@@ -436,6 +436,37 @@ class WindowsPasteInjectionSelectionTests(unittest.TestCase):
         self.assertEqual("send-input", injection.method)
 
 
+def macos_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+
+
+class MacosPasteInjectionDefaultTrustCheckTests(unittest.TestCase):
+    """Every other test of `select_paste_injection`'s macOS branch
+    (`test_mac_clipboard.py`) supplies `macos_accessibility_trusted` as a
+    fake, which is exactly why none of them exercise this function's actual
+    default: `mac_clipboard._real_is_process_trusted`, called with no
+    `try`/`except` around it at all. On a real Mac that call always
+    succeeds -- `ApplicationServices.framework` is a system framework, never
+    absent -- so this is only reachable when a macOS profile is resolved on
+    a host that is not one, exactly the shape `peer_identity_mechanism_for`
+    was already fixed for. Left unguarded, it used to raise a bare `OSError`
+    the instant this branch was reached from anywhere but a real Mac.
+    """
+
+    def test_the_default_trust_check_does_not_raise_off_macos(self) -> None:
+        # No `macos_accessibility_trusted=` here -- the one thing every other
+        # macOS test of this function supplies, and the one thing that was
+        # masking this default from ever running on this machine.
+        injection = select_paste_injection(profile=macos_profile())
+
+        # `ApplicationServices` cannot be loaded here, so the real check
+        # cannot tell -- collapsed to "not trusted", never treated as a
+        # grant, the same "silence is never claimed as a grant" rule every
+        # other permission check in this codebase applies to its own.
+        self.assertFalse(injection.available)
+        self.assertIn("Accessibility", injection.reason)
+
+
 class ClipboardPasterFactoryTests(unittest.TestCase):
     """`create_clipboard_paster` dispatches by profile; Linux must get back
     exactly the same `ClipboardPaster` construction as before this factory

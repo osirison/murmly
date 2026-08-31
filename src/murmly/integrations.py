@@ -293,7 +293,21 @@ def select_paste_injection(
                 reason=f"{CGEVENT_POST_METHOD} failed to inject a paste earlier in this session",
             )
         is_trusted = macos_accessibility_trusted if macos_accessibility_trusted is not None else _real_is_process_trusted
-        if not is_trusted():
+        try:
+            trusted = is_trusted()
+        except (OSError, ValueError, AttributeError):
+            # `_real_is_process_trusted` raises when `ApplicationServices`
+            # cannot even be loaded -- every real macOS host has it, so this
+            # is only reachable when a caller (a test, this function's own
+            # exhaustive cross-platform sweep) resolves a macOS profile on a
+            # host that is not one, the same hazard `platform.py`'s own
+            # `_real_macos_accessibility_trusted` already guards its one
+            # documented caller against. Collapsed to "not trusted", not
+            # "available": a check that cannot tell is never treated as a
+            # grant, the same rule every other permission check in this
+            # codebase applies to its own silence.
+            trusted = False
+        if not trusted:
             permission = PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]
             # Named as the permission this genuinely is (distinct from "no
             # injector is installed", the absent case the branches below

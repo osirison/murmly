@@ -34,7 +34,7 @@ import re
 import unittest
 from pathlib import Path
 
-from murmly import mac_clipboard, mac_focus, mac_hotkey, overlay_renderer_qt
+from murmly import daemon, mac_clipboard, mac_focus, mac_hotkey, overlay_renderer_qt
 from murmly import platform as murmly_platform
 
 
@@ -217,6 +217,123 @@ class PlatformMicrophoneObjcCallTests(unittest.TestCase):
                     f"libobjc.{name}.argtypes = [ctypes.c_char_p]",
                     source,
                     f"{name}'s argtypes is not declared",
+                )
+
+
+class LibobjcHelperDeclarationTests(unittest.TestCase):
+    """`mac_clipboard.py` and `mac_focus.py` each hold their own copy of the
+    `_libobjc()` helper that declares `objc_getClass`/`sel_registerName`'s
+    `restype`/`argtypes` inline (`overlay_renderer_qt.py`'s own copy declares
+    only `sel_registerName` -- it never looks a class up by name, only ever
+    receiving an `NSView` pointer from Qt). `platform.py`'s microphone check
+    duplicates the same two lines a fourth time, in its own local variable
+    rather than a module-level `_libobjc_dll` (`PlatformMicrophoneObjcCallTests`
+    above). Four independent copies of the same declaration is exactly the
+    shape a Windows struct redeclared once per file, and once in its test,
+    drifted apart in without anything catching it (`ab1f794`'s INPUT-struct
+    fix) -- so every copy is checked here, not only the one
+    `PlatformMicrophoneObjcCallTests` already covers, using a variable-name-
+    agnostic pattern so this does not care whether the handle is called
+    `libobjc` or `_libobjc_dll`.
+    """
+
+    _RESTYPE_ARGTYPES_PATTERN = staticmethod(
+        lambda symbol: re.compile(
+            rf"\.{symbol}\.restype\s*=\s*(ctypes\.\w+)\s*\n\s*[\w.]*\.{symbol}\.argtypes\s*=\s*\[([^\]]*)\]"
+        )
+    )
+
+    #: `objc_getClass(const char *)`/`sel_registerName(const char *)` both
+    #: return a plain Objective-C pointer and take one C string -- the exact
+    #: types every one of these four independent copies must declare, not
+    #: merely *some* real ctypes type: `PlatformMicrophoneObjcCallTests`
+    #: above already holds `platform.py`'s own copy to this exact pair via
+    #: `assertIn`, and a copy that declared, say, `ctypes.c_int` instead of
+    #: `ctypes.c_void_p` would still pass a weaker "is this a real type at
+    #: all" check while truncating the returned pointer on 64-bit Darwin.
+    _EXPECTED_RESTYPE = "ctypes.c_void_p"
+    _EXPECTED_ARGTYPES = ("ctypes.c_char_p",)
+
+    def _assert_declared(self, module: object, symbol: str) -> None:
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        matches = self._RESTYPE_ARGTYPES_PATTERN(symbol).findall(source)
+        self.assertTrue(
+            matches, f"{module.__name__} never declares {symbol}'s restype/argtypes together"
+        )
+        for restype_token, argtypes_body in matches:
+            with self.subTest(module=module.__name__, symbol=symbol):
+                self.assertEqual(
+                    self._EXPECTED_RESTYPE,
+                    restype_token,
+                    f"{module.__name__}'s {symbol}.restype is {restype_token!r}, not "
+                    f"{self._EXPECTED_RESTYPE} -- ctypes would otherwise default it to a "
+                    "truncating 32-bit c_int, or accept a wrong-but-real type here",
+                )
+                argtype_tokens = tuple(token.strip() for token in argtypes_body.split(",") if token.strip())
+                self.assertEqual(
+                    self._EXPECTED_ARGTYPES,
+                    argtype_tokens,
+                    f"{module.__name__}'s {symbol}.argtypes is {argtype_tokens!r}, not "
+                    f"{self._EXPECTED_ARGTYPES}",
+                )
+
+    def test_sel_registername_is_declared_in_every_module_that_calls_it(self) -> None:
+        for module in (mac_clipboard, mac_focus, overlay_renderer_qt, murmly_platform):
+            with self.subTest(module=module.__name__):
+                self._assert_declared(module, "sel_registerName")
+
+    def test_objc_getclass_is_declared_in_every_module_that_calls_it(self) -> None:
+        # `overlay_renderer_qt.py` never calls `objc_getClass` at all (its own
+        # docstring says so -- it only ever receives an `NSView` pointer),
+        # so it is deliberately excluded here, unlike the `sel_registerName`
+        # check above which every one of these four modules needs.
+        for module in (mac_clipboard, mac_focus, murmly_platform):
+            with self.subTest(module=module.__name__):
+                self._assert_declared(module, "objc_getClass")
+
+
+class DaemonGetpeereidSignatureTests(unittest.TestCase):
+    """`daemon.py`'s `read_peer_identity_macos` (task 13.2) is a plain-C
+    libSystem call outside `mac_hotkey.py`/`mac_clipboard.py`'s scan above and
+    otherwise invisible to every check in this module. `uid_t`/`gid_t` are
+    4-byte, but `getpeereid` itself returns `c_int` and takes two pointers --
+    an undeclared `restype` would still default to the truncating 32-bit
+    `c_int` `read_peer_identity_macos`'s own docstring says this call happens
+    to be safe from by accident; declaring it explicitly is the rule
+    regardless of whether a given call happens to be safe from the actual
+    defect.
+    """
+
+    _PATTERN = re.compile(
+        r"libc\.getpeereid\.restype\s*=\s*(ctypes\.\w+)\s*\n\s*"
+        r"libc\.getpeereid\.argtypes\s*=\s*\[([^\]]*)\]"
+    )
+
+    def _source(self) -> str:
+        return Path(daemon.__file__).read_text(encoding="utf-8")
+
+    def test_getpeereid_declares_a_real_restype_and_argtypes(self) -> None:
+        source = self._source()
+        matches = self._PATTERN.findall(source)
+        self.assertTrue(matches, "the call-site scan itself found nothing -- check the pattern")
+        restype_token, argtypes_body = matches[0]
+        restype = getattr(ctypes, restype_token.removeprefix("ctypes."))
+        self.assertTrue(
+            _is_real_ctypes_type(restype), f"getpeereid's restype {restype_token!r} is not a real ctypes type"
+        )
+        argtype_tokens = [token.strip() for token in argtypes_body.split(",") if token.strip()]
+        self.assertEqual(3, len(argtype_tokens), "getpeereid takes exactly (int, uid_t*, gid_t*)")
+        for argtype_token in argtype_tokens:
+            with self.subTest(argtype=argtype_token):
+                # `ctypes.POINTER(_DARWIN_UID_T)` is not a bare `ctypes.*`
+                # attribute -- evaluated against the real module's own
+                # namespace so `_DARWIN_UID_T`/`_DARWIN_GID_T` resolve to
+                # what `daemon.py` actually declared them as, rather than
+                # this test guessing their spelling.
+                argtype = eval(argtype_token, {"ctypes": ctypes}, vars(daemon))  # noqa: S307
+                self.assertTrue(
+                    _is_real_ctypes_type(argtype),
+                    f"getpeereid's argtypes includes {argtype_token!r}, not a real ctypes type",
                 )
 
 

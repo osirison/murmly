@@ -3375,23 +3375,32 @@ class PeerIdentityMechanismDispatchTests(unittest.TestCase):
     and the same mechanism supplies what it is compared against."""
 
     def test_linux_keeps_the_existing_socket_functions(self) -> None:
-        if not hasattr(os, "getuid"):
-            # `peer_identity_mechanism_for` references the bare name
-            # `os.getuid` for every non-Windows profile, Windows included --
-            # which is the profile this test deliberately supplies to pin the
-            # Linux branch unchanged. On a real Windows interpreter that name
-            # does not exist at all, so merely calling the dispatcher this
-            # way -- not only running what it returns -- fails here, for a
-            # profile no real Windows machine's own `resolve_platform()`
-            # would ever hand it.
-            self.skipTest("dispatches to os.getuid, which does not exist on Windows")
-        mechanism = peer_identity_mechanism_for(
-            PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
-        )
+        # `peer_identity_mechanism_for`'s else branch already reads
+        # `getattr(os, "getuid", None)`, not the bare name, so calling the
+        # dispatcher itself never raises here on a real Windows interpreter
+        # (unlike the macOS branch before this change -- see
+        # `peer_identity_mechanism_for`'s own docstring). What still needs
+        # guarding is this test's own expectation: `getattr(os, "getuid",
+        # None)`, not the bare name, is what a real Windows host resolves
+        # to (`None`), while every real Linux or macOS host resolves it to
+        # the exact function `os.getuid` -- so this keeps proving the
+        # identical thing on every host instead of skipping on the one host
+        # it would otherwise fail on.
+        linux_profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+        mechanism = peer_identity_mechanism_for(linux_profile)
 
         self.assertIs(read_peer_identity, mechanism.read)
-        self.assertIs(os.getuid, mechanism.local)
-        self.assertEqual(peer_identity_supported(), mechanism.supported)
+        self.assertIs(getattr(os, "getuid", None), mechanism.local)
+        # `peer_identity_supported(linux_profile)`, not the bare
+        # `peer_identity_supported()`: the bare call resolves the *host's*
+        # platform, which on a real macOS runner is macOS, and
+        # `peer_identity_supported` always answers True for macOS (task
+        # 13.2's `getpeereid`) regardless of what this test is asserting
+        # about. That made this assertion compare the host's answer against
+        # the explicitly-constructed Linux profile's `mechanism.supported`
+        # -- True against a real Mac's False (no `SO_PEERCRED`) -- rather
+        # than proving anything about the Linux profile this test names.
+        self.assertEqual(peer_identity_supported(linux_profile), mechanism.supported)
 
     def test_windows_dispatches_to_the_pipes_own_mechanism(self) -> None:
         # Proves the dispatch, and that `murmly.win_pipe` imports cleanly on
@@ -3428,12 +3437,22 @@ class PeerIdentityMechanismDispatchTests(unittest.TestCase):
         """Task 13.2: `getpeereid` reads a uid and nothing else, so it shares
         the Linux branch's `os.getuid` comparison rather than needing one of
         its own -- the same UID-only comparison `_peer_permitted` already
-        makes for every platform."""
+        makes for every platform.
+
+        Asserted through `getattr(os, "getuid", None)`/`hasattr`, not the
+        bare name or a bare `True`: on every real macOS or Linux host
+        `os.getuid` exists, so this keeps proving the same pair
+        (`read_peer_identity_macos`, `os.getuid`) with `supported` True. On a
+        real Windows interpreter -- which only a test resolves a macOS
+        profile on, to keep this dispatch exercised on every host -- neither
+        exists, and the mechanism must report itself unsupported rather than
+        the dispatcher raising while building it (the product defect this
+        pins)."""
         mechanism = peer_identity_mechanism_for(macos_profile())
 
         self.assertIs(read_peer_identity_macos, mechanism.read)
-        self.assertIs(os.getuid, mechanism.local)
-        self.assertTrue(mechanism.supported)
+        self.assertIs(getattr(os, "getuid", None), mechanism.local)
+        self.assertEqual(hasattr(os, "getuid"), mechanism.supported)
 
     def test_macos_reports_peer_identity_supported_without_so_peercred(self) -> None:
         """`socket.SO_PEERCRED` does not exist on macOS's `socket` module --
@@ -3453,7 +3472,11 @@ class PeerIdentityMechanismDispatchTests(unittest.TestCase):
             daemon = MurmlyDaemon(config, session=DummySession(), profile=macos_profile())
 
         self.assertIs(read_peer_identity_macos, daemon._peer_identity)
-        self.assertIs(os.getuid, daemon._local_identity)
+        # `getattr(os, "getuid", None)`, not the bare name -- see
+        # `test_macos_dispatches_to_getpeereid`'s own docstring: a real
+        # Windows interpreter, which only a test constructs a macOS-profiled
+        # daemon on, has no `os.getuid` at all.
+        self.assertIs(getattr(os, "getuid", None), daemon._local_identity)
 
     def test_a_daemon_constructed_for_macos_wires_the_macos_hotkey_registrar(self) -> None:
         """Section 13's own populator of `hotkey_mechanism_is_in_process`

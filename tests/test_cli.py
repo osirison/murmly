@@ -1839,6 +1839,93 @@ class DoctorCompletenessTests(unittest.TestCase):
         # report the wrong platform's remedy instead.
         self.assertEqual("Win32 clipboard API (CF_UNICODETEXT)", report["clipboard_command"])
 
+    def test_macos_reports_the_backends_this_change_built_for_it(self) -> None:
+        """The macOS sibling of the Windows test just above: every one of the
+        eight concerns has a macOS mechanism (tasks 12-15), so 18.17's
+        "unavailable rather than dropped" is asserted by the shape check
+        below the same way, with no concern absent.
+
+        `paste_injection` is ANDed with the Accessibility grant
+        (`platform_diagnostics`'s own docstring), which reads the real,
+        undetermined state of a Linux test runner that has no `Application
+        Services` framework at all -- forced to `GRANTED` here so this test
+        proves the report's *shape* on every host, the same way
+        `test_macos_paste_injection_concern_is_available_when_granted`
+        already isolates that concern's own AND-ing from the host's real
+        grant state.
+        """
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        answered = {"ok": True, "state": "IDLE", "model_resident": False}
+        macos_profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        granted_accessibility = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.GRANTED,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch("murmly.cli.send_command", return_value=answered),
+                patch.dict(
+                    "murmly.cli.PERMISSIONS",
+                    {MACOS_ACCESSIBILITY_PERMISSION: granted_accessibility},
+                ),
+            ):
+                report = self._report(
+                    config, Mock(return_value=("cpu", "int8")), profile=macos_profile
+                )
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
+        built = {
+            "command_channel": "unix-socket",
+            "hotkey_registration": "macos-hotkey",
+            "service_management": "launchd",
+            "clipboard": "macos",
+            "paste_injection": "macos",
+            "focus_observation": "macos",
+            "overlay": "qt",
+            "speech_synthesis": "kokoro",
+        }
+        self.assertEqual(set(built), set(BACKEND_REGISTRIES))
+        for concern, section in report["platform"]["concerns"].items():
+            with self.subTest(concern=concern):
+                self.assertTrue(section["available"])
+                self.assertEqual(built[concern], section["mechanism"])
+
+        # 6.3: a non-Linux session is not misreported as `wayland` or `x11`.
+        self.assertNotIn(report["session"], {"wayland", "x11"})
+        self.assertEqual("macos", report["session"])
+
+        # 12.5, 14.4: both macOS permissions are present, each naming what it
+        # gates -- not their `state`, which this Linux runner cannot read for
+        # real (the same restraint the Windows test above shows its own
+        # registry-backed permissions and preconditions).
+        self.assertEqual(
+            {"macos-microphone", "macos-accessibility"}, set(report["platform"]["permissions"])
+        )
+        self.assertEqual(
+            "microphone capture", report["platform"]["permissions"]["macos-microphone"]["capability"]
+        )
+        self.assertEqual(
+            "paste injection", report["platform"]["permissions"]["macos-accessibility"]["capability"]
+        )
+
+        # 11.5, 11.6: macOS gates neither Windows environment precondition.
+        self.assertEqual({}, report["platform"]["environment"])
+
+        # `choose_clipboard_copy_command` has no macOS branch (task 14.1 is an
+        # `NSPasteboard` call, not a command); `_run_doctor` must not call it
+        # and report a misleading "install xclip" instead (the defect this
+        # pins: left unguarded, this field asked the Linux-only chooser about
+        # a macOS profile and got exactly that).
+        self.assertEqual("NSPasteboard", report["clipboard_command"])
+
     def test_diagnostics_report_a_socket_path_the_daemon_would_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir) / "shared"
@@ -2439,13 +2526,141 @@ class MicrophoneDiagnosticsTests(unittest.TestCase):
         self.assertEqual(base_keys | {"detail"}, set(absent_report))
 
 
+def _assert_never_conflates_absence_with_denial(
+    case: unittest.TestCase, report: dict[str, object]
+) -> None:
+    """Task 12.5's own difficulty: an absent device and a denied permission
+    are indistinguishable from inside the capture path, so the report must
+    resolve that ambiguity itself rather than passing it through. Whenever a
+    device was not confirmed present, the detail must never say "denied" --
+    that would claim a working microphone exists but is locked away, when
+    the truer fact may be there is nothing to lock.
+
+    A module-level helper, not a `TestCase` method, shared between
+    `MicrophoneDiagnosticsInvariantTests`'s injected cases and
+    `MicrophoneDiagnosticsRuntimeIntegrationTests`'s real one: the two
+    classes assert the same guarantee against different inputs and neither
+    is a specialisation of the other, so subclassing one from the other
+    would double-run the injected cases as skipped copies under the runtime
+    class for no benefit."""
+    if report["device_present"] is not True:
+        case.assertNotIn("denied", report.get("detail", "").casefold(), f"full report: {report!r}")
+
+
+def _assert_never_claims_launchd_capture_is_verified(
+    case: unittest.TestCase, report: dict[str, object]
+) -> None:
+    """Task 12.6: whatever the permission says, a granted TCC state and an
+    enumerable device are still not proof a launchd-started daemon receives
+    audio (design.md's largest risk, tasks 12.1-12.4, none of them provable
+    from a diagnostics report). So whenever the report claims the microphone
+    is available on macOS, the "not yet verified end to end" disclaimer must
+    be the reason given -- the claim that must never leak on its own is
+    `available: true` standing for confirmed end-to-end capture."""
+    if report["available"] and report.get("permission") is not None:
+        case.assertIn(
+            "not yet verified end to end", report.get("detail", ""), f"full report: {report!r}"
+        )
+
+
+class MicrophoneDiagnosticsInvariantTests(unittest.TestCase):
+    """Task 12.5's two guarantees, checked against `microphone_diagnostics`'s
+    actual output rather than against one assumed device/permission state.
+
+    These used to be pinned only by `MicrophoneDiagnosticsRuntimeIntegrationTests`,
+    against the real machine's `sounddevice` and TCC state, on the assumption
+    that a GitHub macOS runner is headless: no microphone device and no
+    ordinary user's grant. The first real run of this code on an actual Mac
+    (2026-08-31 CI) showed that assumption wrong -- the runner has an audio
+    device and TCC already reports the microphone granted. A test that
+    asserts "no device, never granted" against a machine that has both a
+    device and a grant is not proving the guarantee failed; it is proving the
+    test's premise about the runner was never true. `microphone_diagnostics`
+    reported correctly, in both directions of that mistaken premise --
+    `device_present: True`, `permission.state: "granted"`, `available: True`
+    -- so the fault was the test's assumed inputs, not the function's output.
+
+    So the guarantees are asserted here as invariants over the report's
+    actual fields, true regardless of what a given Mac's device and grant
+    state turn out to be, and checked against every reachable combination
+    through injected `sounddevice`/permission fakes -- deviceless, denied,
+    undetermined and granted -- rather than against whichever one combination
+    a given CI runner happens to have on a given day.
+    """
+
+    def test_a_deviceless_runner_never_reports_denied(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_a_device_query_failure_never_reports_denied(self) -> None:
+        with (
+            injected_module("sounddevice", _sounddevice_raising(RuntimeError("no host api"))),
+            patch("murmly.cli.microphone_permission_for", return_value=None),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_a_denied_permission_with_a_device_present_renders_as_denied(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("denied", report["permission"]["state"])
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_an_undetermined_permission_with_a_device_present_renders_as_undetermined(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.UNDETERMINED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("undetermined", report["permission"]["state"])
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_a_granted_permission_with_a_device_present_renders_as_granted_but_unverified(
+        self,
+    ) -> None:
+        permission = _fake_microphone_permission(PermissionState.GRANTED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("granted", report["permission"]["state"])
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertTrue(report["available"])
+
+
 class MicrophoneDiagnosticsRuntimeIntegrationTests(unittest.TestCase):
-    """Task 12.5, against the real machine: everything in
-    `MicrophoneDiagnosticsTests` above proves the priority logic against
-    injected fakes for `sounddevice.query_devices` and the permission check.
-    This calls `microphone_diagnostics` with no injection at all, against
-    whatever `resolve_platform()` and the real `sounddevice` report on the
-    runner it executes on.
+    """Task 12.5, against the real machine: `MicrophoneDiagnosticsTests` and
+    `MicrophoneDiagnosticsInvariantTests` above prove the priority logic and
+    its two invariants against injected fakes for `sounddevice.query_devices`
+    and the permission check, covering every reachable combination
+    deliberately. This calls `microphone_diagnostics` with no injection at
+    all, against whatever `resolve_platform()` and the real `sounddevice`
+    report on the runner it executes on, and checks the same two invariants
+    against whatever combination that runner actually has.
 
     Follows the same convention as `MacosMicrophonePermissionRuntimeIntegrationTests`
     and `WindowsMicrophonePermissionRuntimeIntegrationTests`: skip in `setUp`
@@ -2454,29 +2669,44 @@ class MicrophoneDiagnosticsRuntimeIntegrationTests(unittest.TestCase):
     into every failure message so a real run's actual facts land in the CI
     log even when the test passes.
 
-    The macOS CI runner this targets is headless -- "no microphone device at
-    all" is this task's own stated ground truth for it, not a guess this
-    class makes. So this does not pin `device_present is False` specifically:
-    whether PortAudio enumerates zero input devices or `query_devices` raises
-    outright is exactly what cannot be known from a Linux machine, and both
-    outcomes reach `microphone_diagnostics`'s "not `True`" branch. What is
-    pinned, unconditionally, is the parent instruction's literal test: on a
-    runner with no device and no ordinary user's TCC state, this reports
-    unavailable, never claims the microphone works, and -- the distinction
-    task 12.5 exists for -- the detail never says "denied" for a machine that
-    has no device to have denied capture to.
+    What this class does NOT do any more: assume the runner is headless. The
+    first real run of this code on an actual GitHub macOS runner (2026-08-31)
+    showed it has a microphone device and TCC already reports it granted --
+    not the deviceless, ungranted machine this test was originally written
+    for. That runner state is itself informative: it means this class can
+    prove the granted/present branch end to end on real hardware, but it
+    cannot exercise the deviceless or denied branches -- those stay covered
+    only by `MicrophoneDiagnosticsInvariantTests`'s injected cases above, and
+    task 12.6's actual question -- whether a launchd-started daemon receives
+    audio at all -- remains unanswered by any of tasks 12.1-12.5's
+    diagnostics, on this runner or any other; that is what tasks 12.1-12.4
+    exist to establish separately.
     """
 
     def setUp(self) -> None:
         if sys.platform != "darwin":
-            self.skipTest("This proves what the real headless macOS CI runner reports, not a fake")
+            self.skipTest("This proves what the real macOS CI runner reports, not a fake")
 
-    def test_a_headless_runner_reports_no_device_never_denied_never_available(self) -> None:
+    def test_the_runner_never_conflates_device_absence_with_denial(self) -> None:
         report = microphone_diagnostics(resolve_platform())
 
-        self.assertIsNot(True, report["device_present"], f"full report: {report!r}")
-        self.assertFalse(report["available"], f"full report: {report!r}")
-        self.assertNotIn("denied", report["detail"].casefold(), f"full report: {report!r}")
+        _assert_never_conflates_absence_with_denial(self, report)
+
+    def test_the_runner_never_claims_launchd_capture_is_verified(self) -> None:
+        report = microphone_diagnostics(resolve_platform())
+
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+
+    def test_the_runner_reports_a_recognised_permission_state_or_none(self) -> None:
+        report = microphone_diagnostics(resolve_platform())
+        permission = report["permission"]
+
+        if permission is not None:
+            self.assertIn(
+                permission["state"],
+                {state.value for state in PermissionState},
+                f"full report: {report!r}",
+            )
 
 
 class SpeechOutputDiagnosticsTests(unittest.TestCase):
