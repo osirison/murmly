@@ -1327,6 +1327,27 @@ class NamedPipeConnectionTranslationTests(unittest.TestCase):
         with _install_fake_win32(read_file=read_file):
             self.assertEqual(b"", connection.recv(4096))
 
+    def test_recv_translates_pipe_not_connected_to_empty_bytes(self) -> None:
+        """The same disconnect, reported from a later point in it.
+
+        Windows chooses between `ERROR_BROKEN_PIPE` and
+        `ERROR_PIPE_NOT_CONNECTED` by how far the peer's departure had
+        progressed when the read landed, which is not something the caller can
+        arrange or predict. Handling only the first left a speech session whose
+        client stopped reading waiting to be disconnected until the test timed
+        out, on Windows CI, with nothing wrong on Linux.
+        """
+        from murmly.win_pipe import ERROR_PIPE_NOT_CONNECTED, NamedPipeConnection
+
+        def read_file(handle: object, buffer: object, overlapped: object) -> tuple[int, object]:
+            raise _FakeWin32Error(
+                ERROR_PIPE_NOT_CONNECTED, "ReadFile", "No process is on the other end of the pipe."
+            )
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(read_file=read_file):
+            self.assertEqual(b"", connection.recv(4096))
+
     def test_recv_propagates_other_errors(self) -> None:
         from murmly.win_pipe import NamedPipeIOError, NamedPipeConnection
 
@@ -1368,6 +1389,19 @@ class NamedPipeConnectionTranslationTests(unittest.TestCase):
 
         def write_file(handle: object, data: bytes, overlapped: object) -> tuple[int, int]:
             raise _FakeWin32Error(ERROR_BROKEN_PIPE, "WriteFile", "The pipe has been ended.")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(write_file=write_file):
+            with self.assertRaises(BrokenPipeError):
+                connection.sendall(b"hello")
+
+    def test_sendall_translates_pipe_not_connected_to_brokenpipeerror(self) -> None:
+        from murmly.win_pipe import ERROR_PIPE_NOT_CONNECTED, NamedPipeConnection
+
+        def write_file(handle: object, data: bytes, overlapped: object) -> tuple[int, int]:
+            raise _FakeWin32Error(
+                ERROR_PIPE_NOT_CONNECTED, "WriteFile", "No process is on the other end of the pipe."
+            )
 
         connection = NamedPipeConnection(object())
         with _install_fake_win32(write_file=write_file):

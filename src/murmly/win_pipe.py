@@ -131,6 +131,12 @@ ERROR_ACCESS_DENIED = 5  #: `CreateNamedPipe` with `first_instance=True`: the na
 ERROR_BROKEN_PIPE = 109  #: `ReadFile`: the peer disconnected -- a socket's zero-length `recv`.
 ERROR_PIPE_BUSY = 231  #: `CreateFile`: every instance is taken; `WaitNamedPipe` is the retry.
 ERROR_NO_DATA = 232  #: `WriteFile`: the peer is gone -- a socket's `EPIPE`/`BrokenPipeError`.
+#: `ReadFile`/`WriteFile`: the instance has no client on it. The peer left, the
+#: same event `ERROR_BROKEN_PIPE` reports, but Windows chooses between the two
+#: by how far the disconnect had progressed when the call landed rather than by
+#: anything the caller can distinguish -- so both mean end of stream to a reader
+#: and a gone peer to a writer, and both are translated the same way.
+ERROR_PIPE_NOT_CONNECTED = 233
 ERROR_PIPE_CONNECTED = 535  #: `ConnectNamedPipe`: a client connected before the call arrived. Success.
 ERROR_OPERATION_ABORTED = 995  #: `GetOverlappedResult` after `CancelIo`: genuinely cancelled.
 ERROR_IO_INCOMPLETE = 996  #: `GetOverlappedResult(bWait=False)`: still pending. Not a failure.
@@ -593,7 +599,7 @@ class NamedPipeConnection:
         try:
             transferred = _run_overlapped(self._handle, start, self._timeout_seconds)
         except NamedPipeIOError as error:
-            if error.win32_error_code == ERROR_BROKEN_PIPE:
+            if error.win32_error_code in (ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED):
                 # `ERROR_BROKEN_PIPE` on `ReadFile` is a named pipe's way of
                 # reporting exactly what a UNIX socket reports as a
                 # zero-length `recv`: the peer closed its end. Translated
@@ -603,6 +609,12 @@ class NamedPipeConnection:
                 # `send_command`'s own read loop -- sees the same
                 # end-of-stream signal from either transport, with no
                 # named-pipe-specific branch of its own.
+                #
+                # `ERROR_PIPE_NOT_CONNECTED` is the same event reported from a
+                # slightly later point in the disconnect, and reaching a
+                # reader it means the same thing. Leaving it out is what made
+                # a session whose client stopped reading hang until the test
+                # gave up rather than being disconnected.
                 return b""
             raise
         return bytes(buffer[:transferred])
@@ -625,12 +637,17 @@ class NamedPipeConnection:
             try:
                 written = _run_overlapped(self._handle, start, self._timeout_seconds)
             except NamedPipeIOError as error:
-                if error.win32_error_code in (ERROR_NO_DATA, ERROR_BROKEN_PIPE):
+                if error.win32_error_code in (
+                    ERROR_NO_DATA,
+                    ERROR_BROKEN_PIPE,
+                    ERROR_PIPE_NOT_CONNECTED,
+                ):
                     # `ERROR_NO_DATA` ("the pipe is being closed") is
                     # `WriteFile`'s report of what a UNIX socket's `sendall`
                     # reports as `EPIPE`/`BrokenPipeError`: the peer is gone.
-                    # `ERROR_BROKEN_PIPE` is documented for the same
-                    # condition on some pipe states; both raise the same
+                    # `ERROR_BROKEN_PIPE` and `ERROR_PIPE_NOT_CONNECTED` are
+                    # documented for the same condition from other points in
+                    # the disconnect; all three raise the same
                     # exception type `socket.sendall` itself raises for it,
                     # so `daemon._write_response`'s `except OSError`
                     # (`BrokenPipeError` is one) needs no named-pipe-specific
