@@ -132,6 +132,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("uninstall", help="Remove the session service and release the hotkeys.")
 
+    # Task 16.1: what `setup.sh`'s own `sync_environment` (`setup.sh:275-336`)
+    # got right, moved here so it is testable -- carrying the extras already
+    # installed across `uv sync` and reapplying the ONNX Runtime GPU swap
+    # every sync undoes. `setup.sh` becomes this subcommand's caller rather
+    # than reimplementing it: see `environment.py`'s module docstring for
+    # what stays in `setup.sh` instead. Flags mirror `setup.sh`'s own
+    # (`-y`/`--yes`, `--cuda`/`--no-cuda`, `--tts`/`--no-tts`) so `setup.sh`
+    # forwards them verbatim (task 16.5).
+    sync = subparsers.add_parser(
+        "sync",
+        help="Sync the Python environment, carrying forward the extras already installed.",
+    )
+    sync.add_argument(
+        "-y", "--yes", action="store_true", help="Answer every prompt with yes."
+    )
+    cuda_group = sync.add_mutually_exclusive_group()
+    cuda_group.add_argument(
+        "--cuda", dest="want_cuda", action="store_const", const="yes",
+        help="Install the GPU runtime extra.",
+    )
+    cuda_group.add_argument(
+        "--no-cuda", dest="want_cuda", action="store_const", const="no",
+        help="Leave the GPU runtime extra out.",
+    )
+    tts_group = sync.add_mutually_exclusive_group()
+    tts_group.add_argument(
+        "--tts", dest="want_tts", action="store_const", const="yes",
+        help="Carry speech output even on a machine that opted out of it before.",
+    )
+    tts_group.add_argument(
+        "--no-tts", dest="want_tts", action="store_const", const="no",
+        help="Leave speech output out entirely.",
+    )
+    sync.set_defaults(want_cuda="auto", want_tts="auto")
+    sync.add_argument(
+        "--project",
+        default=None,
+        help="Project directory to sync (default: the current directory).",
+    )
+
     spike = subparsers.add_parser("spike", help="Record a short clip, transcribe it, print it, and copy it.")
     spike.add_argument("--seconds", type=float, default=5.0, help="How long to record before transcribing.")
     spike.add_argument("--paste", action="store_true", help="Also paste the transcription after copying it.")
@@ -278,6 +318,8 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return _run_install(args.hotkey, args.session_hotkey, profile=profile, config=config)
     if args.command == "uninstall":
         return _run_uninstall()
+    if args.command == "sync":
+        return _run_sync(args, profile)
     if args.command == "spike":
         return _run_spike(config, args.seconds, args.paste)
     if args.command == "doctor":
@@ -446,6 +488,65 @@ def _run_uninstall() -> int:
 
     for message in outcome.messages:
         print(message)
+    return 0
+
+
+def _run_sync(args: argparse.Namespace, profile: PlatformProfile) -> int:
+    """Task 16.1's caller: `setup.sh`'s own `sync_environment` and
+    `install_system_packages`, moved into `environment.py` and reached here.
+
+    `_dispatch` has already refused an unsupported operating system before
+    this is ever reached (`_unsupported_platform_message`); `refuse_before_sync`
+    is checked again regardless, because a machine with no build of the
+    transcription runtime is a second, narrower refusal `_dispatch`'s own
+    check does not make, and because `environment.refuse_before_sync` is what
+    a fresh checkout's bootstrap needs to be able to call before `murmly` is
+    even the command doing the asking (task 16.3).
+    """
+    from murmly.environment import (
+        EnvironmentSyncError,
+        install_system_packages,
+        make_confirm,
+        refuse_before_sync,
+        refuse_or_warn_environment_preconditions,
+        sync_environment,
+    )
+
+    refusal = refuse_before_sync(profile)
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
+    # Task 16.6: declines every prompt, never assumes, when nothing is
+    # attached to the terminal and `--yes` was not given.
+    confirm = make_confirm(args.yes)
+
+    refusal = refuse_or_warn_environment_preconditions(profile, announce=print)
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
+    project_dir = Path(args.project) if args.project else Path.cwd()
+
+    if profile.operating_system is OperatingSystem.LINUX:
+        install_system_packages(
+            profile,
+            speech_output=args.want_tts != "no",
+            confirm=confirm,
+            announce=print,
+        )
+
+    try:
+        sync_environment(
+            project_dir,
+            want_cuda=args.want_cuda,
+            want_tts=args.want_tts,
+            confirm=confirm,
+            announce=print,
+        )
+    except EnvironmentSyncError as error:
+        print(f"murmly: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -1073,6 +1073,135 @@ class UninstallCommandTests(unittest.TestCase):
         self.assertIn("systemctl unavailable", errors.getvalue())
 
 
+class SyncCommandTests(unittest.TestCase):
+    """Task 16.1's caller in `cli.py`: `murmly sync` reaches
+    `environment.py`'s pre-sync gates and its extras/GPU-swap logic, refusing
+    or delegating rather than reimplementing either."""
+
+    @staticmethod
+    def _parse(*argv: str):
+        from murmly.cli import build_parser
+
+        return build_parser().parse_args(["sync", *argv])
+
+    def test_refuses_before_syncing_on_a_machine_with_no_transcription_runtime(self) -> None:
+        from murmly.cli import _run_sync
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="musl")
+        with (
+            patch("murmly.environment.sync_environment") as sync_environment,
+            patch("murmly.environment.install_system_packages") as install_system_packages,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("ctranslate2", errors.getvalue())
+        sync_environment.assert_not_called()
+        install_system_packages.assert_not_called()
+
+    def test_refuses_before_syncing_when_a_windows_precondition_fails(self) -> None:
+        from murmly.cli import _run_sync
+
+        # Windows is not in `SUPPORTED_OPERATING_SYSTEMS` yet (pending the
+        # overlay-validation phase this change's scope decision names), so
+        # `refuse_before_sync`'s own unsupported-platform half is patched out
+        # here to isolate the environment-precondition refusal this test is
+        # actually about.
+        profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        with (
+            patch("murmly.environment.refuse_before_sync", return_value=None),
+            patch(
+                "murmly.environment.refuse_or_warn_environment_preconditions",
+                return_value="murmly: refusing to sync. long paths are off.",
+            ),
+            patch("murmly.environment.sync_environment") as sync_environment,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("long paths are off", errors.getvalue())
+        sync_environment.assert_not_called()
+
+    def test_installs_system_packages_only_on_linux(self) -> None:
+        from murmly.cli import _run_sync
+
+        windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        with (
+            patch("murmly.environment.refuse_before_sync", return_value=None),
+            patch("murmly.environment.install_system_packages") as install_system_packages,
+            patch("murmly.environment.sync_environment"),
+        ):
+            _run_sync(self._parse(), windows_profile)
+
+        install_system_packages.assert_not_called()
+
+        linux_profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        with (
+            patch("murmly.environment.install_system_packages") as install_system_packages,
+            patch("murmly.environment.sync_environment"),
+        ):
+            _run_sync(self._parse(), linux_profile)
+
+        install_system_packages.assert_called_once()
+
+    def test_forwards_flags_to_sync_environment(self) -> None:
+        from murmly.cli import _run_sync
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        with (
+            patch("murmly.environment.install_system_packages"),
+            patch("murmly.environment.sync_environment") as sync_environment,
+        ):
+            exit_code = _run_sync(
+                self._parse("--cuda", "--no-tts", "--yes", "--project", "/tmp/some-project"), profile
+            )
+
+        self.assertEqual(0, exit_code)
+        sync_environment.assert_called_once()
+        _args, kwargs = sync_environment.call_args
+        self.assertEqual(Path("/tmp/some-project"), _args[0])
+        self.assertEqual("yes", kwargs["want_cuda"])
+        self.assertEqual("no", kwargs["want_tts"])
+
+    def test_a_failing_sync_reports_and_exits_non_zero(self) -> None:
+        from murmly.cli import _run_sync
+        from murmly.environment import EnvironmentSyncError
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        with (
+            patch("murmly.environment.install_system_packages"),
+            patch("murmly.environment.sync_environment", side_effect=EnvironmentSyncError("uv sync failed")),
+            redirect_stderr(StringIO()) as errors,
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("uv sync failed", errors.getvalue())
+
+    def test_declines_prompts_with_nothing_attached_and_no_yes(self) -> None:
+        """Task 16.6, exercised through the real `make_confirm` this command
+        builds -- not a fake -- with stdin faked as non-interactive."""
+        from murmly.cli import _run_sync
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        confirms: list = []
+
+        def fake_sync_environment(_project_dir, *, confirm, **_kwargs):
+            confirms.append(confirm("Install the GPU runtime?"))
+
+        with (
+            patch("murmly.environment.install_system_packages"),
+            patch("murmly.environment.sync_environment", side_effect=fake_sync_environment),
+            patch("sys.stdin.isatty", return_value=False),
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([False], confirms)
+
+
 class InstallationDiagnosticsTests(unittest.TestCase):
     def test_reports_the_installer_status(self) -> None:
         from murmly.cli import installation_diagnostics

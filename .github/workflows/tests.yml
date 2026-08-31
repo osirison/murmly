@@ -83,7 +83,31 @@ jobs:
       # the model files are still absent here, and the suite injects both rather
       # than reading the environment for them.
       - name: Sync the environment
+        if: "!(runner.os == 'Windows' && matrix.python-version == '3.12')"
         run: uv sync --locked
+
+      # The one job named above is deliberately the only one that installs
+      # the `overlay` extra (task 10.2): PySide6/PySide6-Addons/PySide6-Essentials
+      # together are hundreds of megabytes (`uv.lock`'s own recorded wheel
+      # sizes), and every other (os, python-version) pair in this matrix would
+      # pay that cost again for zero additional coverage -- `pyside6` ships as
+      # a `cp310-abi3` wheel, one build for every CPython this project
+      # supports, so installing it on both 3.12 and 3.14 would exercise
+      # byte-identical PySide6 code, never a version-specific difference the
+      # way faster-whisper or pywin32 might have. macOS is left out for a
+      # different reason: task 15's own Qt spike is still an open question
+      # design.md records as unconfirmed, and installing the extra there
+      # without also writing its runtime test would just be dead weight this
+      # change does not add. Windows' floor Python (3.12) is picked over 3.14
+      # arbitrarily between two otherwise-equal options, favoring the more
+      # widely-deployed release.
+      #
+      # This is what makes `overlay_renderer_qt.py` (tasks 10.1/10.3/10.5) run
+      # for the first time anywhere in this project's history, instead of only
+      # ever being import-checked on a machine with no PySide6 at all.
+      - name: Sync the environment with the overlay extra
+        if: "runner.os == 'Windows' && matrix.python-version == '3.12'"
+        run: uv sync --locked --extra overlay
 
       - name: Run the suite
         run: uv run --no-sync python -m unittest discover -s tests

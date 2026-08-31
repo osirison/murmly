@@ -1156,6 +1156,22 @@ class WindowsInProcessInstallTests(unittest.TestCase):
         self.assertTrue(outcome.hotkey_registered)
         self.assertTrue(any("held by the running Murmly daemon" in message for message in outcome.messages))
 
+    def test_states_only_the_microphone_permission_windows_gates(self) -> None:
+        """Task 16.4 on Windows: only its one gated permission is named
+        (there is no Accessibility grant here, unlike macOS)."""
+        from murmly.hotkey import parse_hotkey
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                announced: list[str] = []
+                installer = _windows_installer(temp_dir=temp_dir, announce=announced.append)
+                installer.install(parse_hotkey("Meta+X"))
+
+        self.assertTrue(any("microphone capture" in message for message in announced))
+        self.assertFalse(any("paste injection" in message for message in announced))
+        self.assertTrue(any("Settings > Privacy & security > Microphone" in message for message in announced))
+
     def test_persists_the_record_before_reaching_the_daemon(self) -> None:
         from murmly.hotkey import parse_hotkey
         from murmly.hotkey_record import HotkeyRecordStore
@@ -1533,6 +1549,34 @@ class MacosInProcessInstallTests(unittest.TestCase):
                 installer.install(parse_hotkey("Meta+X"))
 
         self.assertEqual(1, len(requests))
+
+    def test_states_permissions_before_requesting_any_of_them(self) -> None:
+        """Task 16.4: every permission this installation may request is
+        announced -- naming the capability it gates and where it is granted
+        or denied -- before the one explicit request `install()` itself
+        makes (the Accessibility dialog, task 14.5). Both entries append to
+        the same list, so the announcement's position relative to the
+        request is exactly what is asserted, not merely that both happened."""
+        from murmly.hotkey import parse_hotkey
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                events: list[str] = []
+                installer = _macos_installer(
+                    temp_dir=temp_dir,
+                    announce=lambda message: events.append(f"announce:{message}"),
+                )
+                installer._request_macos_accessibility_permission = lambda: events.append("request")
+
+                installer.install(parse_hotkey("Meta+X"))
+
+        request_index = events.index("request")
+        announcements = events[:request_index]
+        self.assertTrue(announcements, "nothing was announced before the Accessibility request")
+        self.assertTrue(any("microphone capture" in message for message in announcements))
+        self.assertTrue(any("paste injection" in message for message in announcements))
+        self.assertTrue(any("System Settings > Privacy & Security" in message for message in announcements))
 
     def test_a_successful_install_registers_and_reports_held(self) -> None:
         from murmly.hotkey import parse_hotkey

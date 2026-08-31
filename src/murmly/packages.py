@@ -25,9 +25,15 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import shutil
+import subprocess
 
 
 WhichCommand = Callable[[str], str | None]
+
+#: Spelled the same way `environment.py` spells it, and for the same reason:
+#: every probe in this codebase takes its command runner as a parameter so a
+#: test can name a machine's state without the machine being in it.
+RunCommand = Callable[..., "subprocess.CompletedProcess[str]"]
 
 #: Checked in this order and stopped at the first match. A machine normally
 #: has exactly one of these on its PATH; where more than one happens to be
@@ -49,6 +55,32 @@ _INSTALL_COMMAND_PREFIX: dict[str, tuple[str, ...]] = {
     "pacman": ("sudo", "pacman", "-S", "--noconfirm"),
     "zypper": ("sudo", "zypper", "install", "-y"),
     "apk": ("sudo", "apk", "add"),
+}
+
+#: How each manager is asked whether one package is already installed, before
+#: the package name is appended. Exit status alone is the answer -- every one
+#: of these exits non-zero for a package that is not installed -- so nothing
+#: here parses output, which is the part that would differ per manager in ways
+#: this table could not hold.
+#:
+#: This exists because dropping it was a regression rather than a
+#: simplification. `setup.sh` diffed against `rpm -q` and printed "Everything
+#: Murmly uses is already installed" when nothing was missing; generalising
+#: that step past `dnf` briefly lost the diff, which meant every `install` and
+#: `upgrade` offered the whole list, and `--yes` then *ran* it -- a `sudo`
+#: prompt, and a package manager invocation, on an upgrade that used to need
+#: neither.
+#:
+#: `zypper` is queried through `rpm` because that is the database it manages,
+#: exactly as `dnf` is. `apt` is queried through `dpkg-query` for the same
+#: reason. Neither is a fifth divergent mechanism; each is one row, the same
+#: shape as its install command above.
+_QUERY_COMMAND_PREFIX: dict[str, tuple[str, ...]] = {
+    "dnf": ("rpm", "-q"),
+    "apt": ("dpkg-query", "-W"),
+    "pacman": ("pacman", "-Q"),
+    "zypper": ("rpm", "-q"),
+    "apk": ("apk", "info", "-e"),
 }
 
 #: One row per package Murmly's optional Linux features use, spelled per
@@ -226,6 +258,49 @@ def wanted_packages(
     return tuple(roles)
 
 
+def install_command(manager: str, names: tuple[str, ...]) -> tuple[str, ...]:
+    """This manager's install command for exactly `names`.
+
+    Separate from `system_packages`, which builds the command for everything a
+    session wants: what actually gets offered is the subset `missing_packages`
+    says is absent, and offering a command for packages already installed is
+    what this exists to stop.
+    """
+    return _INSTALL_COMMAND_PREFIX[manager] + names
+
+
+def missing_packages(
+    manager: str,
+    names: tuple[str, ...],
+    run_command: RunCommand,
+) -> tuple[str, ...]:
+    """Which of `names` this manager does not already have installed.
+
+    Every package whose query cannot be run at all is treated as missing, not
+    as present: offering to install something already there costs a person one
+    declined prompt, while skipping something absent costs them a feature that
+    silently does not work.
+
+    Returns `names` unchanged for a manager with no query row, which is the
+    honest answer -- "could not tell" -- rather than a claim either way.
+    """
+    query = _QUERY_COMMAND_PREFIX.get(manager)
+    if query is None:
+        return names
+    missing = []
+    for name in names:
+        try:
+            completed = run_command([*query, name], check=False, capture_output=True)
+        except OSError:
+            # The query tool itself is absent -- `dpkg-query` on a machine
+            # with `apt` but a broken path, say. Cannot tell, so offer it.
+            missing.append(name)
+            continue
+        if completed.returncode != 0:
+            missing.append(name)
+    return tuple(missing)
+
+
 def system_packages(
     *,
     wayland: bool,
@@ -248,7 +323,7 @@ def system_packages(
         # uses, since every role above is named for its Fedora package.
         return SystemPackages(manager=None, names=roles, command=None)
     names = tuple(_PACKAGE_NAMES[role][manager] for role in roles)
-    command = _INSTALL_COMMAND_PREFIX[manager] + names
+    command = install_command(manager, names)
     return SystemPackages(manager=manager, names=names, command=command)
 
 

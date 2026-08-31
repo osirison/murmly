@@ -533,6 +533,53 @@ class WindowsHotkeyRuntimeIntegrationTests(unittest.TestCase):
         registrar.rebind({"window": self.PORTABLE})
         self.assertEqual(frozenset({"window"}), registrar.held_purposes())
 
+    def test_a_second_registrar_is_refused_the_key_the_first_already_holds(self) -> None:
+        """Task 8.4, against the real collision rather than `FakeWin32`'s
+        modelled one: `RegisterHotKey` scopes a binding to the *calling
+        thread*, not to a process, so two `WindowsHotkeyRegistrar` instances
+        in this one test process -- each running its own message-loop thread,
+        exactly as two independent daemons on the same machine would each run
+        their own -- are enough to produce a genuine, unmodelled refusal.
+        Nothing here queries an owner first; the second `rebind()`'s own
+        `RegisterHotKey` call is what Windows itself refuses, and
+        `win_hotkey.py`'s docstring names that refusal as the collision
+        signal, not a query.
+        """
+        first = WindowsHotkeyRegistrar(on_hotkey=lambda purpose: None)
+        self.addCleanup(first.stop)
+        second = WindowsHotkeyRegistrar(on_hotkey=lambda purpose: None)
+        self.addCleanup(second.stop)
+
+        from ctypes import GetLastError
+
+        try:
+            first.rebind({"window": self.PORTABLE})
+        except HotkeyError as error:
+            last_error = GetLastError()
+            self.skipTest(
+                f"RegisterHotKey refused {self.PORTABLE!r} on this runner "
+                f"(GetLastError={last_error}): {error}"
+            )
+        self.assertEqual(frozenset({"window"}), first.held_purposes())
+
+        with self.assertRaises(HotkeyError) as raised:
+            second.rebind({"session": self.PORTABLE})
+
+        self.assertIn("already claimed by another application", str(raised.exception))
+        # The collision is on `second`'s own registration; `first` never
+        # touched Win32 again and must still hold what it already had.
+        self.assertEqual(frozenset(), second.held_purposes())
+        self.assertEqual(frozenset({"window"}), first.held_purposes())
+
+        # Released, not merely refused-into: once `first` lets the physical
+        # key go, `second` can claim it -- proving the refusal above really
+        # was Windows' own `RegisterHotKey`, not some permanent property of
+        # the chord itself.
+        first.stop()
+        self.assertEqual(frozenset(), first.held_purposes())
+        second.rebind({"session": self.PORTABLE})
+        self.assertEqual(frozenset({"session"}), second.held_purposes())
+
 
 if __name__ == "__main__":
     unittest.main()

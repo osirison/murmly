@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 from unittest.mock import patch
 
+from module_stubs import injected_module
+
 from murmly.config import MurmlyConfig
 from murmly.platform import OperatingSystem, PlatformProfile
 from murmly.stt import (
@@ -388,6 +390,68 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                         (("nvidia-cublas-cu12", relative_dir),),
                         add_dll_directory=lambda _path: None,
                     )
+
+    def test_cuda_dll_directories_finish_registering_before_the_model_is_constructed(self) -> None:
+        """Task 11.1's ordering claim, as far as a GPU-less CI runner can take
+        it: `os.add_dll_directory` over every `nvidia/*/bin` directory must
+        run before whichever call actually resolves CTranslate2's CUDA
+        dependency, which -- per `add_cuda_dll_directories`'s own docstring --
+        is deferred to `WhisperModel(...)`'s own construction, not to
+        `from faster_whisper import WhisperModel`'s bare Python-level import
+        a few lines above it in `_load_model_locked`. design.md's own
+        wording ("before the runtime is imported") is compressed: the two
+        wheels this project actually ships (the CPU-only default and the
+        `cuda` extra) both install the very same `ctranslate2`/`faster_whisper`
+        package names, so import alone cannot be what needs the CUDA
+        libraries already resolvable -- if it were, a plain `uv sync` with no
+        `cuda` extra at all would fail to import `faster_whisper` outright,
+        which it does not (this whole test module does exactly that import,
+        every run, on every platform in this project's CI matrix). What
+        `_load_model_locked` actually guarantees, and what this test proves
+        without a real GPU: `_load_cuda_runtime` -- and so
+        `add_cuda_dll_directories`, task 11.1's own mechanism -- completes in
+        full before `WhisperModel(...)` is ever called.
+
+        `test_add_cuda_dll_directories_registers_each_trusted_directory`
+        above is the other half of task 11.1's claim: that every directory
+        the wheel table names is registered, not merely the first. Composed,
+        the two tests cover "each directory is added" and "all of them are
+        added before the runtime is imported" -- the real `os.add_dll_directory`
+        call, and the real CUDA dependency resolution it is meant to satisfy,
+        both remain unconfirmed: no CI runner here has an NVIDIA device.
+        """
+        events: list[str] = []
+
+        def fake_load_cuda_libraries(libraries, windows_directories, profile=None) -> bool:
+            del libraries, profile
+            events.append(("cuda-dll-directories-added", windows_directories))
+            return True
+
+        class FakeWhisperModel:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+                events.append(("model-constructed",))
+
+        fake_faster_whisper = SimpleNamespace(WhisperModel=FakeWhisperModel)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                device="cuda",
+            )
+            transcriber = FasterWhisperTranscriber(config)
+
+        with (
+            injected_module("faster_whisper", fake_faster_whisper),
+            patch("murmly.stt.load_cuda_libraries", side_effect=fake_load_cuda_libraries),
+        ):
+            transcriber._load_model()
+
+        self.assertEqual(
+            [("cuda-dll-directories-added", CTRANSLATE2_CUDA_DLL_DIRECTORIES), ("model-constructed",)],
+            events,
+        )
 
     def test_cuda_runtime_handles_missing_nvidia_distribution(self) -> None:
         with patch(

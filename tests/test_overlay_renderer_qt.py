@@ -6,10 +6,13 @@ from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
 import socket
+import subprocess
 import sys
+import time
 import unittest
 from unittest.mock import Mock, patch
 
+from murmly.overlay import OverlayBackend, OverlayController
 from murmly.overlay_renderer_qt import (
     NATIVE_EXSTYLE_BITS,
     WS_EX_LAYERED,
@@ -554,6 +557,182 @@ class MacosWindowReadbackRuntimeIntegrationTests(unittest.TestCase):
             f"-> missing={missing!r}",
             file=sys.stderr,
         )
+
+
+def _skip_without_pyside6(test: unittest.TestCase) -> None:
+    if sys.platform != "win32":
+        test.skipTest("A Windows kernel and window station are required for this")
+    try:
+        import PySide6  # noqa: F401
+    except ModuleNotFoundError:
+        test.skipTest("PySide6 is not installed. Run `uv sync --extra overlay`.")
+
+
+class WindowsWindowReadbackRuntimeIntegrationTests(unittest.TestCase):
+    """Task 10.3's spike, against a real `HWND` -- everything above this class
+    proves the window-flags/verification policy against fakes, since
+    `ctypes.WinDLL("user32")` cannot be reached from Linux or macOS.
+
+    Follows `MacosWindowReadbackRuntimeIntegrationTests`'s pattern of
+    skipping in `setUp` on every platform but the one with the mechanism,
+    extended with the same second skip for the `overlay` extra `uv sync
+    --locked` alone never installs (task 10.2's own comment: it is behind
+    `uv sync --extra overlay`, and CI installs it on exactly one job -- see
+    `.github/workflows/tests.yml`).
+
+    Unlike the macOS twin, this asserts a hard pass/fail rather than only
+    printing the reading for a human: task 15's own open question is whether
+    a synthetic click genuinely passes through the live window underneath
+    Qt's `NSWindow`, which needs a person present to click and which no CI
+    run -- headless or not -- can show. `GetWindowLongPtr`'s four bits carry
+    no such ambiguity; they are a local, synchronous, objectively-checkable
+    property of the real `HWND` this test creates, needing nobody present to
+    confirm. `WindowsHotkeyRuntimeIntegrationTests`
+    (`test_win_hotkey.py`) already proved this project's Windows CI runner
+    has a real, interactive window station -- `SendInput` delivered a
+    `WM_HOTKEY` there -- so a missing property found here would be a real
+    regression in `apply_and_verify_exstyle`/the window flags above it, not
+    an artifact of a headless runner.
+    """
+
+    def setUp(self) -> None:
+        _skip_without_pyside6(self)
+
+    def test_the_real_readback_finds_every_required_property_present(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication, QWidget
+
+        try:
+            application = QApplication.instance() or QApplication([sys.argv[0]])
+            window = QWidget()
+            window.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.Tool
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.WindowDoesNotAcceptFocus
+                | Qt.WindowType.WindowTransparentForInput
+            )
+            window.resize(1, 1)
+            window.show()
+            native_id = int(window.winId())
+        except Exception as error:  # noqa: BLE001 - task 10.5's own degrade path
+            self.skipTest(f"This runner could not realize a real HWND: {error}")
+
+        try:
+            self.assertNotEqual(0, native_id, "Qt did not realize a native HWND")
+
+            # Task 10.3's first half: the documented, cross-platform Qt flags
+            # were actually requested, not merely intended.
+            flags = window.windowFlags()
+            self.assertTrue(bool(flags & Qt.WindowType.WindowTransparentForInput))
+            self.assertTrue(bool(flags & Qt.WindowType.WindowDoesNotAcceptFocus))
+
+            # Task 10.3's second half, and task 10.5's actual join point: the
+            # real `SetWindowLongPtr`/`GetWindowLongPtr` round trip, on the
+            # real `HWND` Qt just created, finds every spec-required property
+            # this codebase's own `apply_and_verify_exstyle` is trusted to
+            # decide from a fake readback everywhere else in this file.
+            missing = apply_and_verify_exstyle(native_id)
+            self.assertIsNone(
+                missing,
+                f"A real Windows HWND did not end up with every spec-required "
+                f"property; missing: {missing!r}",
+            )
+        finally:
+            window.hide()
+            del application
+
+
+class WindowsQtOverlayRuntimeIntegrationTests(unittest.TestCase):
+    """Task 10.1, against the real seams: a real PySide6 process, launched by
+    the real `OverlayController._spawn_windows_renderer` -- the Windows-only
+    `socket.share()`/`socket.fromshare()` handoff this module's own docstring
+    records as unconfirmed -- speaking the real newline-delimited JSON
+    protocol back over a real socket pair.
+
+    `_spawn_windows_renderer` is exercised directly, rather than driving the
+    whole `OverlayController` through `start()`/`publish_state()`/`close()`,
+    for the same reason `test_overlay_renderer.py`'s own
+    `test_runtime_integration_skips_without_supported_plasma_session` drives
+    its renderer subprocess directly with raw `socket.sendall` rather than
+    through `OverlayController`: `close()`'s shutdown path races its own
+    bounded `thread.join(0.5)` against the child actually finishing `quit()`
+    and exiting, and terminates the process outright if that race is lost --
+    a real property of `OverlayController.close()`, not of this task, and not
+    what task 10.1 is about. Calling the real spawn method directly still
+    proves the one thing task 10.1 requires: the exact production code path
+    that launches a Qt renderer on Windows -- the same `OverlayController`
+    class, and the same private method, `_load_qt_overlay`/`platform/__init__.py`
+    hands the daemon (see `test_platform.py`'s
+    `test_overlay_selects_qt_on_windows` for the structural half of "the
+    daemon does not learn which renderer it started": both the `qt` and
+    `gtk4` candidates load the identical `OverlayController` class object).
+
+    An exit code alone cannot prove presentation succeeded:
+    `OverlayApplication._fail_visual` calls `self._application.quit()`,
+    after which `run()`'s `self._application.exec()` returns and `main()`
+    returns 0 -- a refused window exits exactly as cleanly as a window that
+    shut down after presenting correctly. What actually discriminates the two
+    is whether the process is *still running*, mid-`LISTENING`, well past the
+    time a real refusal would have already quit it, and whether stderr ever
+    printed the `"Error:"` line `_fail_visual` writes.
+    """
+
+    def setUp(self) -> None:
+        _skip_without_pyside6(self)
+
+    def test_a_real_renderer_process_speaks_the_protocol_and_presents_without_error(self) -> None:
+        def popen_factory(command: list[str], **kwargs: object) -> subprocess.Popen:
+            kwargs.setdefault("stderr", subprocess.PIPE)
+            return subprocess.Popen(command, **kwargs)
+
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=True,
+            backend=OverlayBackend.WINDOWS,
+            popen_factory=popen_factory,
+            autostart=False,
+        )
+        parent_transport, child_transport = socket.socketpair()
+        process = controller._spawn_windows_renderer(child_transport)
+        child_transport.close()
+
+        try:
+            parent_transport.sendall(b'{"type":"state","value":"LISTENING"}\n')
+            parent_transport.sendall(b'{"type":"level","value":0.5}\n')
+
+            # PySide6's cold import (tens of megabytes of `PySide6-Addons`)
+            # is what this margin is for, not the socket round trip itself --
+            # the message is already sitting in the kernel's socket buffer by
+            # the time the renderer's own `QSocketNotifier` starts polling
+            # it, the same reason `test_overlay_renderer.py`'s own runtime
+            # test needs no readiness handshake either.
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline and process.poll() is None:
+                time.sleep(0.2)
+            self.assertIsNone(
+                process.poll(),
+                "The Qt renderer exited instead of presenting while LISTENING "
+                "-- a real placement/verification refusal, or a crash.",
+            )
+
+            parent_transport.sendall(b'{"type":"state","value":"IDLE"}\n')
+            parent_transport.sendall(b'{"type":"shutdown"}\n')
+            returncode = process.wait(timeout=10.0)
+            # `stdout` was never piped (`_spawn_windows_renderer` pipes only
+            # `stdin`, to hand over the shared socket, and this test's own
+            # `popen_factory` adds `stderr` alone) -- reading `stderr`
+            # directly avoids `communicate()`'s own stdin bookkeeping against
+            # a pipe `_spawn_windows_renderer` already wrote to and closed.
+            stderr = process.stderr.read() if process.stderr is not None else b""
+        finally:
+            parent_transport.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5.0)
+
+        self.assertEqual(0, returncode)
+        self.assertNotIn(b"Error:", stderr or b"")
 
 
 if __name__ == "__main__":

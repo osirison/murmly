@@ -36,6 +36,7 @@ from murmly.platform import (
     PlatformProfile,
     RuntimeGap,
     WINDOWS_MICROPHONE_PERMISSION,
+    permissions_for,
     _detected_libc,
     _macos_accessibility_permission_check,
     _macos_microphone_permission_check,
@@ -710,6 +711,42 @@ class PermissionShapeTests(unittest.TestCase):
         self.assertEqual(PermissionState.DENIED, denied.check(linux_plasma_x11()))
         self.assertNotEqual(PermissionState.GRANTED, PermissionState.UNDETERMINED)
         self.assertNotEqual(PermissionState.DENIED, PermissionState.UNDETERMINED)
+
+
+class PermissionsForTests(unittest.TestCase):
+    """Task 16.4's own filter: every permission that gates something on this
+    platform, in the table's order, for `Installer.install`'s pre-request
+    announcement and (potentially) `platform_diagnostics`'s own filtering."""
+
+    def test_linux_has_none(self) -> None:
+        self.assertEqual((), permissions_for(linux_plasma_x11()))
+
+    def test_windows_has_exactly_its_microphone_permission(self) -> None:
+        self.assertEqual((PERMISSIONS[WINDOWS_MICROPHONE_PERMISSION],), permissions_for(windows()))
+
+    def test_macos_has_both_of_its_permissions_in_table_order(self) -> None:
+        self.assertEqual(
+            (PERMISSIONS[MACOS_MICROPHONE_PERMISSION], PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]),
+            permissions_for(macos()),
+        )
+
+    def test_a_constructed_table_is_filtered_the_same_way(self) -> None:
+        applies_here = Permission(
+            name="applies-here",
+            capability="test capability",
+            grant_location="Settings > Test",
+            check=lambda profile: PermissionState.UNDETERMINED,
+        )
+        applies_nowhere = Permission(
+            name="applies-nowhere",
+            capability="test capability",
+            grant_location="Settings > Test",
+            check=lambda profile: PermissionState.UNDETERMINED,
+            applies=lambda profile: False,
+        )
+        table = {"applies-here": applies_here, "applies-nowhere": applies_nowhere}
+
+        self.assertEqual((applies_here,), permissions_for(linux_plasma_x11(), table))
 
 
 class WindowsMicrophonePermissionTests(unittest.TestCase):

@@ -117,8 +117,9 @@ an example rather than a note, and is not spoken.
 
 The notes are generated rather than shipped. To use your own, put a WAV at
 `~/.local/share/murmly/announce-chime.wav` and it is played instead. They go
-to the default output device through `pw-play`, `paplay`, or `aplay` —
-whichever is present — rather than through `[tts] output_device`, which is
+to the default output device — on Linux through `pw-play`, `paplay`, or
+`aplay`, whichever is present, and on Windows through the standard playback
+API — rather than through `[tts] output_device`, which is
 the speech path.
 
 ## What it writes, and how to undo it

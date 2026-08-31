@@ -14,15 +14,19 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
 import wave
 
+from module_stubs import injected_module, removed_module
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -525,6 +529,367 @@ class ChimeTests(unittest.TestCase):
         self.assertEqual(0, samples[0])
         self.assertLess(abs(samples[-1]), 1_000)
         self.assertLess(max(abs(sample) for sample in samples), 32_768)
+
+
+class ChimePlatformTests(unittest.TestCase):
+    """Which player is tried is a function of the platform, taken as a
+    parameter -- pinned per test rather than read from `sys.platform` -- so
+    each answer is checked on whatever machine happens to run the suite."""
+
+    def test_linux_tries_pipewire_then_pulse_then_alsa(self) -> None:
+        self.assertEqual(
+            (("pw-play",), ("paplay",), ("aplay", "-q")),
+            announce.chime_player_candidates("linux"),
+        )
+
+    def test_macos_uses_afplay_alone(self) -> None:
+        self.assertEqual((("afplay",),), announce.chime_player_candidates("darwin"))
+
+    def test_an_unrecognised_platform_falls_back_to_the_linux_candidates(self) -> None:
+        self.assertEqual(announce.LINUX_CHIME_PLAYERS, announce.chime_player_candidates("freebsd13"))
+
+
+class WindowsChimeTests(unittest.TestCase):
+    """`winsound` only exists on Windows. A fake module in `sys.modules`
+    stands in for it so the dispatch and its failure handling are checked
+    without a Windows machine -- the one thing that cannot be faked this way
+    is whether the real `winsound.PlaySound` behaves as documented, which is
+    what the Windows CI job's ordinary run of this suite covers instead."""
+
+    def fake_winsound(self, play_sound) -> types.ModuleType:
+        module = types.ModuleType("winsound")
+        module.SND_FILENAME = 0x00020000
+        module.SND_NODEFAULT = 0x00000002
+        module.PlaySound = play_sound
+        return module
+
+    def test_playsound_is_called_with_no_default_fallback(self) -> None:
+        """`SND_NODEFAULT` matters: without it a file `winsound` cannot play
+        falls back to the system's default sound and reports success anyway."""
+        calls = []
+        module = self.fake_winsound(lambda path, flags: calls.append((path, flags)))
+        with injected_module("winsound", module):
+            result = announce._play_chime_windows("/tmp/chime.wav", "chime")
+        self.assertEqual("chime", result)
+        self.assertEqual([("/tmp/chime.wav", module.SND_FILENAME | module.SND_NODEFAULT)], calls)
+
+    def test_a_runtime_error_from_playsound_is_reported_not_raised(self) -> None:
+        """`winsound.PlaySound` raises `RuntimeError` on failure, not `OSError`."""
+
+        def play_sound(path, flags):
+            raise RuntimeError("no waveform-audio device enabled")
+
+        module = self.fake_winsound(play_sound)
+        with injected_module("winsound", module):
+            result = announce._play_chime_windows("/tmp/chime.wav", "chime")
+        self.assertIn("failed", result)
+        self.assertIn("no waveform-audio device enabled", result)
+
+    def test_a_missing_winsound_is_a_graceful_failure(self) -> None:
+        """The path Linux and macOS actually take, since neither ships the
+        module: this must fail gracefully rather than raise, because it feeds
+        straight into a hook that must exit 0 regardless (17.3)."""
+        with removed_module("winsound"):
+            result = announce._play_chime_windows("/tmp/chime.wav", "chime")
+        self.assertIn("failed", result)
+
+
+class PlayChimeDispatchTests(unittest.TestCase):
+    """`play_chime` picks a mechanism by `sys.platform`, patched here rather
+    than pinned by parameter since `play_chime` itself takes none -- it is
+    the one place platform selection has to read the real attribute, for
+    `_speak_in_background` below to be able to do the same."""
+
+    def test_windows_goes_through_winsound_not_a_subprocess_player(self) -> None:
+        calls = []
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(announce, "_play_chime_windows", lambda path, label: calls.append(label) or "chime"),
+        ):
+            result = announce.play_chime()
+        self.assertEqual("chime", result)
+        self.assertEqual(["chime"], calls)
+
+    def test_linux_goes_through_a_subprocess_player(self) -> None:
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(shutil, "which", lambda name: f"/usr/bin/{name}" if name == "pw-play" else None),
+            patch.object(announce, "_run_player", lambda player, path, label: f"used {player[0]}"),
+        ):
+            result = announce.play_chime()
+        self.assertEqual("used pw-play", result)
+
+    def test_macos_goes_through_a_subprocess_player_too(self) -> None:
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(shutil, "which", lambda name: f"/usr/bin/{name}" if name == "afplay" else None),
+            patch.object(announce, "_run_player", lambda player, path, label: f"used {player[0]}"),
+        ):
+            result = announce.play_chime()
+        self.assertEqual("used afplay", result)
+
+    def test_no_player_on_linux_is_reported_not_raised(self) -> None:
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(shutil, "which", lambda name: None),
+        ):
+            result = announce.play_chime()
+        self.assertEqual("no audio player for the chime", result)
+
+
+class DetachedAnnouncementTests(unittest.TestCase):
+    """17.1: the hook must not hold up the turn waiting on `announce()`, which
+    can hold a connection open for up to `HEARD_ALL_TIMEOUT_SECONDS`. These
+    drive the real, shipped script end to end -- without
+    `MURMLY_ANNOUNCE_FOREGROUND` -- which is the only way to see the actual
+    detach mechanism (`subprocess.Popen` with real creation flags) rather
+    than the in-process shortcut every other test in this file takes."""
+
+    def run_detached(self, message: str, *, socket_path: str) -> tuple[subprocess.CompletedProcess, Path]:
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        transcript = directory / "transcript.jsonl"
+        transcript.write_text(
+            jsonl([{"type": "assistant", "message": {"content": [{"type": "text", "text": message}]}}]),
+            encoding="utf-8",
+        )
+        log = directory / "announce.log"
+        finished = subprocess.run(
+            [sys.executable, str(REPO / "hooks" / "murmly-announce.py")],
+            input=json.dumps(
+                {
+                    "transcript_path": str(transcript),
+                    "last_assistant_message": message,
+                    "cwd": str(directory),
+                }
+            ),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+            env={
+                **os.environ,
+                "MURMLY_ANNOUNCE_LOG": str(log),
+                "MURMLY_ANNOUNCE_CHIME": "0",
+                "MURMLY_SOCKET": socket_path,
+            },
+        )
+        return finished, log
+
+    def read(self, log: Path) -> str:
+        return log.read_text(encoding="utf-8") if log.exists() else ""
+
+    def poll_for(self, log: Path, needle: str, *, seconds: float = 10.0) -> str:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            content = self.read(log)
+            if needle in content:
+                return content
+            time.sleep(0.1)
+        self.fail(f"{needle!r} never appeared in the log within {seconds}s; got: {self.read(log)!r}")
+
+    def test_exits_zero_and_stays_quiet_with_no_daemon_listening(self) -> None:
+        """Runs identically on every CI platform: nothing here depends on
+        AF_UNIX actually working, only on the hook exiting 0 either way
+        (17.3) and the detached child eventually recording why it stayed
+        quiet (17.1) -- proof the `DETACHED_PROCESS`/`start_new_session`
+        child was really started rather than merely not-crashing."""
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        # The non-ASCII character pins the handoff's encoding: the parent
+        # writes the JSON request as UTF-8 and the child must read it back
+        # the same way, rather than in the platform's locale encoding, which
+        # is not UTF-8 on Windows and would mangle this silently there.
+        finished, log = self.run_detached(
+            "<voice-note>Nobody is listening, café.</voice-note>",
+            socket_path=str(directory / "absent.sock"),
+        )
+        self.assertEqual(0, finished.returncode)
+        self.poll_for(log, "café")
+        self.poll_for(log, "no daemon")
+
+    def test_the_parent_does_not_wait_on_the_child_to_be_heard(self) -> None:
+        """Pins the ordering, not the speed: a fake daemon accepts the
+        connection and then withholds its answer, so `announce()` inside the
+        child cannot finish until `Session.declare()` times out on its own
+        (`CONNECT_TIMEOUT_SECONDS`). If the parent process were waiting on
+        that outcome rather than merely spawning the child, the log would
+        already show it by the time `subprocess.run` returns; instead it
+        shows up only afterward, on its own schedule.
+        """
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("no AF_UNIX on this platform")
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        sock_path = str(directory / "slow.sock")
+        try:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(sock_path)
+        except OSError:
+            self.skipTest("could not create a UNIX socket on this platform")
+        self.addCleanup(server.close)
+        server.listen(1)
+
+        accepted = threading.Event()
+        release = threading.Event()
+
+        def slow_daemon() -> None:
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                return
+            accepted.set()
+            release.wait(10.0)
+            connection.close()
+
+        thread = threading.Thread(target=slow_daemon, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (release.set(), thread.join(2.0)))
+
+        finished, log = self.run_detached(
+            "<voice-note>A slow daemon is listening.</voice-note>", socket_path=sock_path
+        )
+
+        self.assertTrue(accepted.wait(5.0), "the detached child never reached the fake daemon")
+        self.assertEqual(0, finished.returncode)
+        self.assertNotIn("->", self.read(log), "the parent waited for the child's outcome before returning")
+
+        self.poll_for(log, "->")
+        release.set()
+
+
+class RunDetachedUnitTests(unittest.TestCase):
+    """The detached child's own entry point, exercised directly rather than
+    through a real subprocess so its edge cases do not need a real socket."""
+
+    class FakeStdin:
+        """A stand-in for `sys.stdin`: only `.buffer` is read, and `sys.stdin`
+        itself has to be replaced wholesale since `TextIOWrapper.buffer` is a
+        read-only attribute that `patch.object` cannot set in place."""
+
+        def __init__(self, data: bytes) -> None:
+            self.buffer = io.BytesIO(data)
+
+    def run_with_stdin(self, request: dict) -> tuple[int, list[tuple[str, str, str]]]:
+        calls: list[tuple[str, str, str]] = []
+        with (
+            patch.object(sys, "stdin", self.FakeStdin(json.dumps(request).encode("utf-8"))),
+            patch.object(
+                announce,
+                "announce",
+                lambda context, spoken, source: calls.append((context, spoken, source)) or "spoken",
+            ),
+        ):
+            result = announce._run_detached()
+        return result, calls
+
+    def test_nothing_to_say_opens_no_session_at_all(self) -> None:
+        """A truncated or empty handoff must not open a speech session to
+        speak nothing -- that would take a session from whoever else might
+        want one for no reason."""
+        result, calls = self.run_with_stdin({"context": "Claude Code in murmly.", "spoken": "", "source": "summary"})
+        self.assertEqual(0, result)
+        self.assertEqual([], calls)
+
+    def test_a_broken_handoff_is_quiet_rather_than_fatal(self) -> None:
+        with patch.object(sys, "stdin", self.FakeStdin(b"not json at all")):
+            result = announce._run_detached()
+        self.assertEqual(0, result)
+
+    def test_a_well_formed_handoff_announces_it(self) -> None:
+        result, calls = self.run_with_stdin(
+            {"context": "Claude Code in murmly.", "spoken": "It works.", "source": announce.SOURCE_SUMMARY}
+        )
+        self.assertEqual(0, result)
+        self.assertEqual([("Claude Code in murmly.", "It works.", announce.SOURCE_SUMMARY)], calls)
+
+
+class SpeakInBackgroundUnitTests(unittest.TestCase):
+    """The Popen call itself: which creation flags go with which platform,
+    and that the request is handed over and the process is never waited on."""
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = io.BytesIO()
+            self.stdin_closed = False
+
+            def close() -> None:
+                # Tracked rather than performed for real: a truly closed
+                # `BytesIO` cannot be read back by `getvalue()` afterward,
+                # which is exactly what the tests below need to do to check
+                # what was written.
+                self.stdin_closed = True
+
+            self.stdin.close = close
+
+    def test_posix_uses_a_new_session_rather_than_creation_flags(self) -> None:
+        captured = {}
+
+        def fake_popen(argv, **keywords):
+            captured["argv"] = argv
+            captured["keywords"] = keywords
+            return self.FakeProcess()
+
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(subprocess, "Popen", fake_popen),
+        ):
+            announce._speak_in_background("context", "spoken", announce.SOURCE_SUMMARY)
+
+        self.assertTrue(captured["keywords"].get("start_new_session"))
+        self.assertNotIn("creationflags", captured["keywords"])
+        self.assertEqual(announce.SPEAK_ARGV, captured["argv"][-1])
+
+    def test_windows_uses_detached_creation_flags_rather_than_a_new_session(self) -> None:
+        captured = {}
+
+        def fake_popen(argv, **keywords):
+            captured["keywords"] = keywords
+            return self.FakeProcess()
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(subprocess, "Popen", fake_popen),
+            patch.object(
+                subprocess, "DETACHED_PROCESS", 0x00000008, create=True
+            ),
+            patch.object(
+                subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+            ),
+        ):
+            announce._speak_in_background("context", "spoken", announce.SOURCE_SUMMARY)
+
+        self.assertNotIn("start_new_session", captured["keywords"])
+        self.assertEqual(0x00000008 | 0x00000200, captured["keywords"]["creationflags"])
+
+    def test_the_request_is_written_as_utf8_and_the_pipe_is_closed(self) -> None:
+        process = self.FakeProcess()
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(subprocess, "Popen", lambda argv, **keywords: process),
+        ):
+            announce._speak_in_background("café", "spoken", announce.SOURCE_SUMMARY)
+
+        request = json.loads(process.stdin.getvalue().decode("utf-8"))
+        self.assertEqual({"context": "café", "spoken": "spoken", "source": announce.SOURCE_SUMMARY}, request)
+        self.assertTrue(process.stdin_closed, "the child's stdin was never closed, so it would block on EOF")
+
+    def test_a_popen_failure_is_logged_rather_than_raised(self) -> None:
+        """17.3's property one level up: even the handoff itself must not
+        turn into an uncaught exception that would fail the turn."""
+        log = Path(tempfile.mkdtemp()) / "announce.log"
+        self.addCleanup(shutil.rmtree, log.parent, True)
+
+        def fake_popen(argv, **keywords):
+            raise OSError("no such interpreter")
+
+        with (
+            patch.object(announce, "LOG_PATH", str(log)),
+            patch.object(subprocess, "Popen", fake_popen),
+        ):
+            announce._speak_in_background("context", "spoken", announce.SOURCE_SUMMARY)
+
+        self.assertIn("no such interpreter", log.read_text(encoding="utf-8"))
 
 
 class SilenceWhenRefusedTests(unittest.TestCase):

@@ -7,14 +7,17 @@
 #   ./setup.sh hooks [claude|copilot|both|off]
 #   ./setup.sh uninstall [--purge]
 #
-# What this wraps that is easy to get wrong by hand:
-#
-#   * `uv sync` makes the environment match exactly the extras it is given, so a
-#     plain sync silently removes the CUDA wheels or speech output. Every sync
-#     here is given every extra that is already installed.
-#   * The GPU build of ONNX Runtime replaces the CPU one rather than joining it,
-#     and any sync puts the CPU build back. It is reapplied after each sync.
-#   * The synthesis model files are not packaged and have to be placed by hand.
+# Two things used to be easy to get wrong by hand here -- carrying the extras
+# already installed across a `uv sync`, since a plain sync matches the
+# environment exactly to what it is given and silently removes the CUDA
+# wheels or speech output, and reapplying the GPU build of ONNX Runtime, which
+# every sync puts back to the CPU one. Both moved into `murmly sync` itself
+# (`src/murmly/environment.py`, `design.md`'s "Installation: `murmly install`
+# grows, `setup.sh` shrinks to a bootstrap"), where they are testable and do
+# not vary by platform. What stays here is what does not fit that description:
+# pulling the source, naming and offering this Linux system's own packages for
+# a `uv sync` that has not run yet to even make `murmly` callable, the
+# synthesis model download, the announcement hooks, and the service.
 #
 # See README.md for what each piece does; this script only sequences them.
 
@@ -22,10 +25,6 @@ set -euo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO
-
-# Pinned by docs/agent-notes/onnxruntime-gpu-cuda-version.md: 1.25+ moved to
-# CUDA 13, whose wheels are not on PyPI, while the cuda extra pins CUDA 12.
-readonly ONNXRUNTIME_GPU_VERSION="1.24.4"
 
 readonly KOKORO_RELEASE="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 readonly MODEL_FILE="kokoro-v1.0.onnx"
@@ -118,25 +117,6 @@ murmly() { uv run --no-sync --project "$REPO" murmly "$@"; }
 # `uv pip show` reads the project environment without changing it.
 installed_package() { uv pip show --project "$REPO" "$1" >/dev/null 2>&1; }
 
-has_nvidia_driver() {
-    # Task 3.6: /proc/driver/nvidia/version is Linux-only by construction, and
-    # this script's install-time detection has to answer the same question
-    # `murmly.packages.has_nvidia_gpu` does elsewhere -- nvidia-smi on PATH,
-    # which the NVIDIA installer places there on every platform it ships for.
-    # A machine with the kernel driver but not the package that ships the
-    # tool now answers the same way `have nvidia-smi` alone always would.
-    have nvidia-smi
-}
-
-is_wayland() { [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; }
-
-is_plasma() {
-    case "${XDG_CURRENT_DESKTOP:-}${XDG_SESSION_DESKTOP:-}" in
-        *KDE*|*plasma*|*Plasma*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
 require_uv() {
     if have uv; then
         return 0
@@ -146,83 +126,23 @@ require_uv() {
   or: sudo dnf install uv"
 }
 
-# ------------------------------------------------------ system packages -----
-
-# The overlay and the delivery tools are recommended rather than required.
-# Murmly reports a missing one through `murmly doctor` and carries on without
-# the feature it serves, so a machine that cannot install them still works.
-wanted_system_packages() {
-    # portaudio: `sounddevice` bundles PortAudio into its own wheel on Windows
-    # and macOS, but not on Linux, so it is the one package here nothing else
-    # in the dependency tree pulls in. Confirmed present under this name in
-    # docs/agent-notes/portaudio-jack-exit-abort.md.
-    local -a packages=(gtk4 python3-gobject libX11 libXext portaudio)
-
-    if is_wayland; then
-        packages+=(wl-clipboard)
-        if is_plasma; then
-            # KWin bridges XTEST through libei, so an X11 tool reaches
-            # Wayland-native windows; layer shell is what places the overlay.
-            packages+=(gtk4-layer-shell xdotool)
-        else
-            packages+=(wtype)
-        fi
-    else
-        packages+=(xclip xdotool)
+# Murmly does not claim macOS (this change's binding scope decision), and the
+# rest of this script assumes a Linux desktop -- `systemctl`, `dnf`/`apt`/etc,
+# XDG directories -- deeply enough that running it there would otherwise fail
+# with an error naming none of that, well after a venv had already been
+# created. Checked before any command below writes anything, the same "every
+# command refuses immediately, before a daemon starts, a channel is created,
+# or a file is written" rule `cli._unsupported_platform_message` already
+# applies once `murmly` itself is reachable -- this is what covers the gap
+# before it is: a fresh checkout's first `uv sync` happens from this bootstrap,
+# not from a `murmly` command that could refuse it itself.
+refuse_unsupported_os() {
+    if [ "$(uname -s)" = "Darwin" ]; then
+        fail "Murmly does not support macOS. It supports Linux and Windows."
     fi
-
-    if wants_speech_output; then
-        packages+=(espeak-ng)
-    fi
-
-    printf '%s\n' "${packages[@]}"
-}
-
-install_system_packages() {
-    step "System packages"
-
-    if ! have dnf; then
-        note "No dnf here, so this step is skipped. The packages Murmly would use are:"
-        note "  $(wanted_system_packages | tr '\n' ' ')"
-        return 0
-    fi
-
-    local -a missing=()
-    local package
-    while IFS= read -r package; do
-        if ! rpm -q "$package" >/dev/null 2>&1; then
-            missing+=("$package")
-        fi
-    done < <(wanted_system_packages)
-
-    if [ ${#missing[@]} -eq 0 ]; then
-        info "Everything Murmly uses is already installed."
-        return 0
-    fi
-
-    info "Missing: ${missing[*]}"
-    info "Command: sudo dnf install ${missing[*]}"
-    if ! confirm "Install these now?"; then
-        warn "Skipped. Murmly runs without them, with the features they serve disabled."
-        return 0
-    fi
-    sudo dnf install -y "${missing[@]}"
 }
 
 # --------------------------------------------------------------- extras -----
-
-#: Extras already present in the environment, so a sync never removes a feature
-#: that was installed. This is the rule the manual instructions keep tripping on.
-#:
-#: Speech output is not among them any more. It is a default dependency group,
-#: which every sync keeps without being told to, and the reading it needed here
-#: is the one below -- whether somebody has deliberately turned it off.
-current_extras() {
-    if installed_package nvidia-cublas-cu12; then
-        printf 'cuda\n'
-    fi
-    return 0
-}
 
 #: Whether the next sync should carry speech output. Yes by default, because the
 #: synthesizer is a default dependency group and arrives without being asked for.
@@ -242,107 +162,47 @@ wants_speech_output() {
     return 0
 }
 
-#: The extras the next sync should be given: what is installed, plus what the
-#: flags or the answers add, minus what the flags remove.
-resolve_extras() {
-    local wants_cuda=0
-    local extra
-    while IFS= read -r extra; do
-        case "$extra" in
-            cuda) wants_cuda=1 ;;
-        esac
-    done < <(current_extras)
-
-    case "$WANT_CUDA" in
-        yes) wants_cuda=1 ;;
-        no) wants_cuda=0 ;;
-        auto)
-            if [ "$wants_cuda" -eq 0 ] && has_nvidia_driver; then
-                info "An NVIDIA driver is present. The cuda extra runs transcription on the GPU."
-                if confirm "Install the GPU runtime?"; then
-                    wants_cuda=1
-                fi
-            fi
-            ;;
-    esac
-
-    if [ "$wants_cuda" -eq 1 ]; then
-        printf 'cuda\n'
-    fi
-    return 0
-}
-
+#: Task 16.1: carrying the extras already installed across a sync, offering
+#: this Linux system's own packages (task 3.4), and reapplying the ONNX
+#: Runtime GPU swap every sync undoes all moved into `murmly sync`
+#: (`src/murmly/environment.py`) -- this is now a thin wrapper around it.
+#:
+#: On a checkout with no environment yet, `murmly` is not a command this
+#: script can run at all -- `uv run --no-sync` has nothing to run without-
+#: syncing *in*. A first, plain `uv sync --locked` is what makes `murmly`
+#: reachable; `murmly sync` then reads what that plain sync actually
+#: installed (no extras, every default group) and takes it from there, the
+#: same as it would for an existing environment upgrading in place.
 sync_environment() {
-    local -a extras=()
-    local extra
-    while IFS= read -r extra; do
-        if [ -n "$extra" ]; then
-            extras+=("$extra")
-        fi
-    done < <(resolve_extras)
-
-    # Recorded before the sync, which puts the CPU build back whatever was there.
-    local restore_gpu_onnxruntime=0
-    if installed_package onnxruntime-gpu; then
-        restore_gpu_onnxruntime=1
-    fi
-
     step "Python environment"
-    local -a arguments=(sync --locked)
-    local has_cuda=0 has_tts=1
-    for extra in "${extras[@]}"; do
-        arguments+=(--extra "$extra")
-        case "$extra" in
-            cuda) has_cuda=1 ;;
-        esac
-    done
-
-    # Named only to leave it out. The group is a default, so the sync carries
-    # the synthesizer unless this says otherwise -- which is the whole point of
-    # it being a group: nothing removes speech output by forgetting to mention
-    # it, only by asking.
-    if ! wants_speech_output; then
-        has_tts=0
-        arguments+=(--no-group tts)
+    if [ ! -d "$REPO/.venv" ]; then
+        info "No environment yet. Creating one before Murmly's own sync runs."
+        ( cd "$REPO" && uv sync --locked )
     fi
 
-    if [ ${#extras[@]} -eq 0 ]; then
-        info "Syncing with no extras."
-    else
-        info "Syncing with: ${extras[*]}"
-    fi
-    if [ "$has_tts" -eq 0 ]; then
-        info "Leaving speech output out."
-    fi
-    ( cd "$REPO" && uv "${arguments[@]}" )
-
-    if [ "$has_cuda" -eq 1 ] && [ "$has_tts" -eq 1 ]; then
-        if [ "$restore_gpu_onnxruntime" -eq 1 ]; then
-            swap_in_gpu_onnxruntime "restoring it, since the sync put the CPU build back"
-        else
-            info "Speech output can also run on the GPU. That build of ONNX Runtime replaces"
-            info "the CPU one rather than joining it, and every sync puts the CPU one back."
-            if confirm "Run synthesis on the GPU?"; then
-                swap_in_gpu_onnxruntime "installing it"
-            fi
-        fi
-    elif [ "$restore_gpu_onnxruntime" -eq 1 ]; then
-        warn "The GPU build of ONNX Runtime was installed but speech output is not, so it was not restored."
+    local want_models=0
+    if wants_speech_output; then
+        want_models=1
     fi
 
-    if [ "$has_tts" -eq 1 ]; then
+    local -a arguments=(sync --project "$REPO")
+    case "$WANT_CUDA" in
+        yes) arguments+=(--cuda) ;;
+        no)  arguments+=(--no-cuda) ;;
+    esac
+    case "$WANT_TTS" in
+        yes) arguments+=(--tts) ;;
+        no)  arguments+=(--no-tts) ;;
+    esac
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        arguments+=(--yes)
+    fi
+
+    murmly "${arguments[@]}"
+
+    if [ "$want_models" -eq 1 ]; then
         install_models
     fi
-}
-
-swap_in_gpu_onnxruntime() {
-    step "GPU build of ONNX Runtime"
-    info "$1: onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}"
-    # Uninstalled first, deliberately. Both distributions install into the same
-    # `onnxruntime` package namespace, and an environment holding the two leaves
-    # whichever survives a later uninstall broken.
-    ( cd "$REPO" && uv pip uninstall onnxruntime >/dev/null 2>&1 ) || true
-    ( cd "$REPO" && uv pip install "onnxruntime-gpu==${ONNXRUNTIME_GPU_VERSION}" )
 }
 
 # --------------------------------------------------------------- models -----
@@ -721,7 +581,6 @@ command_hooks() {
 
 command_install() {
     require_uv
-    install_system_packages
     sync_environment
     bind_hotkeys "${1:-}" "${2:-}"
     restart_service
@@ -744,7 +603,6 @@ command_upgrade() {
         git -C "$REPO" pull --ff-only
     fi
 
-    install_system_packages
     sync_environment
 
     # Rebound rather than left alone: the entrypoint Murmly recorded goes stale
@@ -838,6 +696,13 @@ main() {
         esac
         shift
     done
+
+    # Skipped for `-h`/`--help`/no command at all: printing usage writes
+    # nothing and starts nothing, so there is no reason to refuse it.
+    case "$command" in
+        -h|--help|help|"") ;;
+        *) refuse_unsupported_os ;;
+    esac
 
     case "$command" in
         install) command_install "${positional[@]}" ;;

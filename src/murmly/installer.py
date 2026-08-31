@@ -1123,9 +1123,18 @@ class Installer:
         clock: Callable[[], float] = time.monotonic,
         daemon_timeout: float = WINDOWS_DAEMON_START_TIMEOUT_SECONDS,
         poll_interval: float = WINDOWS_DAEMON_POLL_INTERVAL_SECONDS,
+        announce: Callable[[str], None] = print,
     ) -> None:
         from murmly.platform import resolve_platform
 
+        # Task 16.4: where `install()` states which permissions it is about
+        # to request. `print` in production, matching every other message
+        # this class already prints through `InstallOutcome.messages` for
+        # `cli._run_install` to relay -- injected here instead of collected
+        # into that same tuple because the statement has to reach the person
+        # *before* `_request_macos_accessibility_permission` below, and
+        # `messages` is not read until `install()` has already returned.
+        self._announce = announce
         self._pinned_shortcuts = shortcuts
         self._pinned_launcher = launcher
         self._pinned_session_launcher = session_launcher
@@ -1280,7 +1289,26 @@ class Installer:
         sender that opens a session itself, which is what an existing
         installation upgrading in place gets.
         """
-        from murmly.platform import OperatingSystem, hotkey_mechanism_is_in_process
+        from murmly.platform import OperatingSystem, hotkey_mechanism_is_in_process, permissions_for
+
+        # Task 16.4, and always the first thing this method does: the
+        # `platform-support` spec requires every permission this installation
+        # may request to be named, and what each is for, before requesting
+        # any of them. The Accessibility request two lines below is the
+        # earliest request `install()` itself makes -- the microphone
+        # permission on Windows and macOS is requested later, implicitly, by
+        # the platform itself the first time capture opens a stream, which is
+        # always after this method has already returned -- so stating every
+        # applicable permission here, before that request, is "before any of
+        # them" for the whole installation, not only for this method's own
+        # request.
+        applicable_permissions = permissions_for(self._profile)
+        if applicable_permissions:
+            self._announce("Murmly will request the following permissions:")
+            for permission in applicable_permissions:
+                self._announce(
+                    f"  {permission.capability}, granted or denied in {permission.grant_location}."
+                )
 
         # Task 14.5: raise the Accessibility consent dialog exactly once, from
         # this explicit `murmly install` invocation, before either install

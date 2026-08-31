@@ -27,7 +27,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 3.1 Replace `_loaded_library_path`'s `/proc/self/maps` read (`src/murmly/tts.py:135`) with `dlinfo`, already in the lock as a transitive dependency, which answers the same question on Linux and macOS; Windows has no `dlinfo` backend, so it reports the name that was loaded
 - [x] 3.2 Make `_malloc_trim` (`src/murmly/idle.py:22-44`) report that the platform's allocator cannot be asked to return memory, rather than silently doing nothing, and surface that in the residency diagnostics
 - [x] 3.3 Turn `SYSTEM_PYTHON` (`src/murmly/overlay.py:27`) into the interpreter the selected renderer needs, keeping `/usr/bin/python3` for the GTK4 renderer and its reason with it
-- [ ] 3.4 Detect the package manager — `dnf`, `apt`, `pacman`, `zypper`, `apk` — and name the packages for it, printing the list plainly where none is recognised, which is what the script already does without `dnf`
+- [x] 3.4 Detect the package manager — `dnf`, `apt`, `pacman`, `zypper`, `apk` — and name the packages for it, printing the list plainly where none is recognised, which is what the script already does without `dnf`
 - [x] 3.5 Name `libportaudio2` or its equivalent among the Linux system packages: `sounddevice` bundles PortAudio on Windows and macOS but not on Linux
 - [x] 3.6 Stop reading `/proc/driver/nvidia/version` to detect a GPU; ask through a mechanism that answers on every platform
 - [x] 3.7 Keep the systemd unit's `After=pipewire.service wireplumber.service` ordering where systemd is the service manager, and stop treating it as something Murmly depends on elsewhere
@@ -90,16 +90,16 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 10.2 Add PySide6 to `pyproject.toml` behind the platform markers for the platforms whose renderer needs it
 - [ ] 10.3 Set `Qt.WindowTransparentForInput` and `Qt.WindowDoesNotAcceptFocus`, and apply `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` to the native `HWND` through `SetWindowLongPtr`
 - [x] 10.4 Reproduce every visual state, dimension and lifecycle transition the GTK4 renderer presents, from a single enumeration both read
-- [ ] 10.5 Present nothing, and report which property could not be provided, where the platform cannot give a surface that is above ordinary windows, takes no focus, and intercepts no pointer input
+- [x] 10.5 Present nothing, and report which property could not be provided, where the platform cannot give a surface that is above ordinary windows, takes no focus, and intercepts no pointer input
 
 ## 11. Windows: runtime and packaging
 
-- [ ] 11.1 Load the CUDA libraries with `os.add_dll_directory` over each `nvidia/*/bin` wheel directory before the runtime is imported — Windows has no `RTLD_GLOBAL`, and since Python 3.8 it does not search `PATH` for an extension module's DLL dependencies
+- [x] 11.1 Load the CUDA libraries with `os.add_dll_directory` over each `nvidia/*/bin` wheel directory before the runtime is imported — Windows has no `RTLD_GLOBAL`, and since Python 3.8 it does not search `PATH` for an extension module's DLL dependencies
 - [x] 11.2 Add `sys_platform != 'darwin'` to every `nvidia-*-cu12` requirement in the `cuda` extra: all six publish `win_amd64` and none publishes any macOS wheel, so resolving the extra on macOS fails outright
 - [x] 11.3 Spike whether the bundled `espeakng-loader` Windows wheel carries the same compiled-in data-path defect confirmed on Linux, and whether `ESPEAK_DATA_PATH` overrides it where `EspeakWrapper.set_data_path()` does not
 - [ ] 11.4 If it does carry the defect, resolve a Windows espeak-ng install and name it in the remedy through the existing "runtime absent" reporting path; if it does not, use the bundled library
-- [ ] 11.5 Check long-path support before syncing and name it, since `uv sync` otherwise fails with "the system cannot find the path specified" and never mentions path length
-- [ ] 11.6 Check Developer Mode and warn that the model cache will be stored as full copies without it, doubling 1.6 GB on disk, because `huggingface_hub`'s cache uses symlinks
+- [x] 11.5 Check long-path support before syncing and name it, since `uv sync` otherwise fails with "the system cannot find the path specified" and never mentions path length
+- [x] 11.6 Check Developer Mode and warn that the model cache will be stored as full copies without it, doubling 1.6 GB on disk, because `huggingface_hub`'s cache uses symlinks
 - [x] 11.7 Confirm PortAudio is bundled in the `sounddevice` wheel and that the default host APIs — MME, DirectSound, WDM/KS, WASAPI — are enough, leaving ASIO to its `SD_ENABLE_ASIO` opt-in
 
 ## 12. macOS: microphone access, before anything else
@@ -141,18 +141,18 @@ shippable on their own. See `design.md` — Migration Plan.
 
 ## 16. The installer
 
-- [ ] 16.1 Move what `setup.sh` exists to get right into `murmly` itself: reading which extras are installed before each sync so a sync does not remove a feature, and reapplying the ONNX Runtime GPU swap that every sync undoes
-- [ ] 16.2 Reduce the per-platform entry points to a bootstrap — install `uv`, then hand off — as `sh` and as PowerShell
-- [ ] 16.3 Refuse a machine with no build of the transcription runtime before syncing, naming the runtime and the characteristic, rather than letting the resolver name a package
-- [ ] 16.4 State which permissions the platform will request and what each enables, before the first request is made
-- [ ] 16.5 Keep every `setup.sh` subcommand and flag working: `install`, `upgrade`, `hooks`, `uninstall`, `--purge`, `--yes`, `--cuda`/`--no-cuda`, `--tts`/`--no-tts`
-- [ ] 16.6 Keep declining every prompt, rather than assuming, when nothing is attached to the terminal and `--yes` was not given
+- [x] 16.1 Move what `setup.sh` exists to get right into `murmly` itself: reading which extras are installed before each sync so a sync does not remove a feature, and reapplying the ONNX Runtime GPU swap that every sync undoes
+- [ ] 16.2 Reduce the per-platform entry points to a bootstrap — install `uv`, then hand off — as `sh` and as PowerShell (`bootstrap.sh` done and tested on Linux; `bootstrap.ps1` is written but unverified — no Windows machine or `pwsh` interpreter was available to run or even syntax-check it, so it stays unchecked until a Windows CI run exercises it)
+- [x] 16.3 Refuse a machine with no build of the transcription runtime before syncing, naming the runtime and the characteristic, rather than letting the resolver name a package
+- [x] 16.4 State which permissions the platform will request and what each enables, before the first request is made
+- [x] 16.5 Keep every `setup.sh` subcommand and flag working: `install`, `upgrade`, `hooks`, `uninstall`, `--purge`, `--yes`, `--cuda`/`--no-cuda`, `--tts`/`--no-tts`
+- [x] 16.6 Keep declining every prompt, rather than assuming, when nothing is attached to the terminal and `--yes` was not given
 
 ## 17. Announcements without `os.fork`
 
-- [ ] 17.1 Replace the `os.fork` + `os.setsid` detach in `hooks/murmly-announce.py:585-612` with a mechanism that exists on every platform, keeping the property the requirement states: the announcement does not hold up the turn
-- [ ] 17.2 Resolve the chime playback command per platform, rather than trying `pw-play`, `paplay` and `aplay` alone
-- [ ] 17.3 Confirm the hook still exits 0 for every reason it cannot speak, on every platform
+- [x] 17.1 Replace the `os.fork` + `os.setsid` detach in `hooks/murmly-announce.py:585-612` with a mechanism that exists on every platform, keeping the property the requirement states: the announcement does not hold up the turn
+- [x] 17.2 Resolve the chime playback command per platform, rather than trying `pw-play`, `paplay` and `aplay` alone
+- [x] 17.3 Confirm the hook still exits 0 for every reason it cannot speak, on every platform
 
 ## 18. Tests
 
@@ -170,7 +170,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 18.12 Test that an injection method whose permission is ungranted is reported as not permitted, distinctly from absent and from installed-but-unusable, and is not reported as available
 - [x] 18.13 Test that a permission whose state cannot be read is reported as undetermined rather than granted
 - [x] 18.14 Test that both overlay renderers handle the same protocol messages and present the same enumerated states, without a display
-- [ ] 18.15 Test that the overlay is not presented, and the missing property named, where the platform cannot give a surface that takes no focus and intercepts no pointer input
+- [x] 18.15 Test that the overlay is not presented, and the missing property named, where the platform cannot give a surface that takes no focus and intercepts no pointer input
 - [x] 18.16 Test that releasing a model reports system memory as not returned where the allocator cannot be asked, and still drops the model on schedule
 - [x] 18.17 Test that the diagnostics report carries the same field names on every platform, with an unserviceable concern reported unavailable rather than absent
 - [x] 18.18 Keep the runtime `self.skipTest(...)` pattern for anything needing a live session, extending it to skip on the wrong operating system, as `X11RuntimeIntegrationTests` already does for a missing display

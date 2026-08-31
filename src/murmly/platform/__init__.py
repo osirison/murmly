@@ -1173,6 +1173,28 @@ PERMISSIONS: Mapping[str, Permission] = {
     ),
 }
 
+
+def permissions_for(
+    profile: PlatformProfile,
+    permissions: Mapping[str, Permission] = PERMISSIONS,
+) -> tuple[Permission, ...]:
+    """Every permission in `permissions` that gates something on `profile`'s platform.
+
+    In `permissions`' own iteration order (Python dicts preserve insertion
+    order), so a caller that renders this list -- section 16.4's "state which
+    permissions will be requested" announcement, and `platform_diagnostics`'
+    own filtering, which could be rewritten on top of this without changing
+    what it reports -- gets the same order every time rather than whatever a
+    set or an unordered filter would produce.
+
+    `permissions` defaults to the real table and takes a parameter for the
+    same reason `runtime_gaps_for` does: a test exercises "more than one
+    permission applies" or "none does" against a constructed table, without
+    needing a platform that gates two real permissions to exist.
+    """
+    return tuple(permission for permission in permissions.values() if permission.applies(profile))
+
+
 #: The one microphone-gating permission for a given operating system, if any
 #: -- Linux has none, and no operating system in scope gates it with more
 #: than one. `cli.py`'s `microphone_diagnostics` (task 12.5) reads this
