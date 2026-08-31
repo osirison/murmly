@@ -340,7 +340,12 @@ class OverlayTests(unittest.TestCase):
         # (`/private/tmp/renderer.py` there), not the string this test
         # constructed the controller with. Comparing against the same
         # `.resolve()` is a no-op on Linux, where `/tmp` is not a symlink.
-        self.assertEqual(str(Path("/tmp/renderer.py").resolve()), launches[0][0][1])
+        # `.as_posix()`, not `str(...)`: the command line itself is built with
+        # `.as_posix()` (see `OverlayController.start`'s own comment), since
+        # this renderer is launched only on Linux regardless of which host's
+        # `pathlib` flavour runs the suite, and `str()` on a real Windows
+        # host would render backslashes no launch of this ever produces.
+        self.assertEqual(Path("/tmp/renderer.py").resolve().as_posix(), launches[0][0][1])
         self.assertIn("--reduced-motion", launches[0][0])
         self.assertIn("wayland", launches[0][0])
         self.assertFalse(launches[0][1]["shell"])

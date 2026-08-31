@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import types
 import unittest
 from unittest.mock import patch
 
@@ -860,18 +861,731 @@ class WindowsPipeSecurityDescriptorIntegrationTests(unittest.TestCase):
             # name is itself a client `CreateFile` against the one instance
             # this server has waiting to accept a connection, and would
             # consume that connection rather than merely inspect it.
-            _owner, _group, dacl, _sacl, _descriptor = win32security.GetSecurityInfo(
+            # `GetSecurityInfo` returns a single `PySECURITY_DESCRIPTOR`, not
+            # the 5-tuple its C signature's out-parameters might suggest --
+            # confirmed by this suite's own first real Windows CI run
+            # (`TypeError: cannot unpack non-iterable PySECURITY_DESCRIPTOR
+            # object`, ci2-Windows.log). The DACL is read off it with its own
+            # `GetSecurityDescriptorDacl` method, matching `pywin32`'s usage
+            # for `GetNamedSecurityInfo` elsewhere.
+            descriptor = win32security.GetSecurityInfo(
                 server.handle,
                 win32security.SE_KERNEL_OBJECT,
                 win32security.DACL_SECURITY_INFORMATION,
             )
+            dacl = descriptor.GetSecurityDescriptorDacl()
 
             self.assertIsNotNone(dacl)
             self.assertEqual(1, dacl.GetAceCount())
-            _revision, _flags, _mask, sid = dacl.GetAce(0)
+            # `PyACL.GetAce` returns `((ace_type, ace_flags), mask, sid)` --
+            # a 3-tuple whose first element is itself a 2-tuple, not four
+            # flat values -- per `pywin32`'s own documented shape for this
+            # call.
+            (_ace_type, _ace_flags), _mask, sid = dacl.GetAce(0)
             self.assertEqual(current_user_sid_string(), win32security.ConvertSidToStringSid(sid))
         finally:
             server.close()
+
+
+class _FakeWin32Error(Exception):
+    """Stand-in for `pywintypes.error`: carries `.winerror`/`.funcname`/
+    `.strerror` the same way the real exception does (its `.args` are
+    exactly `(winerror, funcname, strerror)`), without needing `pywin32`
+    installed to construct one. Every real Win32 call site in `win_pipe.py`
+    reads only `.winerror` and `str(error)`, both of which this provides.
+    """
+
+    def __init__(self, winerror: int, funcname: str = "", strerror: str = "") -> None:
+        self.winerror = winerror
+        self.funcname = funcname
+        self.strerror = strerror
+        super().__init__(winerror, funcname, strerror)
+
+
+class _FakeOverlapped:
+    """Stand-in for `pywintypes.OVERLAPPED`: the one attribute `win_pipe.py`
+    ever sets or reads on it (`hEvent`) as a plain, uninspected value."""
+
+    def __init__(self) -> None:
+        self.hEvent = None
+
+
+def _install_fake_win32(
+    *,
+    connect_named_pipe=None,
+    read_file=None,
+    write_file=None,
+    create_file=None,
+    wait_named_pipe=None,
+    wait_for_single_object=None,
+    get_overlapped_result=None,
+    cancel_io_ex=None,
+    close_handle=None,
+):
+    """A minimal Win32 layer, faked at exactly the boundary `win_pipe.py`
+    imports across.
+
+    Every `import win32...`/`import pywintypes` in `win_pipe.py` is
+    function-local (see that module's own docstring for why), which is what
+    makes this possible at all: patching `sys.modules` before a call is
+    enough to make `win_pipe.py`'s real, unmodified code run against these
+    fakes, on a machine with no `pywin32` installed -- the logic under test
+    is `win_pipe.py`'s own state machine and error translation, not a
+    reimplementation of it.
+
+    Every keyword defaults to a no-op or an immediate success, so a test
+    only has to say what it cares about (`get_overlapped_result=...` to
+    control one call's outcome, say) rather than script every function this
+    module might call along the way. Returns a `unittest.mock.patch.dict`
+    context manager -- entries this process never had (nothing here is
+    installed at all) are removed again on exit, never left to leak into
+    `NamedPipeShapeTests`' own proof that `murmly.win_pipe` imports cleanly
+    with no `pywin32` present.
+    """
+    fake_pywintypes = types.SimpleNamespace(error=_FakeWin32Error, OVERLAPPED=_FakeOverlapped)
+    fake_win32event = types.SimpleNamespace(
+        CreateEvent=lambda *a, **k: object(),
+        WaitForSingleObject=wait_for_single_object or (lambda *a, **k: 0),
+        WAIT_TIMEOUT=258,
+        WAIT_OBJECT_0=0,
+        INFINITE=0xFFFFFFFF,
+    )
+    fake_win32file = types.SimpleNamespace(
+        GetOverlappedResult=get_overlapped_result or (lambda *a, **k: 0),
+        CancelIoEx=cancel_io_ex or (lambda *a, **k: None),
+        CloseHandle=close_handle or (lambda *a, **k: None),
+        ReadFile=read_file,
+        WriteFile=write_file,
+        AllocateReadBuffer=lambda size: bytearray(size),
+        CreateFile=create_file,
+    )
+    fake_win32pipe = types.SimpleNamespace(
+        ConnectNamedPipe=connect_named_pipe,
+        WaitNamedPipe=wait_named_pipe,
+    )
+    fake_win32con = types.SimpleNamespace(
+        GENERIC_READ=0x80000000,
+        GENERIC_WRITE=0x40000000,
+        OPEN_EXISTING=3,
+        FILE_FLAG_OVERLAPPED=0x40000000,
+    )
+    return patch.dict(
+        sys.modules,
+        {
+            "pywintypes": fake_pywintypes,
+            "win32event": fake_win32event,
+            "win32file": fake_win32file,
+            "win32pipe": fake_win32pipe,
+            "win32con": fake_win32con,
+        },
+    )
+
+
+class NamedPipeIOErrorTests(unittest.TestCase):
+    """The error-code translation table `_run_overlapped` and its callers
+    build on, tested with no Win32 layer at all -- `_pipe_error_from` reads
+    only `.winerror` and `str()` off whatever it is given (see its own
+    docstring)."""
+
+    def test_carries_the_win32_error_code_as_a_plain_attribute(self) -> None:
+        from murmly.win_pipe import NamedPipeIOError
+
+        error = NamedPipeIOError(109, "The pipe has been ended.")
+
+        self.assertEqual(109, error.win32_error_code)
+        self.assertIsInstance(error, OSError)
+
+    def test_pipe_error_from_reads_the_winerror_code_and_message(self) -> None:
+        from murmly.win_pipe import _pipe_error_from
+
+        source = _FakeWin32Error(232, "WriteFile", "The pipe is being closed.")
+
+        translated = _pipe_error_from(source)
+
+        self.assertEqual(232, translated.win32_error_code)
+        self.assertEqual(str(source), str(translated))
+
+
+class RunOverlappedTests(unittest.TestCase):
+    """Task's item 1 (`GetOverlappedResult(bWait=False)` on a not-yet-complete
+    operation, ci2-Windows.log's 81 `(996, 'GetOverlappedResult', ...)`
+    failures) and the `CancelIoEx`/timeout race it names as its own defect,
+    against a faked Win32 layer standing in for the real one no machine
+    running this suite has.
+    """
+
+    def test_pipe_connected_returns_immediately_without_collecting_a_result(self) -> None:
+        """The regression test for the 996 bug: `ERROR_PIPE_CONNECTED` means
+        no overlapped operation was ever queued (MSDN: the OVERLAPPED's event
+        is never signalled for this case), so `GetOverlappedResult` must
+        never be called for it -- calling it anyway, unconditionally, is
+        exactly what produced every one of the 81 failures."""
+        from murmly.win_pipe import ERROR_PIPE_CONNECTED, _run_overlapped
+
+        collected = []
+
+        def get_overlapped_result(*args: object) -> int:
+            collected.append(args)
+            return 999
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_PIPE_CONNECTED, "ConnectNamedPipe", "connected")
+
+        with _install_fake_win32(get_overlapped_result=get_overlapped_result):
+            result = _run_overlapped(object(), start, 1.0)
+
+        self.assertEqual(0, result)
+        self.assertEqual([], collected)
+
+    def test_pipe_connected_returned_without_raising_also_returns_immediately(self) -> None:
+        """`ConnectNamedPipe`'s own convention, confirmed against `pywin32`'s
+        own C source for it (`win32pipe.i`): it *returns* `ERROR_IO_PENDING`
+        and `ERROR_PIPE_CONNECTED` as a plain int, raising only for a
+        genuinely unexpected failure -- it does not raise for either of the
+        two codes the test above exercises via a raised
+        `pywintypes.error`. Without this branch, a returned
+        `ERROR_PIPE_CONNECTED` falls through to `pending = hr ==
+        ERROR_IO_PENDING` (`False`) and then straight into
+        `_collect_overlapped_result`'s `bWait=True`, which blocks forever:
+        MSDN's own Remarks for this condition are that the OVERLAPPED's event
+        is never signalled, so nothing will ever wake that wait."""
+        from murmly.win_pipe import ERROR_PIPE_CONNECTED, _run_overlapped
+
+        collected = []
+
+        def get_overlapped_result(*args: object) -> int:
+            collected.append(args)
+            return 999
+
+        def start(overlapped: object) -> int:
+            return ERROR_PIPE_CONNECTED
+
+        with _install_fake_win32(get_overlapped_result=get_overlapped_result):
+            result = _run_overlapped(object(), start, 1.0)
+
+        self.assertEqual(0, result)
+        self.assertEqual([], collected)
+
+    def test_a_synchronous_success_still_collects_the_transfer_count(self) -> None:
+        """`ReadFile`/`WriteFile` completing synchronously (`hr == 0`) is the
+        one case that *did* queue real overlapped I/O and does signal the
+        event (MSDN) -- unlike `ERROR_PIPE_CONNECTED` above, collecting the
+        result here is both safe and the only way to learn the transfer
+        count."""
+        from murmly.win_pipe import _run_overlapped
+
+        def start(overlapped: object) -> int:
+            return 0
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            self.assertTrue(wait)
+            return 42
+
+        with _install_fake_win32(get_overlapped_result=get_overlapped_result):
+            result = _run_overlapped(object(), start, 1.0)
+
+        self.assertEqual(42, result)
+
+    def test_a_pending_operation_raised_by_start_waits_then_collects(self) -> None:
+        """`ConnectNamedPipe`'s own convention: pending is signalled by
+        raising `ERROR_IO_PENDING` rather than by returning it."""
+        from murmly.win_pipe import ERROR_IO_PENDING, _run_overlapped
+
+        waited = []
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_IO_PENDING, "ConnectNamedPipe", "pending")
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            waited.append(timeout_ms)
+            return 0
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            return 7
+
+        with _install_fake_win32(
+            wait_for_single_object=wait_for_single_object,
+            get_overlapped_result=get_overlapped_result,
+        ):
+            result = _run_overlapped(object(), start, 2.5)
+
+        self.assertEqual(7, result)
+        self.assertEqual([2500], waited)
+
+    def test_a_pending_operation_returned_without_raising_is_also_waited_on(self) -> None:
+        """`ReadFile`/`WriteFile`'s own convention for the same condition:
+        pending is *returned* as `hr` without raising. Both conventions
+        normalise to the same wait, since a test on Linux cannot confirm
+        which one a given `pywin32` release actually uses for which call."""
+        from murmly.win_pipe import ERROR_IO_PENDING, _run_overlapped
+
+        def start(overlapped: object) -> int:
+            return ERROR_IO_PENDING
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            return 0
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            return 3
+
+        with _install_fake_win32(
+            wait_for_single_object=wait_for_single_object,
+            get_overlapped_result=get_overlapped_result,
+        ):
+            result = _run_overlapped(object(), start, 1.0)
+
+        self.assertEqual(3, result)
+
+    def test_a_timeout_cancels_and_raises_timeouterror_on_confirmed_abort(self) -> None:
+        from murmly.win_pipe import ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, _run_overlapped
+
+        cancelled = []
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_IO_PENDING)
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            return 258  # WAIT_TIMEOUT
+
+        def cancel_io_ex(handle: object, overlapped: object) -> None:
+            cancelled.append(True)
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            raise _FakeWin32Error(ERROR_OPERATION_ABORTED, "GetOverlappedResult", "aborted")
+
+        with _install_fake_win32(
+            wait_for_single_object=wait_for_single_object,
+            cancel_io_ex=cancel_io_ex,
+            get_overlapped_result=get_overlapped_result,
+        ):
+            with self.assertRaises(TimeoutError):
+                _run_overlapped(object(), start, 0.2)
+
+        self.assertEqual([True], cancelled)
+
+    def test_a_timeout_that_races_a_completion_returns_the_completed_result(self) -> None:
+        """The task's own "a cancel that races completion is its own
+        defect": `CancelIoEx` only requests cancellation (MSDN) -- the
+        operation may complete anyway before the request lands. When that
+        happens, `GetOverlappedResult` reports the real outcome instead of
+        `ERROR_OPERATION_ABORTED`, and that outcome -- not a manufactured
+        `TimeoutError` -- is what this call must return."""
+        from murmly.win_pipe import ERROR_IO_PENDING, _run_overlapped
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_IO_PENDING)
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            return 258  # WAIT_TIMEOUT
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            return 5  # the operation actually completed before the cancel landed
+
+        with _install_fake_win32(
+            wait_for_single_object=wait_for_single_object,
+            get_overlapped_result=get_overlapped_result,
+        ):
+            result = _run_overlapped(object(), start, 0.2)
+
+        self.assertEqual(5, result)
+
+    def test_cancelioex_raising_error_not_found_is_tolerated(self) -> None:
+        """`CancelIoEx` itself can raise `ERROR_NOT_FOUND` (1168) -- nothing
+        left to cancel, the operation already completed. Not this function's
+        problem: the `GetOverlappedResult` call that always follows still
+        reports the real outcome."""
+        from murmly.win_pipe import ERROR_IO_PENDING, ERROR_NOT_FOUND, _run_overlapped
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_IO_PENDING)
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            return 258
+
+        def cancel_io_ex(handle: object, overlapped: object) -> None:
+            raise _FakeWin32Error(ERROR_NOT_FOUND, "CancelIoEx", "already done")
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            return 9
+
+        with _install_fake_win32(
+            wait_for_single_object=wait_for_single_object,
+            cancel_io_ex=cancel_io_ex,
+            get_overlapped_result=get_overlapped_result,
+        ):
+            result = _run_overlapped(object(), start, 0.2)
+
+        self.assertEqual(9, result)
+
+    def test_a_genuine_synchronous_failure_is_translated_without_collecting_a_result(
+        self,
+    ) -> None:
+        """A real, immediate failure (not `ERROR_IO_PENDING`, not
+        `ERROR_PIPE_CONNECTED`) never queued an overlapped operation either --
+        `GetOverlappedResult` must not be called for it any more than for
+        `ERROR_PIPE_CONNECTED`, and the original error is the outcome."""
+        from murmly.win_pipe import ERROR_ACCESS_DENIED, NamedPipeIOError, _run_overlapped
+
+        collected = []
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_ACCESS_DENIED, "ReadFile", "denied")
+
+        def get_overlapped_result(*args: object) -> int:
+            collected.append(args)
+            return 0
+
+        with _install_fake_win32(get_overlapped_result=get_overlapped_result):
+            with self.assertRaises(NamedPipeIOError) as failure:
+                _run_overlapped(object(), start, 1.0)
+
+        self.assertEqual(ERROR_ACCESS_DENIED, failure.exception.win32_error_code)
+        self.assertEqual([], collected)
+
+    def test_wait_for_single_object_failure_is_translated(self) -> None:
+        """`WaitForSingleObject`'s C API reports a real failure through its
+        return value (`WAIT_FAILED`); `pywin32`'s wrapper raises instead --
+        translated the same way every other call in this module is, rather
+        than left to escape as the raw Win32 exception type."""
+        from murmly.win_pipe import ERROR_IO_PENDING, NamedPipeIOError, _run_overlapped
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_IO_PENDING)
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            raise _FakeWin32Error(6, "WaitForSingleObject", "invalid handle")
+
+        with _install_fake_win32(wait_for_single_object=wait_for_single_object):
+            with self.assertRaises(NamedPipeIOError) as failure:
+                _run_overlapped(object(), start, 1.0)
+
+        self.assertEqual(6, failure.exception.win32_error_code)
+
+
+class NamedPipeConnectionTranslationTests(unittest.TestCase):
+    """Task item 4: `ERROR_BROKEN_PIPE` on read and `ERROR_NO_DATA` on write
+    are what a named pipe reports for what a UNIX socket reports as a
+    zero-length `recv` and a `BrokenPipeError` `sendall` -- translated so
+    `daemon.py`'s code, written once against `socket.socket`, needs no
+    named-pipe-specific branch."""
+
+    def test_recv_translates_broken_pipe_to_empty_bytes(self) -> None:
+        from murmly.win_pipe import ERROR_BROKEN_PIPE, NamedPipeConnection
+
+        def read_file(handle: object, buffer: object, overlapped: object) -> tuple[int, object]:
+            raise _FakeWin32Error(ERROR_BROKEN_PIPE, "ReadFile", "The pipe has been ended.")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(read_file=read_file):
+            self.assertEqual(b"", connection.recv(4096))
+
+    def test_recv_propagates_other_errors(self) -> None:
+        from murmly.win_pipe import NamedPipeIOError, NamedPipeConnection
+
+        def read_file(handle: object, buffer: object, overlapped: object) -> tuple[int, object]:
+            raise _FakeWin32Error(5, "ReadFile", "denied")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(read_file=read_file):
+            with self.assertRaises(NamedPipeIOError):
+                connection.recv(4096)
+
+    def test_recv_returns_the_transferred_slice_of_the_buffer(self) -> None:
+        from murmly.win_pipe import NamedPipeConnection
+
+        def read_file(handle: object, buffer: bytearray, overlapped: object) -> tuple[int, object]:
+            buffer[:5] = b"hello"
+            return 0, buffer
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            return 5
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(read_file=read_file, get_overlapped_result=get_overlapped_result):
+            self.assertEqual(b"hello", connection.recv(64))
+
+    def test_sendall_translates_no_data_to_brokenpipeerror(self) -> None:
+        from murmly.win_pipe import ERROR_NO_DATA, NamedPipeConnection
+
+        def write_file(handle: object, data: bytes, overlapped: object) -> tuple[int, int]:
+            raise _FakeWin32Error(ERROR_NO_DATA, "WriteFile", "The pipe is being closed.")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(write_file=write_file):
+            with self.assertRaises(BrokenPipeError):
+                connection.sendall(b"hello")
+
+    def test_sendall_translates_broken_pipe_to_brokenpipeerror(self) -> None:
+        from murmly.win_pipe import ERROR_BROKEN_PIPE, NamedPipeConnection
+
+        def write_file(handle: object, data: bytes, overlapped: object) -> tuple[int, int]:
+            raise _FakeWin32Error(ERROR_BROKEN_PIPE, "WriteFile", "The pipe has been ended.")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(write_file=write_file):
+            with self.assertRaises(BrokenPipeError):
+                connection.sendall(b"hello")
+
+    def test_sendall_propagates_other_errors(self) -> None:
+        from murmly.win_pipe import NamedPipeIOError, NamedPipeConnection
+
+        def write_file(handle: object, data: bytes, overlapped: object) -> tuple[int, int]:
+            raise _FakeWin32Error(5, "WriteFile", "denied")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(write_file=write_file):
+            with self.assertRaises(NamedPipeIOError):
+                connection.sendall(b"hello")
+
+
+class NamedPipeServerAcceptTests(unittest.TestCase):
+    """Task item 3's `ERROR_NO_DATA` race, and the `ERROR_PIPE_CONNECTED`
+    race's effect on `accept()` specifically: a state-machine test against a
+    faked `create_named_pipe_server` and a faked `ConnectNamedPipe`."""
+
+    def test_accept_returns_a_connection_when_pipe_connected_races_ahead(self) -> None:
+        from murmly.win_pipe import ERROR_PIPE_CONNECTED, NamedPipeServer
+
+        instances = iter(["first", "second"])
+
+        def fake_create(pipe_name: str, *, first_instance: bool) -> str:
+            return next(instances)
+
+        def connect_named_pipe(handle: object, overlapped: object) -> None:
+            raise _FakeWin32Error(ERROR_PIPE_CONNECTED, "ConnectNamedPipe", "connected")
+
+        waited = []
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            waited.append(timeout_ms)
+            return 0
+
+        with patch("murmly.win_pipe.create_named_pipe_server", side_effect=fake_create), \
+                _install_fake_win32(
+                    connect_named_pipe=connect_named_pipe,
+                    wait_for_single_object=wait_for_single_object,
+                ):
+            server = NamedPipeServer(r"\\.\pipe\murmly-test")
+            connection, address = server.accept()
+
+        self.assertEqual("first", connection.handle)
+        self.assertEqual((r"\\.\pipe\murmly-test", 0), address)
+        # The exact behaviour the 996 bug's fix depends on: a race this
+        # common never has to wait on anything at all.
+        self.assertEqual([], waited)
+
+    def test_accept_returns_a_connection_when_connect_named_pipe_returns_connected(
+        self,
+    ) -> None:
+        """The same race as the test above, reached through `pywin32`'s
+        actual convention for `ConnectNamedPipe` -- a *returned* `hr`, not a
+        raised `pywintypes.error` (confirmed against `pywin32`'s own
+        `win32pipe.i`). `accept`'s own `start` closure must pass that return
+        value through to `_run_overlapped` rather than discarding it: a
+        `start` that always answers `0` regardless of what `ConnectNamedPipe`
+        actually returned would misread this outcome as a *synchronous*
+        completion instead -- `pending = hr == ERROR_IO_PENDING` is `False`
+        either way a discarded return reads as `0` -- and call
+        `GetOverlappedResult(bWait=True)` on an OVERLAPPED MSDN documents as
+        never signalled for this condition, which on the real API blocks
+        forever rather than returning the `999` this fake would hand back
+        harmlessly if called. Asserting `collected == []` is what makes that
+        distinction observable here without a fake that can actually hang."""
+        from murmly.win_pipe import ERROR_PIPE_CONNECTED, NamedPipeServer
+
+        instances = iter(["first", "second"])
+
+        def fake_create(pipe_name: str, *, first_instance: bool) -> str:
+            return next(instances)
+
+        def connect_named_pipe(handle: object, overlapped: object) -> int:
+            return ERROR_PIPE_CONNECTED
+
+        waited = []
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            waited.append(timeout_ms)
+            return 0
+
+        collected = []
+
+        def get_overlapped_result(*args: object) -> int:
+            collected.append(args)
+            return 999
+
+        with patch("murmly.win_pipe.create_named_pipe_server", side_effect=fake_create), \
+                _install_fake_win32(
+                    connect_named_pipe=connect_named_pipe,
+                    wait_for_single_object=wait_for_single_object,
+                    get_overlapped_result=get_overlapped_result,
+                ):
+            server = NamedPipeServer(r"\\.\pipe\murmly-test")
+            connection, address = server.accept()
+
+        self.assertEqual("first", connection.handle)
+        self.assertEqual((r"\\.\pipe\murmly-test", 0), address)
+        self.assertEqual([], waited)
+        self.assertEqual([], collected)
+
+    def test_accept_waits_when_connect_named_pipe_returns_pending(self) -> None:
+        """`ConnectNamedPipe` returning `ERROR_IO_PENDING` (no client waiting
+        yet) rather than raising it -- the ordinary case, per `pywin32`'s own
+        convention for this call (see the test above). `accept`'s `start`
+        closure must pass this return value through too, or every ordinary
+        accept would be misread as already complete rather than waited on."""
+        from murmly.win_pipe import ERROR_IO_PENDING, NamedPipeServer
+
+        instances = iter(["first", "second"])
+
+        def fake_create(pipe_name: str, *, first_instance: bool) -> str:
+            return next(instances)
+
+        def connect_named_pipe(handle: object, overlapped: object) -> int:
+            return ERROR_IO_PENDING
+
+        waited = []
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            waited.append(timeout_ms)
+            return 0
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            self.assertTrue(wait)
+            return 0
+
+        with patch("murmly.win_pipe.create_named_pipe_server", side_effect=fake_create), \
+                _install_fake_win32(
+                    connect_named_pipe=connect_named_pipe,
+                    wait_for_single_object=wait_for_single_object,
+                    get_overlapped_result=get_overlapped_result,
+                ):
+            server = NamedPipeServer(r"\\.\pipe\murmly-test")
+            connection, _address = server.accept()
+
+        self.assertEqual("first", connection.handle)
+        self.assertEqual(1, len(waited))
+
+    def test_accept_retries_after_error_no_data(self) -> None:
+        from murmly.win_pipe import ERROR_NO_DATA, ERROR_PIPE_CONNECTED, NamedPipeServer
+
+        instances = iter(["first", "second", "third"])
+        # Shared with `close_handle` below: the one record of which of the
+        # two happened first, each time a dead instance is replaced. Order
+        # matters -- see `accept`'s own docstring on this race -- so this
+        # tracks interleaving, not merely that both eventually happened.
+        order = []
+
+        def fake_create(pipe_name: str, *, first_instance: bool) -> str:
+            order.append("create")
+            return next(instances)
+
+        connect_calls = []
+
+        def connect_named_pipe(handle: object, overlapped: object) -> None:
+            connect_calls.append(handle)
+            if handle == "first":
+                # A client connected and disconnected again before this
+                # `ConnectNamedPipe` reached the kernel -- the third
+                # documented race for this call.
+                raise _FakeWin32Error(ERROR_NO_DATA, "ConnectNamedPipe", "no data")
+            raise _FakeWin32Error(ERROR_PIPE_CONNECTED, "ConnectNamedPipe", "connected")
+
+        # `close_handle` also receives `_run_overlapped`'s own per-call
+        # cleanup of `overlapped.hEvent` (an opaque sentinel object, never a
+        # string) -- filtered out here so this only tracks the pipe-instance
+        # closes `accept()` itself is responsible for.
+        closed = []
+
+        def close_handle(handle: object) -> None:
+            if isinstance(handle, str):
+                closed.append(handle)
+                order.append("close")
+
+        with patch("murmly.win_pipe.create_named_pipe_server", side_effect=fake_create), \
+                _install_fake_win32(
+                    connect_named_pipe=connect_named_pipe,
+                    close_handle=close_handle,
+                ):
+            server = NamedPipeServer(r"\\.\pipe\murmly-test")
+            connection, _address = server.accept()
+
+        self.assertEqual(["first", "second"], connect_calls)
+        self.assertEqual(["first"], closed)
+        self.assertEqual("second", connection.handle)
+        # The replacement for the dead "first" instance is created before
+        # "first" itself is closed -- never the reverse, which would leave
+        # the pipe name briefly held by no instance at all (see `accept`'s
+        # own docstring for why that window matters).
+        self.assertEqual(["create", "create", "close", "create"], order)
+
+
+class ConnectNamedPipeClientTests(unittest.TestCase):
+    """Task item 4 plus the client-side fix: `WaitNamedPipe` failing with
+    `ERROR_FILE_NOT_FOUND` (the pipe was there a moment ago, per the
+    preceding `ERROR_PIPE_BUSY`, and is now gone entirely) is
+    `FileNotFoundError`, not the generic `ConnectionRefusedError`
+    (ci2-Windows.log: `pywintypes.error: (2, 'WaitNamedPipe', ...)`)."""
+
+    def test_no_pipe_at_all_is_file_not_found(self) -> None:
+        from murmly.win_pipe import ERROR_FILE_NOT_FOUND, connect_named_pipe_client
+
+        def create_file(*args: object, **kwargs: object) -> object:
+            raise _FakeWin32Error(ERROR_FILE_NOT_FOUND, "CreateFile", "not found")
+
+        with _install_fake_win32(create_file=create_file):
+            with self.assertRaises(FileNotFoundError):
+                connect_named_pipe_client(r"\\.\pipe\murmly-test", 1.0)
+
+    def test_busy_then_wait_then_success(self) -> None:
+        from murmly.win_pipe import ERROR_PIPE_BUSY, NamedPipeConnection, connect_named_pipe_client
+
+        calls = {"n": 0}
+
+        def create_file(*args: object, **kwargs: object) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _FakeWin32Error(ERROR_PIPE_BUSY, "CreateFile", "busy")
+            return "handle"
+
+        waited = []
+
+        def wait_named_pipe(pipe_name: str, timeout_ms: int) -> None:
+            waited.append((pipe_name, timeout_ms))
+
+        with _install_fake_win32(create_file=create_file, wait_named_pipe=wait_named_pipe):
+            connection = connect_named_pipe_client(r"\\.\pipe\murmly-test", 2.5)
+
+        self.assertIsInstance(connection, NamedPipeConnection)
+        self.assertEqual("handle", connection.handle)
+        self.assertEqual([(r"\\.\pipe\murmly-test", 2500)], waited)
+
+    def test_busy_then_wait_fails_with_file_not_found(self) -> None:
+        from murmly.win_pipe import ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, connect_named_pipe_client
+
+        def create_file(*args: object, **kwargs: object) -> object:
+            raise _FakeWin32Error(ERROR_PIPE_BUSY, "CreateFile", "busy")
+
+        def wait_named_pipe(pipe_name: str, timeout_ms: int) -> None:
+            raise _FakeWin32Error(ERROR_FILE_NOT_FOUND, "WaitNamedPipe", "gone")
+
+        with _install_fake_win32(create_file=create_file, wait_named_pipe=wait_named_pipe):
+            with self.assertRaises(FileNotFoundError):
+                connect_named_pipe_client(r"\\.\pipe\murmly-test", 1.0)
+
+    def test_busy_then_wait_fails_otherwise_is_connection_refused(self) -> None:
+        from murmly.win_pipe import ERROR_PIPE_BUSY, connect_named_pipe_client
+
+        def create_file(*args: object, **kwargs: object) -> object:
+            raise _FakeWin32Error(ERROR_PIPE_BUSY, "CreateFile", "busy")
+
+        def wait_named_pipe(pipe_name: str, timeout_ms: int) -> None:
+            # ERROR_SEM_TIMEOUT (121): `WaitNamedPipe`'s own real timeout
+            # code, distinct from `ERROR_FILE_NOT_FOUND` above.
+            raise _FakeWin32Error(121, "WaitNamedPipe", "timeout")
+
+        with _install_fake_win32(create_file=create_file, wait_named_pipe=wait_named_pipe):
+            with self.assertRaises(ConnectionRefusedError):
+                connect_named_pipe_client(r"\\.\pipe\murmly-test", 1.0)
 
 
 if __name__ == "__main__":

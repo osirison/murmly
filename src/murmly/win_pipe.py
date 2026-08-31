@@ -105,7 +105,69 @@ def owner_only_dacl_entries(sid: object) -> tuple[OwnerOnlyAce, ...]:
 # Windows-only from here down. Every name below imports `pywin32` from inside
 # its own body; none of it can be exercised except on Windows, and none of it
 # is imported until a caller resolved to the Windows platform reaches it.
+#
+# Exception discipline for this whole section: no `pywintypes.error` may ever
+# escape this module. Every function that can raise one either translates it
+# into a plain `OSError` (or a subclass every caller already knows --
+# `FileNotFoundError`, `BrokenPipeError`, `ConnectionRefusedError`,
+# `TimeoutError`) or swallows it because the failure it names does not matter
+# to the caller. `daemon.py` is written against `socket.socket`'s own
+# vocabulary and must never import `pywintypes` merely to catch what this
+# module's calls can raise.
 # --------------------------------------------------------------------------
+
+
+#: Win32 error codes this module translates, as plain integers rather than
+#: `winerror.ERROR_*` names. `winerror` is itself part of `pywin32` and so is
+#: unavailable on a machine with no `pywin32` installed -- exactly the
+#: machine every test in this suite runs on. A translation table built from
+#: literals is importable, and testable against a faked Win32 layer, on any
+#: platform; the real Windows runtime compares these same numbers against
+#: `pywintypes.error.winerror`, which carries the identical value regardless
+#: of which name looked it up. Every value below is `winerror.h`'s own and
+#: has not changed since Windows NT.
+ERROR_FILE_NOT_FOUND = 2  #: `CreateFile`/`WaitNamedPipe`: no pipe of this name exists.
+ERROR_ACCESS_DENIED = 5  #: `CreateNamedPipe` with `first_instance=True`: the name is squatted.
+ERROR_BROKEN_PIPE = 109  #: `ReadFile`: the peer disconnected -- a socket's zero-length `recv`.
+ERROR_PIPE_BUSY = 231  #: `CreateFile`: every instance is taken; `WaitNamedPipe` is the retry.
+ERROR_NO_DATA = 232  #: `WriteFile`: the peer is gone -- a socket's `EPIPE`/`BrokenPipeError`.
+ERROR_PIPE_CONNECTED = 535  #: `ConnectNamedPipe`: a client connected before the call arrived. Success.
+ERROR_OPERATION_ABORTED = 995  #: `GetOverlappedResult` after `CancelIoEx`: genuinely cancelled.
+ERROR_IO_INCOMPLETE = 996  #: `GetOverlappedResult(bWait=False)`: still pending. Not a failure.
+ERROR_IO_PENDING = 997  #: An overlapped call was queued and has not completed yet.
+ERROR_NOT_FOUND = 1168  #: `CancelIoEx`: nothing left to cancel -- it already completed.
+
+
+class NamedPipeIOError(OSError):
+    """An `OSError` carrying the Win32 error code that produced it.
+
+    Plain `OSError.winerror` exists only on a genuine Windows CPython build
+    -- it is compiled in conditionally, under `sys.platform == 'win32'`, in
+    CPython's own `Objects/exceptions.c` -- so it does not exist to read on
+    any machine this suite's tests run on. `win32_error_code` carries the
+    identical number as an ordinary attribute on every platform instead,
+    which is what lets `recv`'s and `sendall`'s translation of
+    `ERROR_BROKEN_PIPE` and `ERROR_NO_DATA` (see their own docstrings) be
+    exercised and asserted from Linux, against a faked Win32 layer, rather
+    than trusted untested until a Windows machine runs it.
+    """
+
+    def __init__(self, win32_error_code: int, message: str) -> None:
+        super().__init__(message)
+        self.win32_error_code = win32_error_code
+
+
+def _pipe_error_from(error: object) -> NamedPipeIOError:
+    """Turn one raised `pywintypes.error` into what this module raises.
+
+    `error.winerror` is the Win32 error code `pywin32` attaches to every
+    `pywintypes.error` it raises -- its `.args` are `(winerror, funcname,
+    strerror)`, mirrored as same-named attributes for exactly this kind of
+    read. `error` is typed `object`, not `pywintypes.error`, so this
+    function itself never has to import `pywintypes` -- a test can hand it
+    anything exposing the same `.winerror` and `str()` shape.
+    """
+    return NamedPipeIOError(error.winerror, str(error))
 
 
 def _current_user_sid() -> object:
@@ -241,28 +303,144 @@ def _wait_ms(timeout_seconds: float | None) -> int:
     return max(0, int(timeout_seconds * 1000))
 
 
+def _wait_for_signal(event: object, timeout_ms: int) -> int:
+    """`WaitForSingleObject`, kept to this module's own no-`pywintypes.error`
+    rule. The C API reports a real failure through the return value
+    (`WAIT_FAILED`), but `pywin32`'s wrapper raises `pywintypes.error`
+    instead -- translated here the same way every other call in this module
+    is, rather than left to surprise the one caller (`_run_overlapped`) that
+    only checks the return value against `WAIT_TIMEOUT`.
+    """
+    import pywintypes
+    import win32event
+
+    try:
+        return win32event.WaitForSingleObject(event, timeout_ms)
+    except pywintypes.error as error:
+        raise _pipe_error_from(error) from error
+
+
+def _cancel_overlapped(handle: object, overlapped: object) -> None:
+    """`CancelIoEx`, tolerating `ERROR_NOT_FOUND` (1168): "nothing to
+    cancel", meaning the operation had already completed by the time this
+    ran. Not a problem for this call either way -- the
+    `_collect_overlapped_result` call that always follows this one is what
+    reports the actual outcome, whether this cancel request did anything or
+    arrived too late to matter.
+    """
+    import pywintypes
+    import win32file
+
+    try:
+        win32file.CancelIoEx(handle, overlapped)
+    except pywintypes.error:
+        pass
+
+
+def _collect_overlapped_result(handle: object, overlapped: object) -> int:
+    """The one call site for `GetOverlappedResult`, always with `bWait=True`.
+
+    `bWait=False` is what produced 81 of this change's first 101 Windows CI
+    failures, all through `NamedPipeServer.accept` -- `pywintypes.error:
+    (996, 'GetOverlappedResult', 'Overlapped I/O event is not in a signaled
+    state.')`, `ERROR_IO_INCOMPLETE`, meaning "not finished yet", not a
+    failure. `bWait=True` is safe at every one of this function's three call
+    sites in `_run_overlapped`: two are reached only once
+    `WaitForSingleObject` has already reported the event signalled or the
+    wait timed out and `CancelIoEx` was issued, and the third (`hr == 0` from
+    `ReadFile`/`WriteFile`) is a completion that already happened
+    synchronously. `True` costs nothing in any of those cases and guards
+    against a spurious wakeup in the first one -- the same "not yet complete"
+    state the 996 failures above came from, just reached a different way.
+    """
+    import pywintypes
+    import win32file
+
+    try:
+        return win32file.GetOverlappedResult(handle, overlapped, True)
+    except pywintypes.error as error:
+        raise _pipe_error_from(error) from error
+
+
 def _run_overlapped(handle: object, start, timeout_seconds: float | None) -> int:
     """Run one overlapped I/O call, wait up to `timeout_seconds`, return the
     transfer count.
 
     `start(overlapped)` issues the operation (`ConnectNamedPipe`, `ReadFile`,
-    or `WriteFile`) and returns its own `hr` for the caller to inspect;
-    `ERROR_IO_PENDING` is the only outcome this function waits on -- an
-    operation that completes synchronously is not waited on again, since
-    `GetOverlappedResult`'s wait flag is left `False` either way. A timeout
-    cancels the pending operation with `CancelIoEx` before raising, so nothing
-    is left running against a handle the caller may now close or reuse.
+    or `WriteFile`). Both of `pywin32`'s two conventions for reporting an
+    outcome are handled, because they differ by function: `ReadFile`/
+    `WriteFile` *return* `hr` without raising, for every outcome including
+    failure (their own documented convention, needing two Python return
+    values -- `hr` and the byte count -- which is why they cannot simply
+    raise). `ConnectNamedPipe` is a plain BOOL-returning API with only one
+    value to report and no such need, but is *not* a bare "raise on any
+    failure" wrapper either: `pywin32`'s own C source for it (`win32pipe.i`)
+    reads the underlying call's result itself and raises only for a
+    genuinely unexpected failure, explicitly special-casing exactly
+    `ERROR_IO_PENDING` and `ERROR_PIPE_CONNECTED` as `PyLong_FromLong(rc)` --
+    returned, not raised, the same as `ReadFile`/`WriteFile`'s own pending
+    code. Both call shapes are handled below, in both the returned-`hr`
+    branch and the raised-`pywintypes.error` branch, since nothing past this
+    point needs to know which call reported an outcome or which convention
+    it used to report it -- only what the outcome was:
 
-    `FILE_FLAG_OVERLAPPED` and this wait loop are what let a named-pipe
-    `accept`/`recv`/`sendall` honour the same 0.2s shutdown poll and command
-    timeouts the UNIX transport gets from `socket.settimeout`. None of it runs
-    except on Windows, and none of it is exercised by this suite; see the
-    module docstring.
+    * `ERROR_IO_PENDING`, returned or raised. The normal case: no client has
+      connected yet, or no data has arrived yet. Normalised to one `pending`
+      flag below, waited on further down.
+    * `ERROR_PIPE_CONNECTED`, returned or raised. `ConnectNamedPipe`-only: a
+      client's `CreateFile` landed in the window between `CreateNamedPipe`
+      and this call. MSDN's own documented race, and a *success*, not a
+      failure -- but critically, per MSDN's own Remarks for this exact
+      condition, "the event specified in the OVERLAPPED structure is not set
+      to the signaled state": no overlapped operation was ever actually
+      queued for `overlapped`, so nothing will ever signal it, and calling
+      `GetOverlappedResult` on it can only ever report `ERROR_IO_INCOMPLETE`
+      -- or, called with `bWait=True` as this function always does, block
+      forever waiting for a signal that will never come. This is exactly the
+      996 failure named in `_collect_overlapped_result`'s own docstring
+      (`bWait=False`) and its blocking twin (`bWait=True`), and returning `0`
+      immediately without calling that function is the fix for both: there
+      is nothing further to wait for or collect, because the connection is
+      already complete.
+    * Anything else raised is a genuine synchronous failure -- translated and
+      raised immediately, without calling `GetOverlappedResult`: as with
+      `ERROR_PIPE_CONNECTED`, a call that failed outright never queued an
+      overlapped operation, so there is no result belonging to `overlapped`
+      to collect. `ReadFile`/`WriteFile` report their own failures through
+      the returned-`hr` path instead (via `_collect_overlapped_result`
+      raising once called on a synchronous `hr == 0`, or via the caller's own
+      translation of a raised `pywintypes.error` for a truly synchronous
+      failure some Windows versions do raise for), so this branch in
+      practice is reached only through `ConnectNamedPipe`'s own convention.
+
+    A returned `hr` that is neither `ERROR_IO_PENDING` nor
+    `ERROR_PIPE_CONNECTED` -- `ReadFile`/`WriteFile` completing synchronously
+    with `hr == 0` -- is the one case that both *did* queue real overlapped
+    I/O and needs `GetOverlappedResult` regardless of not being asked to wait
+    for it: MSDN documents that a synchronous data-transfer completion,
+    unlike `ConnectNamedPipe`'s `ERROR_PIPE_CONNECTED`, does still signal the
+    event, and the transfer count is only available by collecting it.
+
+    A pending operation is waited on with `WaitForSingleObject` up to
+    `timeout_seconds`; `FILE_FLAG_OVERLAPPED` and this wait are what let a
+    named-pipe `accept`/`recv`/`sendall` honour the same 0.2s shutdown poll
+    and command timeouts the UNIX transport gets from `socket.settimeout`. A
+    timeout cancels the operation with `CancelIoEx`, but does not treat the
+    cancel itself as the outcome: `CancelIoEx` only *requests* cancellation
+    (MSDN) -- the operation may already have completed, or may complete
+    anyway before the request is processed -- so `GetOverlappedResult` is
+    still called, with `bWait=True`, and its result decides what actually
+    happened. Only `ERROR_OPERATION_ABORTED` (confirming the operation was
+    genuinely cancelled) becomes `TimeoutError`; anything else -- a
+    connection or a read that snuck in and completed anyway -- is returned as
+    real data rather than discarded, which is also why `overlapped` and its
+    event are freed only in the `finally` below, never before this collect:
+    MSDN requires exactly this wait before either is touched again, since the
+    kernel may still write a completion into them until it returns.
     """
     import pywintypes
     import win32event
     import win32file
-    import winerror
 
     overlapped = pywintypes.OVERLAPPED()
     overlapped.hEvent = win32event.CreateEvent(None, True, False, None)
@@ -270,27 +448,40 @@ def _run_overlapped(handle: object, start, timeout_seconds: float | None) -> int
         try:
             hr = start(overlapped)
         except pywintypes.error as error:
-            if error.winerror == winerror.ERROR_IO_PENDING:
-                hr = winerror.ERROR_IO_PENDING
-            elif error.winerror == winerror.ERROR_PIPE_CONNECTED:
-                # A client connected between `CreateNamedPipe` and
-                # `ConnectNamedPipe` -- already connected, nothing to wait for.
-                hr = 0
+            if error.winerror == ERROR_IO_PENDING:
+                pending = True
+            elif error.winerror == ERROR_PIPE_CONNECTED:
+                return 0
             else:
-                raise OSError(str(error)) from error
-        if hr == winerror.ERROR_IO_PENDING:
-            result = win32event.WaitForSingleObject(overlapped.hEvent, _wait_ms(timeout_seconds))
-            if result == win32event.WAIT_TIMEOUT:
-                win32file.CancelIoEx(handle, overlapped)
-                raise TimeoutError(
-                    f"No data arrived within {timeout_seconds:g} seconds."
-                    if timeout_seconds is not None
-                    else "The operation did not complete."
-                )
-        try:
-            return win32file.GetOverlappedResult(handle, overlapped, False)
-        except pywintypes.error as error:
-            raise OSError(str(error)) from error
+                raise _pipe_error_from(error) from error
+        else:
+            # `ConnectNamedPipe`'s own convention (see this function's own
+            # docstring, and `pywin32`'s `win32pipe.i`): a *returned* `hr`
+            # can be `ERROR_PIPE_CONNECTED` exactly as a *raised* one can be,
+            # above -- the same "nothing to collect" outcome, reached by the
+            # convention `ConnectNamedPipe` actually uses rather than the one
+            # `ReadFile`/`WriteFile` do.
+            if hr == ERROR_PIPE_CONNECTED:
+                return 0
+            pending = hr == ERROR_IO_PENDING
+
+        if not pending:
+            return _collect_overlapped_result(handle, overlapped)
+
+        result = _wait_for_signal(overlapped.hEvent, _wait_ms(timeout_seconds))
+        if result == win32event.WAIT_TIMEOUT:
+            _cancel_overlapped(handle, overlapped)
+            try:
+                return _collect_overlapped_result(handle, overlapped)
+            except NamedPipeIOError as error:
+                if error.win32_error_code == ERROR_OPERATION_ABORTED:
+                    raise TimeoutError(
+                        f"No data arrived within {timeout_seconds:g} seconds."
+                        if timeout_seconds is not None
+                        else "The operation did not complete."
+                    ) from error
+                raise
+        return _collect_overlapped_result(handle, overlapped)
     finally:
         win32file.CloseHandle(overlapped.hEvent)
 
@@ -329,7 +520,21 @@ class NamedPipeConnection:
             hr, _ = win32file.ReadFile(self._handle, buffer, overlapped)
             return hr
 
-        transferred = _run_overlapped(self._handle, start, self._timeout_seconds)
+        try:
+            transferred = _run_overlapped(self._handle, start, self._timeout_seconds)
+        except NamedPipeIOError as error:
+            if error.win32_error_code == ERROR_BROKEN_PIPE:
+                # `ERROR_BROKEN_PIPE` on `ReadFile` is a named pipe's way of
+                # reporting exactly what a UNIX socket reports as a
+                # zero-length `recv`: the peer closed its end. Translated
+                # here, at the one call site that knows this is a read, so
+                # every caller written against `socket.socket` --
+                # `daemon._read_request`'s `if not chunk: break`,
+                # `send_command`'s own read loop -- sees the same
+                # end-of-stream signal from either transport, with no
+                # named-pipe-specific branch of its own.
+                return b""
+            raise
         return bytes(buffer[:transferred])
 
     def sendall(self, data: bytes) -> None:
@@ -347,7 +552,21 @@ class NamedPipeConnection:
                 hr, _ = win32file.WriteFile(self._handle, chunk, overlapped)
                 return hr
 
-            written = _run_overlapped(self._handle, start, self._timeout_seconds)
+            try:
+                written = _run_overlapped(self._handle, start, self._timeout_seconds)
+            except NamedPipeIOError as error:
+                if error.win32_error_code in (ERROR_NO_DATA, ERROR_BROKEN_PIPE):
+                    # `ERROR_NO_DATA` ("the pipe is being closed") is
+                    # `WriteFile`'s report of what a UNIX socket's `sendall`
+                    # reports as `EPIPE`/`BrokenPipeError`: the peer is gone.
+                    # `ERROR_BROKEN_PIPE` is documented for the same
+                    # condition on some pipe states; both raise the same
+                    # exception type `socket.sendall` itself raises for it,
+                    # so `daemon._write_response`'s `except OSError`
+                    # (`BrokenPipeError` is one) needs no named-pipe-specific
+                    # branch either.
+                    raise BrokenPipeError(str(error)) from error
+                raise
             if written <= 0:
                 raise OSError("The named pipe accepted no bytes.")
             remaining = remaining[written:]
@@ -414,20 +633,71 @@ class NamedPipeServer:
         self._timeout_seconds = seconds
 
     def accept(self) -> tuple[NamedPipeConnection, tuple[str, int]]:
+        """Wait for one client, then hand it back with a fresh instance already waiting.
+
+        `ConnectNamedPipe` has three documented outcomes, all reached through
+        `_run_overlapped`'s own handling except the third, which belongs here
+        because it is specific to this call rather than to overlapped I/O in
+        general:
+
+        * The normal case -- no client has connected yet -- is
+          `ERROR_IO_PENDING`, waited on the same as any other pending
+          overlapped call.
+        * A client connected between `CreateNamedPipe` and this call is
+          `ERROR_PIPE_CONNECTED`, a success `_run_overlapped` returns from
+          directly (see its own docstring for why `GetOverlappedResult` must
+          never be called for it).
+        * A client connected *and disconnected again* in that same window is
+          `ERROR_NO_DATA` -- a third, separately documented race for this
+          specific API, distinct from the ordinary write-side meaning
+          `NamedPipeConnection.sendall` gives the same code. `handle` is now a
+          dead instance no client will ever complete a connection on: closed
+          and replaced exactly as a served connection's handle is below, and
+          the wait restarts on the fresh instance rather than handing
+          `_accept_loop` a connection with nothing on the other end of it.
+          The replacement is created *before* the dead instance is closed,
+          the same order the ordinary path below already keeps: between the
+          two, closing first would leave this pipe name briefly held by no
+          instance at all, and the access check that keeps another account
+          from squatting the name runs against an *existing* instance's DACL
+          -- nothing to check it against is the one gap that check has.
+        """
+        import pywintypes
+        import win32file
         import win32pipe
 
-        handle = self._pending
+        while True:
+            handle = self._pending
 
-        def start(overlapped: object) -> int:
-            # `ConnectNamedPipe` signals overlapped-pending, or an
-            # already-connected client, by raising rather than by returning an
-            # `hr` -- `_run_overlapped`'s own `except pywintypes.error` clause
-            # is what turns either of those into the wait-or-proceed decision
-            # every other `start` function here gets for free.
-            win32pipe.ConnectNamedPipe(handle, overlapped)
-            return 0
+            def start(overlapped: object, handle: object = handle) -> int:
+                # The return value matters here and must be passed through,
+                # not discarded: `pywin32`'s own C source for
+                # `ConnectNamedPipe` (`win32pipe.i`) *returns*
+                # `ERROR_IO_PENDING` and `ERROR_PIPE_CONNECTED` as a plain
+                # int rather than raising for either -- `_run_overlapped`'s
+                # own `hr == ERROR_PIPE_CONNECTED` branch (see its docstring)
+                # is what turns that return into the same "nothing to
+                # collect" outcome its `except pywintypes.error` clause gives
+                # a `pywin32` build that raises for it instead. `handle` is
+                # bound as a default argument for the same reason `sendall`'s
+                # `chunk` is: it must name *this* iteration's instance even
+                # though the enclosing `handle` is reassigned before the
+                # loop's next iteration defines a new closure.
+                return win32pipe.ConnectNamedPipe(handle, overlapped)
 
-        _run_overlapped(handle, start, self._timeout_seconds)
+            try:
+                _run_overlapped(handle, start, self._timeout_seconds)
+            except NamedPipeIOError as error:
+                if error.win32_error_code != ERROR_NO_DATA:
+                    raise
+                self._pending = create_named_pipe_server(self._pipe_name, first_instance=False)
+                try:
+                    win32file.CloseHandle(handle)
+                except pywintypes.error:
+                    pass
+                continue
+            break
+
         # A connection landed on `handle`. Prepared before returning it, so the
         # channel is never left with nothing waiting between one accepted
         # connection and the next -- the same reason the instance above is
@@ -485,16 +755,27 @@ def connect_named_pipe_client(pipe_name: str, timeout_seconds: float) -> NamedPi
     listener with no free backlog slot would not actually raise, but the
     closest existing meaning of "reached the channel, no one is free to serve
     this connection."
+
+    `WaitNamedPipe` itself can also fail with `ERROR_FILE_NOT_FOUND`: the
+    pipe existed a moment ago (that is what the preceding `ERROR_PIPE_BUSY`
+    means), but has since been torn down entirely -- the daemon exited, or
+    crashed, in the gap between this call's first `CreateFile` and this wait
+    (ci2-Windows.log: `pywintypes.error: (2, 'WaitNamedPipe', ...)` reached
+    the generic `ConnectionRefusedError` branch below before this fix).
+    "No daemon running" is the accurate report of that -- matching what the
+    first `CreateFile` above would itself have raised had the daemon already
+    been gone at that point -- not "reached the channel, no one is free to
+    serve this connection", so it is mapped to `FileNotFoundError` here too,
+    and at the retry `CreateFile` below for the same reason.
     """
     import pywintypes
-    import winerror
 
     try:
         handle = _open_pipe_client_handle(pipe_name)
     except pywintypes.error as error:
-        if error.winerror == winerror.ERROR_FILE_NOT_FOUND:
+        if error.winerror == ERROR_FILE_NOT_FOUND:
             raise FileNotFoundError(str(error)) from error
-        if error.winerror != winerror.ERROR_PIPE_BUSY:
+        if error.winerror != ERROR_PIPE_BUSY:
             raise OSError(str(error)) from error
         import win32pipe
 
@@ -506,10 +787,14 @@ def connect_named_pipe_client(pipe_name: str, timeout_seconds: float) -> NamedPi
             # the opposite of what `connect_timeout` means.
             win32pipe.WaitNamedPipe(pipe_name, max(1, int(timeout_seconds * 1000)))
         except pywintypes.error as wait_error:
+            if wait_error.winerror == ERROR_FILE_NOT_FOUND:
+                raise FileNotFoundError(str(wait_error)) from wait_error
             raise ConnectionRefusedError(str(wait_error)) from wait_error
         try:
             handle = _open_pipe_client_handle(pipe_name)
         except pywintypes.error as retry_error:
+            if retry_error.winerror == ERROR_FILE_NOT_FOUND:
+                raise FileNotFoundError(str(retry_error)) from retry_error
             raise OSError(str(retry_error)) from retry_error
     connection = NamedPipeConnection(handle)
     connection.settimeout(timeout_seconds)

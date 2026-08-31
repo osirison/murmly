@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import shutil
 import tempfile
 import threading
@@ -8,7 +7,7 @@ import time
 import unittest
 import wave
 from importlib.metadata import PackageNotFoundError
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -221,17 +220,11 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 FasterWhisperTranscriber.resolve_runtime(config)
 
     def test_cuda_runtime_loads_libraries_from_installed_distributions(self) -> None:
-        if not hasattr(ctypes, "RTLD_GLOBAL"):
-            # `load_cuda_libraries` calls `ctypes.CDLL(..., mode=ctypes.
-            # RTLD_GLOBAL)` unconditionally -- a POSIX dlopen flag Windows'
-            # `ctypes` does not define at all, since Windows DLLs have no
-            # comparable flat, process-wide symbol namespace to load
-            # globally into. `os.add_dll_directory` is task 11.1's own,
-            # not-yet-built Windows answer to this same loading problem
-            # (still unchecked in tasks.md); this test is the current,
-            # POSIX-only implementation specifically, with no Windows branch
-            # to redirect it to yet.
-            self.skipTest("needs ctypes.RTLD_GLOBAL, which Windows does not define")
+        # `ctypes.RTLD_GLOBAL` turns out to be defined on every host this
+        # suite has actually run on, Windows included -- confirmed by this
+        # test running rather than skipping on Windows CI and failing
+        # downstream instead, on the two things below that really do differ
+        # by host. There is no platform left to skip this for.
         relative_paths = [
             "nvidia/cublas/lib/libcublasLt.so.12",
             "nvidia/cublas/lib/libcublas.so.12",
@@ -242,10 +235,26 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             for relative_path in relative_paths:
                 library_path = environment_path / relative_path
                 library_path.parent.mkdir(parents=True, exist_ok=True)
-                library_path.touch(mode=0o644)
+                # Read-only, not 0o644: `trusted_library_path` refuses a
+                # writable library (`st_mode & 0o022`), and Windows' CRT
+                # derives `st_mode` from the FILE_ATTRIBUTE_READONLY flag
+                # alone -- any owner-write bit in `mode` clears it, which
+                # synthesizes `0o666` there regardless of the group/other
+                # bits this call actually asks for. 0o444 is the one mode
+                # both platforms agree reports as non-writable.
+                library_path.touch(mode=0o444)
 
             package = SimpleNamespace(
-                files=[Path(path) for path in relative_paths],
+                # `importlib.metadata.Distribution.files` returns
+                # `PackagePath` entries -- a `PurePosixPath` subclass,
+                # unconditionally, because a wheel's RECORD always spells its
+                # paths with forward slashes -- so `trusted_library_path`'s
+                # `str(file) == relative_path` compares two forward-slash
+                # strings on every host. Standing this fixture up with a bare
+                # `Path` instead renders backslashes on Windows, so it never
+                # matches `relative_path` there and the runtime is reported
+                # unavailable rather than loaded.
+                files=[PurePosixPath(path) for path in relative_paths],
                 locate_file=lambda path: environment_path / path,
             )
             with (

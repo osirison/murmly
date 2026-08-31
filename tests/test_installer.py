@@ -1571,7 +1571,15 @@ class IdempotenceTests(unittest.TestCase):
         from murmly.hotkey import parse_hotkey
         from murmly.installer import DESKTOP_ID
 
-        launcher = FakeLauncher(declared="Meta+X", entrypoint="/bin/murmly toggle")
+        # Built through `Path`, not a bare literal, to match whatever
+        # separator `make_installer`'s default entrypoint_resolver renders on
+        # this host -- see `test_reinstall_repairs_a_stale_entrypoint` for
+        # why. `install()` decides "already bound" partly by comparing this
+        # string against `f"{entrypoint} {purpose.command}"` (installer.py's
+        # own `declared_entrypoint() == ...` check), so a mismatched
+        # separator here reads as a moved entrypoint and defeats the very
+        # idempotence this test means to prove.
+        launcher = FakeLauncher(declared="Meta+X", entrypoint=f"{Path('/bin/murmly')} toggle")
         shortcuts = OwnerRegistry(
             owners={268435544: [owner(DESKTOP_ID, "murmly")]},
             keys={DESKTOP_ID: [268435544]},
@@ -1607,7 +1615,12 @@ class IdempotenceTests(unittest.TestCase):
 
         self.assertEqual([Path("/new/murmly")], service.installs)
         self.assertEqual([(Path("/new/murmly"), "Meta+X")], launcher.registrations)
-        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+        # Built through `Path`, not a bare literal: `make_installer`'s
+        # `entrypoint_resolver` renders "/new/murmly" through the real host's
+        # own `pathlib` flavour (task 7's profile pin covers the OS enum, not
+        # the separator `str(Path(...))` renders), and on Windows that is
+        # backslashes even though the string handed in used forward slashes.
+        self.assertEqual(f"{Path('/new/murmly')} toggle", launcher.declared_entrypoint())
 
     def test_reinstalling_one_hotkey_repairs_a_launcher_it_did_not_request(self) -> None:
         """The session hotkey goes stale whether or not the command names it.
@@ -1640,9 +1653,11 @@ class IdempotenceTests(unittest.TestCase):
 
         installer.install(parse_hotkey("Meta+X"))
 
-        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
+        # See `test_reinstall_repairs_a_stale_entrypoint` for why these are
+        # built through `Path` rather than compared against a bare literal.
+        self.assertEqual(f"{Path('/new/murmly')} toggle", launcher.declared_entrypoint())
         self.assertEqual(
-            "/new/murmly toggle-session",
+            f"{Path('/new/murmly')} toggle-session",
             session_launcher.declared_entrypoint(),
             "a hotkey the command did not name was left running a path that is gone",
         )
@@ -1673,8 +1688,12 @@ class IdempotenceTests(unittest.TestCase):
 
         installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
 
-        self.assertEqual("/new/murmly toggle", launcher.declared_entrypoint())
-        self.assertEqual("/new/murmly toggle-session", session_launcher.declared_entrypoint())
+        # See `test_reinstall_repairs_a_stale_entrypoint` for why these are
+        # built through `Path` rather than compared against a bare literal.
+        self.assertEqual(f"{Path('/new/murmly')} toggle", launcher.declared_entrypoint())
+        self.assertEqual(
+            f"{Path('/new/murmly')} toggle-session", session_launcher.declared_entrypoint()
+        )
 
 
 class VerificationTests(unittest.TestCase):
@@ -2033,7 +2052,9 @@ class SessionScopeTests(unittest.TestCase):
         self.assertFalse(outcome.hotkey_registered)
         self.assertEqual([], launcher.registrations)
         joined = " ".join(outcome.messages)
-        self.assertIn("/bin/murmly toggle", joined)
+        # Built through `Path`, not a bare literal -- see
+        # `test_reinstall_repairs_a_stale_entrypoint` for why.
+        self.assertIn(f"{Path('/bin/murmly')} toggle", joined)
         self.assertIn("KDE Plasma", joined)
 
     def test_an_unsupported_desktop_names_the_session_command_too(self) -> None:
@@ -2052,8 +2073,10 @@ class SessionScopeTests(unittest.TestCase):
         outcome = installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
 
         joined = " ".join(outcome.messages)
-        self.assertIn("/bin/murmly toggle", joined)
-        self.assertIn("/bin/murmly toggle-session", joined)
+        # Built through `Path`, not a bare literal -- see
+        # `test_reinstall_repairs_a_stale_entrypoint` for why.
+        self.assertIn(f"{Path('/bin/murmly')} toggle", joined)
+        self.assertIn(f"{Path('/bin/murmly')} toggle-session", joined)
 
     def test_a_one_key_install_is_not_told_to_bind_a_second(self) -> None:
         """Binding one hotkey is a deliberate path, not an incomplete install."""
@@ -2585,9 +2608,13 @@ class HotkeyRecordPersistenceTests(unittest.TestCase):
         record = FakeRecordStore()
         # The session purpose is already bound before this run, as if an
         # earlier `install` had claimed it -- with a matching entrypoint, so
-        # it is not treated as stale and re-registered by this run.
+        # it is not treated as stale and re-registered by this run. Built
+        # through `Path`, not a bare literal -- see
+        # `test_reinstall_repairs_a_stale_entrypoint` for why.
         session_launcher = FakeLauncher(
-            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/bin/murmly toggle-session"
+            declared="Meta+A",
+            purpose=SESSION_HOTKEY,
+            entrypoint=f"{Path('/bin/murmly')} toggle-session",
         )
         installer = make_installer(record_store=record, session_launcher=session_launcher)
 

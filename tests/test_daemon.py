@@ -37,7 +37,7 @@ from murmly.focus import NullFocusObserver, WindowIdentity
 from murmly.idle import IdleRelease
 from murmly.integrations import DeliveryOutcome
 from murmly.overlay import OverlayHealth, OverlayState
-from murmly.platform import OperatingSystem, PlatformProfile
+from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
 
 
 class DummySession:
@@ -442,7 +442,19 @@ class DaemonTests(unittest.TestCase):
             # scenario has no pipe equivalent to assert.
             self.skipTest("needs a UNIX socket's listen backlog, which the named-pipe transport has no equivalent of")
         clients: list[socket.socket] = []
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # A client that never sends anything leaves its worker blocked in
+        # `recv()`; the shutdown loop only calls `connection.shutdown(SHUT_RDWR)`
+        # on it, and whether that alone wakes a *different* thread's blocking
+        # `recv()` on the same fd promptly is a kernel-specific guarantee, not
+        # a portable one -- observed to hold on Linux and not within 1s on
+        # macOS. `COMMAND_TIMEOUT_SECONDS` is what actually bounds a silent
+        # peer regardless of that (`test_a_request_that_never_arrives_is_
+        # answered` patches it the same way for the same reason), so patching
+        # it down is what makes "closed on shutdown" true, and quick to
+        # observe, on every platform rather than only the one where the
+        # kernel's shutdown()-interrupts-recv() fast path happens to win the
+        # race within the poll window below.
+        with patch("murmly.daemon.COMMAND_TIMEOUT_SECONDS", 0.2), tempfile.TemporaryDirectory() as temp_dir:
             socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(
                 socket_path=socket_path,
@@ -468,7 +480,11 @@ class DaemonTests(unittest.TestCase):
 
             daemon.shutdown()
             server_thread.join(timeout=0.5)
-            deadline = time.time() + 1
+            # 2s, not 1s: with the patched 0.2s read timeout this converges in
+            # well under that on every platform, but the margin is kept
+            # generous rather than tight against a loaded runner, since the
+            # loop below already returns the moment it hits 0.
+            deadline = time.time() + 2
             while True:
                 with daemon._connections_lock:
                     remaining_connections = len(daemon._connections)
@@ -812,13 +828,26 @@ class SegmentSession(DummySession):
 
 class AutoTranscribeTests(unittest.TestCase):
     def _daemon(self, temp_dir: str, session, **overrides: object) -> MurmlyDaemon:
+        # A plain filesystem path, not `command_channel_address`, paired with
+        # a profile pinned to Linux regardless of the real host -- the same
+        # seam `RebindHotkeysCommandTests._daemon` documents. Every test in
+        # this class drives the daemon through `handle_command` in-process,
+        # never over a real socket, so the channel address is never opened;
+        # left to the real host's own resolution, a Windows runner would
+        # build a real in-process `WindowsHotkeyRegistrar` here and `status`
+        # would answer with a `hotkeys_held` key none of these auto-transcribe
+        # tests are about.
         config = MurmlyConfig(
-            socket_path=command_channel_address(temp_dir),
+            socket_path=Path(temp_dir) / "murmly.sock",
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             **overrides,
         )
-        return MurmlyDaemon(config, session=session)
+        return MurmlyDaemon(
+            config,
+            session=session,
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
 
     def _settle(self, daemon: MurmlyDaemon) -> None:
         """Wait for an off-thread segment delivery to finish.
@@ -3033,24 +3062,40 @@ class SocketAccessTests(ServedDaemonTests):
 
     def test_the_default_socket_path_is_served(self) -> None:
         if not hasattr(os, "getuid"):
-            # `default_socket_path` with `XDG_RUNTIME_DIR` set is the Linux
-            # filesystem-socket answer specifically; Windows's default
-            # channel is a named pipe with no comparable per-user runtime
-            # directory (`config.default_runtime_dir` returns `None` there).
+            # Windows's default channel is a named pipe with no comparable
+            # per-user runtime directory (`config.default_runtime_dir`
+            # returns `None` there).
             self.skipTest("needs the Linux XDG_RUNTIME_DIR filesystem-socket default")
         runtime_dir = tempfile.TemporaryDirectory()
         self.addCleanup(runtime_dir.cleanup)
-        socket_path = default_socket_path({"XDG_RUNTIME_DIR": runtime_dir.name})
-        config = MurmlyConfig(
-            socket_path=socket_path,
-            config_path=Path(runtime_dir.name) / "config.toml",
-            overlay_enabled=False,
-        )
+        # `default_runtime_dir` reads `Path.home()` for macOS's own
+        # `~/Library/Caches` default and ignores `XDG_RUNTIME_DIR` there
+        # entirely -- `resolve_platform`, which decides which branch runs,
+        # reads the real `sys.platform`, not the `env` this test hands
+        # `default_socket_path`, so there is no `env` override that could
+        # make a real macOS host answer the Linux way. `Path.home` is
+        # patched, not left real, so this exercises macOS's own answer
+        # without writing into the runner's actual home directory.
+        home_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(home_dir.cleanup)
+        profile = resolve_platform()
+        if profile.operating_system is OperatingSystem.MACOS:
+            expected_path = Path(home_dir.name) / "Library" / "Caches" / "murmly" / "murmly.sock"
+        else:
+            expected_path = Path(runtime_dir.name) / "murmly.sock"
 
-        _daemon, served_path = self.serve_config(config)
+        with patch.object(Path, "home", return_value=Path(home_dir.name)):
+            socket_path = default_socket_path({"XDG_RUNTIME_DIR": runtime_dir.name})
+            config = MurmlyConfig(
+                socket_path=socket_path,
+                config_path=Path(runtime_dir.name) / "config.toml",
+                overlay_enabled=False,
+            )
 
-        self.assertEqual(Path(runtime_dir.name) / "murmly.sock", served_path)
-        self.assertEqual(IDLE_STATUS, send_command(str(served_path), "status"))
+            _daemon, served_path = self.serve_config(config)
+
+            self.assertEqual(expected_path, served_path)
+            self.assertEqual(IDLE_STATUS, send_command(str(served_path), "status"))
 
     def test_the_daemon_refuses_a_private_directory_under_one_others_can_write(self) -> None:
         if not hasattr(os, "getuid"):
@@ -3096,16 +3141,25 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIsNotNone(detail)
         self.assertIn(str(wide), detail)
 
-    @unittest.skipUnless(
-        Path(tempfile.gettempdir()).stat().st_mode & stat.S_ISVTX,
-        "the shared temporary directory is not sticky here",
-    )
     def test_a_sticky_shared_ancestor_leaves_the_path_private(self) -> None:
-        # /tmp is world-writable and sticky, and every temporary directory in
-        # this suite sits under it. The sticky bit is exactly what stops another
-        # account renaming ours away, so it is accepted above the holder.
+        # A shared, world-writable ancestor above the directory holding the
+        # socket is accepted when it is sticky -- the sticky bit is exactly
+        # what stops another account renaming that holder away. Built by
+        # hand, the same as `test_the_sticky_bit_does_not_excuse_the_
+        # directory_holding_the_socket` below, rather than relying on
+        # `tempfile.gettempdir()` itself being sticky and world-writable:
+        # true of the traditional `/tmp` a Linux run sits under, but not of
+        # macOS's own per-user `$TMPDIR`, which is neither -- this exercised
+        # the property on Linux only, and skipped everywhere else.
         with tempfile.TemporaryDirectory() as temp_dir:
-            self.assertIsNone(socket_path_detail(Path(temp_dir) / "murmly.sock"))
+            shared = Path(temp_dir) / "shared"
+            shared.mkdir()
+            shared.chmod(0o1777)
+            holder = shared / "holder"
+            holder.mkdir()
+            holder.chmod(0o700)
+
+            self.assertIsNone(socket_path_detail(holder / "murmly.sock"))
 
     def test_the_sticky_bit_does_not_excuse_the_directory_holding_the_socket(self) -> None:
         if not hasattr(os, "getuid"):
@@ -3231,6 +3285,20 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIn(str(wide), chained)
 
     def test_a_socket_path_that_cannot_be_created_is_reported_as_a_refusal(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            # This test pins the profile to Linux specifically to reach
+            # `_serve_unix_socket`'s own directory-creation refusal (see the
+            # comment below), which on a real Windows interpreter means
+            # constructing a bare `socket.socket(socket.AF_UNIX, ...)`
+            # directly, bypassing the platform dispatch that would otherwise
+            # route a real Windows run to the named-pipe transport instead.
+            # CPython does not expose `socket.AF_UNIX` on Windows at all
+            # (design.md's "The command channel": Winsock has supported it
+            # since build 17063, but `python/cpython#77589` is still open),
+            # so there is no way to reach this specific refusal path on this
+            # host, only a bare `AttributeError` `_serve_unix_socket` does
+            # not, and should not, treat as a `DaemonStartupError`.
+            self.skipTest("needs socket.AF_UNIX, which this Windows Python does not expose")
         # The daemon detected this itself, so it is a refusal rather than the
         # unexpected failure the caller's backstop would otherwise report.
         temp_dir = tempfile.TemporaryDirectory()

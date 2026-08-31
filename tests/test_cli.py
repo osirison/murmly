@@ -1577,8 +1577,26 @@ class DoctorCompletenessTests(unittest.TestCase):
             },
             set(report["delivery"]),
         )
+        # `peer_identity_supported` is what keeps the shape identical across
+        # platforms -- it is always present, and reports the concern
+        # unavailable (False) rather than being absent, exactly as the spec's
+        # "diagnostics report keeps its shape" scenario requires.
+        # `peer_identity_detail` is the accompanying explanation, added only
+        # when there is something to explain, the same convention `delivery`
+        # and `platform.concerns` already use elsewhere in this same report
+        # (compare `test_a_private_socket_path_is_reported_as_private`'s
+        # `assertNotIn("detail", report)`). `linux_profile` cannot make this
+        # one field answer as Linux would on a real macOS interpreter:
+        # `peer_identity_supported` reads `hasattr(socket, "SO_PEERCRED")` on
+        # the real host, not the injected profile -- `getpeereid` for macOS
+        # is tasks.md 13.2, not yet built -- exactly as
+        # `test_a_private_socket_path_reports_peer_identity_support`'s
+        # docstring already documents for this same field.
+        expected_command_socket_fields = {"path", "path_private", "peer_identity_supported"}
+        if not hasattr(socket, "SO_PEERCRED"):
+            expected_command_socket_fields.add("peer_identity_detail")
         self.assertEqual(
-            {"path", "path_private", "peer_identity_supported"},
+            expected_command_socket_fields,
             set(report["command_socket"]),
         )
         self.assertTrue(report["command_socket"]["path_private"])
@@ -2924,8 +2942,15 @@ class DaemonExitTeardownTests(unittest.TestCase):
         """A short-lived command keeps sounddevice's own exit behavior."""
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
+            # A TOML literal string (single quotes), not a basic one: a
+            # Windows temp path is full of backslashes, and a basic string
+            # feeds each one to TOML's own escape processing -- most letters
+            # following it are not a recognised escape at all, which is a
+            # parse error ("Invalid hex value") `load_config` inside `main()`
+            # then reports as this command's own failure before `doctor` is
+            # ever reached.
             config_path.write_text(
-                f'[daemon]\nsocket_path = "{Path(temp_dir) / "murmly.sock"}"\n',
+                f"[daemon]\nsocket_path = '{Path(temp_dir) / 'murmly.sock'}'\n",
                 encoding="utf-8",
             )
             with (
@@ -2969,8 +2994,11 @@ class DaemonExitWithoutFinalizeTests(unittest.TestCase):
 
     def _config_file(self, temp_dir: str) -> Path:
         config_path = Path(temp_dir) / "config.toml"
+        # A TOML literal string -- see
+        # `DaemonExitTeardownTests.test_a_command_other_than_the_daemon_leaves_the_teardown_alone`
+        # for why a basic (double-quoted) string cannot hold a Windows path.
         config_path.write_text(
-            f'[daemon]\nsocket_path = "{Path(temp_dir) / "murmly.sock"}"\n',
+            f"[daemon]\nsocket_path = '{Path(temp_dir) / 'murmly.sock'}'\n",
             encoding="utf-8",
         )
         return config_path

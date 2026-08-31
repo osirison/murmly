@@ -279,7 +279,26 @@ def _directory_exposure(
 
     Each detail carries its own remedy, because they differ: a directory this
     account does not own cannot be corrected with chmod.
+
+    The whole analysis below is skipped, not merely `os.getuid()`, on a host
+    that has no `os.getuid` at all. In production this function is reached
+    only through the Linux/macOS branch of `_require_private_channel`, where
+    the resolved profile and the real host agree and `os.getuid` always
+    exists. A test may deliberately resolve one of those profiles on a real
+    Windows interpreter instead, to keep this branch exercised on every host
+    (see `MurmlyDaemon.__init__`'s own docstring for the matching seam on the
+    peer-identity side). On that host every mode bit this function reads is
+    synthetic: CPython's Windows `os.stat` derives `st_mode` from the
+    FILE_ATTRIBUTE_READONLY flag alone, so an ordinary writable directory
+    reports `0o777` -- group- and other-writable, with no sticky bit -- which
+    would read as "writable by other accounts" for the first directory in
+    every walk, and there is no real uid or mode-bit information underneath
+    it to judge either way. Returning `None` immediately is the same "nothing
+    to report" a `os.getuid()`-only guard would still get wrong one line
+    later.
     """
+    if not hasattr(os, "getuid"):
+        return None
     if info.st_uid not in (0, os.getuid()):
         return (
             f"{directory} is owned by uid {info.st_uid}, which can grant itself write "
@@ -349,7 +368,10 @@ class PeerIdentityMechanism:
 
     supported: bool
     read: Callable[[object], object | None]
-    local: Callable[[], object]
+    # `| None`: `peer_identity_mechanism_for`'s non-Windows branch stores
+    # `None` here on a host with no `os.getuid` at all, never called in that
+    # case -- see that function's own docstring for why.
+    local: Callable[[], object] | None
 
 
 def peer_identity_mechanism_for(profile: PlatformProfile) -> PeerIdentityMechanism:
@@ -360,12 +382,28 @@ def peer_identity_mechanism_for(profile: PlatformProfile) -> PeerIdentityMechani
     SID could ever equal. Every other resolved platform keeps the existing
     `SO_PEERCRED`/`os.getuid()` pair unchanged, which is what keeps this
     dispatch a zero-behaviour-change addition on Linux.
+
+    `getattr(os, "getuid", None)`, not the bare name: on a real Linux or
+    macOS host this returns the exact same function object (`PeerIdentity
+    MechanismDispatchTests.test_linux_keeps_the_existing_socket_functions`
+    asserts `is`, not merely equality), so nothing changes there. The bare
+    name is an `AttributeError` waiting to happen the moment this function
+    is *called* -- not merely referenced -- for a non-Windows profile on a
+    real Windows interpreter, which only a test deliberately does (see
+    `MurmlyDaemon.__init__`'s own comment on this same hazard). `None`
+    reaches `PeerIdentityMechanism.local` there instead, and is never
+    called: `_peer_permitted` only calls it once `self._peer_identity`
+    -- `read_peer_identity` for this branch -- has already answered with a
+    real identity, and `read_peer_identity` itself answers `None` on a host
+    with no `SO_PEERCRED`, which every real Windows host is.
     """
     if profile.operating_system is OperatingSystem.WINDOWS:
         from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
 
         return PeerIdentityMechanism(True, read_peer_identity_from_pipe, current_user_sid_string)
-    return PeerIdentityMechanism(peer_identity_supported(profile), read_peer_identity, os.getuid)
+    return PeerIdentityMechanism(
+        peer_identity_supported(profile), read_peer_identity, getattr(os, "getuid", None)
+    )
 
 
 def create_socket_directory(directory: Path) -> None:
