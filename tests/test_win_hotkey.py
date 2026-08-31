@@ -15,6 +15,7 @@ key when the thread stops (task 8.5).
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import unittest
 
@@ -270,6 +271,139 @@ class StopTests(unittest.TestCase):
         registrar.stop()  # must not raise, must not double-unregister
 
         self.assertEqual([1], fake.unregistered)
+
+
+class WindowsHotkeyRuntimeIntegrationTests(unittest.TestCase):
+    """Task 8.3, against the real seams: `RegisterHotKey` on a real
+    message-loop thread pumping real `GetMessageW`. Everything above this
+    class proves the policy layer against fakes; this is the half that can
+    only be confirmed on Windows, following the `X11RuntimeIntegrationTests`
+    (`test_focus.py`) / `WindowsPipeSecurityDescriptorIntegrationTests`
+    (`test_platform.py`) pattern of skipping in `setUp` on every platform but
+    the one that has the mechanism.
+
+    `Ctrl+Alt+Shift+F24` is chosen specifically as unlikely to already be
+    claimed by another application on a CI runner -- a triple-modifier bind
+    to the least-used function key Windows defines -- but it is still a real
+    machine-wide registration, and `stop()` in `tearDown` releases it
+    unconditionally so a failed assertion never leaves the key claimed
+    against whatever runs next on the same machine (task 8.5).
+
+    `RegisterHotKey` needs a message queue, which every thread gets
+    implicitly, but whether it also needs a window station attached to an
+    interactive desktop -- true of a service running outside any logged-on
+    session -- is exactly the unknown this class exists to answer: a
+    `HotkeyError` surfacing here as a skip, naming Win32's own
+    `GetLastError`, is what tells a session's CI log apart from a session
+    where this genuinely regressed.
+    """
+
+    PORTABLE = "Ctrl+Alt+Shift+F24"
+
+    #: `VK_CONTROL`, `VK_MENU` (Alt), `VK_SHIFT`, `VK_F24` -- `winuser.h`.
+    _CHORD_VKS = (0x11, 0x12, 0x10, 0x87)
+
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("A Windows kernel is required to call RegisterHotKey")
+        self._registrar: WindowsHotkeyRegistrar | None = None
+
+    def tearDown(self) -> None:
+        if self._registrar is not None:
+            self._registrar.stop()
+
+    @classmethod
+    def _send_chord(cls) -> None:
+        """`SendInput` for every key in `_CHORD_VKS` down, then up in reverse.
+
+        Standing in for a physical keypress of the same chord this class
+        registers: proving delivery this way, rather than asking a person to
+        press the combination during a CI run, is what lets this test run
+        unattended. Deliberately not `win_clipboard._real_send_ctrl_v`, which
+        is hard-coded to Ctrl+V -- this needs an arbitrary, four-key chord
+        ending in a function key `win_clipboard.py` has no seam for.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = (
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", wintypes.WPARAM),
+            )
+
+        class _InputUnion(ctypes.Union):
+            _fields_ = (("ki", KEYBDINPUT),)
+
+        class INPUT(ctypes.Structure):
+            _anonymous_ = ("_input",)
+            _fields_ = (("type", wintypes.DWORD), ("_input", _InputUnion))
+
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_KEYUP = 0x0002
+
+        def entry(vk: int, key_up: bool) -> INPUT:
+            item = INPUT()
+            item.type = INPUT_KEYBOARD
+            item.ki = KEYBDINPUT(
+                wVk=vk, wScan=0, dwFlags=KEYEVENTF_KEYUP if key_up else 0, time=0, dwExtraInfo=0
+            )
+            return item
+
+        sequence = [entry(vk, key_up=False) for vk in cls._CHORD_VKS]
+        sequence += [entry(vk, key_up=True) for vk in reversed(cls._CHORD_VKS)]
+        array = (INPUT * len(sequence))(*sequence)
+        sent = ctypes.windll.user32.SendInput(len(sequence), array, ctypes.sizeof(INPUT))
+        if sent != len(sequence):
+            raise OSError(
+                f"SendInput accepted {sent} of {len(sequence)} events; "
+                f"GetLastError={ctypes.GetLastError()}"
+            )
+
+    def test_registers_fires_and_releases_a_real_hotkey(self) -> None:
+        from ctypes import GetLastError
+
+        fired: queue.Queue[str] = queue.Queue()
+        registrar = WindowsHotkeyRegistrar(on_hotkey=fired.put)
+        self._registrar = registrar
+
+        try:
+            registrar.rebind({"window": self.PORTABLE})
+        except HotkeyError as error:
+            last_error = GetLastError()
+            self.skipTest(
+                f"RegisterHotKey refused {self.PORTABLE!r} on this runner "
+                f"(GetLastError={last_error}): {error}"
+            )
+
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+
+        try:
+            self._send_chord()
+        except OSError as error:
+            self.skipTest(f"SendInput could not inject the chord on this runner: {error}")
+
+        try:
+            purpose = fired.get(timeout=5.0)
+        except queue.Empty:
+            self.fail(
+                "RegisterHotKey accepted the chord but no WM_HOTKEY was "
+                "delivered within 5 seconds of injecting it."
+            )
+        self.assertEqual("window", purpose)
+
+        registrar.stop()
+
+        self.assertEqual(frozenset(), registrar.held_purposes())
+        # Released, not merely forgotten: re-registering the same physical
+        # key must succeed now that this process no longer holds it, which it
+        # would not if `stop()` had merely dropped the bookkeeping without
+        # calling `UnregisterHotKey`.
+        registrar.rebind({"window": self.PORTABLE})
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
 
 
 if __name__ == "__main__":

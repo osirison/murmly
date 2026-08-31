@@ -13,7 +13,12 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 from murmly.config import MurmlyConfig
-from murmly.stt import FasterWhisperTranscriber
+from murmly.platform import OperatingSystem, PlatformProfile
+from murmly.stt import (
+    CTRANSLATE2_CUDA_DLL_DIRECTORIES,
+    FasterWhisperTranscriber,
+    add_cuda_dll_directories,
+)
 
 
 # A gate a test forgot to open fails that test rather than hanging the suite.
@@ -225,6 +230,14 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
         # test running rather than skipping on Windows CI and failing
         # downstream instead, on the two things below that really do differ
         # by host. There is no platform left to skip this for.
+        #
+        # An explicit Linux profile, not the host's own: since task 11.1,
+        # `load_cuda_libraries` dispatches Windows to `add_cuda_dll_directories`
+        # instead (`test_windows_dispatches_to_add_cuda_dll_directories`
+        # below), so a real Windows CI runner would otherwise take that branch
+        # here and never reach the `ctypes.CDLL`/`RTLD_GLOBAL` path this test
+        # exists to exercise. This is a provenance-check test, not a claim
+        # about what any one host actually runs in production.
         relative_paths = [
             "nvidia/cublas/lib/libcublasLt.so.12",
             "nvidia/cublas/lib/libcublas.so.12",
@@ -262,7 +275,9 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 patch("murmly.stt.sys.prefix", temp_dir),
                 patch("murmly.stt.ctypes.CDLL") as load_library,
             ):
-                loaded = FasterWhisperTranscriber._load_cuda_runtime()
+                loaded = FasterWhisperTranscriber._load_cuda_runtime(
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+                )
 
         self.assertTrue(loaded)
         # `trusted_library_path` loads `unresolved_path.resolve(strict=True)`,
@@ -275,6 +290,103 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             [str((environment_path / path).resolve()) for path in relative_paths],
             [call.args[0] for call in load_library.call_args_list],
         )
+
+    def test_windows_dispatches_to_add_cuda_dll_directories(self) -> None:
+        """Task 11.1: Windows never reaches the `RTLD_GLOBAL` loop above.
+
+        `RTLD_GLOBAL` has no Windows counterpart; `ctypes.CDLL` is never
+        called on this branch at all.
+        """
+        with (
+            patch("murmly.stt.add_cuda_dll_directories", return_value=True) as add_directories,
+            patch("murmly.stt.ctypes.CDLL") as load_library,
+        ):
+            loaded = FasterWhisperTranscriber._load_cuda_runtime(
+                PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+            )
+
+        self.assertTrue(loaded)
+        add_directories.assert_called_once_with(CTRANSLATE2_CUDA_DLL_DIRECTORIES)
+        load_library.assert_not_called()
+
+    def test_add_cuda_dll_directories_registers_each_trusted_directory(self) -> None:
+        """The mechanism `test_windows_dispatches_to_add_cuda_dll_directories`
+        mocks out: real provenance checks, against fixture directories laid
+        out the way task 11.1's report found the real `win_amd64` wheels to
+        be -- a `bin` directory per package, not a single named file.
+
+        `add_dll_directory` is injected because the real `os.add_dll_directory`
+        does not exist on this host at all (it is defined only under
+        `sys.platform == "win32"`), which is exactly why
+        `add_cuda_dll_directories` takes it as a parameter rather than
+        reading `os.add_dll_directory` directly.
+        """
+        relative_dirs = ["nvidia/cublas/bin", "nvidia/cudnn/bin"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment_path = Path(temp_dir)
+            file_records = []
+            for relative_dir in relative_dirs:
+                directory = environment_path / relative_dir
+                directory.mkdir(parents=True, exist_ok=True)
+                dll_name = "cublas64_12.dll" if "cublas" in relative_dir else "cudnn64_9.dll"
+                (directory / dll_name).touch()
+                file_records.append(PurePosixPath(f"{relative_dir}/{dll_name}"))
+
+            package = SimpleNamespace(
+                files=file_records,
+                locate_file=lambda path: environment_path / path,
+            )
+            registered: list[str] = []
+            with (
+                patch("murmly.stt.distribution", return_value=package),
+                patch("murmly.stt.sys.prefix", temp_dir),
+            ):
+                loaded = add_cuda_dll_directories(
+                    tuple(
+                        ("nvidia-cublas-cu12" if "cublas" in path else "nvidia-cudnn-cu12", path)
+                        for path in relative_dirs
+                    ),
+                    add_dll_directory=registered.append,
+                )
+
+        self.assertTrue(loaded)
+        self.assertEqual(
+            [str((environment_path / path).resolve()) for path in relative_dirs],
+            registered,
+        )
+
+    def test_add_cuda_dll_directories_handles_missing_nvidia_distribution(self) -> None:
+        with patch("murmly.stt.distribution", side_effect=PackageNotFoundError):
+            self.assertFalse(
+                add_cuda_dll_directories(
+                    (("nvidia-cublas-cu12", "nvidia/cublas/bin"),),
+                    add_dll_directory=lambda _path: None,
+                )
+            )
+
+    def test_add_cuda_dll_directories_rejects_directory_outside_environment(self) -> None:
+        relative_dir = "nvidia/cublas/bin"
+        with (
+            tempfile.TemporaryDirectory() as environment_dir,
+            tempfile.TemporaryDirectory() as external_dir,
+        ):
+            directory = Path(external_dir) / relative_dir
+            directory.mkdir(parents=True)
+            (directory / "cublas64_12.dll").touch()
+            package = SimpleNamespace(
+                files=[PurePosixPath(f"{relative_dir}/cublas64_12.dll")],
+                locate_file=lambda path: Path(external_dir) / path,
+            )
+
+            with (
+                patch("murmly.stt.distribution", return_value=package),
+                patch("murmly.stt.sys.prefix", environment_dir),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "outside the active environment"):
+                    add_cuda_dll_directories(
+                        (("nvidia-cublas-cu12", relative_dir),),
+                        add_dll_directory=lambda _path: None,
+                    )
 
     def test_cuda_runtime_handles_missing_nvidia_distribution(self) -> None:
         with patch(

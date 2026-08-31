@@ -453,6 +453,17 @@ def _load_gtk4_overlay() -> object:
     return OverlayController
 
 
+def _load_qt_overlay() -> object:
+    # The same class the GTK4 candidate loads (task 10.1): `OverlayController`
+    # already selects its renderer's script and interpreter from the backend
+    # it was given (`renderer_script`/`renderer_python` in `overlay.py`), so
+    # the daemon never learns which renderer it started by asking this
+    # registry for a different class per platform.
+    from murmly.overlay import OverlayController
+
+    return OverlayController
+
+
 def _load_kokoro_synthesis() -> object:
     from murmly.tts import KokoroSynthesizer
 
@@ -573,6 +584,9 @@ FOCUS_OBSERVATION = BackendRegistry(
 
 
 def _overlay_unavailable_reason(profile: PlatformProfile) -> str:
+    # Windows always matches the `qt` candidate below, so this branch is
+    # unreached for it -- the same shape `_hotkey_unavailable_reason` and
+    # `_focus_unavailable_reason` already have for the same reason.
     if not _is_linux(profile):
         return f"No overlay backend exists for {profile.operating_system.value} yet."
     if not _is_plasma(profile):
@@ -614,6 +628,15 @@ OVERLAY = BackendRegistry(
         BackendCandidate(
             "gtk4", lambda profile: _is_plasma(profile) and _has_overlay_display(profile), _load_gtk4_overlay
         ),
+        # A Qt renderer speaking the same newline-delimited JSON protocol
+        # (task 10.1, design.md's "The overlay: keep GTK4 on Linux, add a Qt
+        # renderer for Windows and macOS"). Every interactive Windows session
+        # has a desktop to draw on; whether it can actually host a layered,
+        # click-through, non-activating surface is what the renderer's own
+        # `--check` answers, the same split the GTK4 candidate already keeps
+        # between "Plasma is here" and "this session's display is usable"
+        # (`_has_overlay_display`).
+        BackendCandidate("qt", _is_windows, _load_qt_overlay),
     ),
     unavailable_reason=_overlay_unavailable_reason,
     unavailable_remedy=_overlay_unavailable_remedy,
@@ -822,6 +845,172 @@ PERMISSIONS: Mapping[str, Permission] = {
         applies=_is_windows,
     ),
 }
+
+
+# --------------------------------------------------------------------------
+# Windows environment preconditions (tasks 11.5, 11.6)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentPrecondition:
+    """One machine-level setting that changes what installing or running
+    Murmly costs, without being a grant any mechanism is refused for.
+
+    Distinct from `Permission` on purpose: a denied `Permission` blocks a
+    capability outright (microphone capture fails), while these two are a
+    hard install-time failure with a message that never names the real
+    cause (long paths) and a silent doubling of disk usage (Developer Mode)
+    -- worth naming, never worth refusing anything over. `check` answers
+    `True` (satisfied), `False` (not satisfied), or `None` (the platform
+    offers no way to read it, or offered one and it did not answer) rather
+    than reusing `PermissionState`, whose `GRANTED`/`DENIED` vocabulary is
+    about what a person allowed Murmly to do, not about what is configured
+    on the machine underneath it.
+
+    Two callers, not one: section 16's `murmly install` bootstrap is
+    `windows-long-paths`'s caller, and it needs the answer *before* `uv sync`
+    runs, naming the precondition rather than letting the sync fail with "the
+    system cannot find the path specified" and no mention of length.
+    `murmly doctor`'s `platform` section (task 6.1) is the ongoing caller for
+    both -- `windows-developer-mode` is not a one-time installation fact the
+    way `windows-long-paths` is: the model cache stays doubled for as long as
+    Developer Mode is off, on every day Murmly runs, not only at install.
+    """
+
+    name: str
+    description: str
+    remedy: str
+    check: Callable[[PlatformProfile], bool | None]
+    applies: Callable[[PlatformProfile], bool] = lambda profile: True
+
+
+#: Documented at
+#: https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
+#: -- a DWORD, 1 when enabled, read from Local Machine because it is a
+#: machine-wide setting rather than a per-user one, unlike the microphone
+#: consent keys above. Not confirmed on a real Windows machine.
+_WINDOWS_LONG_PATHS_KEY = r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FileSystem"
+_WINDOWS_LONG_PATHS_VALUE = "LongPathsEnabled"
+
+#: Documented at
+#: https://learn.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development
+#: -- also a DWORD, also machine-wide. Not confirmed on a real Windows machine.
+_WINDOWS_DEVELOPER_MODE_KEY = (
+    r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
+)
+_WINDOWS_DEVELOPER_MODE_VALUE = "AllowDevelopmentWithoutDevLicense"
+
+
+def _windows_registry_flag(
+    key_path: str,
+    value_name: str,
+    read_registry_value: Callable[[str, str], str | None],
+) -> bool | None:
+    """A DWORD registry value read as tri-state: on, off, or unreadable.
+
+    Shared by both preconditions below rather than duplicated: both are a
+    single machine-wide DWORD, checked the same way the per-user microphone
+    consent keys are, through the same injected `read_registry_value` seam
+    `_real_read_registry_value` fills in production.
+    """
+    value = read_registry_value(key_path, value_name)
+    if value is None:
+        return None
+    return value != "0"
+
+
+def _windows_long_paths_enabled(
+    profile: PlatformProfile,
+    read_registry_value: Callable[[str, str], str | None] = _real_read_registry_value,
+) -> bool | None:
+    """Task 11.5: whether `uv sync` will find long enough paths to work with."""
+    return _windows_registry_flag(
+        _WINDOWS_LONG_PATHS_KEY, _WINDOWS_LONG_PATHS_VALUE, read_registry_value
+    )
+
+
+def _windows_developer_mode_enabled(
+    profile: PlatformProfile,
+    read_registry_value: Callable[[str, str], str | None] = _real_read_registry_value,
+) -> bool | None:
+    """Task 11.6: whether `huggingface_hub`'s cache can use symlinks here."""
+    return _windows_registry_flag(
+        _WINDOWS_DEVELOPER_MODE_KEY, _WINDOWS_DEVELOPER_MODE_VALUE, read_registry_value
+    )
+
+
+WINDOWS_LONG_PATHS = "windows-long-paths"
+WINDOWS_DEVELOPER_MODE = "windows-developer-mode"
+
+#: Every environment precondition Murmly currently knows to check, keyed by
+#: `name`. Rendered the same way `PERMISSIONS` is: `environment_preconditions_for`
+#: filters this through each entry's `applies` before checking anything, so a
+#: platform neither precondition concerns never grows an entry for it.
+ENVIRONMENT_PRECONDITIONS: Mapping[str, EnvironmentPrecondition] = {
+    WINDOWS_LONG_PATHS: EnvironmentPrecondition(
+        name=WINDOWS_LONG_PATHS,
+        description=(
+            "long file paths, which `uv sync` needs -- without them it fails with "
+            '"the system cannot find the path specified" and never names the length'
+        ),
+        remedy=(
+            "Local Group Policy Editor > Computer Configuration > Administrative "
+            'Templates > System > Filesystem > "Enable Win32 long paths", or set '
+            f"{_WINDOWS_LONG_PATHS_KEY}\\{_WINDOWS_LONG_PATHS_VALUE} to 1 (DWORD) directly."
+        ),
+        check=_windows_long_paths_enabled,
+        applies=_is_windows,
+    ),
+    WINDOWS_DEVELOPER_MODE: EnvironmentPrecondition(
+        name=WINDOWS_DEVELOPER_MODE,
+        description=(
+            "Developer Mode, which lets `huggingface_hub`'s cache use symlinks -- "
+            "without it the 1.6 GB transcription model is stored as a second full "
+            "copy as well, doubling the disk it uses"
+        ),
+        remedy="Settings > Privacy & security > For developers > Developer Mode.",
+        check=_windows_developer_mode_enabled,
+        applies=_is_windows,
+    ),
+}
+
+
+def environment_preconditions_for(
+    profile: PlatformProfile,
+    preconditions: Mapping[str, EnvironmentPrecondition] = ENVIRONMENT_PRECONDITIONS,
+) -> dict[str, dict[str, object]]:
+    """Every precondition that applies to `profile`, with its current state.
+
+    A check that raises is reported exactly like a check that answers
+    `None`, and never as `True`: whatever went wrong, it is not evidence the
+    precondition is satisfied. `satisfied` is only ever `True`, `False`, or
+    `None` in the returned mapping -- `remedy` is present whenever it is not
+    `True`, since `None` is as much a reason to name what to check as `False`
+    is.
+    """
+    report: dict[str, dict[str, object]] = {}
+    for name, precondition in preconditions.items():
+        if not precondition.applies(profile):
+            continue
+        try:
+            satisfied = precondition.check(profile)
+        except Exception as error:  # noqa: BLE001 - a precondition check must not raise
+            report[name] = {
+                "description": precondition.description,
+                "satisfied": None,
+                "remedy": precondition.remedy,
+                "detail": f"Unable to determine whether {name} is satisfied: {error}",
+            }
+            continue
+        entry: dict[str, object] = {
+            "description": precondition.description,
+            "satisfied": satisfied,
+        }
+        if satisfied is not True:
+            entry["remedy"] = precondition.remedy
+        report[name] = entry
+    return report
 
 
 # --------------------------------------------------------------------------

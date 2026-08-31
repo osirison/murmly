@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -2930,3 +2932,107 @@ class EndToEndBackendSelectionTests(unittest.TestCase):
             self.assertFalse((applications_dir / DESKTOP_ID).is_file())
             self.assertFalse((applications_dir / SESSION_DESKTOP_ID).is_file())
             self.assertIsNone(record_store.bindings)
+
+
+class WindowsSchtasksIntegrationTests(unittest.TestCase):
+    """Tasks 8.1 and 8.2, against real `schtasks.exe`: everything
+    `WindowsServiceInstallTests` above proves against `FakeSchtasks` is
+    exercised here against the real Task Scheduler, following the
+    `WindowsPipeSecurityDescriptorIntegrationTests` pattern (`test_platform.py`)
+    of skipping in `setUp` on every platform but the one that has the
+    mechanism.
+
+    The task name is unique per run (`uuid4`), never `WINDOWS_TASK_NAME`: this
+    suite also runs on a developer's own Windows machine, where that name may
+    already be a real install, and `/create ... /f` would silently overwrite
+    it. `remove()` is registered with `addCleanup` before `install()` runs, so
+    a failure partway through -- including `self.fail()` on an assertion --
+    still tears the task down rather than leaving it registered against the
+    next run of this same test.
+
+    `install()` both creates the task and starts it (`self.start()`, see
+    `WindowsUserService.install`), so the entrypoint has to be something
+    genuinely safe to run unattended and unprivileged: a batch script that
+    idles rather than the real Murmly entrypoint. `install()` appends
+    `" daemon"` to whatever path it is given (`WindowsUserService.install`'s
+    `run_line`), which a `.bat` file sees as an ignored `%1` and a real
+    Murmly entrypoint would not -- one more reason not to point this at one.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("A Windows kernel is required to drive schtasks.exe")
+
+    def test_full_lifecycle_against_a_real_task(self) -> None:
+        import uuid
+
+        from murmly.installer import _windows_path_text
+
+        task_name = f"MurmlyIntegrationTest-{uuid.uuid4().hex[:12]}"
+        service = WindowsUserService(task_name=task_name)
+        self.addCleanup(service.remove)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Idles for a couple of minutes rather than exiting immediately --
+            # long enough for `is_active()`'s `/query` to have something
+            # running to observe, per this class's docstring.
+            script_path = Path(temp_dir) / "murmly-integration-idle.bat"
+            script_path.write_text("@echo off\r\nping -n 120 127.0.0.1 >nul\r\n")
+
+            self.assertIsNone(service.recorded_entrypoint())
+            self.assertFalse(service.is_installed)
+
+            service.install(script_path)
+
+            self.assertTrue(service.is_installed)
+            self.assertEqual(_windows_path_text(script_path), service.recorded_entrypoint())
+
+            # `install()` already called `start()`, but Task Scheduler does
+            # not necessarily report `Running` back the same instant `/run`
+            # returns -- this polls rather than asserting on the first read.
+            active = False
+            for _ in range(20):
+                if service.is_active():
+                    active = True
+                    break
+                time.sleep(0.5)
+            self.assertTrue(active, "the task never reported Status: Running")
+
+            status = service.status()
+            self.assertTrue(status.installed)
+            self.assertTrue(status.active)
+            self.assertEqual(_windows_path_text(script_path), status.entrypoint)
+
+            self.assertTrue(service.stop())
+            self.assertFalse(service.is_active())
+
+            self.assertTrue(service.disable())
+            self.assertTrue(service.enable())
+
+            removed = service.remove()
+            self.assertTrue(removed)
+            self.assertFalse(service.is_installed)
+
+    def test_registers_and_starts_without_asking_for_elevation(self) -> None:
+        """Task 8.2's own claim: the process installing Murmly is not itself
+        elevated, so a lifecycle that runs to completion at all (the test
+        above) already shows `/create` and `/run` asked for nothing this
+        session's token could not grant on its own. What is checked here is
+        the precondition that makes that reading meaningful: if the *runner's*
+        token is already elevated, the test above's success would be
+        consistent with 8.2 but would not distinguish it from a runner that
+        happens to grant elevated tasks no differently -- so this names that
+        case explicitly with `IsUserAnAdmin` rather than leaving it assumed.
+        """
+        from ctypes import windll
+
+        if bool(windll.shell32.IsUserAnAdmin()):
+            self.skipTest(
+                "This process is already elevated (IsUserAnAdmin), so a "
+                "passing lifecycle above cannot distinguish 'schtasks needs "
+                "no elevation' from 'this token already has it'."
+            )
+        # No assertion beyond the skip guard: the elevation-free schtasks
+        # lifecycle itself is `test_full_lifecycle_against_a_real_task`
+        # above. Reaching this point unskipped is what makes that other
+        # test's pass mean what task 8.2 asks it to mean.

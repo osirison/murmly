@@ -51,9 +51,11 @@ from murmly.focus import FocusObserver, create_focus_observer, record_target, sh
 from murmly.idle import system_memory_returnable, system_memory_unreturnable_reason
 from murmly.overlay import (
     SYSTEM_PYTHON,
+    OverlayBackend,
     detect_overlay_backend,
     renderer_environment,
     renderer_python,
+    renderer_script,
 )
 from murmly.platform import (
     BACKEND_REGISTRIES,
@@ -62,6 +64,7 @@ from murmly.platform import (
     PlatformProfile,
     SUPPORTED_OPERATING_SYSTEMS,
     OperatingSystem,
+    environment_preconditions_for,
     hotkey_mechanism_is_in_process,
     resolve_platform,
     transcription_runtime_gap,
@@ -780,6 +783,17 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
         "desktop": profile.desktop.value,
         "concerns": concerns,
         "permissions": permissions,
+        # Tasks 11.5, 11.6: machine settings that change what installing or
+        # running Murmly costs without blocking any capability outright, so
+        # they are their own section rather than folded into `permissions`
+        # (`EnvironmentPrecondition`'s docstring has the distinction) or
+        # `concerns` (neither gates a registry entry). `windows-long-paths`
+        # is chiefly an install-time fact; `murmly install`'s bootstrap
+        # (section 16) checks it before `uv sync` runs, where it can still
+        # change anything -- this is the ongoing report for a machine already
+        # running Murmly, same relationship `concerns` has to the registries
+        # it also reports.
+        "environment": environment_preconditions_for(profile),
     }
 
 
@@ -1343,6 +1357,19 @@ def delivery_diagnostics(
     return report
 
 
+#: Every key a renderer's own `--check` report can contribute, regardless of
+#: which renderer answered. Keeping both renderers' keys in one place, copied
+#: unconditionally into every report's defaults below, is what keeps the
+#: `platform-support` spec's "the diagnostics report keeps its shape"
+#: requirement true here too: a GTK4-only report on Linux still carries
+#: `pyside6`/`qt_version` (as their does-not-apply defaults), and a Qt-only
+#: report on Windows still carries `pygobject`/`gtk4`/etc, rather than the
+#: field set depending on which platform answered.
+_GTK4_CHECK_KEYS: tuple[str, ...] = ("pygobject", "gtk4", "gdk_x11", "native_x11", "gtk4_layer_shell")
+_QT_CHECK_KEYS: tuple[str, ...] = ("pyside6", "qt_version")
+_RENDERER_CHECK_KEYS: tuple[str, ...] = ("system_python", *_GTK4_CHECK_KEYS, *_QT_CHECK_KEYS)
+
+
 def overlay_diagnostics(
     config: MurmlyConfig,
     env: dict[str, str] | None = None,
@@ -1350,11 +1377,20 @@ def overlay_diagnostics(
     helper_path: Path | None = None,
 ) -> dict[str, object]:
     environment = env if env is not None else os.environ
-    desktop = environment.get("XDG_CURRENT_DESKTOP") or environment.get("XDG_SESSION_DESKTOP", "")
-    session = "wayland" if is_wayland_session(environment) else "x11"
+    profile = resolve_platform(environment)
     backend = detect_overlay_backend(environment)
+    if profile.operating_system is OperatingSystem.LINUX:
+        desktop = environment.get("XDG_CURRENT_DESKTOP") or environment.get("XDG_SESSION_DESKTOP", "")
+        session = "wayland" if is_wayland_session(environment) else "x11"
+    else:
+        # No wayland/x11 distinction to misreport off Linux (task 6.3's same
+        # reasoning, applied to this report's own `session`/`desktop` fields
+        # rather than only the top-level one): the platform itself is what
+        # both name instead.
+        desktop = profile.operating_system.value
+        session = profile.operating_system.value
     supported_session = backend is not None
-    renderer_path = (helper_path or Path(__file__).with_name("overlay_renderer.py")).resolve()
+    renderer_path = (helper_path or renderer_script(backend if backend is not None else OverlayBackend.X11)).resolve()
     report: dict[str, object] = {
         "enabled": config.overlay_enabled,
         "desktop": desktop or "unknown",
@@ -1371,6 +1407,8 @@ def overlay_diagnostics(
         "gdk_x11": False,
         "native_x11": False,
         "gtk4_layer_shell": False,
+        "pyside6": False,
+        "qt_version": None,
         "available": False,
     }
     if backend is None:
@@ -1393,14 +1431,7 @@ def overlay_diagnostics(
         helper_report = json.loads(result.stdout)
         if not isinstance(helper_report, dict):
             raise ValueError("Overlay helper returned a non-object report.")
-        for key in (
-            "system_python",
-            "pygobject",
-            "gtk4",
-            "gdk_x11",
-            "native_x11",
-            "gtk4_layer_shell",
-        ):
+        for key in _RENDERER_CHECK_KEYS:
             if key in helper_report:
                 report[key] = helper_report[key]
         runtime_available = bool(helper_report.get("available")) and result.returncode == 0

@@ -14,6 +14,7 @@ injection still leaves the transcript on the clipboard.
 
 from __future__ import annotations
 
+import sys
 import unittest
 
 from murmly.integrations import DeliveryOutcome, PasteInjection
@@ -168,6 +169,96 @@ class ImportsCleanlyOnLinuxTests(unittest.TestCase):
         The real seam bodies (`_real_write_clipboard`, `_real_read_clipboard`,
         `_real_send_ctrl_v`) can only be confirmed on Windows."""
         WindowsClipboardPaster()
+
+
+class WindowsClipboardRuntimeIntegrationTests(unittest.TestCase):
+    """Task 9.1, and the acceptance half of 9.2, against the real Win32
+    calls: everything above this class proves the policy layer against
+    fakes, since `ctypes.windll` cannot even be imported from Linux. This
+    follows the `WindowsPipeSecurityDescriptorIntegrationTests`
+    (`test_platform.py`) pattern of skipping in `setUp` on every platform but
+    the one with the mechanism.
+
+    The clipboard is a single machine-wide slot, so every test here reads
+    whatever it held on entry and restores exactly that in `tearDown` --
+    never leaving its own fixture text sitting there afterwards, which the
+    task this class exists for calls out by name as a defect.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("A Windows kernel is required to reach the Win32 clipboard")
+        from murmly.win_clipboard import _real_read_clipboard
+
+        try:
+            self._previous = _real_read_clipboard()
+        except OSError as error:
+            self.skipTest(f"OpenClipboard failed reading the prior contents: {error}")
+
+    def tearDown(self) -> None:
+        from murmly.win_clipboard import _real_write_clipboard
+
+        if self._previous is not None:
+            _real_write_clipboard(self._previous)
+        else:
+            self._clear_clipboard()
+
+    @staticmethod
+    def _clear_clipboard() -> None:
+        """`OpenClipboard`/`EmptyClipboard`/`CloseClipboard`, with no
+        `SetClipboardData` call -- there is nothing to put back when the
+        clipboard held no `CF_UNICODETEXT` value on entry, and writing an
+        empty string would itself be a value the clipboard did not have
+        before this test ran."""
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if not user32.OpenClipboard(None):
+            return
+        try:
+            user32.EmptyClipboard()
+        finally:
+            user32.CloseClipboard()
+
+    def test_round_trip_of_text_outside_any_console_codepage(self) -> None:
+        """The whole reason this module exists rather than shelling out to
+        `clip.exe` (module docstring): `clip.exe` reads stdin through the
+        console's OEM/ANSI codepage, which loses every one of these
+        characters. `CF_UNICODETEXT` is UTF-16LE with no codepage in the
+        path, so this fixture -- CJK, a Latin letter no Windows-1252 codepage
+        carries, and an astral-plane emoji needing a UTF-16 surrogate pair --
+        must survive exactly."""
+        from murmly.win_clipboard import _real_read_clipboard, _real_write_clipboard
+
+        fixture = "日本語のテスト 😀 Straße Ĺẅṽ"
+
+        _real_write_clipboard(fixture)
+        roundtripped = _real_read_clipboard()
+
+        self.assertEqual(fixture, roundtripped)
+
+    def test_send_input_accepts_the_hand_built_input_struct(self) -> None:
+        """Task 9.2's acceptance half of 18.11: `SendInput` receiving the
+        `INPUT`/`KEYBDINPUT` structs `_real_send_ctrl_v` builds by hand and
+        reporting every event accepted (`sent == 4`) is what proves the
+        struct layout -- `cbSize`, the anonymous union, `ULONG_PTR` sized
+        correctly for this process's bitness -- matches what real `user32`
+        expects; a wrong one fails exactly here with `sent != 4`, distinctly
+        from `OSError` on a genuinely refused call.
+
+        This says nothing about *delivery* -- task 9.3 and 18.11's other half
+        register that as permanently unconfirmable, since UIPI drops
+        synthetic input aimed at a higher-integrity window without telling
+        the sender. So the clipboard is seeded with a short, harmless marker
+        first: wherever this Ctrl+V actually lands (nothing may have focus at
+        all on a CI runner), it must never risk pasting something that
+        matters into it.
+        """
+        from murmly.win_clipboard import _real_send_ctrl_v, _real_write_clipboard
+
+        _real_write_clipboard("murmly-integration-test-marker")
+
+        _real_send_ctrl_v()  # raises OSError on a struct/acceptance mismatch
 
 
 if __name__ == "__main__":

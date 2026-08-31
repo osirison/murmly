@@ -442,6 +442,44 @@ class CliTests(unittest.TestCase):
         self.assertFalse(report["available"])
         self.assertIn("system interpreter missing", report["detail"])
 
+    def test_overlay_diagnostics_reports_the_qt_renderer_on_windows(self) -> None:
+        """Task 10.1/10.5: on Windows the Qt renderer's own `--check` is
+        launched (`renderer_script`, not the hardcoded GTK4 file name), and
+        `session`/`desktop` name the platform instead of misreporting a
+        non-Linux machine as `x11` (task 6.3's same reasoning, applied here)."""
+        config = self._config()
+        completed = self._helper_result(
+            {"available": True, "pyside6": True, "qt_version": "6.11.2"}
+        )
+        launches: list[list[str]] = []
+
+        def record(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            launches.append(command)
+            return completed
+
+        windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        with (
+            patch("murmly.cli.resolve_platform", return_value=windows_profile),
+            patch("murmly.cli.detect_overlay_backend", return_value=OverlayBackend.WINDOWS),
+        ):
+            report = overlay_diagnostics(config, env={}, run_command=record)
+
+        self.assertTrue(report["available"])
+        self.assertEqual("windows", report["backend"])
+        self.assertEqual("windows", report["session"])
+        self.assertEqual("windows", report["desktop"])
+        self.assertTrue(report["pyside6"])
+        self.assertEqual("6.11.2", report["qt_version"])
+        # Every GTK4-only key still present, as its does-not-apply default --
+        # the field set does not depend on which renderer answered.
+        self.assertFalse(report["pygobject"])
+        self.assertIsNone(report["gtk4"])
+
+        command = launches[0]
+        self.assertEqual(str(Path(sys.executable)), command[0])
+        self.assertTrue(command[1].endswith("overlay_renderer_qt.py"))
+        self.assertIn("windows", command)
+
     def _run_spike(self, *, paste: bool, focus_changed: bool, verify_target: bool = True):
         from murmly.focus import WindowIdentity
 
@@ -1609,6 +1647,7 @@ class DoctorCompletenessTests(unittest.TestCase):
                 "desktop",
                 "concerns",
                 "permissions",
+                "environment",
             },
             set(report["platform"]),
         )
@@ -1619,6 +1658,8 @@ class DoctorCompletenessTests(unittest.TestCase):
         # anything behind -- the field stays exactly as empty as it was
         # before that permission existed.
         self.assertEqual({}, report["platform"]["permissions"])
+        # 11.5, 11.6: same rule, for the two Windows environment preconditions.
+        self.assertEqual({}, report["platform"]["environment"])
 
     def test_the_report_carries_the_same_field_names_on_a_platform_with_no_mechanisms(self) -> None:
         """18.17: an unserviceable concern is reported unavailable, not absent
@@ -1650,10 +1691,10 @@ class DoctorCompletenessTests(unittest.TestCase):
     def test_windows_reports_the_backends_this_change_built_for_it(self) -> None:
         """The command channel (task 7.1), hotkey registration (task 8.3),
         service management (task 8.1), clipboard (task 9.1), paste injection
-        (task 9.2) and focus observation (task 9.4) all have a Windows
-        mechanism now; the overlay and speech synthesis this change did not
-        build for Windows still report unavailable rather than dropped
-        (18.17)."""
+        (task 9.2), focus observation (task 9.4) and the overlay (task 10.1)
+        all have a Windows mechanism now; speech synthesis, which this change
+        did not build for Windows, still reports unavailable rather than
+        dropped (18.17)."""
         answered = {"ok": True, "state": "IDLE", "model_resident": False}
         windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1675,6 +1716,7 @@ class DoctorCompletenessTests(unittest.TestCase):
             "clipboard": "windows",
             "paste_injection": "windows",
             "focus_observation": "windows",
+            "overlay": "qt",
         }
         for concern, section in report["platform"]["concerns"].items():
             with self.subTest(concern=concern):
@@ -1696,6 +1738,27 @@ class DoctorCompletenessTests(unittest.TestCase):
             "microphone capture",
             report["platform"]["permissions"]["windows-microphone"]["capability"],
         )
+
+        # 11.5, 11.6: both environment preconditions, present on a Windows
+        # profile. Not asserted here: what `satisfied` actually is -- this
+        # test also runs on a real Windows CI runner, where
+        # `_real_read_registry_value` reads that runner's own registry rather
+        # than failing to import `winreg` the way the Linux host running this
+        # assertion locally does, so `satisfied` is a real `True`/`False`
+        # there, not `None`. Asserted instead is the one thing true on every
+        # host: both names are reported, each with a description, and a
+        # remedy is present exactly when the precondition is not satisfied --
+        # the same restraint this test already shows the microphone entry
+        # above, asserting `capability` and never `state`.
+        self.assertEqual(
+            {"windows-long-paths", "windows-developer-mode"},
+            set(report["platform"]["environment"]),
+        )
+        for name, section in report["platform"]["environment"].items():
+            with self.subTest(precondition=name):
+                self.assertIn(section["satisfied"], (None, True, False))
+                self.assertTrue(section["description"])
+                self.assertEqual("remedy" in section, section["satisfied"] is not True)
 
         # `choose_clipboard_copy_command` has no Windows branch (task 9.1 is a
         # Win32 API call, not a command); `_run_doctor` must not call it and

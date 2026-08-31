@@ -2,24 +2,31 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import threading
 import time
 import unittest
 
 from murmly.overlay import (
     GTK4_RENDERER_PYTHON,
+    GTK4_RENDERER_SCRIPT_NAME,
     MAX_MESSAGE_BYTES,
     MAX_PARTIAL_CHARS,
     NullOverlayController,
     OverlayBackend,
     OverlayController,
     OverlayState,
+    QT_RENDERER_SCRIPT_NAME,
+    WINDOWS_RENDERER_ENVIRONMENT_KEYS,
     bound_partial_text,
     detect_overlay_backend,
     encode_overlay_message,
+    overlay_backend_for_profile,
     renderer_environment,
     renderer_python,
+    renderer_script,
 )
+from murmly.platform import Desktop, OperatingSystem, PlatformProfile
 
 
 class RendererPythonTests(unittest.TestCase):
@@ -36,6 +43,90 @@ class RendererPythonTests(unittest.TestCase):
         # only inside the system interpreter, and `sys.executable` -- Murmly's
         # own, `uv`-managed -- has never had them.
         self.assertEqual(Path("/usr/bin/python3"), GTK4_RENDERER_PYTHON)
+
+    def test_windows_needs_the_projects_own_interpreter(self) -> None:
+        # Task 10: PySide6 is a wheel, so its renderer runs under the same
+        # interpreter Murmly's own daemon is already running under, never the
+        # system one the GTK4 renderer needs.
+        self.assertEqual(Path(sys.executable), renderer_python(OverlayBackend.WINDOWS))
+
+
+class RendererScriptTests(unittest.TestCase):
+    """Task 10.1: `OverlayController` launches a different script per backend."""
+
+    def test_gtk4_backends_launch_the_gtk4_script(self) -> None:
+        self.assertEqual(GTK4_RENDERER_SCRIPT_NAME, renderer_script(OverlayBackend.X11).name)
+        self.assertEqual(GTK4_RENDERER_SCRIPT_NAME, renderer_script(OverlayBackend.WAYLAND).name)
+
+    def test_windows_launches_the_qt_script(self) -> None:
+        self.assertEqual(QT_RENDERER_SCRIPT_NAME, renderer_script(OverlayBackend.WINDOWS).name)
+
+    def test_both_scripts_live_beside_this_module(self) -> None:
+        from murmly import overlay as overlay_module
+
+        directory = Path(overlay_module.__file__).parent
+        self.assertEqual(directory, renderer_script(OverlayBackend.X11).parent)
+        self.assertEqual(directory, renderer_script(OverlayBackend.WINDOWS).parent)
+
+
+class OverlayBackendForProfileTests(unittest.TestCase):
+    """Task 10.1: Windows always gets the Qt backend, independent of the
+    Linux-only desktop/session fields `detect_overlay_backend` otherwise
+    gates on -- and independent of `env=`, which cannot steer
+    `PlatformProfile.operating_system` (that comes from `sys.platform`), so
+    the Windows branch is exercised by constructing a profile directly.
+    """
+
+    def test_windows_selects_the_windows_backend_regardless_of_desktop_fields(self) -> None:
+        profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        self.assertEqual(OverlayBackend.WINDOWS, overlay_backend_for_profile(profile))
+
+        # Even a profile carrying Linux-shaped fields (which a real Windows
+        # profile never would) still answers Windows: the OS check comes
+        # first, before the desktop/session gate GTK4 uses.
+        odd_profile = PlatformProfile(
+            operating_system=OperatingSystem.WINDOWS,
+            architecture="x86_64",
+            desktop=Desktop.OTHER,
+            session_type="x11",
+        )
+        self.assertEqual(OverlayBackend.WINDOWS, overlay_backend_for_profile(odd_profile))
+
+    def test_macos_and_unsupported_platforms_have_no_backend(self) -> None:
+        self.assertIsNone(overlay_backend_for_profile(PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")))
+        self.assertIsNone(overlay_backend_for_profile(PlatformProfile(operating_system=OperatingSystem.OTHER, architecture="x86_64")))
+
+
+class RendererEnvironmentWindowsTests(unittest.TestCase):
+    """Task 10: the Qt renderer's environment is built from Windows
+    vocabulary, not the GTK4/XDG one -- and carries `SYSTEMROOT`, without
+    which Winsock (and Qt through it) fails to initialize."""
+
+    def test_only_windows_keys_pass_through(self) -> None:
+        source = {
+            "SYSTEMROOT": r"C:\Windows",
+            "TEMP": r"C:\Users\person\AppData\Local\Temp",
+            "USERPROFILE": r"C:\Users\person",
+            "PATH": r"C:\Windows\System32",
+            # Linux-only vocabulary the Qt renderer has no use for; must not
+            # leak through, and must not gain the GTK-specific keys either.
+            "WAYLAND_DISPLAY": "wayland-0",
+            "DISPLAY": ":0",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+        }
+
+        environment = renderer_environment(OverlayBackend.WINDOWS, source)
+
+        self.assertEqual(set(WINDOWS_RENDERER_ENVIRONMENT_KEYS) & set(source), set(environment))
+        self.assertNotIn("WAYLAND_DISPLAY", environment)
+        self.assertNotIn("DISPLAY", environment)
+        self.assertNotIn("XDG_RUNTIME_DIR", environment)
+        self.assertNotIn("GDK_BACKEND", environment)
+        self.assertNotIn("PYTHONNOUSERSITE", environment)
+        self.assertEqual(r"C:\Windows", environment["SYSTEMROOT"])
+
+    def test_missing_keys_are_simply_absent_not_empty(self) -> None:
+        self.assertEqual({}, renderer_environment(OverlayBackend.WINDOWS, {}))
 
 
 class FakeSocket:
@@ -81,6 +172,37 @@ class FakeProcess:
 
     def kill(self) -> None:
         self.return_code = -9
+
+
+class FakeShareableSocket(FakeSocket):
+    """`FakeSocket` plus `socket.socket.share`'s Windows-only shape."""
+
+    def __init__(self, descriptor: int) -> None:
+        super().__init__(descriptor)
+        self.shared_for_pid: int | None = None
+
+    def share(self, process_id: int) -> bytes:
+        self.shared_for_pid = process_id
+        return f"share-data-for-{process_id}".encode()
+
+
+class FakeStdin:
+    def __init__(self) -> None:
+        self.written = b""
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.written += data
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeWindowsProcess(FakeProcess):
+    def __init__(self, pid: int) -> None:
+        super().__init__()
+        self.pid = pid
+        self.stdin = FakeStdin()
 
 
 class OverlayTests(unittest.TestCase):
@@ -517,6 +639,76 @@ class OverlayTests(unittest.TestCase):
 
         self.assertIn({"type": "shutdown"}, [json.loads(message) for message in parent.messages])
         self.assertTrue(parent.closed)
+
+    def test_windows_backend_shares_the_socket_over_stdin_instead_of_pass_fds(self) -> None:
+        """Task 10.1: the Windows launch seam. `pass_fds` is POSIX-only and a
+        `socket.socketpair()` socket has no fd a Windows child could inherit
+        that way regardless, so the child gets a `str()` command line, no
+        `--fd`, and its half of the pair over a piped stdin instead --
+        `OverlayController._spawn_windows_renderer`'s own docstring records
+        what only a real Windows machine can still confirm about this."""
+        parent = FakeSocket(10)
+        child = FakeShareableSocket(11)
+        process = FakeWindowsProcess(pid=4_242)
+        launches: list[tuple[list[str], dict[str, object]]] = []
+
+        def popen(command: list[str], **kwargs: object) -> FakeWindowsProcess:
+            launches.append((command, kwargs))
+            return process
+
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.WINDOWS,
+            helper_path=Path("/tmp/renderer_qt.py"),
+            popen_factory=popen,
+            socket_pair_factory=lambda: (parent, child),
+            autostart=False,
+        )
+        controller.start()
+        self.addCleanup(controller.close)
+        self._wait_for(lambda: bool(launches))
+
+        command, kwargs = launches[0]
+        # `str()`, not `.as_posix()`: on a real Windows host this command
+        # line is rendered by a `WindowsPath`, and `.as_posix()` would force
+        # forward slashes a real launch never produces there.
+        self.assertEqual(str(Path(sys.executable)), command[0])
+        self.assertEqual(str(Path("/tmp/renderer_qt.py").resolve()), command[1])
+        self.assertIn("--fd-share-stdin", command)
+        self.assertNotIn("--fd", command)
+        self.assertNotIn("pass_fds", kwargs)
+
+        self._wait_for(lambda: process.stdin.closed)
+        self.assertEqual(4_242, child.shared_for_pid)
+        self.assertEqual(b"share-data-for-4242", process.stdin.written)
+        self.assertTrue(controller.health.available)
+
+    def test_windows_launch_environment_has_no_gtk_vocabulary(self) -> None:
+        parent = FakeSocket(12)
+        child = FakeShareableSocket(13)
+        process = FakeWindowsProcess(pid=7)
+        launches: list[dict[str, object]] = []
+
+        def popen(command: list[str], **kwargs: object) -> FakeWindowsProcess:
+            del command
+            launches.append(kwargs)
+            return process
+
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.WINDOWS,
+            helper_path=Path("/tmp/renderer_qt.py"),
+            popen_factory=popen,
+            socket_pair_factory=lambda: (parent, child),
+        )
+        self.addCleanup(controller.close)
+        self._wait_for(lambda: bool(launches))
+
+        environment = launches[0]["env"]
+        self.assertNotIn("GDK_BACKEND", environment)
+        self.assertNotIn("PYTHONNOUSERSITE", environment)
 
     def _wait_for(self, condition: callable, timeout: float = 1.0) -> None:
         deadline = time.monotonic() + timeout

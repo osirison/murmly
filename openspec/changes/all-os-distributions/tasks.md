@@ -87,20 +87,20 @@ shippable on their own. See `design.md` — Migration Plan.
 ## 10. Windows: overlay
 
 - [ ] 10.1 Add a Qt renderer speaking the existing newline-delimited JSON protocol over the socketpair, so the daemon does not learn which renderer it started
-- [ ] 10.2 Add PySide6 to `pyproject.toml` behind the platform markers for the platforms whose renderer needs it
+- [x] 10.2 Add PySide6 to `pyproject.toml` behind the platform markers for the platforms whose renderer needs it
 - [ ] 10.3 Set `Qt.WindowTransparentForInput` and `Qt.WindowDoesNotAcceptFocus`, and apply `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` to the native `HWND` through `SetWindowLongPtr`
-- [ ] 10.4 Reproduce every visual state, dimension and lifecycle transition the GTK4 renderer presents, from a single enumeration both read
-- [ ] 10.5 Present nothing, and report which property could not be provided, where the platform cannot give a surface that is above ordinary windows, takes no focus, and intercepts no pointer input
+- [x] 10.4 Reproduce every visual state, dimension and lifecycle transition the GTK4 renderer presents, from a single enumeration both read
+- [x] 10.5 Present nothing, and report which property could not be provided, where the platform cannot give a surface that is above ordinary windows, takes no focus, and intercepts no pointer input
 
 ## 11. Windows: runtime and packaging
 
 - [ ] 11.1 Load the CUDA libraries with `os.add_dll_directory` over each `nvidia/*/bin` wheel directory before the runtime is imported — Windows has no `RTLD_GLOBAL`, and since Python 3.8 it does not search `PATH` for an extension module's DLL dependencies
-- [ ] 11.2 Add `sys_platform != 'darwin'` to every `nvidia-*-cu12` requirement in the `cuda` extra: all six publish `win_amd64` and none publishes any macOS wheel, so resolving the extra on macOS fails outright
-- [ ] 11.3 Spike whether the bundled `espeakng-loader` Windows wheel carries the same compiled-in data-path defect confirmed on Linux, and whether `ESPEAK_DATA_PATH` overrides it where `EspeakWrapper.set_data_path()` does not
+- [x] 11.2 Add `sys_platform != 'darwin'` to every `nvidia-*-cu12` requirement in the `cuda` extra: all six publish `win_amd64` and none publishes any macOS wheel, so resolving the extra on macOS fails outright
+- [x] 11.3 Spike whether the bundled `espeakng-loader` Windows wheel carries the same compiled-in data-path defect confirmed on Linux, and whether `ESPEAK_DATA_PATH` overrides it where `EspeakWrapper.set_data_path()` does not
 - [ ] 11.4 If it does carry the defect, resolve a Windows espeak-ng install and name it in the remedy through the existing "runtime absent" reporting path; if it does not, use the bundled library
 - [ ] 11.5 Check long-path support before syncing and name it, since `uv sync` otherwise fails with "the system cannot find the path specified" and never mentions path length
 - [ ] 11.6 Check Developer Mode and warn that the model cache will be stored as full copies without it, doubling 1.6 GB on disk, because `huggingface_hub`'s cache uses symlinks
-- [ ] 11.7 Confirm PortAudio is bundled in the `sounddevice` wheel and that the default host APIs — MME, DirectSound, WDM/KS, WASAPI — are enough, leaving ASIO to its `SD_ENABLE_ASIO` opt-in
+- [x] 11.7 Confirm PortAudio is bundled in the `sounddevice` wheel and that the default host APIs — MME, DirectSound, WDM/KS, WASAPI — are enough, leaving ASIO to its `SD_ENABLE_ASIO` opt-in
 
 ## 12. macOS: microphone access, before anything else
 
@@ -169,7 +169,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [ ] 18.11 Test that `SendInput` and `CGEventPost` are treated as unconfirmable: the transcript stays on the clipboard and the previous contents are not restored over it
 - [ ] 18.12 Test that an injection method whose permission is ungranted is reported as not permitted, distinctly from absent and from installed-but-unusable, and is not reported as available
 - [x] 18.13 Test that a permission whose state cannot be read is reported as undetermined rather than granted
-- [ ] 18.14 Test that both overlay renderers handle the same protocol messages and present the same enumerated states, without a display
+- [x] 18.14 Test that both overlay renderers handle the same protocol messages and present the same enumerated states, without a display
 - [ ] 18.15 Test that the overlay is not presented, and the missing property named, where the platform cannot give a surface that takes no focus and intercepts no pointer input
 - [x] 18.16 Test that releasing a model reports system memory as not returned where the allocator cannot be asked, and still drops the model on schedule
 - [x] 18.17 Test that the diagnostics report carries the same field names on every platform, with an unserviceable concern reported unavailable rather than absent

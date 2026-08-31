@@ -21,15 +21,41 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# All six `nvidia-*-cu12` packages publish `win_amd64` wheels -- confirmed
+# per-package in task 11's report -- so CUDA transcription and synthesis are
+# available on Windows too, through `stt.py`'s own `os.add_dll_directory`
+# mechanism rather than the `RTLD_GLOBAL` one these wheels' Linux builds use.
+# None of the six publishes any macOS wheel, of either architecture, so
+# resolving this extra on macOS fails outright with a build error naming a
+# package rather than the situation -- `sys_platform != 'darwin'` on every
+# requirement is what keeps that resolution failure from happening at all.
+# Task 15's own macOS spike, not this one, is what decides whether macOS
+# needs an entry here of its own (`design.md`: CTranslate2 has no GPU backend
+# on macOS regardless).
 cuda = [
-    "nvidia-cublas-cu12>=12,<13",
-    "nvidia-cudnn-cu12>=9,<10",
+    "nvidia-cublas-cu12>=12,<13 ; sys_platform != 'darwin'",
+    "nvidia-cudnn-cu12>=9,<10 ; sys_platform != 'darwin'",
     # The ONNX synthesis provider links four libraries CTranslate2 does not, and
     # reports a missing one as a warning before running on the CPU.
-    "nvidia-cuda-runtime-cu12>=12,<13",
-    "nvidia-cufft-cu12>=11,<12",
-    "nvidia-curand-cu12>=10,<11",
-    "nvidia-nvjitlink-cu12>=12,<13",
+    "nvidia-cuda-runtime-cu12>=12,<13 ; sys_platform != 'darwin'",
+    "nvidia-cufft-cu12>=11,<12 ; sys_platform != 'darwin'",
+    "nvidia-curand-cu12>=10,<11 ; sys_platform != 'darwin'",
+    "nvidia-nvjitlink-cu12>=12,<13 ; sys_platform != 'darwin'",
+]
+
+# The Windows overlay renderer's toolkit (task 10.2). An extra, not a default
+# dependency the way `pywin32` is: the overlay already degrades to
+# `NullOverlayController` when its backend has no usable mechanism -- the
+# same thing that happens today on every non-Plasma Linux desktop -- so
+# nothing about starting Murmly or serving a command needs it. PySide6 is a
+# large wheel; marking it `sys_platform == 'win32'` on a *default*
+# dependency, the way `pywin32` is marked, would still put it in every
+# Windows install and CI run whether or not the overlay is wanted, and macOS
+# is not marked in at all -- its own overlay (section 15) is an open spike,
+# not a shipped renderer, so nothing here should resolve for it yet. Installed
+# with `uv sync --extra overlay` on Windows.
+overlay = [
+    "PySide6>=6.7,<7 ; sys_platform == 'win32'",
 ]
 
 # Speech output on the CPU. Also needs espeak-ng from the distribution, and the

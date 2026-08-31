@@ -346,15 +346,45 @@ the machine against this table before it syncs and refuses with the reason, and
 from elsewhere. The runtime check the spec requires is the second line of defence,
 not the first.
 
-### espeak-ng: keep preferring the platform's, and spike the bundled wheel
+### espeak-ng: keep preferring the platform's on Linux and macOS, use the bundled wheel on Windows
 
 `resolve_espeak()` finds the system library with `ctypes.util.find_library`, its
 real path by reading `/proc/self/maps`, and its data directory by parsing
-`espeak-ng --version` (`src/murmly/tts.py:104-159`). It deliberately avoids the
-bundled `espeakng-loader` wheel because that wheel's library has its data directory
-compiled in as the path on the machine that built it, ignores
-`EspeakWrapper.set_data_path()`, and fails by printing to stderr and returning no
-audio — recorded in `docs/agent-notes/espeakng-loader-data-path.md`.
+`espeak-ng --version` (`src/murmly/tts.py:104-159`). On Linux and macOS it
+deliberately avoids the bundled `espeakng-loader` wheel because that wheel's
+library has its data directory compiled in as the path on the machine that
+built it and fails by printing to stderr and returning no audio when nothing
+tells it otherwise — recorded in
+`docs/agent-notes/espeakng-loader-data-path.md`.
+
+That note originally also claimed `EspeakWrapper.set_data_path()` does not
+override the compiled-in path. **That claim was wrong**, corrected in task
+11's spike (11.3): `set_data_path()`, called before the first `EspeakWrapper`
+is constructed, does override it, traced to source
+(`phonemizer/backend/espeak/api.py`) forwarding the path straight into
+`espeak_Initialize`'s `path` argument, which falls back to the compiled-in
+directory only when that argument is NULL. `resolve_espeak()` always builds an
+explicit `EspeakConfig(lib_path=, data_path=)`, which keeps that argument
+non-NULL — so nothing here was ever exposed to the defect this correction is
+about. The Linux and macOS preference for the system package is unaffected by
+the correction and stays exactly as decided above: it is not what the defect
+turned out to be about.
+
+Windows is where the correction changes something. Unpacking the real
+`win_amd64` wheel found the identical compiled-in-path defect in its
+`espeak-ng.dll` (a `D:/a/espeakng-loader/...` build-machine path in the
+binary's string table, alongside `ESPEAK_DATA_PATH`, `getenv`, and the format
+string `%s/espeak-ng-data` — the same cluster of strings the Linux `.so`
+carries, from the same upstream C source) — but since the defect is a NULL-path
+fallback rather than an unconditional override refusal, and `resolve_espeak()`
+never leaves that argument NULL, the bundled wheel is safe to use on Windows
+specifically. Windows has no espeak-ng package-manager route the way Linux and
+Homebrew do, so `_resolve_bundled_espeak` (task 11.4) resolves
+`espeakng_loader.get_library_path()`/`get_data_path()` directly rather than
+hunting a system install that would have needed the espeak-ng installer or a
+winget package named as its own remedy. Not run on a real Windows machine —
+the DLL was inspected, not executed; the override mechanism was executed, on
+Linux, against the identical upstream source.
 
 `/proc/self/maps` is Linux-only and has to go regardless; `dlinfo`, already in the
 lock as a transitive dependency, answers the same question on Linux and macOS.
@@ -374,15 +404,19 @@ test may have patched `ctypes.util.find_library` underneath. That is a real
 constraint on where the import goes, and it is why the import is made eagerly
 under a platform guard rather than on first use.
 
-The larger question is whether the bundled wheel can be made to work through
-espeak-ng's `ESPEAK_DATA_PATH` environment variable, which the library reads when
-its caller passes no path. If it can, speech output needs no system package on any
-platform and the whole class of "install espeak-ng from your distribution" remedies
-disappears. That is a spike, not an assumption. Until it resolves, the fallback is
-what Linux does today, per platform: the distribution package, Homebrew on macOS,
-and the espeak-ng installer or winget package on Windows — reported by `doctor`
-through the existing "runtime absent, here is what to install" path, which already
-handles it.
+The larger question this design originally posed was whether the bundled wheel
+could be made to work through espeak-ng's `ESPEAK_DATA_PATH` environment
+variable, on the premise that `set_data_path()` could not. Resolved above: it
+already works, through `set_data_path()` itself, on whichever platform
+`resolve_espeak()` chooses to try the bundled wheel — Windows now, per the
+correction above. `ESPEAK_DATA_PATH` was also confirmed as a second, equally
+working path (the C library's own `getenv` fallback, ahead of Python
+entirely), but nothing in this codebase needs it: `resolve_espeak()` already
+had the call shape the override needs, for a reason that predates this
+question. Linux and macOS keep naming their own remedy when the system
+package is absent — the distribution package on Linux, Homebrew on macOS —
+reported by `doctor` through the existing "runtime absent, here is what to
+install" path, which already handles it.
 
 ### Installation: `murmly install` grows, `setup.sh` shrinks to a bootstrap
 
@@ -526,16 +560,25 @@ registry entries: no other platform's path runs through them.
 
 ## Open Questions
 
-- **Does the bundled `espeakng-loader` library carry the same compiled-in data-path
-  defect on Windows and macOS that it carries on Linux?** The defect is confirmed
-  only on Fedora. If the Windows and macOS wheels are sound — or if
-  `ESPEAK_DATA_PATH` overrides the compiled-in path where
-  `EspeakWrapper.set_data_path()` does not — speech output needs no system package
-  on those platforms and possibly on none. If not, each platform names its own
-  espeak-ng install: Homebrew on macOS, and on Windows the espeak-ng installer,
-  which has no standard package-manager route. Deferrable: the spec requires only
-  that an absent runtime is reported with what to install, and every answer
-  satisfies it. The spike is a task in phases 2 and 3.
+The Windows half of the espeak-ng question below is resolved rather than open,
+by task 11's spike (11.3); the macOS half is still open, a task in phase 3.
+
+- ~~**Does the bundled `espeakng-loader` library carry the same compiled-in
+  data-path defect on Windows and macOS that it carries on Linux?**~~ **Windows:
+  resolved.** The defect is confirmed on the real `win_amd64` wheel (its
+  `espeak-ng.dll` carries the identical compiled-in build-machine path, found by
+  unpacking the wheel and reading the binary's string table directly) — but the
+  premise that `EspeakWrapper.set_data_path()` cannot override it was itself
+  false, confirmed by executing the identical upstream C source through the
+  Linux wheel already in this environment (`docs/agent-notes/espeakng-loader-data-path.md`
+  has the evidence). `resolve_espeak()`'s existing call shape never leaves the
+  override unset, so Windows uses the bundled wheel directly
+  (`_resolve_bundled_espeak`) rather than naming an espeak-ng install with no
+  standard package-manager route. **macOS: still open.** Its wheel has not been
+  inspected, and section 15's own spike is where that happens; Homebrew remains
+  the fallback named until then. Deferrable there for the same reason it always
+  was: the spec requires only that an absent runtime is reported with what to
+  install, and either answer satisfies it.
 
 The question about `nvidia-*-cu12` wheels on Windows is resolved rather than open:
 all six publish `win_amd64`, none publishes any macOS wheel. It is recorded under

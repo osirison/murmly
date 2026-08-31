@@ -27,6 +27,7 @@ from murmly.platform import (
     resolve_platform,
 )
 from murmly.stt import (
+    CTRANSLATE2_CUDA_DLL_DIRECTORIES,
     CTRANSLATE2_CUDA_LIBRARIES,
     cuda_device_count_available,
     load_cuda_libraries,
@@ -74,6 +75,16 @@ ONNX_CUDA_LIBRARIES = CTRANSLATE2_CUDA_LIBRARIES + (
     ("nvidia-cufft-cu12", "nvidia/cufft/lib/libcufft.so.11"),
     ("nvidia-curand-cu12", "nvidia/curand/lib/libcurand.so.10"),
     ("nvidia-nvjitlink-cu12", "nvidia/nvjitlink/lib/libnvJitLink.so.12"),
+)
+# Windows' counterpart, read from each package's real `win_amd64` wheel
+# contents (task 11.1's report has the full listing) rather than translated
+# from the tuple above -- the directory name and the DLL names inside it are
+# both different from the `.so` world, not only the extension.
+ONNX_CUDA_DLL_DIRECTORIES = CTRANSLATE2_CUDA_DLL_DIRECTORIES + (
+    ("nvidia-cuda-runtime-cu12", "nvidia/cuda_runtime/bin"),
+    ("nvidia-cufft-cu12", "nvidia/cufft/bin"),
+    ("nvidia-curand-cu12", "nvidia/curand/bin"),
+    ("nvidia-nvjitlink-cu12", "nvidia/nvjitlink/bin"),
 )
 CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
@@ -130,36 +141,91 @@ def split_sentences(text: str) -> list[str]:
 def _espeak_library_name(profile: PlatformProfile) -> str | None:
     """The name to ask the loader for, resolved for `profile`.
 
+    Windows has no branch here: `resolve_espeak` never reaches this function
+    for it, see that docstring for why.
+
     `ctypes.util.find_library` turns a bare package name into a platform's own
     naming convention -- but only on the platforms where its guess matches
     what espeak-ng actually ships. On Linux that guess is `libespeak-ng.so.1`,
-    which is exactly right. It is not right anywhere else: Windows' loader
-    does not add a `lib` prefix at all, so asking `find_library` for
-    `espeak-ng` there never finds `libespeak-ng.dll`; and macOS's Homebrew
-    build ships only the versioned `libespeak-ng.1.dylib`, which `find_library`
-    would also miss since it guesses the unversioned name. So only Linux (and
-    anything `resolve_platform` could not name) asks `find_library`; Windows
-    and macOS name the file `ctypes.CDLL` should try directly. A name that does
-    not exist on this machine is not a bug in this function -- `resolve_espeak`
-    turns the resulting `OSError` into the same "not found" report a `None`
-    soname already produces.
+    which is exactly right. It is not right on macOS: Homebrew's build ships
+    only the versioned `libespeak-ng.1.dylib`, which `find_library` would miss
+    since it guesses the unversioned name. So only Linux (and anything
+    `resolve_platform` could not name) asks `find_library`; macOS names the
+    file `ctypes.CDLL` should try directly. A name that does not exist on this
+    machine is not a bug in this function -- `resolve_espeak` turns the
+    resulting `OSError` into the same "not found" report a `None` soname
+    already produces.
     """
-    if profile.operating_system is OperatingSystem.WINDOWS:
-        return "libespeak-ng.dll"
     if profile.operating_system is OperatingSystem.MACOS:
         return "libespeak-ng.1.dylib"
     return ctypes.util.find_library(ESPEAK_LIBRARY_NAME)
 
 
+def _resolve_bundled_espeak() -> tuple[str, str]:
+    """Windows: `espeakng_loader`'s own bundled library, not a system install.
+
+    Reversed from every other platform on purpose. Task 11.3's spike found
+    that the bundled wheel's compiled-in data directory -- the machine that
+    built it, confirmed here by unpacking the `win_amd64` wheel and reading
+    the string table of its `espeak-ng.dll` directly, and executing the
+    identical upstream code through the Linux wheel already installed in this
+    environment -- is a *fallback*, reached only when nothing else tells the
+    library where its data lives. `EspeakAPI.__init__`
+    (`phonemizer/backend/espeak/api.py`) passes `data_path` straight into
+    `espeak_Initialize`'s `path` argument; the compiled-in directory is what
+    the C library falls back to only when that argument is NULL, which is the
+    case exactly when a caller never calls `EspeakWrapper.set_data_path()`
+    before the first `EspeakWrapper` is constructed. `resolve_espeak` always
+    builds an explicit `EspeakConfig(lib_path=, data_path=)` (see
+    `KokoroSynthesizer._construct_model`), which is precisely the call shape
+    that keeps the argument non-NULL -- so the defect this function exists to
+    route around does not fire here. See
+    `docs/agent-notes/espeakng-loader-data-path.md` for the corrected account
+    and the evidence, and design.md's Open Questions, which this answers for
+    Windows: there is no espeak-ng package-manager route on Windows the way
+    there is `dnf`/`apt`/Homebrew, so nothing is lost by using the wheel that
+    already ships in every default `speech-output` install. Not run on a real
+    Windows machine -- the DLL was inspected, not executed.
+    """
+    try:
+        import espeakng_loader
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            f"{SYNTHESIS_PACKAGE} is required for speech output, and it carries "
+            "the espeak-ng library Windows uses. Run `uv sync`; speech output "
+            "is installed by default and only `--no-group tts` leaves it out."
+        ) from error
+
+    try:
+        library_path = espeakng_loader.get_library_path()
+        data_path = espeakng_loader.get_data_path()
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"the bundled espeak-ng data is missing or corrupt: {error}. "
+            "Reinstall speech output with `uv sync --reinstall`."
+        ) from error
+
+    try:
+        handle = ctypes.CDLL(library_path)
+    except OSError as error:
+        raise RuntimeError(f"espeak-ng ({library_path}) could not be loaded: {error}") from error
+    del handle
+    return library_path, data_path
+
+
 def resolve_espeak(profile: PlatformProfile | None = None) -> tuple[str, str]:
     """The phoneme library and its data directory, or why they cannot be found.
 
-    Neither path is written down here. The wheel that bundles espeak-ng compiles
-    its data directory in as the machine that built it and ignores every attempt
-    to override it, so the system install is the one that works -- but naming
-    `/usr/lib64` would only move the problem to the next distribution.
+    Every platform but Windows leaves the path unwritten here and finds the
+    system install instead: the wheel that bundles espeak-ng compiles its
+    data directory in as the machine that built it, and a caller that never
+    tells it otherwise gets that machine's path back. Windows is the
+    exception -- `_resolve_bundled_espeak`'s docstring has the reasoning and
+    the evidence for why the bundled wheel is safe to use there specifically.
     """
     resolved = profile if profile is not None else resolve_platform()
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        return _resolve_bundled_espeak()
     soname = _espeak_library_name(resolved)
     if soname is None:
         raise RuntimeError(
@@ -296,7 +362,7 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         return [CPU_PROVIDER]
 
     try:
-        cuda_ready = load_cuda_libraries(ONNX_CUDA_LIBRARIES)
+        cuda_ready = load_cuda_libraries(ONNX_CUDA_LIBRARIES, ONNX_CUDA_DLL_DIRECTORIES)
     except RuntimeError as error:
         logger.warning("Speech output falling back to the CPU: %s", error)
         return [CPU_PROVIDER]

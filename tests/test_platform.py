@@ -16,13 +16,17 @@ from murmly.integrations import WAYLAND_INJECTORS, X11_INJECTORS, choose_clipboa
 from murmly.overlay import OverlayController
 from murmly.platform import (
     BACKEND_REGISTRIES,
+    ENVIRONMENT_PRECONDITIONS,
     IN_PROCESS_HOTKEY_MECHANISMS,
     PERMISSIONS,
     RUNTIME_GAPS,
     TRANSCRIPTION_CAPABILITY,
+    WINDOWS_DEVELOPER_MODE,
+    WINDOWS_LONG_PATHS,
     BackendCandidate,
     BackendRegistry,
     Desktop,
+    EnvironmentPrecondition,
     OperatingSystem,
     Permission,
     PermissionState,
@@ -30,7 +34,10 @@ from murmly.platform import (
     RuntimeGap,
     WINDOWS_MICROPHONE_PERMISSION,
     _detected_libc,
+    _windows_developer_mode_enabled,
+    _windows_long_paths_enabled,
     _windows_microphone_permission_check,
+    environment_preconditions_for,
     hotkey_mechanism_is_in_process,
     operating_system_for,
     resolve_platform,
@@ -469,6 +476,16 @@ class BackendRegistryTests(unittest.TestCase):
         # something to install for, so `remedy` must stay empty.
         self.assertEqual((), not_plasma_choice.remedy)
 
+    def test_overlay_selects_qt_on_windows(self) -> None:
+        """Task 10.1: a Qt renderer, behind the same `OverlayController` class
+        the GTK4 candidate loads -- the daemon does not learn which renderer
+        it started."""
+        choice = BACKEND_REGISTRIES["overlay"].select(windows())
+
+        self.assertEqual("qt", choice.mechanism)
+        self.assertTrue(choice.available)
+        self.assertIs(OverlayController, choice.load())
+
     def test_speech_synthesis_selects_kokoro_on_linux_only(self) -> None:
         choice = BACKEND_REGISTRIES["speech_synthesis"].select(linux_plasma_x11())
 
@@ -681,6 +698,181 @@ class WindowsMicrophonePermissionTests(unittest.TestCase):
         permission = PERMISSIONS[WINDOWS_MICROPHONE_PERMISSION]
 
         self.assertIs(_windows_microphone_permission_check, permission.check)
+
+
+class WindowsMicrophonePermissionRuntimeIntegrationTests(unittest.TestCase):
+    """Task 9.5, against the real registry: everything above this class
+    proves the tri-state rule against an injected fake reader. This follows
+    the `WindowsPipeSecurityDescriptorIntegrationTests` pattern of skipping in
+    `setUp` on every platform but the one with the mechanism -- but unlike
+    that class's named pipe, or `RegisterHotKey`, or the clipboard, reading
+    `HKCU` needs no desktop and no session at all, so this is one of the six
+    tasks this round expects to run unconditionally on any Windows runner,
+    interactive or not.
+
+    No assertion pins a specific `PermissionState`: which one a given runner
+    reads depends on what its `ConsentStore` actually holds, which this class
+    does not control and a default Windows image may set either way (see
+    `_windows_microphone_permission_check`'s own docstring -- its "Allow at
+    both keys reads GRANTED" branch is written from documentation, not from a
+    real key, and this is the first real read of one). What is pinned is that
+    the real read returns a `PermissionState` member at all, never raises, and
+    that the two raw per-key values -- printed into the failure message so a
+    real run's actual `ConsentStore` shape lands in the CI log even when the
+    test passes -- are internally consistent with whichever state came back.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("A Windows kernel is required to read HKEY_CURRENT_USER")
+
+    def test_reads_a_permission_state_from_the_real_consent_store(self) -> None:
+        from murmly.platform import _windows_microphone_consent_values, _real_read_registry_value
+
+        raw_values = _windows_microphone_consent_values(_real_read_registry_value)
+        state = _windows_microphone_permission_check(windows())
+
+        self.assertIn(
+            state,
+            (PermissionState.GRANTED, PermissionState.DENIED, PermissionState.UNDETERMINED),
+            f"raw ConsentStore values on this runner: {raw_values!r}",
+        )
+        if any(value is None for value in raw_values):
+            # At least one key was unreadable (absent, or access refused):
+            # the spec's rule this class exists to pin is that this is never
+            # reported as a grant, whether or not the *other* key said "Deny".
+            self.assertNotEqual(PermissionState.GRANTED, state, f"raw values: {raw_values!r}")
+        elif any(value.casefold() == "deny" for value in raw_values):
+            self.assertEqual(PermissionState.DENIED, state, f"raw values: {raw_values!r}")
+        else:
+            self.assertEqual(PermissionState.GRANTED, state, f"raw values: {raw_values!r}")
+
+
+class EnvironmentPreconditionShapeTests(unittest.TestCase):
+    """Tasks 11.5, 11.6: the reporting shape, distinct from `Permission`
+    because neither precondition blocks a capability the way a denied
+    permission does -- see `EnvironmentPrecondition`'s docstring."""
+
+    def test_the_real_table_has_exactly_the_two_windows_preconditions(self) -> None:
+        self.assertEqual({"windows-long-paths", "windows-developer-mode"}, set(ENVIRONMENT_PRECONDITIONS))
+
+    def test_both_preconditions_apply_only_to_windows(self) -> None:
+        for precondition in ENVIRONMENT_PRECONDITIONS.values():
+            with self.subTest(precondition=precondition.name):
+                self.assertTrue(precondition.applies(windows()))
+                self.assertFalse(precondition.applies(linux_plasma_x11()))
+                self.assertFalse(precondition.applies(macos()))
+
+    def test_a_linux_report_grows_no_entry_for_either_precondition(self) -> None:
+        """The same rule task 9.5 established for `permissions`: a platform
+        neither precondition concerns must not gain a field for it."""
+        self.assertEqual({}, environment_preconditions_for(linux_plasma_x11()))
+
+    def test_satisfied_is_reported_without_a_remedy(self) -> None:
+        satisfied = EnvironmentPrecondition(
+            name="test-precondition",
+            description="a test precondition",
+            remedy="Settings > Test",
+            check=lambda profile: True,
+        )
+
+        report = environment_preconditions_for(windows(), {"test-precondition": satisfied})
+
+        self.assertEqual({"satisfied": True, "description": "a test precondition"}, report["test-precondition"])
+
+    def test_not_satisfied_carries_the_remedy(self) -> None:
+        not_satisfied = EnvironmentPrecondition(
+            name="test-precondition",
+            description="a test precondition",
+            remedy="Settings > Test",
+            check=lambda profile: False,
+        )
+
+        report = environment_preconditions_for(windows(), {"test-precondition": not_satisfied})
+
+        self.assertFalse(report["test-precondition"]["satisfied"])
+        self.assertEqual("Settings > Test", report["test-precondition"]["remedy"])
+
+    def test_undetermined_is_reported_with_a_remedy_rather_than_as_satisfied(self) -> None:
+        """A platform offering no way to read the setting is not evidence it
+        is fine -- the same rule `PermissionState.UNDETERMINED` enforces for
+        `permissions`, applied here to a type that has no such enum at all."""
+        cannot_tell = EnvironmentPrecondition(
+            name="test-precondition",
+            description="a test precondition",
+            remedy="Settings > Test",
+            check=lambda profile: None,
+        )
+
+        report = environment_preconditions_for(windows(), {"test-precondition": cannot_tell})
+
+        self.assertIsNone(report["test-precondition"]["satisfied"])
+        self.assertEqual("Settings > Test", report["test-precondition"]["remedy"])
+
+    def test_a_check_that_raises_is_undetermined_not_satisfied(self) -> None:
+        def _raises(profile: PlatformProfile) -> bool | None:
+            raise RuntimeError("could not read the setting")
+
+        broken = EnvironmentPrecondition(
+            name="test-precondition",
+            description="a test precondition",
+            remedy="Settings > Test",
+            check=_raises,
+        )
+
+        report = environment_preconditions_for(windows(), {"test-precondition": broken})
+
+        self.assertIsNone(report["test-precondition"]["satisfied"])
+        self.assertEqual("Settings > Test", report["test-precondition"]["remedy"])
+        self.assertIn("could not read the setting", report["test-precondition"]["detail"])
+
+
+class WindowsEnvironmentPreconditionChecksTests(unittest.TestCase):
+    """Tasks 11.5, 11.6, over the same injected-registry-reader seam
+    `_windows_microphone_permission_check` uses. The exact registry paths are
+    documented in `_windows_long_paths_enabled`/`_windows_developer_mode_enabled`'s
+    module-level comments and are unconfirmed on a real Windows machine; what
+    is proven here is the tri-state rule applied to whatever that seam
+    answers."""
+
+    def test_long_paths_enabled_reads_true(self) -> None:
+        self.assertTrue(
+            _windows_long_paths_enabled(windows(), read_registry_value=lambda key, name: "1")
+        )
+
+    def test_long_paths_disabled_reads_false(self) -> None:
+        self.assertFalse(
+            _windows_long_paths_enabled(windows(), read_registry_value=lambda key, name: "0")
+        )
+
+    def test_long_paths_unreadable_is_undetermined(self) -> None:
+        self.assertIsNone(
+            _windows_long_paths_enabled(windows(), read_registry_value=lambda key, name: None)
+        )
+
+    def test_developer_mode_enabled_reads_true(self) -> None:
+        self.assertTrue(
+            _windows_developer_mode_enabled(windows(), read_registry_value=lambda key, name: "1")
+        )
+
+    def test_developer_mode_disabled_reads_false(self) -> None:
+        self.assertFalse(
+            _windows_developer_mode_enabled(windows(), read_registry_value=lambda key, name: "0")
+        )
+
+    def test_developer_mode_unreadable_is_undetermined(self) -> None:
+        self.assertIsNone(
+            _windows_developer_mode_enabled(windows(), read_registry_value=lambda key, name: None)
+        )
+
+    def test_registered_under_the_real_table_with_their_checks_wired_in(self) -> None:
+        self.assertIs(
+            _windows_long_paths_enabled, ENVIRONMENT_PRECONDITIONS[WINDOWS_LONG_PATHS].check
+        )
+        self.assertIs(
+            _windows_developer_mode_enabled,
+            ENVIRONMENT_PRECONDITIONS[WINDOWS_DEVELOPER_MODE].check,
+        )
 
 
 class RuntimeGapTests(unittest.TestCase):

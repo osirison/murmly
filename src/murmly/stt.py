@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import ctypes
 from importlib.metadata import PackageNotFoundError, distribution
 import logging
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -11,18 +13,32 @@ import wave
 
 from murmly.config import MurmlyConfig
 from murmly.idle import return_free_heap
+from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
 
 
 logger = logging.getLogger(__name__)
 WHISPER_SAMPLE_RATE_HZ = 16_000
 
-# What CTranslate2 needs to run on CUDA. The ONNX synthesis runtime needs these
-# and four more, so `tts.py` extends this tuple rather than restating it: the
-# provenance checks below are the point, and two copies of them would drift.
+# What CTranslate2 needs to run on CUDA, on every platform but Windows. The
+# ONNX synthesis runtime needs these and four more, so `tts.py` extends this
+# tuple rather than restating it: the provenance checks below are the point,
+# and two copies of them would drift.
 CTRANSLATE2_CUDA_LIBRARIES = (
     ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublasLt.so.12"),
     ("nvidia-cublas-cu12", "nvidia/cublas/lib/libcublas.so.12"),
     ("nvidia-cudnn-cu12", "nvidia/cudnn/lib/libcudnn.so.9"),
+)
+
+# Windows' counterpart to `CTRANSLATE2_CUDA_LIBRARIES`. One entry per package
+# rather than one per file: what Windows needs registered is the whole `bin`
+# directory a package installed (task 11.1), not a specific DLL loaded by
+# name -- see `add_cuda_dll_directories`. Confirmed against each package's
+# real `win_amd64` wheel contents rather than translated from the `.so` list
+# above, which names individual files under a differently-named `lib/`
+# directory: the layout genuinely differs, not only the file extension.
+CTRANSLATE2_CUDA_DLL_DIRECTORIES = (
+    ("nvidia-cublas-cu12", "nvidia/cublas/bin"),
+    ("nvidia-cudnn-cu12", "nvidia/cudnn/bin"),
 )
 
 # What CTranslate2 4.8.1 puts on the `Whisper` object behind `WhisperModel.model`.
@@ -89,8 +105,100 @@ def trusted_library_path(distribution_name: str, relative_path: str) -> Path | N
     return library_path
 
 
-def load_cuda_libraries(libraries: tuple[tuple[str, str], ...]) -> bool:
-    """Load every named CUDA library globally, or report that one is missing."""
+def trusted_library_directory(distribution_name: str, relative_dir: str) -> Path | None:
+    """The directory of native libraries a wheel installed, or None when absent.
+
+    Windows' counterpart to `trusted_library_path`: `os.add_dll_directory`
+    (task 11.1) registers a whole search directory rather than loading one
+    named file, so what needs trusting is the directory, not a file inside it.
+
+    Ownership is checked the same way -- at least one file the wheel actually
+    installed lives under `relative_dir`, per `package.files`, rather than
+    trusting a caller-supplied path outright -- and the same symlink and
+    `sys.prefix`-containment refusals apply. The one check this drops is
+    `trusted_library_path`'s "group or other writable" bit: `os.stat` on
+    Windows synthesizes `st_mode` from the read-only file attribute alone,
+    which would refuse nearly every ordinary directory a `uv sync` produces,
+    and this function is only ever reached on Windows in the first place (see
+    `load_cuda_libraries`). Real ACL inspection is a heavier mechanism this
+    does not attempt.
+    """
+    try:
+        package = distribution(distribution_name)
+    except PackageNotFoundError:
+        return None
+
+    prefix = relative_dir.rstrip("/") + "/"
+    owns_directory = any(
+        str(file).replace("\\", "/").startswith(prefix) for file in package.files or ()
+    )
+    if not owns_directory:
+        return None
+
+    unresolved_path = Path(package.locate_file(relative_dir))
+    if unresolved_path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked CUDA runtime directory: {unresolved_path}")
+
+    try:
+        directory_path = unresolved_path.resolve(strict=True)
+        directory_path.relative_to(Path(sys.prefix).resolve(strict=True))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"CUDA runtime directory is outside the active environment: {unresolved_path}"
+        ) from error
+
+    if not directory_path.is_dir():
+        return None
+    return directory_path
+
+
+def add_cuda_dll_directories(
+    directories: tuple[tuple[str, str], ...],
+    add_dll_directory: Callable[[str], object] | None = None,
+) -> bool:
+    """Windows' counterpart to loading each library with `RTLD_GLOBAL` (task 11.1).
+
+    `RTLD_GLOBAL` is POSIX symbol visibility and has no Windows counterpart.
+    What Windows needs instead: since Python 3.8, an extension module's own
+    DLL dependencies are no longer searched for on `PATH`, so `ctranslate2`'s
+    (or `onnxruntime`'s) compiled extension cannot find `cublas64_12.dll`
+    merely because its wheel installed one next to it. `os.add_dll_directory`
+    is the replacement search path, registered once per package's `bin`
+    directory rather than library by library -- one directory covers every
+    DLL the package ships, including ones this table never names directly,
+    such as `cudnn64_9.dll`'s own eight `cudnn_*` delegate libraries.
+
+    Ordering is the entire point, matching `load_posix_cuda_libraries`: this
+    must run before whichever call actually resolves the dependency, which
+    for both `ctranslate2` and `onnxruntime` is deferred to session or device
+    construction rather than to their own Python-level `import` -- the same
+    reason `load_cuda_libraries` is called from `resolve_runtime`/
+    `resolve_providers` rather than at this module's own import time.
+
+    `add_dll_directory` takes an injected callable, defaulting to the real
+    `os.add_dll_directory`, rather than reading that name directly at every
+    call: it exists only under `sys.platform == "win32"` in the real `os`
+    module, so a direct reference would make this function's own definition
+    fail to evaluate on every other host. The default is read once the
+    function actually runs, by which point `load_cuda_libraries` has already
+    confirmed the platform, rather than at import time.
+    """
+    if add_dll_directory is None:
+        add_dll_directory = os.add_dll_directory
+    for distribution_name, relative_dir in directories:
+        directory_path = trusted_library_directory(distribution_name, relative_dir)
+        if directory_path is None:
+            return False
+        add_dll_directory(str(directory_path))
+    return True
+
+
+def load_posix_cuda_libraries(libraries: tuple[tuple[str, str], ...]) -> bool:
+    """Load every named CUDA library globally, or report that one is missing.
+
+    Every platform but Windows: `RTLD_GLOBAL` genuinely is what these need
+    there. See `add_cuda_dll_directories` for Windows' own mechanism.
+    """
     for distribution_name, relative_path in libraries:
         library_path = trusted_library_path(distribution_name, relative_path)
         if library_path is None:
@@ -102,6 +210,24 @@ def load_cuda_libraries(libraries: tuple[tuple[str, str], ...]) -> bool:
                 f"Unable to load trusted CUDA runtime library {library_path}: {error}"
             ) from error
     return True
+
+
+def load_cuda_libraries(
+    libraries: tuple[tuple[str, str], ...],
+    windows_directories: tuple[tuple[str, str], ...],
+    profile: PlatformProfile | None = None,
+) -> bool:
+    """Make the CUDA runtime this platform ships loadable, or report it is not.
+
+    A second implementation behind one name, not a translation of one: see
+    `load_posix_cuda_libraries` and `add_cuda_dll_directories` for why the two
+    mechanisms share nothing beyond the shape "here is the thing that answers
+    False when a library the caller named is missing."
+    """
+    resolved = profile if profile is not None else resolve_platform()
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        return add_cuda_dll_directories(windows_directories)
+    return load_posix_cuda_libraries(libraries)
 
 
 class FasterWhisperTranscriber:
@@ -461,8 +587,8 @@ class FasterWhisperTranscriber:
         return device, compute_type
 
     @staticmethod
-    def _load_cuda_runtime() -> bool:
-        return load_cuda_libraries(CTRANSLATE2_CUDA_LIBRARIES)
+    def _load_cuda_runtime(profile: PlatformProfile | None = None) -> bool:
+        return load_cuda_libraries(CTRANSLATE2_CUDA_LIBRARIES, CTRANSLATE2_CUDA_DLL_DIRECTORIES, profile)
 
     @staticmethod
     def _trusted_library_path(

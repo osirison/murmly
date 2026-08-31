@@ -288,6 +288,18 @@ class AvailabilityTests(unittest.TestCase):
             with (
                 patch("importlib.util.find_spec", return_value=object()),
                 patch("ctypes.util.find_library", return_value=None),
+                # An explicit Linux profile: since task 11.4, `resolve_espeak`
+                # takes a different branch on Windows that never calls
+                # `find_library` at all, resolving the real bundled
+                # `espeakng_loader` (installed here too, as a default `tts`
+                # dependency) instead -- which would make this probe succeed
+                # on a real Windows CI runner and this assertion false.
+                patch(
+                    "murmly.tts.resolve_platform",
+                    return_value=PlatformProfile(
+                        operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                    ),
+                ),
             ):
                 synthesizer = KokoroSynthesizer(make_config(temp_dir))
 
@@ -295,9 +307,15 @@ class AvailabilityTests(unittest.TestCase):
         self.assertIn("espeak-ng", synthesizer.unavailable_reason)
 
     def test_resolving_the_phoneme_library_names_what_to_install(self) -> None:
+        # An explicit Linux profile: on Windows, `resolve_espeak` takes the
+        # bundled-wheel branch (task 11.4) instead, which never calls
+        # `find_library` and would resolve the real, installed
+        # `espeakng_loader` rather than raise.
         with patch("ctypes.util.find_library", return_value=None):
             with self.assertRaises(RuntimeError) as raised:
-                resolve_espeak()
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+                )
 
         self.assertIn("espeak-ng", str(raised.exception))
 
@@ -306,6 +324,9 @@ class AvailabilityTests(unittest.TestCase):
 
         Reported here instead, because a caller that only watches for exceptions
         would see an empty result and call it success.
+
+        An explicit Linux profile for the same reason as the test above: the
+        Windows branch never calls `_espeak_data_path` at all.
         """
         with (
             patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
@@ -313,7 +334,9 @@ class AvailabilityTests(unittest.TestCase):
             patch("murmly.tts._espeak_data_path", return_value=None),
         ):
             with self.assertRaises(RuntimeError) as raised:
-                resolve_espeak()
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+                )
 
         self.assertIn("data directory", str(raised.exception))
 
@@ -394,6 +417,69 @@ class AvailabilityTests(unittest.TestCase):
 
         self.assertEqual("libespeak-ng.so.1", library_path)
         self.assertEqual("/usr/share/espeak-ng-data", data_path)
+
+    def test_windows_resolves_the_bundled_wheel_rather_than_a_system_install(self) -> None:
+        """Task 11.4: Windows has no espeak-ng package-manager route, so this
+        uses `espeakng_loader`'s own bundled library and data instead of
+        hunting a system install the way every other platform does.
+
+        Exercised against the real, installed `espeakng_loader` package
+        rather than a fake: it is a hard dependency of `kokoro-onnx`, already
+        in this environment, and its own `get_library_path()`/
+        `get_data_path()` read `platform.system()` rather than the
+        `PlatformProfile` passed in here -- so on this host they resolve to
+        its Linux build, not the `.dll` a real Windows machine would carry.
+        What this test proves is the whole mechanism around that call --
+        the import, both lookups, the `ctypes.CDLL` load, the returned tuple
+        -- for real, using the real package's own build standing in for its
+        Windows one. Which file suffix a real Windows machine resolves to is
+        the one thing this cannot confirm; see the section 11 report.
+        """
+        import espeakng_loader
+
+        library_path, data_path = resolve_espeak(
+            PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        )
+
+        self.assertEqual(espeakng_loader.get_library_path(), library_path)
+        self.assertEqual(espeakng_loader.get_data_path(), data_path)
+
+    def test_windows_without_the_bundled_loader_names_the_remedy(self) -> None:
+        """`espeakng_loader` is a hard dependency of `kokoro-onnx`, so its
+        absence here means the same thing an absent `kokoro_onnx` does
+        elsewhere in this module: run `uv sync`.
+        """
+        with injected_module("espeakng_loader", None):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+                )
+
+        self.assertIn("uv sync", str(raised.exception))
+
+    def test_windows_with_corrupt_bundled_data_names_the_remedy(self) -> None:
+        """`espeakng_loader.get_data_path()` already raises `RuntimeError`
+        when its own data directory is missing -- a broken or partial
+        install, not the compiled-in-path defect this module otherwise
+        guards against. Wrapped here into the same reinstall remedy the
+        rest of this module gives a corrupt runtime.
+        """
+        with patch("espeakng_loader.get_data_path", side_effect=RuntimeError("data path not exists")):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+                )
+
+        self.assertIn("uv sync --reinstall", str(raised.exception))
+
+    def test_windows_bundled_library_that_will_not_load_is_reported(self) -> None:
+        with patch("ctypes.CDLL", side_effect=OSError("not a valid Win32 application")):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+                )
+
+        self.assertIn("could not be loaded", str(raised.exception))
 
 
 class AvailabilityNowTests(unittest.TestCase):

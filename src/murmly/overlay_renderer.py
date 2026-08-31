@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import ctypes.util
-from dataclasses import dataclass
 import json
 import math
 import os
@@ -15,18 +14,84 @@ from typing import Any
 import warnings
 
 
-MAX_MESSAGE_BYTES = 1_024
-MIN_ERROR_DURATION_MS = 100
-MAX_ERROR_DURATION_MS = 10_000
-MAX_PARTIAL_CHARS = 200
-WINDOW_WIDTH = 156
-WINDOW_HEIGHT = 48
-MIN_TEXT_SIZE_PX = 8
-MAX_TEXT_SIZE_PX = 48
-PANEL_MAX_DISPLAY_FRACTION = 0.75
-PANEL_HORIZONTAL_PADDING = 12
-PANEL_VERTICAL_PADDING = 6
-PANEL_GAP_PX = 6
+if __package__ in (None, ""):
+    # Launched as a bare script by `OverlayController` -- `python3
+    # /path/to/overlay_renderer.py ...` -- whose only directory on `sys.path`
+    # is its own (`src/murmly/`), not `src/`. `murmly/__init__.py` does
+    # nothing but declare `__version__`, so adding `src/` to the path here
+    # costs nothing beyond making `murmly.overlay_shared` importable; nothing
+    # heavier from the `murmly` package is ever touched by this process. See
+    # `overlay_shared.py`'s module docstring for the full reasoning.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
+from murmly.overlay_shared import (
+    BACKGROUND_RGBA,
+    BAR_AMPLITUDE_HEIGHT,
+    BAR_CORNER_RADIUS,
+    BAR_MIN_HEIGHT,
+    BAR_MULTIPLIERS,
+    BAR_SPACING_X,
+    BAR_START_X,
+    BAR_WIDTH,
+    CORNER_RADIUS_PX,
+    ERROR_CIRCLE_CENTER_Y,
+    ERROR_CIRCLE_RADIUS,
+    ERROR_DOT_RADIUS,
+    ERROR_DOT_Y,
+    ERROR_LINE_WIDTH,
+    ERROR_RGB,
+    ERROR_STEM_BOTTOM_Y,
+    ERROR_STEM_TOP_Y,
+    FOREGROUND_RGB,
+    MAX_MESSAGE_BYTES,
+    MAX_PARTIAL_CHARS,
+    MAX_TEXT_SIZE_PX,
+    MICROPHONE_ACTIVE_RGB,
+    MICROPHONE_BODY_CENTER_Y,
+    MICROPHONE_BODY_LEFT_X,
+    MICROPHONE_BODY_RADIUS_INNER,
+    MICROPHONE_BODY_RADIUS_OUTER,
+    MICROPHONE_BODY_RIGHT_X,
+    MICROPHONE_CENTER_X,
+    MICROPHONE_HEAD_CENTER_Y,
+    MICROPHONE_HEAD_RADIUS,
+    MICROPHONE_INACTIVE_RGB,
+    MICROPHONE_LINE_WIDTH,
+    MICROPHONE_STEM_BOTTOM_Y,
+    MICROPHONE_STEM_TOP_Y,
+    MIN_TEXT_SIZE_PX,
+    PANEL_GAP_PX,
+    PANEL_HORIZONTAL_PADDING,
+    PANEL_VERTICAL_PADDING,
+    REDUCED_MOTION_LEVEL_INTERVAL_S,
+    REDUCED_MOTION_QUANTUM_STEPS,
+    STATIC_PROCESSING_DOT_COUNT,
+    STATIC_PROCESSING_DOT_RADIUS,
+    STATIC_PROCESSING_DOT_SPACING_X,
+    STATIC_PROCESSING_DOT_START_X,
+    STATIC_PROCESSING_DOT_Y,
+    THINKING_FRAME_INTERVAL_MS,
+    THINKING_PHASE_PER_BAR,
+    THINKING_PHASE_STEP,
+    WINDOW_HEIGHT,
+    WINDOW_WIDTH,
+    MessageParser,
+    MonitorGeometry,
+    RendererViewState,
+    RendererVisualState,
+    bottom_center_position as x11_position,
+    panel_height,
+    panel_max_width,
+    panel_position,
+    panel_width,
+    select_monitor_index,
+    truncate_to_width,
+)
+
+
 SUPPORTED_BACKENDS = {"x11", "wayland"}
 LAYER_SHELL_LIBRARY = "libgtk4-layer-shell.so.0"
 XA_ATOM = 4
@@ -70,93 +135,6 @@ class _XEvent(ctypes.Union):
     ]
 
 
-@dataclass(frozen=True, slots=True)
-class MonitorGeometry:
-    connector: str
-    x: int
-    y: int
-    width: int
-    height: int
-    scale: int = 1
-
-
-def select_monitor_index(monitors: list[MonitorGeometry]) -> int | None:
-    for index, monitor in enumerate(monitors):
-        if monitor.x <= 0 < monitor.x + monitor.width and monitor.y <= 0 < monitor.y + monitor.height:
-            return index
-    if not monitors:
-        return None
-    return min(range(len(monitors)), key=lambda index: monitors[index].connector)
-
-
-def x11_position(monitor: MonitorGeometry, bottom_margin_px: int) -> tuple[int, int]:
-    return (
-        (monitor.x + (monitor.width - WINDOW_WIDTH) // 2) * monitor.scale,
-        (monitor.y + monitor.height - WINDOW_HEIGHT - bottom_margin_px) * monitor.scale,
-    )
-
-
-def panel_height(text_size_px: int) -> int:
-    return text_size_px + 2 * PANEL_VERTICAL_PADDING
-
-
-def panel_max_width(monitor: MonitorGeometry) -> int:
-    return max(int(monitor.width * PANEL_MAX_DISPLAY_FRACTION), WINDOW_WIDTH)
-
-
-def panel_width(text_width_px: float, monitor: MonitorGeometry) -> int:
-    """Size the transcript panel to its text, bounded by the display fraction."""
-    requested = int(math.ceil(text_width_px)) + 2 * PANEL_HORIZONTAL_PADDING
-    return max(min(requested, panel_max_width(monitor)), WINDOW_WIDTH)
-
-
-def panel_position(
-    monitor: MonitorGeometry,
-    bottom_margin_px: int,
-    width: int,
-    height: int,
-) -> tuple[int, int]:
-    """Place the panel below the recording indicator without moving it.
-
-    The indicator keeps its own margin, so the panel occupies the space between
-    the indicator's bottom edge and the display edge, clamped so it never leaves
-    the screen.
-    """
-    indicator_top = monitor.y + monitor.height - WINDOW_HEIGHT - bottom_margin_px
-    indicator_bottom = indicator_top + WINDOW_HEIGHT
-    below_top = indicator_bottom + PANEL_GAP_PX
-    if below_top + height <= monitor.y + monitor.height:
-        top = below_top
-    else:
-        # No room in the margin. Sitting above the indicator keeps the panel
-        # visible and adjacent; clamping it downward instead would draw it on top
-        # of the indicator, and leaving it below would push it off the display.
-        top = max(indicator_top - PANEL_GAP_PX - height, monitor.y)
-    return (
-        (monitor.x + (monitor.width - width) // 2) * monitor.scale,
-        top * monitor.scale,
-    )
-
-
-def truncate_to_width(text: str, measure, available_px: float) -> str:
-    """Drop leading characters until the tail fits, matching the encoder's bias.
-
-    Binary searched: measuring one candidate per starting offset is quadratic
-    glyph shaping, and this runs on every draw.
-    """
-    if not text or measure(text) <= available_px:
-        return text
-    low, high = 1, len(text)
-    while low < high:
-        middle = (low + high) // 2
-        if measure("…" + text[middle:]) <= available_px:
-            high = middle
-        else:
-            low = middle + 1
-    candidate = "…" + text[low:]
-    return candidate if low < len(text) and measure(candidate) <= available_px else ""
-
-
 def x11_surface_id(gdk_x11: Any, surface: Any) -> int:
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -165,113 +143,6 @@ def x11_surface_id(gdk_x11: Any, surface: Any) -> int:
             category=DeprecationWarning,
         )
         return int(gdk_x11.X11Surface.get_xid(surface))
-
-
-def validate_message(message: object) -> dict[str, object] | None:
-    if not isinstance(message, dict):
-        return None
-    message_type = message.get("type")
-    if message_type == "state":
-        if set(message) != {"type", "value"} or message.get("value") not in {
-            "IDLE",
-            "LISTENING",
-            "THINKING",
-        }:
-            return None
-    elif message_type == "partial":
-        value = message.get("value")
-        if set(message) != {"type", "value"} or not isinstance(value, str):
-            return None
-        if len(value) > MAX_PARTIAL_CHARS:
-            return None
-    elif message_type == "level":
-        value = message.get("value")
-        if (
-            set(message) != {"type", "value"}
-            or isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or not 0.0 <= value <= 1.0
-        ):
-            return None
-    elif message_type == "error":
-        duration_ms = message.get("duration_ms")
-        if (
-            set(message) != {"type", "duration_ms"}
-            or isinstance(duration_ms, bool)
-            or not isinstance(duration_ms, int)
-            or not MIN_ERROR_DURATION_MS <= duration_ms <= MAX_ERROR_DURATION_MS
-        ):
-            return None
-    elif message_type == "shutdown":
-        if set(message) != {"type"}:
-            return None
-    else:
-        return None
-    return message
-
-
-class MessageParser:
-    def __init__(self) -> None:
-        self._buffer = bytearray()
-
-    def feed(self, data: bytes) -> list[dict[str, object]]:
-        self._buffer.extend(data)
-        messages: list[dict[str, object]] = []
-        while b"\n" in self._buffer:
-            line, _, remainder = self._buffer.partition(b"\n")
-            self._buffer = bytearray(remainder)
-            if not line or len(line) + 1 > MAX_MESSAGE_BYTES:
-                continue
-            try:
-                decoded = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            validated = validate_message(decoded)
-            if validated is not None:
-                messages.append(validated)
-        if len(self._buffer) >= MAX_MESSAGE_BYTES:
-            self._buffer.clear()
-        return messages
-
-
-@dataclass(slots=True)
-class RendererViewState:
-    state: str = "IDLE"
-    level: float = 0.0
-    partial: str = ""
-    error_generation: int = 0
-
-    @property
-    def visible(self) -> bool:
-        return self.state != "IDLE"
-
-    def apply(self, message: dict[str, object]) -> bool:
-        message_type = message["type"]
-        if message_type == "state":
-            self.state = str(message["value"])
-            if self.state != "LISTENING":
-                self.level = 0.0
-                # Partial text describes audio still being captured. Dropping it
-                # here, rather than at each call site, is what keeps it out of the
-                # processing and error presentations.
-                self.partial = ""
-            return False
-        if message_type == "level":
-            if self.state == "LISTENING":
-                self.level = float(message["value"])
-            return False
-        if message_type == "partial":
-            if self.state == "LISTENING":
-                self.partial = str(message["value"])
-            return False
-        if message_type == "error":
-            self.state = "ERROR"
-            self.level = 0.0
-            self.partial = ""
-            self.error_generation += 1
-            return False
-        return message_type == "shutdown"
 
 
 COMPOSITOR_LACKS_LAYER_SHELL = "The active Wayland compositor does not support Layer Shell."
@@ -726,7 +597,7 @@ class OverlayApplication:
             self._build_panel(application, css)
 
         threading.Thread(target=self._read_messages, name="murmly-overlay-reader", daemon=True).start()
-        self._GLib.timeout_add(33, self._animate)
+        self._GLib.timeout_add(THINKING_FRAME_INTERVAL_MS, self._animate)
 
     def _build_panel(self, application: Any, css: Any) -> None:
         height = panel_height(self._text_size_px)
@@ -775,7 +646,7 @@ class OverlayApplication:
     def _handle_message(self, message: dict[str, object]) -> bool:
         if message["type"] == "level" and self._reduced_motion:
             now = time.monotonic()
-            if now - self._last_reduced_level_at < 0.25:
+            if now - self._last_reduced_level_at < REDUCED_MOTION_LEVEL_INTERVAL_S:
                 return False
             self._last_reduced_level_at = now
 
@@ -802,7 +673,7 @@ class OverlayApplication:
     def _sync_panel(self) -> None:
         if self._panel_window is None:
             return
-        showing = bool(self._view.partial) and self._view.state == "LISTENING"
+        showing = bool(self._view.partial) and self._view.state == RendererVisualState.LISTENING
         if not showing:
             self._panel_window.set_visible(False)
             return
@@ -996,13 +867,13 @@ class OverlayApplication:
 
         background_width = float(min(panel_width(measure(text), self._panel_monitor(width)), width))
         left = (width - background_width) / 2.0
-        self._rounded_rectangle(context, left + 0.5, 0.5, background_width - 1.0, height - 1.0, 8.0)
-        context.set_source_rgba(0.07, 0.08, 0.09, 0.92)
+        self._rounded_rectangle(context, left + 0.5, 0.5, background_width - 1.0, height - 1.0, CORNER_RADIUS_PX)
+        context.set_source_rgba(*BACKGROUND_RGBA)
         context.fill()
 
         extents = context.font_extents()
         baseline = (height + extents[0] - extents[1]) / 2.0
-        context.set_source_rgb(0.9, 0.92, 0.94)
+        context.set_source_rgb(*FOREGROUND_RGB)
         context.move_to(left + PANEL_HORIZONTAL_PADDING, baseline)
         context.show_text(text)
 
@@ -1013,14 +884,14 @@ class OverlayApplication:
         self._application.quit()
 
     def _hide_error(self, generation: int) -> bool:
-        if self._view.state == "ERROR" and self._view.error_generation == generation:
-            self._view.state = "IDLE"
+        if self._view.state == RendererVisualState.ERROR and self._view.error_generation == generation:
+            self._view.state = RendererVisualState.IDLE
             self._sync_visibility()
         return False
 
     def _animate(self) -> bool:
-        if self._view.state == "THINKING" and not self._reduced_motion:
-            self._phase = (self._phase + 0.16) % (2 * math.pi)
+        if self._view.state == RendererVisualState.THINKING and not self._reduced_motion:
+            self._phase = (self._phase + THINKING_PHASE_STEP) % (2 * math.pi)
             if self._drawing_area is not None:
                 self._drawing_area.queue_draw()
         return True
@@ -1030,71 +901,73 @@ class OverlayApplication:
         context.set_source_rgba(0.0, 0.0, 0.0, 0.0)
         context.paint()
         context.set_operator(self._cairo.OPERATOR_OVER)
-        self._rounded_rectangle(context, 0.5, 0.5, width - 1.0, height - 1.0, 8.0)
-        context.set_source_rgba(0.07, 0.08, 0.09, 0.92)
+        self._rounded_rectangle(context, 0.5, 0.5, width - 1.0, height - 1.0, CORNER_RADIUS_PX)
+        context.set_source_rgba(*BACKGROUND_RGBA)
         context.fill()
 
-        if self._view.state == "ERROR":
+        if self._view.state == RendererVisualState.ERROR:
             self._draw_error(context)
             return
-        self._draw_microphone(context, active=self._view.state == "LISTENING")
-        if self._view.state == "THINKING" and self._reduced_motion:
+        self._draw_microphone(context, active=self._view.state == RendererVisualState.LISTENING)
+        if self._view.state == RendererVisualState.THINKING and self._reduced_motion:
             self._draw_static_processing(context)
         else:
             self._draw_bars(context)
 
     def _draw_microphone(self, context: Any, *, active: bool) -> None:
-        if active:
-            context.set_source_rgb(1.0, 0.27, 0.29)
-        else:
-            context.set_source_rgb(0.88, 0.9, 0.92)
-        context.set_line_width(2.2)
-        context.arc(25.0, 20.0, 5.0, math.pi, 0.0)
-        context.line_to(30.0, 23.0)
-        context.arc(25.0, 23.0, 5.0, 0.0, math.pi)
+        context.set_source_rgb(*(MICROPHONE_ACTIVE_RGB if active else MICROPHONE_INACTIVE_RGB))
+        context.set_line_width(MICROPHONE_LINE_WIDTH)
+        context.arc(MICROPHONE_CENTER_X, MICROPHONE_HEAD_CENTER_Y, MICROPHONE_HEAD_RADIUS, math.pi, 0.0)
+        context.line_to(MICROPHONE_BODY_RIGHT_X, MICROPHONE_BODY_CENTER_Y)
+        context.arc(MICROPHONE_CENTER_X, MICROPHONE_BODY_CENTER_Y, MICROPHONE_BODY_RADIUS_INNER, 0.0, math.pi)
         context.close_path()
         context.stroke()
-        context.arc(25.0, 23.0, 9.0, 0.0, math.pi)
+        context.arc(MICROPHONE_CENTER_X, MICROPHONE_BODY_CENTER_Y, MICROPHONE_BODY_RADIUS_OUTER, 0.0, math.pi)
         context.stroke()
-        context.move_to(25.0, 32.0)
-        context.line_to(25.0, 36.0)
-        context.move_to(20.0, 36.0)
-        context.line_to(30.0, 36.0)
+        context.move_to(MICROPHONE_CENTER_X, MICROPHONE_STEM_TOP_Y)
+        context.line_to(MICROPHONE_CENTER_X, MICROPHONE_STEM_BOTTOM_Y)
+        context.move_to(MICROPHONE_BODY_LEFT_X, MICROPHONE_STEM_BOTTOM_Y)
+        context.line_to(MICROPHONE_BODY_RIGHT_X, MICROPHONE_STEM_BOTTOM_Y)
         context.stroke()
 
     def _draw_bars(self, context: Any) -> None:
-        context.set_source_rgb(0.9, 0.92, 0.94)
-        multipliers = (0.5, 0.72, 0.9, 1.0, 0.82, 0.65, 0.45)
-        for index, multiplier in enumerate(multipliers):
-            if self._view.state == "THINKING":
-                amplitude = (math.sin(self._phase + index * 0.75) + 1.0) / 2.0
-            elif self._view.state == "LISTENING":
+        context.set_source_rgb(*FOREGROUND_RGB)
+        for index, multiplier in enumerate(BAR_MULTIPLIERS):
+            if self._view.state == RendererVisualState.THINKING:
+                amplitude = (math.sin(self._phase + index * THINKING_PHASE_PER_BAR) + 1.0) / 2.0
+            elif self._view.state == RendererVisualState.LISTENING:
                 amplitude = self._view.level * multiplier
             else:
                 amplitude = 0.0
-            if self._reduced_motion and self._view.state == "LISTENING":
-                amplitude = round(amplitude * 3.0) / 3.0
-            bar_height = 4.0 + amplitude * 22.0
-            x = 53.0 + index * 13.0
+            if self._reduced_motion and self._view.state == RendererVisualState.LISTENING:
+                amplitude = round(amplitude * REDUCED_MOTION_QUANTUM_STEPS) / REDUCED_MOTION_QUANTUM_STEPS
+            bar_height = BAR_MIN_HEIGHT + amplitude * BAR_AMPLITUDE_HEIGHT
+            x = BAR_START_X + index * BAR_SPACING_X
             y = (WINDOW_HEIGHT - bar_height) / 2.0
-            self._rounded_rectangle(context, x, y, 6.0, bar_height, 3.0)
+            self._rounded_rectangle(context, x, y, BAR_WIDTH, bar_height, BAR_CORNER_RADIUS)
             context.fill()
 
     def _draw_static_processing(self, context: Any) -> None:
-        context.set_source_rgb(0.9, 0.92, 0.94)
-        for index in range(3):
-            context.arc(76.0 + index * 18.0, 24.0, 3.0, 0.0, 2 * math.pi)
+        context.set_source_rgb(*FOREGROUND_RGB)
+        for index in range(STATIC_PROCESSING_DOT_COUNT):
+            context.arc(
+                STATIC_PROCESSING_DOT_START_X + index * STATIC_PROCESSING_DOT_SPACING_X,
+                STATIC_PROCESSING_DOT_Y,
+                STATIC_PROCESSING_DOT_RADIUS,
+                0.0,
+                2 * math.pi,
+            )
             context.fill()
 
     def _draw_error(self, context: Any) -> None:
-        context.set_source_rgb(1.0, 0.3, 0.3)
-        context.set_line_width(3.0)
-        context.arc(WINDOW_WIDTH / 2.0, 24.0, 12.0, 0.0, 2 * math.pi)
+        context.set_source_rgb(*ERROR_RGB)
+        context.set_line_width(ERROR_LINE_WIDTH)
+        context.arc(WINDOW_WIDTH / 2.0, ERROR_CIRCLE_CENTER_Y, ERROR_CIRCLE_RADIUS, 0.0, 2 * math.pi)
         context.stroke()
-        context.move_to(WINDOW_WIDTH / 2.0, 16.0)
-        context.line_to(WINDOW_WIDTH / 2.0, 26.0)
+        context.move_to(WINDOW_WIDTH / 2.0, ERROR_STEM_TOP_Y)
+        context.line_to(WINDOW_WIDTH / 2.0, ERROR_STEM_BOTTOM_Y)
         context.stroke()
-        context.arc(WINDOW_WIDTH / 2.0, 31.0, 1.5, 0.0, 2 * math.pi)
+        context.arc(WINDOW_WIDTH / 2.0, ERROR_DOT_Y, ERROR_DOT_RADIUS, 0.0, 2 * math.pi)
         context.fill()
 
     @staticmethod
