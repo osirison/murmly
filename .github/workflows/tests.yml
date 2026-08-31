@@ -88,6 +88,16 @@ jobs:
       - name: Run the suite
         run: uv run --no-sync python -m unittest discover -s tests
 
+      # A green run on a platform says nothing about how much of the suite that
+      # platform actually ran: a test that skips itself is not a test that
+      # passed. Windows and macOS skip more than Linux does, legitimately -- no
+      # AF_UNIX, no SO_PEERCRED, no X11 -- and the only way to tell a legitimate
+      # skip from coverage quietly lost is to be able to read the list. This
+      # prints it, per platform, in the log of the run that produced it.
+      - name: List what this platform skipped
+        if: always()
+        run: uv run --no-sync python -m unittest discover -s tests -v 2>&1 | grep -E "skipped '" || echo "nothing skipped"
+
   docs:
     name: docs
     runs-on: ubuntu-latest
