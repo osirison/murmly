@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import threading
 
 
 logger = logging.getLogger(__name__)
@@ -243,6 +244,19 @@ def _security_attributes_for_owner_only_pipe() -> object:
 #: ordinary command or streamed speech frame never spans two `ReadFile` calls
 #: worth thinking about differently from a socket's own buffering.
 PIPE_BUFFER_BYTES = 65_536
+
+#: How long `NamedPipeConnection.shutdown` waits for `FlushFileBuffers` to
+#: report that the client has read everything before giving up and skipping
+#: `DisconnectNamedPipe` (see that method's own docstring for why skipping it
+#: is the safe choice, not a shortcut). Kept small because a session's final
+#: frame is a handful of bytes already sitting in the pipe's buffer -- a
+#: client that is still reading has no real work left to do to drain it, so a
+#: generous bound would only lengthen the one case this exists to bound: a
+#: client that has stopped reading and is never going to. `daemon.py` shuts
+#: down two duplicated handles onto the same pipe instance per session, so a
+#: session that stops reading pays this bound twice -- see the same
+#: docstring.
+PIPE_FLUSH_TIMEOUT_SECONDS = 0.5
 
 
 def create_named_pipe_server(pipe_name: str, *, first_instance: bool) -> object:
@@ -659,13 +673,103 @@ class NamedPipeConnection:
             remaining = remaining[written:]
 
     def shutdown(self, _how: int) -> None:
+        """End the connection from the server side -- but only discard what
+        is safe to discard.
+
+        A UNIX socket's `shutdown(SHUT_RDWR)` leaves bytes already written
+        sitting in the kernel's own buffer for the peer to read after close;
+        `DisconnectNamedPipe` does not carry that guarantee for a named pipe
+        -- its own remarks say plainly that "any unread data in the pipe is
+        discarded" the moment it runs. `SpeechSessionConnection` (`daemon.py`)
+        writes its last frame (`EVENT_SHUTTING_DOWN`, or a refusal) and then
+        shuts the connection down right after, exactly the sequence that
+        defect bites: `sendall` already returned successfully -- the frame
+        fits easily inside `PIPE_BUFFER_BYTES` -- so nothing downstream ever
+        learns it was never actually delivered.
+
+        `FlushFileBuffers` is Microsoft's own answer: called on the server
+        end, it "does not return until the client has read all buffered data
+        from the pipe" (its own remarks, with no documented early-out for a
+        broken or disconnected pipe). That is exactly right for a client
+        still reading and exactly wrong, left unbounded, for one that has
+        stopped -- `SpeechSessionConnection.send`'s own backlog check exists
+        for precisely that client, and an unbounded flush here would turn a
+        bounded disconnect into a hang.
+
+        So the flush is bounded on its own thread, and what happens next
+        depends on whether it actually finished in time:
+
+        * Finished -- the client has read everything, so nothing is lost by
+          calling `DisconnectNamedPipe` now, and doing so forces the client
+          off immediately rather than leaving it to notice only once every
+          server handle closes (`daemon._shutdown_socket` closes both this
+          handle and the session's duplicated write handle right after this
+          call returns either way).
+        * Timed out -- the client is not currently reading (it may never
+          read again, or it may simply not have gotten to it yet), so
+          `DisconnectNamedPipe` is skipped rather than risk discarding
+          exactly the bytes this method exists to protect. `close()` is
+          still coming, and closing every server handle without ever having
+          called `DisconnectNamedPipe` on this instance does not discard
+          buffered data the way disconnecting does -- a client that has not
+          closed its own handle can still read what is left, then see the
+          same broken-pipe end-of-stream `recv` already translates, once
+          every server-side reference is gone.
+
+        `daemon._shutdown_socket` calls `shutdown` on two handles for one
+        session -- this connection and its `dup()`'d write handle -- both
+        naming the same underlying pipe instance, so a client that has
+        stopped reading pays this bound twice (once per handle) before both
+        handles are finally closed. `PIPE_FLUSH_TIMEOUT_SECONDS` is kept
+        small for exactly that reason: doubled, it is still a small, bounded
+        addition to shutdown latency, never the unbounded hang a bare flush
+        would risk.
+        """
         import pywintypes
         import win32pipe
 
-        try:
-            win32pipe.DisconnectNamedPipe(self._handle)
-        except pywintypes.error as error:
-            raise OSError(str(error)) from error
+        if self._flush_completed_within(PIPE_FLUSH_TIMEOUT_SECONDS):
+            try:
+                win32pipe.DisconnectNamedPipe(self._handle)
+            except pywintypes.error as error:
+                raise OSError(str(error)) from error
+
+    def _flush_completed_within(self, timeout_seconds: float) -> bool:
+        """Run `FlushFileBuffers` on its own thread; report whether it
+        finished inside `timeout_seconds`.
+
+        A thread of its own, not a direct call: `FlushFileBuffers` has no
+        overlapped form and no timeout parameter of its own, so bounding it
+        at all means giving up on ever joining a thread that is genuinely
+        stuck -- accepted here because it is a daemon thread, and because
+        `shutdown` calling `DisconnectNamedPipe` next (when this returns
+        `True`) or `daemon._shutdown_socket` closing every server handle
+        right after (either way) breaks the pipe shortly afterwards, which
+        is what a still-running flush is actually waiting on.
+
+        A raised `pywintypes.error` -- the pipe already broken, already
+        disconnected, or never connected at all -- is treated the same as a
+        prompt, successful flush: there is nothing left to protect, so
+        `shutdown` proceeds to `DisconnectNamedPipe` exactly as the
+        unconditional call this replaces always did.
+        """
+        import pywintypes
+        import win32file
+
+        finished = threading.Event()
+
+        def flush() -> None:
+            try:
+                win32file.FlushFileBuffers(self._handle)
+            except pywintypes.error:
+                pass
+            finally:
+                finished.set()
+
+        threading.Thread(
+            target=flush, name="murmly-pipe-flush", daemon=True
+        ).start()
+        return finished.wait(timeout_seconds)
 
     def close(self) -> None:
         import pywintypes

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -923,6 +925,8 @@ def _install_fake_win32(
     close_handle=None,
     get_current_process=None,
     duplicate_handle=None,
+    disconnect_named_pipe=None,
+    flush_file_buffers=None,
 ):
     """A minimal Win32 layer, faked at exactly the boundary `win_pipe.py`
     imports across.
@@ -960,10 +964,12 @@ def _install_fake_win32(
         WriteFile=write_file,
         AllocateReadBuffer=lambda size: bytearray(size),
         CreateFile=create_file,
+        FlushFileBuffers=flush_file_buffers or (lambda *a, **k: None),
     )
     fake_win32pipe = types.SimpleNamespace(
         ConnectNamedPipe=connect_named_pipe,
         WaitNamedPipe=wait_named_pipe,
+        DisconnectNamedPipe=disconnect_named_pipe or (lambda *a, **k: None),
     )
     fake_win32con = types.SimpleNamespace(
         GENERIC_READ=0x80000000,
@@ -1502,6 +1508,115 @@ class NamedPipeConnectionDupTests(unittest.TestCase):
         with _install_fake_win32(duplicate_handle=duplicate_handle):
             with self.assertRaises(OSError):
                 connection.dup()
+
+
+class NamedPipeConnectionShutdownTests(unittest.TestCase):
+    """`shutdown()` must never discard a frame a still-reading client would
+    otherwise get, and must never hang past its own bound for a client that
+    has stopped reading -- the two Windows-only failures task item 20
+    exists to fix (`test_shutdown_stops_speech_and_tells_the_session` and
+    `test_a_session_that_stops_reading_is_disconnected_rather_than_stalling_
+    playback` in `tests/test_speech_session.py`). `DisconnectNamedPipe`'s
+    own remarks say it discards unread data; `FlushFileBuffers`'s own remarks
+    say it does not return until the client has read everything -- so
+    whether the flush actually finished in time is what must decide whether
+    disconnecting is safe."""
+
+    def test_shutdown_disconnects_once_the_flush_completes(self) -> None:
+        """A flush that finishes promptly (a client still reading, or
+        nothing left to protect) means disconnecting cannot lose anything."""
+        from murmly.win_pipe import NamedPipeConnection
+
+        disconnect_calls = []
+
+        def disconnect_named_pipe(handle: object) -> None:
+            disconnect_calls.append(handle)
+
+        handle = object()
+        connection = NamedPipeConnection(handle)
+        with _install_fake_win32(disconnect_named_pipe=disconnect_named_pipe):
+            connection.shutdown(socket.SHUT_RDWR)
+
+        self.assertEqual([handle], disconnect_calls)
+
+    def test_shutdown_flushes_before_disconnecting(self) -> None:
+        from murmly.win_pipe import NamedPipeConnection
+
+        order = []
+
+        def flush_file_buffers(handle: object) -> None:
+            order.append("flush")
+
+        def disconnect_named_pipe(handle: object) -> None:
+            order.append("disconnect")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(
+            flush_file_buffers=flush_file_buffers, disconnect_named_pipe=disconnect_named_pipe
+        ):
+            connection.shutdown(socket.SHUT_RDWR)
+
+        self.assertEqual(["flush", "disconnect"], order)
+
+    def test_shutdown_skips_disconnect_when_the_flush_does_not_finish_in_time(
+        self,
+    ) -> None:
+        """A client that has stopped reading -- exactly what
+        `SpeechSessionConnection.send`'s own backlog check disconnects a
+        session for -- never lets `FlushFileBuffers` return. Skipping
+        `DisconnectNamedPipe` here is what keeps its buffered bytes readable
+        by anyone still holding the client handle; disconnecting anyway would
+        discard them for no reason -- the client is already gone from
+        Murmly's own point of view."""
+        from murmly.win_pipe import PIPE_FLUSH_TIMEOUT_SECONDS, NamedPipeConnection
+
+        never_returns = threading.Event()
+        disconnect_calls = []
+
+        def flush_file_buffers(handle: object) -> None:
+            never_returns.wait()  # a client that will never read this out
+
+        def disconnect_named_pipe(handle: object) -> None:
+            disconnect_calls.append(handle)
+
+        connection = NamedPipeConnection(object())
+        started = time.monotonic()
+        with _install_fake_win32(
+            flush_file_buffers=flush_file_buffers, disconnect_named_pipe=disconnect_named_pipe
+        ):
+            connection.shutdown(socket.SHUT_RDWR)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual([], disconnect_calls, "disconnect must not run over unflushed data")
+        self.assertLess(
+            elapsed,
+            PIPE_FLUSH_TIMEOUT_SECONDS + 2.0,
+            "shutdown must not hang past its own flush bound",
+        )
+        never_returns.set()  # let the leaked flush thread stop waiting
+
+    def test_shutdown_disconnects_when_the_flush_itself_fails(self) -> None:
+        """A flush that raises -- the pipe already broken or disconnected --
+        has nothing left to protect, so `shutdown` falls back to the
+        unconditional `DisconnectNamedPipe` this replaced."""
+        from murmly.win_pipe import NamedPipeConnection
+
+        disconnect_calls = []
+
+        def flush_file_buffers(handle: object) -> None:
+            raise _FakeWin32Error(232, "FlushFileBuffers", "the pipe is being closed")
+
+        def disconnect_named_pipe(handle: object) -> None:
+            disconnect_calls.append(handle)
+
+        handle = object()
+        connection = NamedPipeConnection(handle)
+        with _install_fake_win32(
+            flush_file_buffers=flush_file_buffers, disconnect_named_pipe=disconnect_named_pipe
+        ):
+            connection.shutdown(socket.SHUT_RDWR)
+
+        self.assertEqual([handle], disconnect_calls)
 
 
 class NamedPipeServerAcceptTests(unittest.TestCase):
