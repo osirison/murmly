@@ -132,10 +132,9 @@ ERROR_BROKEN_PIPE = 109  #: `ReadFile`: the peer disconnected -- a socket's zero
 ERROR_PIPE_BUSY = 231  #: `CreateFile`: every instance is taken; `WaitNamedPipe` is the retry.
 ERROR_NO_DATA = 232  #: `WriteFile`: the peer is gone -- a socket's `EPIPE`/`BrokenPipeError`.
 ERROR_PIPE_CONNECTED = 535  #: `ConnectNamedPipe`: a client connected before the call arrived. Success.
-ERROR_OPERATION_ABORTED = 995  #: `GetOverlappedResult` after `CancelIoEx`: genuinely cancelled.
+ERROR_OPERATION_ABORTED = 995  #: `GetOverlappedResult` after `CancelIo`: genuinely cancelled.
 ERROR_IO_INCOMPLETE = 996  #: `GetOverlappedResult(bWait=False)`: still pending. Not a failure.
 ERROR_IO_PENDING = 997  #: An overlapped call was queued and has not completed yet.
-ERROR_NOT_FOUND = 1168  #: `CancelIoEx`: nothing left to cancel -- it already completed.
 
 
 class NamedPipeIOError(OSError):
@@ -321,18 +320,42 @@ def _wait_for_signal(event: object, timeout_ms: int) -> int:
 
 
 def _cancel_overlapped(handle: object, overlapped: object) -> None:
-    """`CancelIoEx`, tolerating `ERROR_NOT_FOUND` (1168): "nothing to
-    cancel", meaning the operation had already completed by the time this
-    ran. Not a problem for this call either way -- the
-    `_collect_overlapped_result` call that always follows this one is what
-    reports the actual outcome, whether this cancel request did anything or
-    arrived too late to matter.
+    """`CancelIo`, not `CancelIoEx`: confirmed against `pywin32`'s own C
+    source (`win32file.i`), which wraps `CancelIo` and has no `CancelIoEx`
+    wrapper at all -- the ci3-Windows.log's 14 `AttributeError: module
+    'win32file' has no attribute 'CancelIoEx'` failures.
+
+    The two calls differ in what they can reach, not just in name:
+    `CancelIoEx` can target one specific `OVERLAPPED` from any thread;
+    `CancelIo` cancels *every* pending operation the *calling* thread has
+    outstanding on `handle`, and cannot be told about a single operation --
+    it takes only the handle, which is why `overlapped` is accepted here but
+    never passed on. That coarser scope is still exactly right at every call
+    site in this module: `NamedPipeConnection.recv`, `NamedPipeConnection.
+    sendall`, and `NamedPipeServer.accept` each issue their one overlapped
+    call and, on timeout, cancel it from inside the very same function call
+    on the very same thread -- there is never a second overlapped operation
+    outstanding on that handle, from that thread, for `CancelIo` to catch by
+    mistake. The two directions of a `SpeechSessionConnection` do not share a
+    handle to confuse this either: its duplicated write handle
+    (`NamedPipeConnection.dup`) is a distinct HANDLE value, read by the
+    session's reader thread through the original handle and written by its
+    writer thread through the duplicate, so a cancel issued by one thread on
+    its own handle can never reach an operation pending on the other.
+
+    Tolerates whatever `pywintypes.error` `CancelIo` raises -- unlike
+    `CancelIoEx`, it does not document an "already completed" failure code
+    for the no-longer-pending case (there is no specific operation to have
+    gone missing), so nothing here needs to distinguish that case from any
+    other. The `_collect_overlapped_result` call that always follows this
+    one is what reports the actual outcome regardless, whether this cancel
+    request did anything, arrived too late to matter, or failed outright.
     """
     import pywintypes
     import win32file
 
     try:
-        win32file.CancelIoEx(handle, overlapped)
+        win32file.CancelIo(handle)
     except pywintypes.error:
         pass
 
@@ -347,7 +370,7 @@ def _collect_overlapped_result(handle: object, overlapped: object) -> int:
     failure. `bWait=True` is safe at every one of this function's three call
     sites in `_run_overlapped`: two are reached only once
     `WaitForSingleObject` has already reported the event signalled or the
-    wait timed out and `CancelIoEx` was issued, and the third (`hr == 0` from
+    wait timed out and `CancelIo` was issued, and the third (`hr == 0` from
     `ReadFile`/`WriteFile`) is a completion that already happened
     synchronously. `True` costs nothing in any of those cases and guards
     against a spurious wakeup in the first one -- the same "not yet complete"
@@ -425,8 +448,8 @@ def _run_overlapped(handle: object, start, timeout_seconds: float | None) -> int
     `timeout_seconds`; `FILE_FLAG_OVERLAPPED` and this wait are what let a
     named-pipe `accept`/`recv`/`sendall` honour the same 0.2s shutdown poll
     and command timeouts the UNIX transport gets from `socket.settimeout`. A
-    timeout cancels the operation with `CancelIoEx`, but does not treat the
-    cancel itself as the outcome: `CancelIoEx` only *requests* cancellation
+    timeout cancels the operation with `CancelIo`, but does not treat the
+    cancel itself as the outcome: `CancelIo` only *requests* cancellation
     (MSDN) -- the operation may already have completed, or may complete
     anyway before the request is processed -- so `GetOverlappedResult` is
     still called, with `bWait=True`, and its result decides what actually
@@ -491,13 +514,13 @@ class NamedPipeConnection:
 
     Exposes exactly the subset of `socket.socket`'s interface `daemon.py`'s
     connection handling calls -- `settimeout`, `recv`, `sendall`, `shutdown`,
-    `close` -- and nothing else, in particular no `getsockopt`: a pipe's peer
-    identity comes from its client process token
+    `close`, `dup` -- and nothing else, in particular no `getsockopt`: a
+    pipe's peer identity comes from its client process token
     (`read_peer_identity_from_pipe`), not a socket option, so it is read
     through a separate function rather than reused through this one's
     interface. Keeping to that subset is what lets `daemon.py`'s
-    `_serve_connection`, `_read_request`, `_write_response`, and `_refuse` run
-    unmodified against either transport.
+    `_serve_connection`, `_read_request`, `_write_response`, `_refuse`, and
+    `SpeechSessionConnection` run unmodified against either transport.
     """
 
     def __init__(self, handle: object) -> None:
@@ -507,6 +530,53 @@ class NamedPipeConnection:
     @property
     def handle(self) -> object:
         return self._handle
+
+    def dup(self) -> NamedPipeConnection:
+        """A second, independently closable handle onto this same connection.
+
+        `SpeechSessionConnection` (`daemon.py`) is what needs this: one
+        handle its reader thread keeps reading on with a short poll timeout,
+        and a second, independent handle its writer thread sends on with a
+        longer send timeout and closes on its own schedule -- the same
+        reason `socket.socket.dup()` exists, and the ci3-Windows.log defect
+        this fixes (45 `AttributeError: 'NamedPipeConnection' object has no
+        attribute 'dup'`) is exactly that a duck-typed pipe connection did
+        not have it.
+
+        `DuplicateHandle` against the current process, for both the source
+        and the target, is the Win32 mechanism: it hands back a *new* HANDLE
+        value that refers to the same open pipe instance `self._handle`
+        does, the way `socket.socket.dup()`'s new file descriptor refers to
+        the same open file description as the original. Ownership follows
+        from that: the two HANDLE values are now independent references to
+        one shared kernel object, so closing either one (`CloseHandle`, in
+        `close` below) only drops that reference and leaves the other, and
+        the connection it names, open -- never closing the underlying pipe
+        instance, and never closing the original from underneath a caller
+        still reading or writing through it. `DUPLICATE_SAME_ACCESS` is
+        passed so the duplicate carries the same read/write access
+        `_open_pipe_client_handle`/`create_named_pipe_server` already
+        granted the original, rather than this function having to name it
+        again; `bInheritHandle=False` matches every other handle this module
+        creates, none of which a child process is meant to inherit.
+        """
+        import pywintypes
+        import win32api
+        import win32con
+
+        process = win32api.GetCurrentProcess()
+        try:
+            duplicated = win32api.DuplicateHandle(
+                process,
+                self._handle,
+                process,
+                0,
+                False,
+                win32con.DUPLICATE_SAME_ACCESS,
+            )
+        except pywintypes.error as error:
+            raise OSError(str(error)) from error
+        return NamedPipeConnection(duplicated)
 
     def settimeout(self, seconds: float | None) -> None:
         self._timeout_seconds = seconds

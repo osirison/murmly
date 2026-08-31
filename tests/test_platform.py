@@ -919,8 +919,10 @@ def _install_fake_win32(
     wait_named_pipe=None,
     wait_for_single_object=None,
     get_overlapped_result=None,
-    cancel_io_ex=None,
+    cancel_io=None,
     close_handle=None,
+    get_current_process=None,
+    duplicate_handle=None,
 ):
     """A minimal Win32 layer, faked at exactly the boundary `win_pipe.py`
     imports across.
@@ -952,7 +954,7 @@ def _install_fake_win32(
     )
     fake_win32file = types.SimpleNamespace(
         GetOverlappedResult=get_overlapped_result or (lambda *a, **k: 0),
-        CancelIoEx=cancel_io_ex or (lambda *a, **k: None),
+        CancelIo=cancel_io or (lambda *a, **k: None),
         CloseHandle=close_handle or (lambda *a, **k: None),
         ReadFile=read_file,
         WriteFile=write_file,
@@ -968,6 +970,11 @@ def _install_fake_win32(
         GENERIC_WRITE=0x40000000,
         OPEN_EXISTING=3,
         FILE_FLAG_OVERLAPPED=0x40000000,
+        DUPLICATE_SAME_ACCESS=2,
+    )
+    fake_win32api = types.SimpleNamespace(
+        GetCurrentProcess=get_current_process or (lambda: object()),
+        DuplicateHandle=duplicate_handle or (lambda *a, **k: object()),
     )
     return patch.dict(
         sys.modules,
@@ -977,6 +984,7 @@ def _install_fake_win32(
             "win32file": fake_win32file,
             "win32pipe": fake_win32pipe,
             "win32con": fake_win32con,
+            "win32api": fake_win32api,
         },
     )
 
@@ -1009,7 +1017,7 @@ class NamedPipeIOErrorTests(unittest.TestCase):
 class RunOverlappedTests(unittest.TestCase):
     """Task's item 1 (`GetOverlappedResult(bWait=False)` on a not-yet-complete
     operation, ci2-Windows.log's 81 `(996, 'GetOverlappedResult', ...)`
-    failures) and the `CancelIoEx`/timeout race it names as its own defect,
+    failures) and the `CancelIo`/timeout race it names as its own defect,
     against a faked Win32 layer standing in for the real one no machine
     running this suite has.
     """
@@ -1147,7 +1155,7 @@ class RunOverlappedTests(unittest.TestCase):
         def wait_for_single_object(event: object, timeout_ms: int) -> int:
             return 258  # WAIT_TIMEOUT
 
-        def cancel_io_ex(handle: object, overlapped: object) -> None:
+        def cancel_io(handle: object) -> None:
             cancelled.append(True)
 
         def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
@@ -1155,7 +1163,7 @@ class RunOverlappedTests(unittest.TestCase):
 
         with _install_fake_win32(
             wait_for_single_object=wait_for_single_object,
-            cancel_io_ex=cancel_io_ex,
+            cancel_io=cancel_io,
             get_overlapped_result=get_overlapped_result,
         ):
             with self.assertRaises(TimeoutError):
@@ -1165,7 +1173,7 @@ class RunOverlappedTests(unittest.TestCase):
 
     def test_a_timeout_that_races_a_completion_returns_the_completed_result(self) -> None:
         """The task's own "a cancel that races completion is its own
-        defect": `CancelIoEx` only requests cancellation (MSDN) -- the
+        defect": `CancelIo` only requests cancellation (MSDN) -- the
         operation may complete anyway before the request lands. When that
         happens, `GetOverlappedResult` reports the real outcome instead of
         `ERROR_OPERATION_ABORTED`, and that outcome -- not a manufactured
@@ -1189,12 +1197,16 @@ class RunOverlappedTests(unittest.TestCase):
 
         self.assertEqual(5, result)
 
-    def test_cancelioex_raising_error_not_found_is_tolerated(self) -> None:
-        """`CancelIoEx` itself can raise `ERROR_NOT_FOUND` (1168) -- nothing
-        left to cancel, the operation already completed. Not this function's
-        problem: the `GetOverlappedResult` call that always follows still
-        reports the real outcome."""
-        from murmly.win_pipe import ERROR_IO_PENDING, ERROR_NOT_FOUND, _run_overlapped
+    def test_cancelio_raising_an_error_is_tolerated(self) -> None:
+        """Unlike `CancelIoEx`, `pywin32`'s `CancelIo` wrapper is a bare
+        `BOOLAPI` (`win32file.i`: `BOOLAPI CancelIo(PyHANDLE handle);`) with
+        no operation-specific "already completed" failure code of its own to
+        single out -- so `_cancel_overlapped` tolerates whatever
+        `pywintypes.error` it raises, for whatever reason, exactly the way it
+        tolerated `CancelIoEx`'s `ERROR_NOT_FOUND` before this fix. Not this
+        function's problem either way: the `GetOverlappedResult` call that
+        always follows still reports the real outcome."""
+        from murmly.win_pipe import ERROR_IO_PENDING, _run_overlapped
 
         def start(overlapped: object) -> int:
             raise _FakeWin32Error(ERROR_IO_PENDING)
@@ -1202,20 +1214,56 @@ class RunOverlappedTests(unittest.TestCase):
         def wait_for_single_object(event: object, timeout_ms: int) -> int:
             return 258
 
-        def cancel_io_ex(handle: object, overlapped: object) -> None:
-            raise _FakeWin32Error(ERROR_NOT_FOUND, "CancelIoEx", "already done")
+        def cancel_io(handle: object) -> None:
+            raise _FakeWin32Error(6, "CancelIo", "invalid handle")
 
         def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
             return 9
 
         with _install_fake_win32(
             wait_for_single_object=wait_for_single_object,
-            cancel_io_ex=cancel_io_ex,
+            cancel_io=cancel_io,
             get_overlapped_result=get_overlapped_result,
         ):
             result = _run_overlapped(object(), start, 0.2)
 
         self.assertEqual(9, result)
+
+    def test_cancelio_is_called_with_only_the_handle(self) -> None:
+        """`CancelIo`'s C signature takes one argument -- confirmed against
+        `pywin32`'s own source for it (`win32file.i`) -- unlike `CancelIoEx`,
+        which also takes the specific `OVERLAPPED` to target. Passing the
+        `overlapped` this module still threads through `_cancel_overlapped`
+        (kept so its one call site in `_run_overlapped` needs no special
+        case) would be a `TypeError` against the real wrapper; nothing here
+        can raise that on a faked one; this test is the state-machine's own
+        proof, so a real Windows run is not the first place a wrong arity
+        would surface."""
+        from murmly.win_pipe import ERROR_IO_PENDING, _run_overlapped
+
+        cancel_calls = []
+
+        def start(overlapped: object) -> int:
+            raise _FakeWin32Error(ERROR_IO_PENDING)
+
+        def wait_for_single_object(event: object, timeout_ms: int) -> int:
+            return 258
+
+        def cancel_io(*args: object) -> None:
+            cancel_calls.append(args)
+
+        def get_overlapped_result(handle: object, overlapped: object, wait: bool) -> int:
+            return 9
+
+        handle = object()
+        with _install_fake_win32(
+            wait_for_single_object=wait_for_single_object,
+            cancel_io=cancel_io,
+            get_overlapped_result=get_overlapped_result,
+        ):
+            _run_overlapped(handle, start, 0.2)
+
+        self.assertEqual([(handle,)], cancel_calls)
 
     def test_a_genuine_synchronous_failure_is_translated_without_collecting_a_result(
         self,
@@ -1336,6 +1384,90 @@ class NamedPipeConnectionTranslationTests(unittest.TestCase):
         with _install_fake_win32(write_file=write_file):
             with self.assertRaises(NamedPipeIOError):
                 connection.sendall(b"hello")
+
+
+class NamedPipeConnectionDupTests(unittest.TestCase):
+    """Task item 1: 45 `AttributeError: 'NamedPipeConnection' object has no
+    attribute 'dup'` -- `SpeechSessionConnection` (`daemon.py`) needs a
+    second, independently closable handle onto the same connection, the way
+    `socket.socket.dup()` already gives the UNIX transport."""
+
+    def test_dup_duplicates_against_the_current_process_on_both_sides(self) -> None:
+        from murmly.win_pipe import NamedPipeConnection
+
+        process = object()
+        original_handle = object()
+        calls = []
+
+        def get_current_process() -> object:
+            return process
+
+        def duplicate_handle(*args: object) -> object:
+            calls.append(args)
+            return object()
+
+        connection = NamedPipeConnection(original_handle)
+        with _install_fake_win32(
+            get_current_process=get_current_process, duplicate_handle=duplicate_handle
+        ):
+            connection.dup()
+
+        # `(hSourceProcess, hSource, hTargetProcess, desiredAccess,
+        # bInheritHandle, options)` -- `pywin32`'s own parameter order for
+        # `DuplicateHandle` (`win32apimodule.cpp`). Both process arguments
+        # are this same process, both ends of one call, and `options`
+        # carries `DUPLICATE_SAME_ACCESS` so the duplicate needs no access
+        # mask of its own.
+        self.assertEqual([(process, original_handle, process, 0, False, 2)], calls)
+
+    def test_dup_returns_a_distinct_connection_wrapping_the_duplicated_handle(self) -> None:
+        from murmly.win_pipe import NamedPipeConnection
+
+        duplicated_handle = object()
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(duplicate_handle=lambda *a, **k: duplicated_handle):
+            duplicate = connection.dup()
+
+        self.assertIsInstance(duplicate, NamedPipeConnection)
+        self.assertIsNot(duplicate, connection)
+        self.assertIs(duplicated_handle, duplicate.handle)
+
+    def test_closing_the_duplicate_does_not_touch_the_original(self) -> None:
+        """The whole reason `dup()` exists for `SpeechSessionConnection`: a
+        writer thread that closes its own handle on its own schedule must
+        never close the handle the reader thread is still using -- proven
+        here by driving both handles' `close()` through the same faked
+        `CloseHandle` and checking only the duplicate's handle was ever
+        passed to it."""
+        from murmly.win_pipe import NamedPipeConnection
+
+        original_handle = object()
+        duplicated_handle = object()
+        closed = []
+
+        def close_handle(handle: object) -> None:
+            closed.append(handle)
+
+        connection = NamedPipeConnection(original_handle)
+        with _install_fake_win32(
+            duplicate_handle=lambda *a, **k: duplicated_handle, close_handle=close_handle
+        ):
+            duplicate = connection.dup()
+            duplicate.close()
+
+        self.assertEqual([duplicated_handle], closed)
+
+    def test_dup_translates_a_failure_into_oserror(self) -> None:
+        from murmly.win_pipe import NamedPipeConnection
+
+        def duplicate_handle(*args: object) -> object:
+            raise _FakeWin32Error(6, "DuplicateHandle", "invalid handle")
+
+        connection = NamedPipeConnection(object())
+        with _install_fake_win32(duplicate_handle=duplicate_handle):
+            with self.assertRaises(OSError):
+                connection.dup()
 
 
 class NamedPipeServerAcceptTests(unittest.TestCase):

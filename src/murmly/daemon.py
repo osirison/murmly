@@ -2090,16 +2090,20 @@ class MurmlyDaemon:
             # absent -- which is the same case it must handle for a daemon that
             # does not answer at all.
             response: dict[str, object] = {"ok": True, "state": self.state, **self._residency()}
-            # Present only where a platform holds a hotkey in-process (task
-            # 8.6/8.7, 18.10): absent on Linux, unchanged from before this
-            # field existed, since Plasma and GNOME hold their own bindings
-            # and this daemon knows nothing `status` needs to say about them
-            # beyond what `Installer.status()` already reads from the
-            # desktop directly.
-            if self._hotkey_registrar is not None:
-                held = getattr(self._hotkey_registrar, "held_purposes", None)
-                if held is not None:
-                    response["hotkeys_held"] = sorted(held())
+            # Present on every platform (platform-support's "What does not
+            # depend on the platform is identical on every platform": the
+            # command protocol's responses are the same shape everywhere,
+            # and a concern the platform cannot serve is reported as such
+            # rather than the field being silently absent). Task 8.6/8.7,
+            # 18.10's registrar reports the purposes it actually holds; where
+            # there is no in-process registrar at all -- Linux and macOS,
+            # where Plasma and GNOME hold their own bindings and this daemon
+            # holds none in-process for `status` to report -- the true
+            # answer is the empty list, not an omitted key: this daemon
+            # genuinely holds no hotkeys in-process there, which is a fact
+            # about the platform, not a value this daemon failed to produce.
+            held = getattr(self._hotkey_registrar, "held_purposes", None)
+            response["hotkeys_held"] = sorted(held()) if held is not None else []
             return response
         if command not in (COMMAND_TOGGLE, COMMAND_TOGGLE_SESSION):
             return failure_response(

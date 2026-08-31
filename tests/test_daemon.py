@@ -156,9 +156,12 @@ class FakeOverlay:
 
 
 # What `status` answers from a daemon that has done nothing yet: idle, holding no
-# transcription model, and with no synthesis residency at all, because a daemon
-# with speech output off never builds a synthesizer to hold a session.
-IDLE_STATUS = {"ok": True, "state": "IDLE", "model_resident": False}
+# transcription model, with no synthesis residency at all (a daemon with speech
+# output off never builds a synthesizer to hold a session), and holding no
+# hotkeys in-process -- present on every platform (platform-support's
+# "identical on every platform"), empty here because these tests build a
+# daemon with no in-process hotkey registrar at all.
+IDLE_STATUS = {"ok": True, "state": "IDLE", "model_resident": False, "hotkeys_held": []}
 
 
 def wait_until_served(
@@ -2377,8 +2380,12 @@ class InProcessHotkeyRegistrarWiringTests(unittest.TestCase):
 
         self.assertEqual([], response["hotkeys_held"])
 
-    def test_status_omits_hotkeys_held_with_no_registrar(self) -> None:
-        """Unchanged shape on Linux: no registrar, no key."""
+    def test_status_reports_hotkeys_held_empty_with_no_registrar(self) -> None:
+        """platform-support's "identical on every platform": the key is
+        present on Linux too, since a client written against one platform's
+        response shape must work unchanged against another's -- but empty,
+        since this daemon genuinely holds no hotkeys in-process here (Plasma
+        and GNOME hold their own bindings)."""
         with tempfile.TemporaryDirectory() as temp_dir:
             # A plain filesystem path: the profile below is pinned to Linux
             # regardless of the real host, so the channel has to match it --
@@ -2400,7 +2407,7 @@ class InProcessHotkeyRegistrarWiringTests(unittest.TestCase):
 
             response = daemon.handle_command("status")
 
-        self.assertNotIn("hotkeys_held", response)
+        self.assertEqual([], response["hotkeys_held"])
 
     def test_a_fired_hotkey_toggles_capture_through_handle_command(self) -> None:
         registrar = FakeHotkeyRegistrar()
@@ -3524,7 +3531,13 @@ class StatusResidencyTests(ServedDaemonTests):
         response = send_command(str(socket_path), "status")
 
         self.assertEqual(
-            {"ok": True, "state": "IDLE", "model_resident": True, "synthesis_resident": True},
+            {
+                "ok": True,
+                "state": "IDLE",
+                "model_resident": True,
+                "synthesis_resident": True,
+                "hotkeys_held": [],
+            },
             response,
         )
 
