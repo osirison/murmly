@@ -94,8 +94,56 @@ class _KEYBDINPUT(ctypes.Structure):
     )
 
 
+class _MOUSEINPUT(ctypes.Structure):
+    """`winuser.h`'s `MOUSEINPUT`. Never sent -- declared for its size.
+
+    It is the largest of the three members of `INPUT`'s union, so it is what
+    decides `sizeof(INPUT)`. See `_InputUnion`.
+    """
+
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    )
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    """`winuser.h`'s `HARDWAREINPUT`. Never sent -- declared for completeness."""
+
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
 class _InputUnion(ctypes.Union):
-    _fields_ = (("ki", _KEYBDINPUT),)
+    """All three members, though only `ki` is ever written.
+
+    Declaring the union with `ki` alone was the module's third real bug, and
+    the one that survived longest because it is invisible from Linux. A C
+    union is as large as its largest member, and `MOUSEINPUT` is larger than
+    `KEYBDINPUT`: on 64-bit Windows the real `sizeof(INPUT)` is 40, while a
+    `ki`-only union gives 32. `SendInput` compares the `cbSize` it is passed
+    against its own idea of the size and rejects the whole batch with
+    `ERROR_INVALID_PARAMETER` when they differ -- which is what it did,
+    accepting 0 of 4 events.
+
+    On 64-bit Linux the two sizes coincide at 40 by accident, because
+    `wintypes.DWORD` is `c_ulong`, which is 8 bytes here and 4 on Windows.
+    That is why the size has to be asserted as a relationship between these
+    classes rather than against a literal.
+    """
+
+    _fields_ = (
+        ("ki", _KEYBDINPUT),
+        ("mi", _MOUSEINPUT),
+        ("hi", _HARDWAREINPUT),
+    )
 
 
 class _INPUT(ctypes.Structure):

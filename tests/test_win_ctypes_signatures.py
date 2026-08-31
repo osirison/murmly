@@ -215,6 +215,36 @@ class ExtraInfoIsPointerSizedTests(unittest.TestCase):
         entry.ki = win_clipboard._KEYBDINPUT(wVk=1, wScan=0, dwFlags=0, time=0, dwExtraInfo=0)
         self.assertEqual(1, entry.ki.wVk)
 
+    def test_the_union_carries_every_member_winuser_h_gives_it(self) -> None:
+        """A union is as large as its largest member, and only `ki` is written.
+
+        Declaring it with `ki` alone made `sizeof(INPUT)` 32 on Windows where
+        the real size is 40, because `MOUSEINPUT` is the largest of the three
+        and it was absent. `SendInput` checks the `cbSize` it is passed
+        against its own size and rejected the batch outright:
+        `SendInput accepted 0 of 4 events; GetLastError=87`.
+
+        Asserted as a relationship rather than a byte count, because
+        `wintypes.DWORD` is `c_ulong` -- 4 bytes under MSVC, 8 on this host --
+        so every literal size differs between the machine that runs this and
+        the machine the struct is for.
+        """
+        self.assertEqual(
+            ["ki", "mi", "hi"],
+            [name for name, _type in win_clipboard._InputUnion._fields_],
+        )
+        largest = max(
+            ctypes.sizeof(member)
+            for _name, member in win_clipboard._InputUnion._fields_
+        )
+        self.assertEqual(largest, ctypes.sizeof(win_clipboard._InputUnion))
+        self.assertGreater(
+            ctypes.sizeof(win_clipboard._MOUSEINPUT),
+            ctypes.sizeof(win_clipboard._KEYBDINPUT),
+            "MOUSEINPUT is what decides sizeof(INPUT); if it stops being the "
+            "largest member this test is no longer guarding what it thinks",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
