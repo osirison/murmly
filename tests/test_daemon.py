@@ -2341,20 +2341,34 @@ class InProcessHotkeyRegistrarWiringTests(unittest.TestCase):
         self,
     ) -> None:
         """8.5's release must hold on `serve_forever`'s own error paths, not
-        only when something external calls `shutdown()`: a daemon that dies
-        from an unhandled exception while starting its channel must not leave
-        a hotkey thread holding `RegisterHotKey` bindings with nothing left to
-        release them. This machine has no `pywin32` to import, which is
-        exactly what drives `_serve_named_pipe`'s `NamedPipeServer(...)` call
-        to raise here -- a real exception from real code, not a fake standing
-        in for one."""
+        only when something external calls `shutdown()`: a daemon that fails
+        to start its channel must not leave a hotkey thread holding
+        `RegisterHotKey` bindings with nothing left to release them.
+
+        `NamedPipeServer` is patched to raise, rather than relied on to raise
+        on its own: on this machine, with no `pywin32` installed, the
+        deferred `from murmly.win_pipe import NamedPipeServer` import inside
+        `_serve_named_pipe` fails on its own -- but that is an accident of
+        this machine's dependencies, not something the test means to prove,
+        and on a real Windows host, where `pywin32` is installed, it does not
+        happen at all: `NamedPipeServer(...)` succeeds, `_accept_loop` starts
+        polling its 0.2s accept timeout, and `daemon.serve_forever()` never
+        returns -- exactly the hang `ci4-Windows.log` recorded at this line.
+        Patching the constructor is what makes the startup failure this test
+        is actually about happen deterministically, on every platform,
+        without depending on whether the real dependency is importable here.
+        """
         registrar = FakeHotkeyRegistrar()
         registrar.rebind({"window": "Meta+X"})
         with tempfile.TemporaryDirectory() as temp_dir:
             daemon = self._daemon(temp_dir, registrar)
 
-            with self.assertRaises(Exception):
-                daemon.serve_forever()
+            with patch(
+                "murmly.win_pipe.NamedPipeServer",
+                side_effect=OSError("simulated named-pipe creation failure"),
+            ):
+                with self.assertRaises(DaemonStartupError):
+                    daemon.serve_forever()
 
         self.assertTrue(registrar.stopped)
 
