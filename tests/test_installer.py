@@ -795,6 +795,19 @@ class LaunchdServiceRuntimeIntegrationTests(unittest.TestCase):
         os.chmod(script, 0o755)
         return script
 
+    @staticmethod
+    def _becomes_active(service, attempts: int = 20, interval: float = 0.5) -> bool:
+        """True once `is_active()` answers True, or False after the deadline.
+
+        A bounded wait rather than an unbounded one: a service that never
+        starts must fail this test, not hang it.
+        """
+        for _ in range(attempts):
+            if service.is_active():
+                return True
+            time.sleep(interval)
+        return False
+
     def test_install_status_stop_start_remove_against_real_launchctl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             agents_dir = Path(tmp) / "LaunchAgents"
@@ -803,7 +816,18 @@ class LaunchdServiceRuntimeIntegrationTests(unittest.TestCase):
 
             service.install(entrypoint)
 
-            self.assertTrue(service.is_active())
+            # Polled, not asserted on the first read: `launchctl bootstrap`
+            # returns once launchd has accepted the job, not once the job is
+            # running, so `state = running` appears a moment later. Asserting
+            # immediately passed on one CI runner and failed on another for
+            # that reason alone, which is a race in the test rather than
+            # anything about the service. The same shape
+            # `WindowsSchtasksIntegrationTests` already uses against
+            # `schtasks /query` for the identical reason.
+            self.assertTrue(
+                self._becomes_active(service),
+                "the agent never reported state = running",
+            )
             status = service.status()
             self.assertTrue(status.installed)
             self.assertTrue(status.active)
@@ -813,7 +837,10 @@ class LaunchdServiceRuntimeIntegrationTests(unittest.TestCase):
             self.assertFalse(service.is_active())
 
             self.assertTrue(service.start())
-            self.assertTrue(service.is_active())
+            self.assertTrue(
+                self._becomes_active(service),
+                "the agent never reported state = running after being restarted",
+            )
 
             existed = service.remove()
             self.assertTrue(existed)
