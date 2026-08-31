@@ -515,6 +515,71 @@ class AvailabilityTests(unittest.TestCase):
         self.assertIn("could not be loaded", str(raised.exception))
 
 
+class WindowsBundledEspeakRuntimeTests(unittest.TestCase):
+    """Task 11.4, closed on the one machine the claim is actually about.
+
+    `test_windows_resolves_the_bundled_wheel_rather_than_a_system_install`
+    above proves the whole `_resolve_bundled_espeak` mechanism -- the import,
+    both lookups, the `ctypes.CDLL` load, the returned tuple -- for real, but
+    its own docstring names what it cannot: it runs on this Linux machine
+    against an injected `PlatformProfile(operating_system=WINDOWS)`, so
+    `espeakng_loader`'s real, installed package resolves to *its* Linux
+    build, not the `.dll` a real Windows machine would carry. This class
+    is that test's twin, gated to the machine where `resolve_platform()`
+    genuinely answers Windows, closing the one thing the other test's own
+    docstring says it cannot confirm.
+
+    Phonemising, not full synthesis: `tests.yml`'s own comment records that
+    `kokoro-v1.0.onnx` and `voices-v1.0.bin` are absent in CI -- the ~350 MB
+    pair is never downloaded there, and every synthesis test in this module
+    injects a `FakeKokoroModel` instead of a real one. Phonemising is the
+    ceiling this runner can prove, not a lesser test of the claim: the defect
+    docs/agent-notes/espeakng-loader-data-path.md and this module's own
+    `_resolve_bundled_espeak` describe lives entirely in `EspeakWrapper.
+    set_data_path`/`espeak_Initialize`, which phonemising already exercises
+    in full -- synthesis afterward runs the ONNX model, a separate concern
+    this defect has nothing to do with.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("proves the bundled espeak-ng wheel for real, on a real Windows machine")
+
+    def test_bundled_wheel_phonemizes_without_a_system_espeak_ng(self) -> None:
+        from kokoro_onnx import EspeakConfig
+        from kokoro_onnx.tokenizer import Tokenizer
+
+        # No profile passed: `resolve_platform()` resolves this runner for
+        # real, exactly the call `KokoroSynthesizer._construct_model` makes.
+        library_path, data_path = resolve_espeak()
+
+        # The gap named above, closed: which file suffix a real Windows
+        # machine resolves to.
+        self.assertTrue(library_path.endswith(".dll"), library_path)
+
+        tokenizer = Tokenizer(EspeakConfig(lib_path=library_path, data_path=data_path))
+        phonemes = tokenizer.phonemize("hello world")
+
+        # The defect's own symptom (docs/agent-notes/espeakng-loader-data-
+        # path.md's Symptom section) is not an exception -- the library
+        # prints to stderr and returns silently, so a caller that only
+        # watches for a raise sees an empty string and calls it success.
+        # Checked for IPA marks rather than the exact string this same call
+        # produces on Linux (`həlˈoʊ wˈɜːld`,
+        # recorded in that agent note), which would pin a suprasegmental
+        # detail this test is not about and could legitimately differ by
+        # espeak-ng version.
+        self.assertTrue(phonemes, "phonemize returned nothing: the bundled data was not found")
+        self.assertTrue(
+            any(mark in phonemes for mark in ("ˈ", "ə", "ː")),
+            f"phonemize returned {phonemes!r}, which carries no IPA marks -- "
+            "suggests the compiled-in build-machine path fired instead of "
+            "the bundled data this call passed explicitly (task 11.4's "
+            "premise would then be false: see this module's docstring for "
+            "the 'name what to install' remedy this would call for instead)",
+        )
+
+
 class AvailabilityNowTests(unittest.TestCase):
     """The startup answer goes stale; this is the one asked at the declaration."""
 

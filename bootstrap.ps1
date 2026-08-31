@@ -14,11 +14,16 @@
 # "no environment yet" bootstrap `setup.sh`'s own `sync_environment` performs
 # with a plain `uv sync --locked` before it can call `murmly sync` itself).
 #
-# Not run on a real Windows machine: written against `uv`'s own documented
-# Windows install command and PowerShell's own environment-variable and
-# process-launching syntax, not exercised on a live interpreter. Report a
-# failure here in exactly the terms `docs/agent-notes/` records one, the same
-# as any other Windows-only path in this codebase not yet confirmed live.
+# Task 16.2: parsed and its argument handling exercised against a stubbed
+# `uv` in `tests/test_bootstrap_ps1.py`, on both `pwsh` and, on the Windows CI
+# runner, `powershell.exe` (5.1) besides -- which is what caught and fixed a
+# real defect here (see the comment on the `-ErrorAction Continue` below).
+# What remains unconfirmed is the one thing no CI job can stand in for: a
+# real `uv` install running for real on a real Windows machine, since that
+# is exactly the network call this file's own tests stub out rather than run.
+# Report a failure there in exactly the terms `docs/agent-notes/` records
+# one, the same as any other Windows-only path in this codebase not yet
+# confirmed on hardware.
 
 $ErrorActionPreference = "Stop"
 
@@ -46,7 +51,18 @@ function Invoke-Bootstrap {
     if (-not (Test-Uv)) {
         Install-Uv
         if (-not (Test-Uv)) {
-            Write-Error "uv installed but is still not on PATH. Open a new terminal and run:`n    uv run --project `"$RepoDir`" murmly $Arguments"
+            # -ErrorAction Continue overrides the script-wide "Stop" above for
+            # this one call: with it inherited, `Write-Error` becomes a
+            # terminating error and the `return 1` right after it never runs
+            # -- confirmed by dot-sourcing this file and calling
+            # `Invoke-Bootstrap` directly, which is exactly the composition
+            # the guard below exists for. Run as the top-level script this
+            # still happened to exit non-zero, because an uncaught terminating
+            # error at the top level is itself PowerShell's own non-zero exit
+            # -- but a caller that dot-sources this file and reads the
+            # returned code, the way the guard below's own comment describes,
+            # got an unhandled exception instead of a 1.
+            Write-Error "uv installed but is still not on PATH. Open a new terminal and run:`n    uv run --project `"$RepoDir`" murmly $Arguments" -ErrorAction Continue
             return 1
         }
     }

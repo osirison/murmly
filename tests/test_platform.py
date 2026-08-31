@@ -216,14 +216,23 @@ class PlatformProfileConstructionTests(unittest.TestCase):
     """PlatformProfile is a value tests construct directly (18.1)."""
 
     def test_a_profile_for_a_platform_this_machine_is_not_running_is_constructible(self) -> None:
+        """Windows, not macOS: this asserts a profile can be built for a
+        platform other than the one running the test, and Windows is
+        `SUPPORTED_OPERATING_SYSTEMS` while still not being this machine's
+        own -- macOS is used just below, where the point is the opposite."""
         profile = windows()
 
         self.assertEqual(OperatingSystem.WINDOWS, profile.operating_system)
-        self.assertFalse(profile.supported)
+        self.assertTrue(profile.supported)
 
     def test_supported_reports_only_the_operating_systems_murmly_claims_today(self) -> None:
+        """Windows joined `SUPPORTED_OPERATING_SYSTEMS` once phase 2's own
+        list (design.md's Migration Plan) was proven on a real Windows CI
+        runner -- tasks 11.4 and 16.2 were the last two items on it. macOS
+        stays refused: phase 3 (launchd microphone access foremost) is still
+        open, per this change's binding scope decision."""
         self.assertTrue(linux_plasma_x11().supported)
-        self.assertFalse(windows().supported)
+        self.assertTrue(windows().supported)
         self.assertFalse(macos().supported)
 
 

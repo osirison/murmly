@@ -99,7 +99,7 @@ class DaemonUnavailableError(RuntimeError):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local voice-to-text for Fedora-first Linux desktops.")
+    parser = argparse.ArgumentParser(description="Local voice-to-text for Linux and Windows desktops.")
     parser.add_argument("--config", help="Path to config.toml", default=None)
 
     subparsers = parser.add_subparsers(dest="command", required=True)

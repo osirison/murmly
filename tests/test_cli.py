@@ -88,20 +88,19 @@ class CliTests(unittest.TestCase):
         if not hasattr(os, "getuid") or not resolve_platform().supported:
             # A real subprocess running the real `python -m murmly`, so there
             # is no profile to inject the way every other test in this file
-            # injects one into `main()` in-process: on a real Windows host,
-            # `resolve_platform()` genuinely resolves Windows, which Murmly
-            # does not yet claim to support (see `test_platform.py`'s
+            # injects one into `main()` in-process: it runs under whatever
+            # `resolve_platform()` genuinely resolves for this host, checked
+            # directly rather than hardcoding a platform name. Windows joined
+            # `SUPPORTED_OPERATING_SYSTEMS` (see `test_platform.py`'s
             # `test_supported_reports_only_the_operating_systems_murmly_
-            # claims_today`), so the daemon here would exit immediately,
-            # before ever creating a socket, for reasons this test is not
-            # about. `SIGTERM` itself is also not the same signal there:
+            # claims_today`), but still has no `os.getuid`, so this still
+            # skips there -- for a different, and still valid, reason:
+            # `SIGTERM` is not the same signal there either, since
             # `Popen.send_signal` maps it to `TerminateProcess`, not a
             # catchable signal a clean-exit handler could run for. macOS has
-            # `os.getuid` and a real SIGTERM, but is not in
-            # `SUPPORTED_OPERATING_SYSTEMS` yet either, so the real,
-            # unresolved `resolve_platform()` this subprocess actually runs
-            # under is checked directly rather than hardcoding the one
-            # platform name that gap happens to be today.
+            # both `os.getuid` and a real `SIGTERM`, but is not in
+            # `SUPPORTED_OPERATING_SYSTEMS` at all, per this change's binding
+            # scope decision, so it skips on the `not .supported` half instead.
             self.skipTest("needs a real subprocess on a Murmly-supported operating system")
         with tempfile.TemporaryDirectory() as temp_dir:
             socket_path = Path(temp_dir) / "murmly.sock"
@@ -1103,11 +1102,12 @@ class SyncCommandTests(unittest.TestCase):
     def test_refuses_before_syncing_when_a_windows_precondition_fails(self) -> None:
         from murmly.cli import _run_sync
 
-        # Windows is not in `SUPPORTED_OPERATING_SYSTEMS` yet (pending the
-        # overlay-validation phase this change's scope decision names), so
-        # `refuse_before_sync`'s own unsupported-platform half is patched out
-        # here to isolate the environment-precondition refusal this test is
-        # actually about.
+        # `refuse_before_sync` is patched out wholesale -- rather than relied
+        # on to pass a Windows profile through its own unsupported-platform
+        # check for free -- so this test does not depend on whether Windows
+        # is in `SUPPORTED_OPERATING_SYSTEMS`: it isolates the
+        # environment-precondition refusal this test is actually about,
+        # regardless of that flag's current value.
         profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
         with (
             patch("murmly.environment.refuse_before_sync", return_value=None),

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Provide unobtrusive visual confirmation of Murmly's microphone capture and transcription lifecycle on KDE Plasma X11 and Wayland while preserving focused application input and core voice-to-text operation.
+Provide unobtrusive visual confirmation of Murmly's microphone capture and transcription lifecycle on every platform Murmly presents it on, while preserving focused application input and core voice-to-text operation. Where a platform cannot provide a surface that stays above ordinary windows, takes no focus, and intercepts no pointer input, Murmly presents no overlay rather than compromise those properties.
 
 ## Requirements
 

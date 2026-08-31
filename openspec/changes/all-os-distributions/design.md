@@ -580,6 +580,30 @@ phase 1 is reverting the platform layer, since every backend behind it is the co
 that is there now. Rollback for phases 2 and 3 is removing that platform's
 registry entries: no other platform's path runs through them.
 
+**Phase 2 is closed.** Every item on its own list above ran, for real, on a
+Windows CI runner: the named-pipe transport and its DACL, `RegisterHotKey`
+and its collision, Task Scheduler, the Win32 clipboard and `SendInput`, the
+focus observer, the Qt renderer, and the PowerShell bootstrap
+(`tests/test_bootstrap_ps1.py`, task 16.2 — which also caught and fixed a
+real defect in `bootstrap.ps1` itself: `Write-Error` on its "uv still not on
+PATH" branch was a terminating error under the script's own
+`$ErrorActionPreference = "Stop"`, so the `return 1` right after it never
+ran). Task 11.4 closed the one item that could still have gone the other
+way: `tests/test_tts.py`'s `WindowsBundledEspeakRuntimeTests`, gated to a
+real Windows machine, phonemises through the bundled `espeakng_loader` wheel
+with no system espeak-ng present, confirming the `.dll` suffix and the IPA
+output the Linux-injected version of this test (`test_windows_resolves_the_
+bundled_wheel_rather_than_a_system_install`) could not.
+`SUPPORTED_OPERATING_SYSTEMS` now includes `OperatingSystem.WINDOWS`
+(`src/murmly/platform/__init__.py`) — this tuple, not phase 4's documentation
+pass, is what actually gates whether a `murmly` command runs, and every
+concern it names is now proven on the runner it concerns rather than only
+from this Linux machine. Phase 4 (task 19: README, the manual, the project
+page) and the deeper end-to-end verification of task 20.4 (a second Windows
+account, an elevated-window paste) remain open and unaffected by this —
+documentation and manual, real-desktop verification follow capability here,
+they do not gate it.
+
 ## Open Questions
 
 Both halves of the espeak-ng question below are resolved: the Windows half by

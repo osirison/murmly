@@ -45,6 +45,21 @@ itself, not with the service.
 If you need to change which key is bound, see [changing your
 hotkey](changing-your-hotkey.md).
 
+On Linux, whether the hotkey registers itself at all depends on your desktop —
+see [what you need before you start](what-you-need.md#linux-your-desktop). If
+you are on GNOME and the key does nothing, that backend has never been run
+against a live GNOME session anywhere murmly is built or tested; `murmly
+doctor` and the messages `murmly install` printed are the only evidence of
+whether it actually took effect on your machine. On any other desktop besides
+KDE Plasma and GNOME, murmly does not register the key at all, by design —
+`murmly install` prints the command to bind it yourself, and running that
+command is the fix.
+
+On Windows, a hotkey reported as taken by another application is reported
+without naming which one: Windows' own `RegisterHotKey` refuses a combination
+another application already holds, and that refusal is the only signal
+Windows gives, unlike KDE, which can name the owner. Pick a different key.
+
 ## Murmly says nothing when it should speak
 
 Check `speech_output` in `murmly doctor`. If `available` is `false`, it comes
@@ -77,6 +92,19 @@ its report is what the overlay would actually do.
 If the overlay's packages were missing and you have just installed them — see
 [installing murmly](install.md) for the list — restart the service afterwards
 so it picks them up.
+
+## My transcript stayed on the clipboard, on Windows
+
+If you were dictating into a window running elevated — opened with "Run as
+administrator" — this is expected, not a bug: Windows' own User Interface
+Privilege Isolation silently discards synthetic keystrokes aimed at a window
+belonging to a higher-privilege process, and murmly is never told the paste
+failed. The transcript is left on your clipboard, your previous clipboard
+contents are not restored over it, and `murmly doctor`'s `delivery` field
+reports Windows as never confirming a paste, elevated window or not. Paste it
+yourself. See [where your words
+go](where-your-words-go.md#pasting-into-an-elevated-window-on-windows) for the
+full explanation.
 
 ## My recordings are silent, on an Intel laptop
 

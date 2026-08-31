@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>murmly — press a key, speak, press again</title>
-<meta name="description" content="Press a key, speak, press again — your words appear wherever you were typing, transcribed on your own machine. Fedora-first local voice-to-text for Linux desktops.">
+<meta name="description" content="Press a key, speak, press again — your words appear wherever you were typing, transcribed on your own machine. Local voice-to-text for Linux and Windows desktops.">
 <link rel="canonical" href="https://osirison.github.io/murmly/">
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="assets/favicon.ico" sizes="16x16 32x32 48x48">
@@ -12,7 +12,7 @@
 <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
 <meta property="og:type" content="website">
 <meta property="og:title" content="murmly — press a key, speak, press again">
-<meta property="og:description" content="Your words appear wherever you were typing, transcribed on your own machine. Fedora-first local voice-to-text for Linux desktops.">
+<meta property="og:description" content="Your words appear wherever you were typing, transcribed on your own machine. Local voice-to-text for Linux and Windows desktops.">
 <meta property="og:url" content="https://osirison.github.io/murmly/">
 <meta property="og:image" content="https://osirison.github.io/murmly/assets/social-preview.png">
 <meta name="twitter:card" content="summary_large_image">
@@ -72,7 +72,7 @@
       <a class="button" href="#install">Install it</a>
       <a class="quiet" href="https://github.com/osirison/murmly">Read the source</a>
     </p>
-    <p class="runs-on">Fedora · KDE Plasma · Python 3.12+ · Apache-2.0</p>
+    <p class="runs-on">Linux · Windows · Python 3.12+ · Apache-2.0</p>
   </div>
 </header>
 
@@ -184,19 +184,21 @@
   <div class="requires">
     <h3>What it needs</h3>
     <dl>
-      <dt>Fedora</dt><dd>murmly is Fedora-first. Other distributions are not what it is built and tested against.</dd>
-      <dt>KDE Plasma</dt><dd>The hotkey registers itself and the indicator draws itself on Plasma. On other desktops murmly still installs and prints the command to bind the key yourself.</dd>
-      <dt>Python 3.12 or newer</dt><dd>Older versions are not supported.</dd>
-      <dt>A terminal</dt><dd>Installation is one command that you run yourself. There is no graphical installer.</dd>
-      <dt>X11, for now</dt><dd>murmly is verified end to end on X11. Plasma Wayland uses the same registration path but has not been verified all the way through, and murmly says so while installing.</dd>
+      <dt>Linux or Windows</dt><dd>Any glibc-based Linux distribution, or Windows on x86_64. macOS is not supported. Musl-based Linux and Windows on ARM64 have no build of the transcription runtime and cannot run murmly either.</dd>
+      <dt>Python 3.12 or newer</dt><dd>Older versions are not supported, on either platform.</dd>
+      <dt>A terminal</dt><dd>Installation is one command that you run yourself, on both platforms. There is no graphical installer.</dd>
+      <dt>Your desktop, on Linux</dt><dd>The hotkey and the overlay both depend on it. KDE Plasma X11 is verified end to end; Plasma Wayland is not, though it uses the same registration path; GNOME has a hotkey backend that has never been run against a live GNOME session; any other desktop registers no hotkey and shows no overlay, though everything else — capture, transcription, clipboard, paste — still installs and works.</dd>
+      <dt>Permissions, on Windows</dt><dd>The hotkey and clipboard need none. Microphone capture depends on Windows' own privacy setting, and <code>murmly doctor</code> reports whether it is granted, denied, or undetermined. Every one of these has run as an automated test on a real Windows machine; a second account and an elevated window are the one deeper check still open.</dd>
+      <dt>Permissions, on Linux</dt><dd>None on plain X11. Under KDE Plasma's Wayland session, the first paste raises a one-time permission dialog. Everything else needs none, except the rare fallback path that needs a one-time root setup instead.</dd>
     </dl>
   </div>
 
-  <p>Clone the repository, then run one command. It installs the system packages for your session after showing you the command and asking, sets up the environment, binds your hotkey and starts the service.</p>
+  <p>Clone the repository, then run one command. On both platforms it installs <code>uv</code> first if it is not already on <code>PATH</code>. On Linux it then installs the system packages for your session after showing you the command and asking, sets up the environment, binds your hotkey and starts the service. On Windows it hands off directly to murmly — there are no system packages to install first.</p>
 
-  <pre><code>./setup.sh install Meta+X</code></pre>
+  <pre><code>./bootstrap.sh install Meta+X      # Linux
+.\bootstrap.ps1 install Meta+X     # Windows</code></pre>
 
-  <p>The same script handles upgrading and removal. Pick a combination that suits you — murmly checks before it binds, and tells you who owns a key it will not take.</p>
+  <p>The same script handles upgrading and removal, on each platform. Pick a combination that suits you — murmly checks before it binds, and on Linux tells you who owns a key it will not take; on Windows the platform can refuse a taken key but cannot name who holds it.</p>
 
   <h3>It tells you what it found</h3>
   <p>One command reports what murmly detected on the machine it is running on, and names what to install for anything it could not find.</p>

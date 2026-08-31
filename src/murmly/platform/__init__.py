@@ -57,7 +57,24 @@ class OperatingSystem(StrEnum):
 #: them, and "no new operating system is claimed" -- see design.md's Migration
 #: Plan. Windows joins in phase 2 and macOS in phase 3, each by adding its
 #: value here once its backends exist, not by changing how this check works.
-SUPPORTED_OPERATING_SYSTEMS: tuple[OperatingSystem, ...] = (OperatingSystem.LINUX,)
+#:
+#: Windows joined here once phase 2's own list -- the named-pipe transport
+#: and its DACL, Task Scheduler, the hotkey and its collision, the Win32
+#: clipboard and `SendInput`, the focus observer, the Qt overlay, the CUDA
+#: DLL loading and the bundled espeak-ng wheel (task 11.4), and the
+#: PowerShell bootstrap (task 16.2) -- was proven on a real Windows CI
+#: runner rather than only from this Linux machine, closing every item phase
+#: 2 names. macOS stays out: phase 3's own list (launchd microphone access
+#: foremost, tasks 12 and 15) is still open, per this change's binding scope
+#: decision -- macOS code, tests and its CI job all stay exactly as they are,
+#: not claimed. Documentation catching up to state the Windows support this
+#: adds is task 19, tracked separately: this tuple is what actually gates
+#: whether a `murmly` command runs, and phase 4's own place in the Migration
+#: Plan is documentation following capability, not gating it.
+SUPPORTED_OPERATING_SYSTEMS: tuple[OperatingSystem, ...] = (
+    OperatingSystem.LINUX,
+    OperatingSystem.WINDOWS,
+)
 
 
 class Desktop(StrEnum):

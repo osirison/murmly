@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "murmly"
 version = "0.1.0"
-description = "Fedora-first local voice-to-text daemon for Linux desktops"
+description = "Local voice-to-text daemon for Linux and Windows desktops"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }

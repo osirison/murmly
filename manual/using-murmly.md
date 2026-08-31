@@ -32,12 +32,15 @@ see [Seeing your words as you speak](words-as-you-speak.md).
 Press the hotkey a second time and the panel changes to show murmly working on
 the recording, between you finishing speaking and the transcript landing.
 
-The overlay works on KDE Plasma, under both X11 and Wayland. Under X11 it is
-built from two window-system features called X11 EWMH window state and the X
-Shape extension; under Wayland it uses a Wayland feature called Layer Shell.
-On both, the overlay is a fixed size — 156 by 48 logical pixels — and it does
-not request keyboard focus and does not receive pointer input: it never steals
-your typing and never intercepts a click.
+On Linux, the overlay works on KDE Plasma, under both X11 and Wayland — no
+other Linux desktop presents it. Under X11 it is built from two window-system
+features called X11 EWMH window state and the X Shape extension; under Wayland
+it uses a Wayland feature called Layer Shell. On Windows, a Qt-based renderer
+draws it instead, using the platform's own window styles to get the same
+properties. Every platform that presents the overlay at all shows the same
+fixed size — 156 by 48 logical pixels — the same states, and the same rule:
+it does not request keyboard focus and does not receive pointer input, so it
+never steals your typing and never intercepts a click.
 
 If you have more than one display connected, murmly shows the overlay on the
 display containing the desktop origin, and keeps it on that display for the

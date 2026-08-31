@@ -43,6 +43,11 @@ This needs speech output turned on first. See
 ./setup.sh hooks off        # unregister
 ```
 
+This registration step is `setup.sh` only, on Linux — `bootstrap.ps1` has no
+equivalent yet. On Windows, register the hook directly with the coding
+assistant's own mechanism, pointing it at `hooks/murmly-announce.py`; the
+hook itself runs the same way, and exits cleanly, on every platform.
+
 Claude Code and GitHub Copilot CLI both fire a `Stop` event at the end of a
 turn, and both hand it the same thing — a JSON payload naming a JSONL
 transcript — so one script serves both. What differs between them is the
