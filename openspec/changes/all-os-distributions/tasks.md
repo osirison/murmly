@@ -59,10 +59,10 @@ shippable on their own. See `design.md` — Migration Plan.
 
 ## 7. Windows: the command channel
 
-- [ ] 7.1 Add a named-pipe transport, since CPython exposes no `AF_UNIX` on Windows and the open implementation targets 3.16
-- [ ] 7.2 Create the pipe with a security descriptor whose DACL grants only the creating user's SID — the OS default DACL grants `Everyone` read access, which is not the guarantee the requirement states
+- [x] 7.1 Add a named-pipe transport, since CPython exposes no `AF_UNIX` on Windows and the open implementation targets 3.16
+- [x] 7.2 Create the pipe with a security descriptor whose DACL grants only the creating user's SID — the OS default DACL grants `Everyone` read access, which is not the guarantee the requirement states
 - [x] 7.3 Add `pywin32` to `pyproject.toml` behind `sys_platform == 'win32'`, pinned
-- [ ] 7.4 Read the peer's identity from the pipe's client process token, behind the existing `peer_identity_supported()` guard
+- [x] 7.4 Read the peer's identity from the pipe's client process token, behind the existing `peer_identity_supported()` guard
 - [x] 7.5 Refuse at startup a configured channel name that cannot be created privately, naming the reason and the correction, and skip the filesystem path-privacy analysis, which does not apply to a name that is not in the filesystem
 - [x] 7.6 Keep the `daemon.socket_path` configuration key and its meaning: the channel Murmly serves on
 
@@ -161,7 +161,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 18.3 Test that an unsupported operating system is refused before any file is written
 - [x] 18.4 Test that a machine with no transcription runtime is refused at startup naming the runtime and the characteristic, and that a machine missing anything else starts with that capability reported unavailable
 - [x] 18.5 Test that the Linux configuration, data and runtime paths are byte-identical to what they are today, for every combination of `XDG_*` set and unset
-- [ ] 18.6 Test the Windows pipe's security descriptor by reading back its DACL and asserting it names only the creating user's SID — a second account is not available in CI
+- [x] 18.6 Test the Windows pipe's security descriptor by reading back its DACL and asserting it names only the creating user's SID — a second account is not available in CI
 - [x] 18.7 Test that peer identity is read by the resolved platform's mechanism and that the same rule is applied to the result
 - [x] 18.8 Test the GNOME backend against a fake command runner: binding written, read back, conflict refused, and removal taking out exactly what was added
 - [x] 18.9 Test that one hotkey specification produces the same physical key on each platform's encoding, and that a modifier a platform does not have is refused by name
@@ -173,7 +173,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [ ] 18.15 Test that the overlay is not presented, and the missing property named, where the platform cannot give a surface that takes no focus and intercepts no pointer input
 - [x] 18.16 Test that releasing a model reports system memory as not returned where the allocator cannot be asked, and still drops the model on schedule
 - [x] 18.17 Test that the diagnostics report carries the same field names on every platform, with an unserviceable concern reported unavailable rather than absent
-- [ ] 18.18 Keep the runtime `self.skipTest(...)` pattern for anything needing a live session, extending it to skip on the wrong operating system, as `X11RuntimeIntegrationTests` already does for a missing display
+- [x] 18.18 Keep the runtime `self.skipTest(...)` pattern for anything needing a live session, extending it to skip on the wrong operating system, as `X11RuntimeIntegrationTests` already does for a missing display
 - [x] 18.19 Add Windows and macOS CI runners running everything that does not need a session
 
 ## 19. Documentation and the project page
