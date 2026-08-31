@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 import unittest
 
 from murmly.hotkey import HotkeyError
-from murmly.mac_hotkey import MacosHotkeyRegistrar
+from murmly.mac_hotkey import HotkeyRegistrationRefused, MacosHotkeyRegistrar
 
 
 class FakeCarbon:
@@ -77,6 +78,28 @@ class FakeCarbon:
 
     def fire(self, id_: int) -> None:
         self._on_fired(id_)
+
+
+class FakeUnresponsiveCarbon(FakeCarbon):
+    """`request_stop` that never unblocks `run_loop` -- the exact failure
+    `MacosHotkeyRegistrar._stop_locked`'s own docstring describes: a thread
+    that keeps running, and so keeps every hotkey it holds, past `stop()`'s
+    own bounded join. Standing in for `QuitApplicationEventLoop` not
+    interrupting a loop running on a thread other than the one that called
+    it, which is what a real macOS CI run showed happening (see
+    `mac_hotkey.py`'s module docstring).
+
+    `really_stop()` is the test's own escape hatch: called once the
+    assertions this unresponsiveness exists to enable are done, so the
+    thread this fake spins up does not outlive the test that started it.
+    """
+
+    def request_stop(self) -> None:
+        pass
+
+    def really_stop(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
 
 
 class RebindTests(unittest.TestCase):
@@ -312,6 +335,120 @@ class StopTests(unittest.TestCase):
         self.assertEqual([1], fake.unregistered)
 
 
+class UnconfirmedReleaseTests(unittest.TestCase):
+    """`stop()` must not report a release it cannot confirm -- the defect a
+    real macOS CI run exposed: `thread.join()` timing out while the
+    event-loop thread kept running (and so kept every key it held), yet
+    `_held` was cleared regardless, so `held_purposes()` answered empty and
+    the next registration of the same key collided with this same process.
+    Exercised here with `FakeUnresponsiveCarbon`, which reproduces the
+    timeout on any platform without touching Carbon at all.
+    """
+
+    def test_stop_does_not_report_a_release_it_cannot_confirm(self) -> None:
+        fake = FakeUnresponsiveCarbon()
+        registrar = MacosHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=fake.unregister,
+            install_handler=fake.install_handler,
+            remove_handler=fake.remove_handler,
+            run_loop=fake.run_loop,
+            request_stop=fake.request_stop,
+            ready_timeout=2.0,
+            stop_timeout=0.05,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        registrar.stop()  # returns anyway -- stop() is bounded, not honest-but-hanging
+
+        # The thread never confirmed it released "window": stop() must not
+        # claim it did.
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+
+        fake.really_stop()  # let the leaked thread actually finish
+
+    def test_rebind_refuses_to_start_a_new_thread_over_an_unconfirmed_release(self) -> None:
+        fake = FakeUnresponsiveCarbon()
+        registrar = MacosHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=fake.unregister,
+            install_handler=fake.install_handler,
+            remove_handler=fake.remove_handler,
+            run_loop=fake.run_loop,
+            request_stop=fake.request_stop,
+            ready_timeout=2.0,
+            stop_timeout=0.05,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        with self.assertRaises(HotkeyError) as raised:
+            registrar.rebind({"session": "Meta+Shift+X"})
+
+        self.assertIn("could not confirm", str(raised.exception).lower())
+        # Refusing to layer a new thread on top never blames "another
+        # application" for a key this very process still holds -- and never
+        # attempted the second registration at all.
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+        # The refused rebind never even attempted "session"'s registration.
+        self.assertEqual(1, len(fake.register_calls))
+
+        fake.really_stop()
+
+    def test_a_stop_that_later_confirms_reports_it_released(self) -> None:
+        fake = FakeUnresponsiveCarbon()
+        registrar = MacosHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=fake.unregister,
+            install_handler=fake.install_handler,
+            remove_handler=fake.remove_handler,
+            run_loop=fake.run_loop,
+            request_stop=fake.request_stop,
+            ready_timeout=2.0,
+            stop_timeout=0.05,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        registrar.stop()
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+
+        # The loop finally does unwind -- a later stop() gets another bounded
+        # chance to join it and reports it released once it actually is.
+        fake.really_stop()
+        deadline = time.monotonic() + 2.0
+        while registrar.held_purposes() and time.monotonic() < deadline:
+            registrar.stop()
+        self.assertEqual(frozenset(), registrar.held_purposes())
+        self.assertEqual([1], fake.unregistered)
+
+    def test_a_thread_that_fails_to_unregister_stays_reported_as_held(self) -> None:
+        fake = FakeCarbon()
+
+        def failing_unregister(ref: int) -> None:
+            raise OSError("UnregisterEventHotKey refused")
+
+        registrar = MacosHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=failing_unregister,
+            install_handler=fake.install_handler,
+            remove_handler=fake.remove_handler,
+            run_loop=fake.run_loop,
+            request_stop=fake.request_stop,
+            ready_timeout=2.0,
+            stop_timeout=2.0,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        registrar.stop()  # the thread itself joins cleanly...
+
+        # ...but `UnregisterEventHotKey` never actually released the key, so
+        # `held_purposes()` must not say it did.
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+
+
 class MacosHotkeyRuntimeIntegrationTests(unittest.TestCase):
     """Task 13.5, against the real Carbon calls: everything above this class
     proves the policy layer against fakes, since `HIToolbox` cannot be loaded
@@ -348,9 +485,18 @@ class MacosHotkeyRuntimeIntegrationTests(unittest.TestCase):
         registrar = MacosHotkeyRegistrar(on_hotkey=lambda purpose: None)
         self._registrar = registrar
 
+        # Only `HotkeyRegistrationRefused` -- a non-collision `OSStatus`,
+        # meaning this runner cannot register hotkeys at all (no window
+        # server session, typically) -- is a legitimate reason to skip. A
+        # plain `HotkeyError` here means `RegisterEventHotKey` reported a
+        # genuine `eventHotKeyExistsErr` collision, which this test's own
+        # first line cannot cause on a runner nothing else has claimed
+        # `Ctrl+Alt+Shift+F20` on -- catching it as a skip would hide exactly
+        # the defect task 13.6 exists to catch: a previous run's own thread
+        # still holding the key.
         try:
             registrar.rebind({"window": self.PORTABLE})
-        except HotkeyError as error:
+        except HotkeyRegistrationRefused as error:
             self.skipTest(f"RegisterEventHotKey refused {self.PORTABLE!r} on this runner: {error}")
 
         self.assertEqual(frozenset({"window"}), registrar.held_purposes())

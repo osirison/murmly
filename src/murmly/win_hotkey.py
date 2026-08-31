@@ -163,8 +163,25 @@ def _real_register(id_: int, modifiers: int, vk: int) -> bool:
 
 
 def _real_unregister(id_: int) -> None:
+    """`UnregisterHotKey(None, id_)`.
+
+    Raises on a falsy return rather than discarding it the way this function
+    used to: a discarded failure here is indistinguishable from a successful
+    release everywhere that matters -- `_run`'s own `finally` reports a
+    purpose as still held only when `_unregister` raises, so a
+    silently-ignored failure would report every purpose released regardless
+    of whether Win32 actually did. Mirrors `mac_hotkey.py`'s own
+    `_real_unregister` checking `UnregisterEventHotKey`'s `OSStatus` for the
+    identical reason: the same "hypothesis 3" a stuck event/message loop
+    produces (a same-process collision on the very next registration of the
+    same key) is just as real here as it is on macOS, even though nothing has
+    observed it on this platform yet.
+    """
     user32 = _user32()
-    user32.UnregisterHotKey(None, id_)
+    if not user32.UnregisterHotKey(None, id_):
+        raise HotkeyError(
+            f"UnregisterHotKey failed; GetLastError={ctypes.GetLastError()}."
+        )
 
 
 def _real_pump() -> PumpResult:
@@ -252,11 +269,16 @@ class WindowsHotkeyRegistrar:
     def held_purposes(self) -> frozenset[str]:
         """Which purposes are registered right now, for a `status` response.
 
-        Empty whenever no thread is running -- including the whole window
-        between `stop()` being called and a later `rebind()` completing --
-        which is exactly the "not currently held" state task 8.7 and the
-        `desktop-integration` spec's "daemon holding the hotkey stops"
-        scenario require.
+        Empty once a `stop()` has *confirmed* every registration released --
+        including the whole window between that and a later `rebind()`
+        completing -- which is exactly the "not currently held" state task
+        8.7 and the `desktop-integration` spec's "daemon holding the hotkey
+        stops" scenario require. If the message-loop thread has not confirmed
+        that -- still running past `stop()`'s own timeout, or its own
+        `UnregisterHotKey` call failing -- the purposes it may still hold stay
+        reported here, deliberately: this is what a `doctor`/`status`
+        response actually holding the record is more useful for than a
+        report of "released" that has not been confirmed.
         """
         with self._operation_lock:
             return frozenset(self._held)
@@ -284,6 +306,20 @@ class WindowsHotkeyRegistrar:
 
         with self._operation_lock:
             self._stop_locked()
+            if self._thread is not None:
+                # `_stop_locked` could not confirm the previous thread
+                # released its registrations (see its own docstring).
+                # Layering a new thread on top would either collide with keys
+                # this same process may still hold -- reported as "claimed by
+                # another application", which would be a lie -- or, if the
+                # old thread does finish a moment later, leave its own
+                # `_held`/`_by_id` write racing the new thread's. Neither is
+                # acceptable, so the rebind itself fails instead.
+                raise HotkeyError(
+                    "Could not confirm the previous hotkey registrations were "
+                    "released; refusing to register a new set while they may "
+                    "still be held."
+                )
             if not encoded:
                 return
             self._start_locked(encoded)
@@ -294,12 +330,36 @@ class WindowsHotkeyRegistrar:
         Safe to call with no thread running: `rebind`'s own first step is
         `stop`, and a daemon that never registered a hotkey still calls this
         during shutdown. Never raises -- a hotkey release must not be the
-        reason shutdown reports a failure.
+        reason shutdown reports a failure. Not guaranteed to finish releasing
+        every hotkey by the time it returns: see `_stop_locked`.
         """
         with self._operation_lock:
             self._stop_locked()
 
     def _stop_locked(self) -> None:
+        """Ask the message-loop thread to stop and wait up to `_stop_timeout`
+        for it to.
+
+        If the thread has not finished by then, this returns anyway -- `stop()`
+        must complete in bounded time, since a daemon that cannot shut down is
+        worse than one whose hotkeys briefly outlive it -- but `_thread`,
+        `_thread_id`, `_held` and `_by_id` are all left exactly as they are:
+        still pointing at the (possibly still running) thread and its
+        (possibly still held) registrations. Clearing them here would report a
+        release that has not been confirmed, which is the defect this method
+        exists to not have. `_run`'s own `finally` is the only thing that ever
+        writes `_held`/`_by_id` to reflect a thread that has actually
+        finished -- by the time `thread.join()` returns `True` below, that
+        write has already happened, so nothing here needs to repeat it.
+
+        Leaving `_thread` set on an unconfirmed stop also means the next
+        `stop()` or `rebind()` gets another bounded chance to join the same
+        thread and pick up whatever it left behind, rather than losing track
+        of it. Mirrors `MacosHotkeyRegistrar._stop_locked` exactly, for the
+        same reason: both backends bound their own release to one thread's
+        message/event loop, and both can now only lose track of that thread
+        by choice, not by a timeout clearing state out from under it.
+        """
         thread = self._thread
         if thread is None:
             return
@@ -312,13 +372,18 @@ class WindowsHotkeyRegistrar:
         if self._thread_id is not None:
             try:
                 self._post_quit(self._thread_id)
-            except Exception:  # noqa: BLE001 - stop must still join and clear state
+            except Exception:  # noqa: BLE001 - stop must still join
                 logger.warning("Could not signal the hotkey thread to stop.", exc_info=True)
         thread.join(self._stop_timeout)
+        if thread.is_alive():
+            logger.warning(
+                "The hotkey message-loop thread did not stop within %.3g seconds; "
+                "its registrations could not be confirmed released.",
+                self._stop_timeout,
+            )
+            return
         self._thread = None
         self._thread_id = None
-        self._held = {}
-        self._by_id = {}
 
     def _start_locked(self, encoded: dict[str, object]) -> None:
         self._ready.clear()
@@ -329,14 +394,18 @@ class WindowsHotkeyRegistrar:
         self._thread = thread
         thread.start()
         if not self._ready.wait(self._ready_timeout):
-            self._thread = None
+            # `self._thread` is not cleared here -- it may yet finish starting
+            # and go on to register keys `held_purposes()` needs to keep
+            # reporting, and a later `stop()`/`rebind()` needs a live
+            # reference to be able to join. Losing that reference would be
+            # the same "reported a release that never happened" defect
+            # `_stop_locked` exists to avoid, applied to a thread that never
+            # even confirmed starting.
             raise HotkeyError(
                 "The hotkey registration thread did not start within "
                 f"{self._ready_timeout:g} seconds."
             )
         if self._ready_error is not None:
-            self._thread = None
-            self._thread_id = None
             raise HotkeyError(self._ready_error)
 
     def _run(self, encoded: dict[str, object]) -> None:
@@ -346,6 +415,16 @@ class WindowsHotkeyRegistrar:
         `RegisterHotKey` and `UnregisterHotKey` both bind to the calling
         thread, so every claim this thread makes must also be the one that
         releases it, in the `finally` below, whichever way the loop ends.
+
+        `self._held`/`self._by_id` are this thread's own responsibility for
+        its entire life, written twice: once after registration (what this
+        thread holds while its loop runs) and once more in `finally` (what it
+        *still* holds on the way out, which is empty unless `_unregister`
+        itself failed for some purpose -- in which case that purpose stays
+        reported as held, honestly, rather than as released because this
+        thread merely stopped pumping). `_stop_locked` never has to repeat
+        either write: by the time `thread.join()` sees this thread has
+        finished, `finally` has already run.
         """
         thread_id = self._current_thread_id()
         registered: list[int] = []
@@ -394,8 +473,14 @@ class WindowsHotkeyRegistrar:
                     except Exception:  # noqa: BLE001 - the loop must survive a bad handler
                         logger.warning("Hotkey handler for %r failed.", purpose, exc_info=True)
         finally:
+            unreleased: dict[str, int] = {}
             for claimed_id in registered:
                 try:
                     self._unregister(claimed_id)
                 except Exception:  # noqa: BLE001 - every other claim still needs releasing
                     logger.warning("Could not release hotkey id %s.", claimed_id, exc_info=True)
+                    purpose = by_id.get(claimed_id)
+                    if purpose is not None:
+                        unreleased[purpose] = claimed_id
+            self._held = unreleased
+            self._by_id = {claimed_id: purpose for purpose, claimed_id in unreleased.items()}

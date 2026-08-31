@@ -17,6 +17,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 import unittest
 
 from murmly.hotkey import HotkeyError
@@ -78,6 +79,25 @@ class FakeWin32:
 
     def fire(self, id_: int) -> None:
         self._queue.put(id_)
+
+
+class FakeUnresponsiveWin32(FakeWin32):
+    """`post_quit` that never unblocks `pump` -- the exact failure
+    `WindowsHotkeyRegistrar._stop_locked`'s own docstring describes: a thread
+    that keeps running, and so keeps every hotkey it holds, past `stop()`'s
+    own bounded join. Mirrors `test_mac_hotkey.py`'s own
+    `FakeUnresponsiveCarbon` for the identical shape the two backends share.
+
+    `really_stop()` is the test's own escape hatch: called once the
+    assertions this unresponsiveness exists to enable are done, so the
+    thread this fake spins up does not outlive the test that started it.
+    """
+
+    def post_quit(self, thread_id: int) -> None:
+        pass
+
+    def really_stop(self) -> None:
+        self._queue.put("quit")
 
 
 class RebindTests(unittest.TestCase):
@@ -271,6 +291,115 @@ class StopTests(unittest.TestCase):
         registrar.stop()  # must not raise, must not double-unregister
 
         self.assertEqual([1], fake.unregistered)
+
+
+class UnconfirmedReleaseTests(unittest.TestCase):
+    """`stop()` must not report a release it cannot confirm -- mirrors
+    `test_mac_hotkey.py`'s own `UnconfirmedReleaseTests` test-for-test, for
+    the identical bounded-join shape `WindowsHotkeyRegistrar._stop_locked`
+    shares with `MacosHotkeyRegistrar._stop_locked`. Exercised here with
+    `FakeUnresponsiveWin32`, which reproduces a `GetMessageW` loop that
+    `PostThreadMessageW(WM_QUIT)` fails to unblock without touching Win32 at
+    all.
+    """
+
+    def test_stop_does_not_report_a_release_it_cannot_confirm(self) -> None:
+        fake = FakeUnresponsiveWin32()
+        registrar = WindowsHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=fake.unregister,
+            pump=fake.pump,
+            post_quit=fake.post_quit,
+            current_thread_id=fake.current_thread_id,
+            ready_timeout=2.0,
+            stop_timeout=0.05,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        registrar.stop()  # returns anyway -- stop() is bounded, not honest-but-hanging
+
+        # The thread never confirmed it released "window": stop() must not
+        # claim it did.
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+
+        fake.really_stop()  # let the leaked thread actually finish
+
+    def test_rebind_refuses_to_start_a_new_thread_over_an_unconfirmed_release(self) -> None:
+        fake = FakeUnresponsiveWin32()
+        registrar = WindowsHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=fake.unregister,
+            pump=fake.pump,
+            post_quit=fake.post_quit,
+            current_thread_id=fake.current_thread_id,
+            ready_timeout=2.0,
+            stop_timeout=0.05,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        with self.assertRaises(HotkeyError) as raised:
+            registrar.rebind({"session": "Meta+Shift+X"})
+
+        self.assertIn("could not confirm", str(raised.exception).lower())
+        # Refusing to layer a new thread on top never blames "another
+        # application" for a key this very process still holds -- and never
+        # attempted the second registration at all.
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+        self.assertEqual(1, len(fake.register_calls))
+
+        fake.really_stop()
+
+    def test_a_stop_that_later_confirms_reports_it_released(self) -> None:
+        fake = FakeUnresponsiveWin32()
+        registrar = WindowsHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=fake.unregister,
+            pump=fake.pump,
+            post_quit=fake.post_quit,
+            current_thread_id=fake.current_thread_id,
+            ready_timeout=2.0,
+            stop_timeout=0.05,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        registrar.stop()
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
+
+        # The loop finally does unwind -- a later stop() gets another bounded
+        # chance to join it and reports it released once it actually is.
+        fake.really_stop()
+        deadline = time.monotonic() + 2.0
+        while registrar.held_purposes() and time.monotonic() < deadline:
+            registrar.stop()
+        self.assertEqual(frozenset(), registrar.held_purposes())
+        self.assertEqual([1], fake.unregistered)
+
+    def test_a_thread_that_fails_to_unregister_stays_reported_as_held(self) -> None:
+        fake = FakeWin32()
+
+        def failing_unregister(id_: int) -> None:
+            raise OSError("UnregisterHotKey refused")
+
+        registrar = WindowsHotkeyRegistrar(
+            on_hotkey=lambda purpose: None,
+            register=fake.register,
+            unregister=failing_unregister,
+            pump=fake.pump,
+            post_quit=fake.post_quit,
+            current_thread_id=fake.current_thread_id,
+            ready_timeout=2.0,
+            stop_timeout=2.0,
+        )
+        registrar.rebind({"window": "Meta+X"})
+
+        registrar.stop()  # the thread itself joins cleanly...
+
+        # ...but `UnregisterHotKey` never actually released the key, so
+        # `held_purposes()` must not say it did.
+        self.assertEqual(frozenset({"window"}), registrar.held_purposes())
 
 
 class WindowsHotkeyRuntimeIntegrationTests(unittest.TestCase):
