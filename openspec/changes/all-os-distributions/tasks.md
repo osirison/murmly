@@ -108,35 +108,35 @@ shippable on their own. See `design.md` — Migration Plan.
 - [ ] 12.2 Run the same spike from a terminal to confirm the difference, since a terminal-started process inherits the terminal application's own grant and would hide the problem
 - [ ] 12.3 If launchd gets no audio, set `AssociatedBundleIdentifiers` in the plist so TCC attributes the agent to a bundle holding the grant, and verify
 - [ ] 12.4 If that does not work either, ship a minimal `.app` wrapper carrying the usage-description string, and verify
-- [ ] 12.5 Have diagnostics distinguish a denied microphone from an absent device, which are identical from inside the process
+- [x] 12.5 Have diagnostics distinguish a denied microphone from an absent device, which are identical from inside the process
 - [ ] 12.6 Do not claim macOS capture until one of these is proven working end to end
 
 ## 13. macOS: transport, service, hotkey
 
-- [ ] 13.1 Keep the UNIX socket and its whole path-privacy analysis — macOS has `AF_UNIX` and the requirement is unchanged there
-- [ ] 13.2 Read the peer's identity with `getpeereid(3)` through `ctypes.CDLL(None)`; it returns UID and GID and no PID, which is enough for the UID comparison the check already makes
-- [ ] 13.3 Add a launchd service backend writing `~/Library/LaunchAgents/<label>.plist` with `Label`, `ProgramArguments`, `RunAtLoad` and `KeepAlive`
-- [ ] 13.4 Drive it with `launchctl bootstrap gui/$UID`, `print`, `kickstart -k` and `bootout` — never `load`, which exits 0 and does nothing on a malformed plist and would make installation report success for a service that will never start
-- [ ] 13.5 Add a hotkey backend calling Carbon `RegisterEventHotKey` through `ctypes` into HIToolbox, which needs no permission at all, unlike either mode of `CGEventTap`
-- [ ] 13.6 Release the hotkey when the daemon stops, and report it as held by the running daemon
-- [ ] 13.7 Report the mechanism's limitation in diagnostics: `RegisterEventHotKey` does not fire when the frontmost application consumes the combination itself, and cannot express a modifier-only chord
+- [x] 13.1 Keep the UNIX socket and its whole path-privacy analysis — macOS has `AF_UNIX` and the requirement is unchanged there
+- [x] 13.2 Read the peer's identity with `getpeereid(3)` through `ctypes.CDLL(None)`; it returns UID and GID and no PID, which is enough for the UID comparison the check already makes
+- [x] 13.3 Add a launchd service backend writing `~/Library/LaunchAgents/<label>.plist` with `Label`, `ProgramArguments`, `RunAtLoad` and `KeepAlive`
+- [x] 13.4 Drive it with `launchctl bootstrap gui/$UID`, `print`, `kickstart -k` and `bootout` — never `load`, which exits 0 and does nothing on a malformed plist and would make installation report success for a service that will never start
+- [x] 13.5 Add a hotkey backend calling Carbon `RegisterEventHotKey` through `ctypes` into HIToolbox, which needs no permission at all, unlike either mode of `CGEventTap`
+- [x] 13.6 Release the hotkey when the daemon stops, and report it as held by the running daemon
+- [x] 13.7 Report the mechanism's limitation in diagnostics: `RegisterEventHotKey` does not fire when the frontmost application consumes the combination itself, and cannot express a modifier-only chord
 
 ## 14. macOS: clipboard, injection, focus
 
-- [ ] 14.1 Copy and read through `NSPasteboard`
-- [ ] 14.2 Inject the paste with `CGEventPost` of Cmd+V
-- [ ] 14.3 Register it as a method whose success cannot be observed: without an Accessibility grant the call does not fail, the event is dropped, and nothing arrives
-- [ ] 14.4 Report the Accessibility grant with `AXIsProcessTrusted()`, which does not prompt
-- [ ] 14.5 Request it with `AXIsProcessTrustedWithOptions(prompt: true)` only from `murmly install`, never from the daemon — a dialog raised by a background process the person did not just invoke is one they cannot connect to anything
-- [ ] 14.6 Add a focus observer using `NSWorkspace.sharedWorkspace().frontmostApplication()`, which returns bundle identifier and PID as unprotected metadata
-- [ ] 14.7 Do not use `CGWindowListCopyWindowInfo`: since macOS 10.15 it omits the window title without Screen Recording permission, and Murmly's target is the owning application, which needs no grant
+- [x] 14.1 Copy and read through `NSPasteboard`
+- [x] 14.2 Inject the paste with `CGEventPost` of Cmd+V
+- [x] 14.3 Register it as a method whose success cannot be observed: without an Accessibility grant the call does not fail, the event is dropped, and nothing arrives
+- [x] 14.4 Report the Accessibility grant with `AXIsProcessTrusted()`, which does not prompt
+- [x] 14.5 Request it with `AXIsProcessTrustedWithOptions(prompt: true)` only from `murmly install`, never from the daemon — a dialog raised by a background process the person did not just invoke is one they cannot connect to anything
+- [x] 14.6 Add a focus observer using `NSWorkspace.sharedWorkspace().frontmostApplication()`, which returns bundle identifier and PID as unprotected metadata
+- [x] 14.7 Do not use `CGWindowListCopyWindowInfo`: since macOS 10.15 it omits the window title without Screen Recording permission, and Murmly's target is the owning application, which needs no grant
 
 ## 15. macOS: overlay and runtime
 
 - [ ] 15.1 Spike whether Qt's own `WindowTransparentForInput` and `WindowDoesNotAcceptFocus` give a non-activating, click-through, all-Spaces panel on macOS
 - [ ] 15.2 If they do not, build the renderer directly on `NSPanel` through PyObjC — `NSWindowStyleMaskNonactivatingPanel`, `setLevel_`, `setIgnoresMouseEvents_`, and an all-Spaces `collectionBehavior` — rather than reflecting AppKit calls onto Qt's `NSWindow`, which is a community technique with no documented confirmation
 - [ ] 15.3 Present nothing and report the reason where neither route gives the required properties
-- [ ] 15.4 Confirm synthesis resolves the CoreML execution provider, which the stock `onnxruntime` macOS wheel carries, and that `[tts] device = "auto"` uses it while `[stt] device` correctly finds no accelerator — CTranslate2 has no GPU backend on macOS
+- [x] 15.4 Confirm synthesis resolves the CoreML execution provider, which the stock `onnxruntime` macOS wheel carries, and that `[tts] device = "auto"` uses it while `[stt] device` correctly finds no accelerator — CTranslate2 has no GPU backend on macOS
 - [x] 15.5 Spike the bundled `espeakng-loader` macOS wheel for the same data-path defect, and name Homebrew's `espeak-ng` in the remedy if it carries it
 
 ## 16. The installer

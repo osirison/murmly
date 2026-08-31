@@ -239,6 +239,10 @@ class BackendCandidate:
     #: subsystem already defines -- imported from inside the callable's own
     #: body so this module never imports the subsystem at module load time.
     load: Callable[[], object]
+    #: What this mechanism cannot do even when it is working. Carried on the
+    #: candidate rather than decided at selection time, because a limitation
+    #: belongs to the mechanism itself and does not vary by profile.
+    limitations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,10 +264,19 @@ class BackendChoice:
     answer for code.
     """
 
+    #: What a selected mechanism cannot do, where that is worth saying even
+    #: though it was selected. Distinct from `reason`, which explains an
+    #: absence, and from `remedy`, which names a fix: these are properties of
+    #: a mechanism that works, and nothing makes them go away. Task 13.7 is
+    #: the case that required them -- Carbon's `RegisterEventHotKey` does not
+    #: fire when the frontmost application consumes the chord itself, and a
+    #: person whose hotkey is silent in one application and not others has no
+    #: way to learn that from anywhere else.
     mechanism: str | None
     reason: str | None = None
     load: Callable[[], object] | None = None
     remedy: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
 
     @property
     def available(self) -> bool:
@@ -305,7 +318,11 @@ class BackendRegistry:
     def select(self, profile: PlatformProfile) -> BackendChoice:
         for candidate in self._candidates:
             if candidate.supports(profile):
-                return BackendChoice(candidate.mechanism, load=candidate.load)
+                return BackendChoice(
+                    candidate.mechanism,
+                    load=candidate.load,
+                    limitations=candidate.limitations,
+                )
         return BackendChoice(
             None,
             reason=self._unavailable_reason(profile),
@@ -594,7 +611,23 @@ HOTKEY_REGISTRATION = BackendRegistry(
         # for the same structural reason `windows-hotkey` is one: the binding
         # lives inside the daemon's own event-loop thread, not in any
         # desktop-held state. See `mac_hotkey.py`.
-        BackendCandidate("macos-hotkey", _is_macos, _load_macos_hotkey_registrar),
+        BackendCandidate(
+            "macos-hotkey",
+            _is_macos,
+            _load_macos_hotkey_registrar,
+            # Task 13.7. Both are permanent properties of
+            # `RegisterEventHotKey`, not faults to fix: the trade design.md
+            # took for a hotkey that needs no permission at all, where either
+            # mode of `CGEventTap` would need one. Reported because a hotkey
+            # that works everywhere except inside one application looks like a
+            # defect in Murmly, and there is nowhere else to learn otherwise.
+            limitations=(
+                "A hotkey does not fire while an application that consumes the "
+                "same combination itself is frontmost.",
+                "A modifier-only combination cannot be registered; every hotkey "
+                "needs a non-modifier key.",
+            ),
+        ),
     ),
     unavailable_reason=_hotkey_unavailable_reason,
 )

@@ -775,6 +775,19 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
         if not choice.available:
             concern_report["reason"] = choice.reason
             concern_report["remedy"] = list(choice.remedy)
+        # Task 13.7. Reported for a mechanism that *is* available, unlike
+        # `reason` and `remedy`, which describe an absence and its fix. These
+        # are permanent properties of a working mechanism, and the only place
+        # a person can learn them: a macOS hotkey that is silent in one
+        # application and fine in every other looks exactly like a defect in
+        # Murmly from outside.
+        #
+        # Always present, empty where the mechanism has none. `reason` and
+        # `remedy` may be gated on `available` because that is a state every
+        # platform can be in; a key gated on *which* mechanism was selected
+        # would be present on macOS and absent on Linux, which is the
+        # platform-varying report shape `platform-support` forbids.
+        concern_report["limitations"] = list(choice.limitations)
         concerns[concern] = concern_report
 
     if profile.operating_system is OperatingSystem.MACOS and concerns["paste_injection"]["available"]:

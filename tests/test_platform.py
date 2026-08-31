@@ -526,6 +526,31 @@ class BackendRegistryTests(unittest.TestCase):
                 self.assertEqual("kokoro", choice.mechanism)
                 self.assertIs(KokoroSynthesizer, choice.load())
 
+    def test_the_macos_hotkey_reports_what_it_cannot_do(self) -> None:
+        """Task 13.7: a mechanism can be selected and still have limits.
+
+        Carbon's `RegisterEventHotKey` is the trade design.md took for a
+        hotkey needing no permission at all -- either mode of `CGEventTap`
+        would need one. The cost is that an application consuming the same
+        chord itself wins while it is frontmost, and that a modifier-only
+        combination cannot be expressed. Both are permanent, so they are
+        reported rather than fixed: a hotkey silent in one application and
+        fine everywhere else is indistinguishable from a defect in Murmly
+        unless something says otherwise.
+        """
+        choice = BACKEND_REGISTRIES["hotkey_registration"].select(macos())
+
+        self.assertTrue(choice.available)
+        self.assertEqual(2, len(choice.limitations))
+        self.assertTrue(any("frontmost" in text for text in choice.limitations))
+        self.assertTrue(any("modifier-only" in text for text in choice.limitations))
+
+    def test_a_mechanism_with_nothing_to_declare_reports_no_limitations(self) -> None:
+        choice = BACKEND_REGISTRIES["hotkey_registration"].select(linux_plasma_x11())
+
+        self.assertTrue(choice.available)
+        self.assertEqual((), choice.limitations)
+
     def test_speech_synthesis_has_no_backend_on_an_unnamed_operating_system(self) -> None:
         choice = BACKEND_REGISTRIES["speech_synthesis"].select(
             replace(linux_plasma_x11(), operating_system=OperatingSystem.OTHER)
