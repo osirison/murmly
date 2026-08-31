@@ -88,6 +88,49 @@ class SessionClassificationTests(unittest.TestCase):
         self.assertIn("_NET_ACTIVE_WINDOW", observer.detail)
 
 
+class WindowsClassificationTests(unittest.TestCase):
+    """Task 9.4: `profile`, not `env`, selects the Windows branch -- `env`
+    carries session/desktop variables, never the operating system itself, so
+    a test exercising Windows from this Linux machine supplies a
+    `PlatformProfile` directly."""
+
+    def _windows_profile(self):
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        return PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+    def test_a_windows_profile_gets_the_windows_observer_without_touching_x11(self) -> None:
+        sentinel = object()
+
+        observer = create_focus_observer(
+            profile=self._windows_profile(),
+            x11_loader=lambda: self.fail("X11 must not be loaded on Windows"),
+            windows_focus_observer=lambda: sentinel,
+        )
+
+        self.assertIs(sentinel, observer)
+
+    def test_a_windows_profile_wins_over_a_wayland_shaped_env(self) -> None:
+        """A stale or forwarded `WAYLAND_DISPLAY` must not steer a Windows
+        profile into the Wayland branch -- `profile` decides first."""
+        sentinel = object()
+
+        observer = create_focus_observer(
+            env={"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"},
+            profile=self._windows_profile(),
+            windows_focus_observer=lambda: sentinel,
+        )
+
+        self.assertIs(sentinel, observer)
+
+    def test_the_default_loader_returns_a_real_windows_focus_observer(self) -> None:
+        from murmly.win_focus import WindowsFocusObserver
+
+        observer = create_focus_observer(profile=self._windows_profile())
+
+        self.assertIsInstance(observer, WindowsFocusObserver)
+
+
 class DeliveryDecisionTests(unittest.TestCase):
     TARGET = WindowIdentity(window_id=42, pid=100, window_class="editor")
 

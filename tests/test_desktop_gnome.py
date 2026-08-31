@@ -15,6 +15,8 @@ import unittest
 from murmly.desktop import (
     GNOME_CUSTOM_KEYBINDING_SCHEMA,
     GNOME_MEDIA_KEYS_SCHEMA,
+    GNOME_SHELL_KEYBINDINGS_SCHEMA,
+    GNOME_WM_KEYBINDINGS_SCHEMA,
     GnomeShortcuts,
     GnomeShortcutLauncher,
     gnome_binding_path,
@@ -48,10 +50,28 @@ class FakeGsettings:
     gsettings/dconf pair is -- `recorded()` in test_desktop.py is stateless and
     cannot model a read-modify-write against what an earlier call wrote."""
 
-    def __init__(self, custom_keybindings: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        custom_keybindings: list[str] | None = None,
+        fixed: dict[str, dict[str, str]] | None = None,
+    ) -> None:
         self._list: list[str] = list(custom_keybindings or [])
         self._values: dict[tuple[str, str], str] = {}
         self.calls: list[list[str]] = []
+        # GNOME's fixed schemas (`org.gnome.desktop.wm.keybindings` and
+        # similar), keyed by schema then key name, holding the raw GVariant
+        # text `gsettings list-recursively` would print for it. Empty by
+        # default: a test that does not care about the fixed-schema scan gets
+        # the same "nothing there" answer for it that the custom-keybindings
+        # scan already gave before this schema was scanned at all.
+        self._fixed: dict[str, dict[str, str]] = {
+            schema: dict(entries) for schema, entries in (fixed or {}).items()
+        }
+        # Schemas this fake should report as unreadable, to exercise the
+        # fail-closed path -- a real `gsettings list-recursively` failing the
+        # same way (an unknown schema, a broken dconf) must not be mistaken
+        # for that schema simply holding nothing.
+        self.unreadable_schemas: set[str] = set()
 
     def __call__(self, command, **_kwargs) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(command))
@@ -65,7 +85,17 @@ class FakeGsettings:
         if verb == "reset-recursively":
             (schema_arg,) = rest
             return self._reset(schema_arg)
+        if verb == "list-recursively":
+            (schema_arg,) = rest
+            return self._list_recursively(schema_arg)
         return self._result(1, stderr=f"unknown verb {verb!r}")
+
+    def _list_recursively(self, schema: str) -> subprocess.CompletedProcess[str]:
+        if schema in self.unreadable_schemas:
+            return self._result(1, stderr=f"No such schema {schema!r}")
+        entries = self._fixed.get(schema, {})
+        lines = [f"{schema} {key} {value}" for key, value in entries.items()]
+        return self._result(0, stdout="\n".join(lines))
 
     @staticmethod
     def _path_of(schema_arg: str) -> str | None:
@@ -247,6 +277,102 @@ class ConflictDetectionTests(unittest.TestCase):
         shortcuts = GnomeShortcuts(run_command=FakeGsettings())
 
         self.assertEqual([], shortcuts.registered_keys("net.local.something-else.desktop"))
+
+
+class FixedSchemaConflictTests(unittest.TestCase):
+    """Task 4.4's other half: a key GNOME already owns through one of its own
+    fixed schemas, not through `custom-keybindings`, must also be refused."""
+
+    def test_a_builtin_wm_keybinding_holding_the_target_accelerator_is_reported(self) -> None:
+        fake = FakeGsettings(fixed={GNOME_WM_KEYBINDINGS_SCHEMA: {"switch-windows": "['<Alt>Tab']"}})
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        owners = shortcuts.owners_of(parse_hotkey("Alt+Tab").keycode)
+
+        self.assertEqual(1, len(owners))
+        self.assertEqual(GNOME_WM_KEYBINDINGS_SCHEMA, owners[0].component_unique)
+        self.assertEqual("switch-windows", owners[0].action_unique)
+
+    def test_a_builtin_shell_keybinding_holding_the_target_accelerator_is_reported(self) -> None:
+        fake = FakeGsettings(fixed={GNOME_SHELL_KEYBINDINGS_SCHEMA: {"toggle-overview": "['<Super>x']"}})
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        owners = shortcuts.owners_of(parse_hotkey("Meta+X").keycode)
+
+        self.assertEqual(1, len(owners))
+        self.assertEqual(GNOME_SHELL_KEYBINDINGS_SCHEMA, owners[0].component_unique)
+
+    def test_a_builtin_media_keys_binding_holding_the_target_accelerator_is_reported(self) -> None:
+        """The media-keys plugin's *base* schema, not the relocatable
+        `custom-keybinding` schema `custom-keybindings` entries live under --
+        GNOME's own volume/brightness/screenshot bindings live here."""
+        fake = FakeGsettings(fixed={GNOME_MEDIA_KEYS_SCHEMA: {"screenshot": "['<Alt>F4']"}})
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        owners = shortcuts.owners_of(parse_hotkey("Alt+F4").keycode)
+
+        self.assertEqual(1, len(owners))
+        self.assertEqual(GNOME_MEDIA_KEYS_SCHEMA, owners[0].component_unique)
+        self.assertEqual("screenshot", owners[0].action_unique)
+
+    def test_the_custom_keybindings_path_list_itself_is_not_mistaken_for_an_accelerator(self) -> None:
+        """`list-recursively` on the media-keys base schema also reports its
+        own `custom-keybindings` key -- a list of dconf paths, not
+        accelerators. It must not double-report Murmly's own binding."""
+        fake = FakeGsettings(
+            custom_keybindings=[FOREIGN_PATH_1],
+            fixed={GNOME_MEDIA_KEYS_SCHEMA: {"custom-keybindings": f"['{FOREIGN_PATH_1}']"}},
+        )
+        fake._values[(FOREIGN_PATH_1, "binding")] = repr("<Super>x")
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        owners = shortcuts.owners_of(parse_hotkey("Meta+X").keycode)
+
+        self.assertEqual(1, len(owners))
+        self.assertEqual(FOREIGN_PATH_1, owners[0].component_unique)
+
+    def test_no_owner_is_reported_for_a_free_key_across_every_fixed_schema(self) -> None:
+        fake = FakeGsettings(
+            fixed={
+                GNOME_WM_KEYBINDINGS_SCHEMA: {"switch-windows": "['<Alt>Tab']"},
+                GNOME_SHELL_KEYBINDINGS_SCHEMA: {"toggle-overview": "['<Super>s']"},
+                GNOME_MEDIA_KEYS_SCHEMA: {"screenshot": "['Print']"},
+            }
+        )
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        self.assertEqual([], shortcuts.owners_of(parse_hotkey("Meta+X").keycode))
+
+    def test_a_disabled_builtin_binding_is_not_reported(self) -> None:
+        """Conventionally written back as `@as []` when a person clears it in
+        Settings -- must not parse as an accelerator."""
+        fake = FakeGsettings(fixed={GNOME_WM_KEYBINDINGS_SCHEMA: {"switch-windows": "@as []"}})
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        self.assertEqual([], shortcuts.owners_of(parse_hotkey("Alt+Tab").keycode))
+
+    def test_a_schema_that_cannot_be_read_raises_rather_than_reporting_no_collision(self) -> None:
+        """Fail closed: a query that could not be answered must never be read
+        as evidence a key is free, or a refusal decision built on it would take
+        a key GNOME already owns without ever knowing."""
+        from murmly.desktop import DesktopQueryError
+
+        fake = FakeGsettings()
+        fake.unreadable_schemas.add(GNOME_SHELL_KEYBINDINGS_SCHEMA)
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        with self.assertRaises(DesktopQueryError):
+            shortcuts.owners_of(parse_hotkey("Meta+X").keycode)
+
+    def test_is_available_also_fails_closed_on_an_unreadable_fixed_schema(self) -> None:
+        from murmly.desktop import DesktopQueryError
+
+        fake = FakeGsettings()
+        fake.unreadable_schemas.add(GNOME_WM_KEYBINDINGS_SCHEMA)
+        shortcuts = GnomeShortcuts(run_command=fake)
+
+        with self.assertRaises(DesktopQueryError):
+            shortcuts.is_available(parse_hotkey("Meta+X").keycode)
 
 
 class NoConfirmationRaisesTests(unittest.TestCase):

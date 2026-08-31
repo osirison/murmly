@@ -10,10 +10,12 @@ from murmly.integrations import (
     ClipboardPaster,
     MissingToolError,
     PasteInjection,
+    create_clipboard_paster,
     input_consent_advisory,
     choose_clipboard_copy_command,
     select_paste_injection,
 )
+from murmly.platform import OperatingSystem, PlatformProfile
 
 
 def fake_which_factory(*available: str):
@@ -355,3 +357,64 @@ class InputConsentAdvisoryTests(unittest.TestCase):
             granted = self._env(temp_dir, "XwaylandEisNoPromptApps=\n")
             self.assertIsNone(input_consent_advisory("wtype", granted))
             self.assertIsNone(input_consent_advisory("xdotool", {"XDG_SESSION_TYPE": "x11", "XDG_CONFIG_HOME": temp_dir}))
+
+
+def windows_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+
+class WindowsPasteInjectionSelectionTests(unittest.TestCase):
+    """Task 9.2/9.3: `select_paste_injection`'s Windows branch, exercised with
+    an explicit `profile` since `env` cannot fake being on Windows (it carries
+    session variables, never `sys.platform`)."""
+
+    def test_send_input_is_always_available_and_never_confirms(self) -> None:
+        injection = select_paste_injection(profile=windows_profile())
+
+        self.assertTrue(injection.available)
+        self.assertEqual("send-input", injection.method)
+        self.assertFalse(injection.confirms_delivery)
+        # Nothing to run -- the method is an in-process API call, not a
+        # subprocess command -- but `available` still reads true from it.
+        self.assertEqual((), injection.command)
+
+    def test_a_send_input_failure_leaves_nothing_to_fall_back_to(self) -> None:
+        """Unlike Wayland/X11, Windows has exactly one candidate: once it is
+        excluded there is no second method, distinctly from "not installed"."""
+        injection = select_paste_injection(profile=windows_profile(), excluded={"send-input"})
+
+        self.assertFalse(injection.available)
+        self.assertIn("send-input", injection.reason)
+        self.assertIn("earlier in this session", injection.reason)
+
+    def test_a_supplied_profile_overrides_env_based_resolution(self) -> None:
+        """`profile` -- not `env` -- is what selects the Windows branch: a
+        Wayland-shaped `env` must not leak Linux candidates through when a
+        Windows profile is supplied explicitly."""
+        injection = select_paste_injection(
+            env={"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"},
+            profile=windows_profile(),
+        )
+
+        self.assertEqual("send-input", injection.method)
+
+
+class ClipboardPasterFactoryTests(unittest.TestCase):
+    """`create_clipboard_paster` dispatches by profile; Linux must get back
+    exactly the same `ClipboardPaster` construction as before this factory
+    existed (zero behaviour change), and Windows must get the Win32 one."""
+
+    def test_linux_gets_an_ordinary_clipboard_paster(self) -> None:
+        paster = create_clipboard_paster(
+            env={"XDG_SESSION_TYPE": "x11"},
+            which=lambda name: f"/usr/bin/{name}",
+        )
+
+        self.assertIsInstance(paster, ClipboardPaster)
+
+    def test_windows_gets_the_win32_paster(self) -> None:
+        from murmly.win_clipboard import WindowsClipboardPaster
+
+        paster = create_clipboard_paster(profile=windows_profile())
+
+        self.assertIsInstance(paster, WindowsClipboardPaster)

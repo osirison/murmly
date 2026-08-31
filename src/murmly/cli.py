@@ -40,10 +40,10 @@ from murmly.installer import (
     UserService,
 )
 from murmly.integrations import (
-    ClipboardPaster,
     MissingToolError,
     PasteInjection,
     choose_clipboard_copy_command,
+    create_clipboard_paster,
     is_wayland_session,
     select_paste_injection,
 )
@@ -71,6 +71,7 @@ from murmly.platform import (
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
 from murmly.tts import CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
+from murmly.win_pipe import is_pipe_name
 
 
 logger = logging.getLogger(__name__)
@@ -488,7 +489,7 @@ def _serve_daemon(config: MurmlyConfig, profile: PlatformProfile | None = None) 
             )
 
     try:
-        daemon = MurmlyDaemon(config)
+        daemon = MurmlyDaemon(config, profile=resolved)
     except DaemonStartupError as error:
         print(str(error), file=sys.stderr)
         return 1
@@ -522,7 +523,7 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
         return 0
     print(text)
     allowed, reason = should_deliver(observer, target, config.verify_target) if paste else (False, None)
-    paster = ClipboardPaster(
+    paster = create_clipboard_paster(
         restore_clipboard=config.restore_clipboard and allowed,
         restore_delay_ms=config.restore_clipboard_delay_ms,
     )
@@ -554,13 +555,21 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     # not what this report caused on its way past.
     (model_resident, model_resident_detail), synthesis_residency = daemon_residency(config)
 
-    try:
-        clipboard_command: list[str] | str = choose_clipboard_copy_command()
-    except MissingToolError as error:
-        clipboard_command = f"unavailable: {error}"
+    # `choose_clipboard_copy_command` has no Windows branch of its own (task
+    # 9.1's clipboard is a Win32 API call, not a command to name), so this
+    # reports the mechanism directly rather than asking a Linux-only chooser
+    # about a platform it was never taught, which would otherwise surface a
+    # misleading "install xclip" on a machine that never needed it.
+    if resolved_profile.operating_system is OperatingSystem.WINDOWS:
+        clipboard_command = "Win32 clipboard API (CF_UNICODETEXT)"
+    else:
+        try:
+            clipboard_command = choose_clipboard_copy_command()
+        except MissingToolError as error:
+            clipboard_command = f"unavailable: {error}"
 
     try:
-        injection_report = paste_injection_diagnostics(select_paste_injection())
+        injection_report = paste_injection_diagnostics(select_paste_injection(profile=resolved_profile))
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         injection_report = {
             "available": False,
@@ -629,7 +638,7 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     report: dict[str, object] = {
         "config_path": str(config.config_path),
         "socket_path": str(config.socket_path),
-        "command_socket": command_socket_diagnostics(config),
+        "command_socket": command_socket_diagnostics(config, resolved_profile),
         "platform": platform_diagnostics(resolved_profile),
         "session": session,
         "clipboard_command": clipboard_command,
@@ -709,13 +718,16 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
     concern this platform cannot serve is `available: False` with a reason,
     never a key the report omits.
 
-    A concern whose mechanism is gated behind a permission (none are, yet --
-    see `PERMISSIONS`) must AND that permission's state into its own
-    `available` once one exists: a present mechanism whose permission is
-    denied is not an available concern, and deriving `available` from
-    `BackendChoice.available` alone, as this does today, would report it as
-    one. Nothing in `BACKEND_REGISTRIES` is permission-gated yet, so that rule
-    has no case to apply to here.
+    A concern whose mechanism is gated behind a permission must AND that
+    permission's state into its own `available`: a present mechanism whose
+    permission is denied is not an available concern, and deriving
+    `available` from `BackendChoice.available` alone, as this does today,
+    would report it as one. None of the eight registries in
+    `BACKEND_REGISTRIES` is permission-gated yet -- `PERMISSIONS`' first entry
+    (Windows' microphone privacy setting, task 9.5) gates microphone capture,
+    which is not one of the eight -- so that rule still has no case to apply
+    to here, and `permissions` is rendered as its own section below rather
+    than folded into any concern.
     """
     concerns: dict[str, object] = {}
     for concern, registry in BACKEND_REGISTRIES.items():
@@ -731,6 +743,14 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
 
     permissions: dict[str, object] = {}
     for name, permission in PERMISSIONS.items():
+        # Filtered before the check runs, not only before rendering: a
+        # platform this permission does not apply to must not pay for -- or
+        # be reported on the strength of -- a check written for a different
+        # operating system (task 9.5's Windows registry read has no meaning
+        # to run against a Linux profile, and no `winreg` module to run it
+        # with).
+        if not permission.applies(profile):
+            continue
         try:
             state = permission.check(profile)
         except Exception as error:  # noqa: BLE001 - a permission check must not raise
@@ -763,25 +783,48 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
     }
 
 
-def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
+def command_socket_diagnostics(
+    config: MurmlyConfig, profile: PlatformProfile | None = None
+) -> dict[str, object]:
     """Who can reach the command socket, for `murmly doctor`.
 
     Reported, never refused. Only the daemon refuses to start on a path another
     account can write, because every command loads this configuration and the
-    command that exists to explain the condition must keep running.
+    command that exists to explain the condition must keep running -- the
+    `command-interface` spec's "Other commands still run when the daemon would
+    refuse" scenario.
+
+    Task 7.5: `socket_path_detail`'s directory-privacy analysis presumes a
+    filesystem object, which a pipe name is not, so a pipe-shaped configured
+    value skips it entirely rather than being walked as a filesystem path.
     """
-    detail = socket_path_detail(config.socket_path)
+    resolved = profile if profile is not None else resolve_platform()
+    path = str(config.socket_path)
     report: dict[str, object] = {
-        "path": str(config.socket_path),
-        "path_private": detail is None,
-        "peer_identity_supported": peer_identity_supported(),
+        "path": path,
+        "peer_identity_supported": peer_identity_supported(resolved),
     }
-    if detail is not None:
-        report["detail"] = detail
+    if is_pipe_name(path):
+        # A named pipe's DACL is built owner-only unconditionally (task 7.2),
+        # so any pipe-shaped value is private wherever Windows is the platform
+        # actually serving it; a pipe-shaped value configured anywhere else is
+        # the mismatch `MurmlyDaemon._require_private_channel` also refuses.
+        report["path_private"] = resolved.operating_system is OperatingSystem.WINDOWS
+        if resolved.operating_system is not OperatingSystem.WINDOWS:
+            report["detail"] = (
+                f"{path} is a Windows named-pipe name, but "
+                f"{resolved.operating_system.value} serves its command channel as "
+                "a filesystem socket."
+            )
+    else:
+        detail = socket_path_detail(config.socket_path)
+        report["path_private"] = detail is None
+        if detail is not None:
+            report["detail"] = detail
     if not report["peer_identity_supported"]:
         report["peer_identity_detail"] = (
             "This platform cannot report the account behind a connection. The "
-            "command socket is protected by its file permissions alone."
+            "command channel is protected by its own access control alone."
         )
     return report
 

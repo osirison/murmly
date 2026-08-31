@@ -11,19 +11,23 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from murmly.config import MurmlyConfig, default_socket_path
+from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, default_socket_path
 from murmly.daemon import (
     ADOPT_SESSION,
+    DESTINATION_SESSION,
     MAX_COMMAND_BYTES,
     MAX_COMMAND_WORKERS,
     CommandCode,
     DaemonNotRespondingError,
     DaemonStartupError,
     MurmlyDaemon,
+    PeerIdentityMechanism,
     ProcessingResult,
     RequestError,
     SpeechSession,
     SpeechSessionConnection,
+    peer_identity_mechanism_for,
+    peer_identity_supported,
     read_peer_identity,
     send_command,
     socket_path_detail,
@@ -32,6 +36,7 @@ from murmly.focus import NullFocusObserver, WindowIdentity
 from murmly.idle import IdleRelease
 from murmly.integrations import DeliveryOutcome
 from murmly.overlay import OverlayHealth, OverlayState
+from murmly.platform import OperatingSystem, PlatformProfile
 
 
 class DummySession:
@@ -2172,23 +2177,178 @@ class RebindHotkeysCommandTests(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertIn("held by the desktop", response["detail"])
 
-    def test_never_raises_even_if_resolving_the_platform_explodes(self) -> None:
+    def test_never_raises_even_if_the_rebind_itself_explodes(self) -> None:
         """A hotkey rebind failing must never be why a command -- or, at
         startup, the whole daemon -- stops answering."""
         with tempfile.TemporaryDirectory() as temp_dir:
             daemon = self._daemon(temp_dir)
 
-            with patch("murmly.platform.resolve_platform", side_effect=RuntimeError("boom")):
+            with patch("murmly.daemon.rebind_from_record", side_effect=RuntimeError("boom")):
                 response = daemon.handle_command("rebind_hotkeys")
 
         self.assertTrue(response["ok"])
         self.assertIn("Hotkey rebind failed", response["detail"])
+
+    def test_uses_the_profile_resolved_at_construction_not_a_fresh_one(self) -> None:
+        """`_rebind_hotkeys` must read `self._profile` -- resolved once at
+        construction (task 1.3) -- rather than calling `resolve_platform()`
+        again: the registrar it drives (`self._hotkey_registrar`) was built
+        from that same resolution, and a second, independent call could in
+        principle disagree with it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(
+                config, session=DummySession(), profile=windows_profile(), hotkey_registrar=object()
+            )
+
+            with patch("murmly.platform.resolve_platform") as resolve:
+                daemon.handle_command("rebind_hotkeys")
+
+        resolve.assert_not_called()
 
     def test_a_default_daemon_holds_no_in_process_registrar(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             daemon = self._daemon(temp_dir)
 
         self.assertIsNone(daemon._hotkey_registrar)
+
+
+class FakeHotkeyRegistrar:
+    """The `hotkey_record.py` `rebind` contract, plus `stop`/`held_purposes`
+    -- exactly `win_hotkey.WindowsHotkeyRegistrar`'s public surface, without
+    touching a real thread or any Win32 call."""
+
+    def __init__(self) -> None:
+        self.rebind_calls: list[dict[str, str]] = []
+        self.stopped = False
+        self._held: frozenset[str] = frozenset()
+
+    def rebind(self, bindings: dict[str, str]) -> None:
+        self.rebind_calls.append(dict(bindings))
+        self._held = frozenset(bindings)
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._held = frozenset()
+
+    def held_purposes(self) -> frozenset[str]:
+        return self._held
+
+
+class InProcessHotkeyRegistrarWiringTests(unittest.TestCase):
+    """Task 8.3/8.5, 18.10: a fired hotkey dispatches through `handle_command`
+    like any other command, the registrar is released on shutdown, and
+    `status` reports what it holds -- present only where a registrar exists
+    at all, so a Linux daemon's `status` response is unchanged."""
+
+    def _daemon(self, temp_dir: str, registrar: object) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(WINDOWS_PIPE_NAME),
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+        )
+        return MurmlyDaemon(
+            config, session=DummySession(), profile=windows_profile(), hotkey_registrar=registrar
+        )
+
+    def test_shutdown_releases_the_registrar(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon.shutdown()
+
+        self.assertTrue(registrar.stopped)
+
+    def test_serve_forever_releases_the_registrar_even_when_it_never_reaches_shutdown(
+        self,
+    ) -> None:
+        """8.5's release must hold on `serve_forever`'s own error paths, not
+        only when something external calls `shutdown()`: a daemon that dies
+        from an unhandled exception while starting its channel must not leave
+        a hotkey thread holding `RegisterHotKey` bindings with nothing left to
+        release them. This machine has no `pywin32` to import, which is
+        exactly what drives `_serve_named_pipe`'s `NamedPipeServer(...)` call
+        to raise here -- a real exception from real code, not a fake standing
+        in for one."""
+        registrar = FakeHotkeyRegistrar()
+        registrar.rebind({"window": "Meta+X"})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            with self.assertRaises(Exception):
+                daemon.serve_forever()
+
+        self.assertTrue(registrar.stopped)
+
+    def test_status_reports_the_registrars_held_purposes(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        registrar.rebind({"window": "Meta+X"})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            response = daemon.handle_command("status")
+
+        self.assertEqual(["window"], response["hotkeys_held"])
+
+    def test_status_reports_nothing_held_once_stopped(self) -> None:
+        """18.10: not held once the registrar (and so the daemon) stops."""
+        registrar = FakeHotkeyRegistrar()
+        registrar.rebind({"window": "Meta+X"})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon.shutdown()
+            response = daemon.handle_command("status")
+
+        self.assertEqual([], response["hotkeys_held"])
+
+    def test_status_omits_hotkeys_held_with_no_registrar(self) -> None:
+        """Unchanged shape on Linux: no registrar, no key."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession())
+
+            response = daemon.handle_command("status")
+
+        self.assertNotIn("hotkeys_held", response)
+
+    def test_a_fired_hotkey_toggles_capture_through_handle_command(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon._handle_in_process_hotkey("window")
+
+        self.assertEqual(1, daemon._session.started)
+
+    def test_a_fired_hotkey_for_the_session_purpose_toggles_the_session_destination(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon._handle_in_process_hotkey("session")
+
+        self.assertEqual(1, daemon._session.started)
+        self.assertEqual(DESTINATION_SESSION, daemon._capture_destination)
+
+    def test_an_unrecognized_purpose_is_logged_not_raised(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            with self.assertLogs("murmly.daemon", level="WARNING") as logs:
+                daemon._handle_in_process_hotkey("unknown")
+
+        self.assertTrue(any("unrecognized purpose" in line for line in logs.output))
 
 
 class RebindAtStartupTests(unittest.TestCase):
@@ -2709,6 +2869,29 @@ class SocketAccessTests(ServedDaemonTests):
 
         self.assertEqual(0, session.started)
 
+    def test_a_peer_identity_of_any_comparable_type_is_permitted_when_equal(self) -> None:
+        """18.7: `_peer_permitted` compares with `==` against whatever
+        `local_identity` returns, not an int-specific comparison -- the same
+        code path that lets Linux compare `os.getuid()` integers is what lets
+        Windows compare the SID strings `win_pipe` reads."""
+        _daemon, socket_path = self.serve(
+            peer_identity=lambda _connection: "S-1-5-21-000-111-222-1000",
+            local_identity=lambda: "S-1-5-21-000-111-222-1000",
+        )
+
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
+
+    def test_a_peer_identity_of_any_comparable_type_is_refused_when_it_differs(self) -> None:
+        _daemon, socket_path = self.serve(
+            peer_identity=lambda _connection: "S-1-5-21-000-111-222-9999",
+            local_identity=lambda: "S-1-5-21-000-111-222-1000",
+        )
+
+        response = json.loads(send_payload(socket_path, b'{"command": "toggle"}\n'))
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.NOT_PERMITTED, response["code"])
+
     def test_the_daemon_refuses_a_socket_path_other_accounts_can_write(self) -> None:
         for mode in (0o777, 0o770):
             with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as temp_dir:
@@ -2969,6 +3152,101 @@ class SocketAccessTests(ServedDaemonTests):
             any("cannot report the account" in line for line in logs.output),
             f"expected the startup warning, got {logs.output!r}",
         )
+
+
+def windows_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+
+class PeerIdentityMechanismDispatchTests(unittest.TestCase):
+    """18.7: peer identity is read by the resolved platform's own mechanism,
+    and the same mechanism supplies what it is compared against."""
+
+    def test_linux_keeps_the_existing_socket_functions(self) -> None:
+        mechanism = peer_identity_mechanism_for(
+            PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+        )
+
+        self.assertIs(read_peer_identity, mechanism.read)
+        self.assertIs(os.getuid, mechanism.local)
+        self.assertEqual(peer_identity_supported(), mechanism.supported)
+
+    def test_windows_dispatches_to_the_pipes_own_mechanism(self) -> None:
+        # Proves the dispatch, and that `murmly.win_pipe` imports cleanly on
+        # this Linux machine -- calling either function is what would need
+        # `pywin32`, not naming them.
+        from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
+
+        mechanism = peer_identity_mechanism_for(windows_profile())
+
+        self.assertIs(read_peer_identity_from_pipe, mechanism.read)
+        self.assertIs(current_user_sid_string, mechanism.local)
+        self.assertTrue(mechanism.supported)
+
+    def test_windows_reports_peer_identity_supported_without_so_peercred(self) -> None:
+        self.assertTrue(peer_identity_supported(windows_profile()))
+
+    def test_a_daemon_constructed_for_windows_wires_the_pipes_mechanism(self) -> None:
+        """The dispatch is not only reachable directly -- `MurmlyDaemon.__init__`
+        actually uses it when a resolved Windows profile is supplied."""
+        from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=windows_profile())
+
+        self.assertIs(read_peer_identity_from_pipe, daemon._peer_identity)
+        self.assertIs(current_user_sid_string, daemon._local_identity)
+
+
+class ChannelShapeMismatchTests(unittest.TestCase):
+    """Task 7.5: a configured channel value shaped for the other platform's
+    transport is refused at startup, naming the mismatch -- never guessed at
+    or silently reinterpreted, and never run through the filesystem
+    path-privacy analysis, which does not apply to a name that is not one."""
+
+    def test_a_pipe_shaped_socket_path_is_refused_on_a_filesystem_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            with self.assertRaises(DaemonStartupError) as raised:
+                MurmlyDaemon(config, session=DummySession())
+
+        self.assertIn("named-pipe name", str(raised.exception))
+        self.assertIn("filesystem socket", str(raised.exception))
+
+    def test_a_filesystem_shaped_socket_path_is_refused_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            with self.assertRaises(DaemonStartupError) as raised:
+                MurmlyDaemon(config, session=DummySession(), profile=windows_profile())
+
+        self.assertIn("named pipe, not a filesystem path", str(raised.exception))
+
+    def test_a_pipe_shaped_socket_path_on_windows_passes_the_shape_check(self) -> None:
+        """Construction reaches past `_require_private_channel` -- the pipe
+        itself is never created here, which is what `NamedPipeServer` needs
+        `pywin32` for and this machine does not have."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=windows_profile())
+
+        self.assertTrue(daemon._uses_named_pipe())
 
 
 class UnaskableTranscriber:

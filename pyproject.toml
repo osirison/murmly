@@ -13,6 +13,11 @@ authors = [{ name = "osirison" }]
 dependencies = [
     "faster-whisper>=1.2.1",
     "sounddevice>=0.5.5",
+    # The command channel's named-pipe transport (section 7): CPython exposes no
+    # `AF_UNIX` on Windows, and `win32pipe`/`win32security` are what build a pipe
+    # whose DACL grants only the creating user's SID. Markered so no other
+    # platform resolves or installs it.
+    "pywin32==312 ; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

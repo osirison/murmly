@@ -32,6 +32,7 @@ import subprocess
 
 from murmly.hotkey import (
     HotkeyError,
+    HotkeySpec,
     decode_kde_keycode,
     encode_for_kde,
     gnome_accelerator,
@@ -317,6 +318,25 @@ GNOME_CUSTOM_KEYBINDINGS_KEY = "custom-keybindings"
 GNOME_CUSTOM_KEYBINDINGS_BASE = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/"
 GNOME_QUERY_TIMEOUT_SECONDS = 5.0
 
+GNOME_WM_KEYBINDINGS_SCHEMA = "org.gnome.desktop.wm.keybindings"
+GNOME_SHELL_KEYBINDINGS_SCHEMA = "org.gnome.shell.keybindings"
+
+#: GNOME's own fixed shortcuts, scanned in addition to `custom-keybindings`.
+#: `GNOME_MEDIA_KEYS_SCHEMA` appears twice in this module for two different
+#: reasons: as the *base* schema here, it carries GNOME's own built-in
+#: volume/brightness/screenshot bindings directly; the *relocatable*
+#: `GNOME_CUSTOM_KEYBINDING_SCHEMA` above is what each `custom-keybindings`
+#: entry is addressed through, and is never in this tuple. A key one of these
+#: schemas holds is a GNOME shortcut Murmly did not create and cannot rebind;
+#: taking it anyway leaves the new hotkey silently unfired, since GNOME does
+#: not arbitrate two claimants any more than KDE's `kglobalaccel` does. See
+#: ``docs/agent-notes/gnome-custom-keybindings.md``.
+GNOME_FIXED_SCHEMAS: tuple[str, ...] = (
+    GNOME_WM_KEYBINDINGS_SCHEMA,
+    GNOME_SHELL_KEYBINDINGS_SCHEMA,
+    GNOME_MEDIA_KEYS_SCHEMA,
+)
+
 
 def gnome_binding_path(slug: str) -> str:
     """The dconf path for one of Murmly's own custom-keybinding entries.
@@ -365,6 +385,36 @@ def _format_gvariant_string_list(paths: list[str]) -> str:
     if not paths:
         return "@as []"
     return "[" + ", ".join(repr(path) for path in paths) + "]"
+
+
+def _tolerant_accelerator_candidates(raw: str) -> list[str]:
+    """Every string `raw` could hold, for a key this code does not own.
+
+    `gsettings list-recursively` walks a whole fixed schema, most of whose keys
+    are not accelerators at all -- ints, bools, enums, the `custom-keybindings`
+    path list itself. Unlike `_parse_gvariant_string_list`, which raises on an
+    unexpected shape because its caller already knows the key is `as`, this
+    accepts either an array of strings (how every fixed-schema accelerator key
+    is typed today) or a bare string (in case a future or older schema still
+    uses the single-accelerator shape `custom-keybinding.binding` does), and
+    answers "nothing to check" for anything else -- a value that is not a
+    string is never mistaken for one, and `parse_gnome_accelerator` still gets
+    the final say on whether a candidate is a real accelerator.
+    """
+    text = raw.strip()
+    if text.startswith("@as "):
+        text = text[4:]
+    if not text:
+        return []
+    try:
+        value = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    return []
 
 
 def _unquote_gvariant_string(raw: str) -> str:
@@ -514,12 +564,17 @@ class GnomeShortcuts:
     def owners_of(self, keycode: int) -> list[ShortcutOwner]:
         """Every registered owner of the physical key `keycode` names.
 
-        Scans every entry in `custom-keybindings` -- covers other
+        Two scans: every entry in `custom-keybindings` -- covers other
         applications' and the user's own custom shortcuts, which live in the
-        same schema. GNOME's fixed keybinding schemas
-        (`org.gnome.desktop.wm.keybindings` and similar) are not scanned; a
-        collision with one of those is not detected here. See
+        same schema -- and every key in `GNOME_FIXED_SCHEMAS`, GNOME's own
+        built-in shortcuts (window management, the Shell, and the media-keys
+        plugin's own volume/brightness/screenshot bindings). See
         ``docs/agent-notes/gnome-custom-keybindings.md``.
+
+        A fixed schema that cannot be read raises rather than being treated as
+        holding no collision: this is the query a refusal decision is based
+        on, and reporting "clear" from a query that was never answered is
+        exactly the silent double-bind this method exists to prevent.
         """
         target = decode_kde_keycode(keycode)
         owners: list[ShortcutOwner] = []
@@ -540,7 +595,48 @@ class GnomeShortcuts:
                     component_friendly=name or component_unique,
                 )
             )
+        owners.extend(self._fixed_owners_of(target))
         return owners
+
+    def _fixed_owners_of(self, target: HotkeySpec) -> list[ShortcutOwner]:
+        owners: list[ShortcutOwner] = []
+        for schema in GNOME_FIXED_SCHEMAS:
+            for key, raw_value in self._list_recursively(schema):
+                for candidate in _tolerant_accelerator_candidates(raw_value):
+                    spec = parse_gnome_accelerator(candidate)
+                    if spec is None or spec != target:
+                        continue
+                    owners.append(
+                        ShortcutOwner(
+                            action_unique=key,
+                            action_friendly=key,
+                            component_unique=schema,
+                            component_friendly=schema,
+                        )
+                    )
+        return owners
+
+    def _list_recursively(self, schema: str) -> list[tuple[str, str]]:
+        """Every `(key, raw value)` pair `gsettings list-recursively` reports
+        for `schema`, each line split on the first two spaces: schema id and
+        key name are always plain tokens, and everything after them is the
+        value, which may itself contain spaces (an array of accelerators).
+        """
+        result = self._run(["list-recursively", schema])
+        if result.returncode != 0:
+            raise DesktopQueryError(
+                f"Unable to read {schema!r} for a hotkey collision: "
+                f"{(result.stderr or '').strip() or 'unknown error'}. Refusing to treat "
+                "an unreadable schema as free of one."
+            )
+        pairs: list[tuple[str, str]] = []
+        for line in (result.stdout or "").splitlines():
+            parts = line.split(" ", 2)
+            if len(parts) != 3:
+                continue
+            _schema, key, raw_value = parts
+            pairs.append((key, raw_value))
+        return pairs
 
     def is_available(self, keycode: int) -> bool:
         return not self.owners_of(keycode)

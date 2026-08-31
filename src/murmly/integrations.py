@@ -8,8 +8,9 @@ from pathlib import Path
 from shutil import which as shutil_which
 import subprocess
 import time
+from typing import Protocol
 
-from murmly.platform import resolve_platform
+from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,23 @@ class PasteInjection:
 class DeliveryOutcome:
     injected: bool
     reason: str | None = None
+
+
+class Paster(Protocol):
+    """What `daemon.SpeechSession` and `cli._run_spike` need from a paster,
+    satisfied structurally by `ClipboardPaster` (Linux) and
+    `win_clipboard.WindowsClipboardPaster` (Windows) without either
+    subclassing this -- the same shape `focus.FocusObserver` gives the two
+    focus-observer implementations. `create_clipboard_paster` is what chooses
+    between them.
+    """
+
+    @property
+    def injection(self) -> PasteInjection: ...
+
+    def copy(self, text: str) -> None: ...
+
+    def copy_and_paste(self, text: str) -> DeliveryOutcome: ...
 
 
 WAYLAND_INJECTORS = (
@@ -219,13 +237,37 @@ def select_paste_injection(
     which: Which = shutil_which,
     run: Run = subprocess.run,
     excluded: Iterable[str] = (),
+    profile: PlatformProfile | None = None,
 ) -> PasteInjection:
     """Pick an injection method this session can actually execute.
 
     A tool that is installed but cannot run here is never selected: preferring it
     on presence alone is what leaves a transcript undelivered with nothing said.
+
+    `profile` defaults to resolving from `env` (real `sys.platform`, exactly as
+    `is_wayland_session` does), and takes an explicit value only so a test can
+    supply a `PlatformProfile` naming an operating system this machine is not
+    running on -- `env` alone cannot do that, since it carries session and
+    desktop variables, never the operating system itself.
+
+    Windows has exactly one method, `SendInput`, which `win_clipboard.py`
+    documents as always present and never confirming delivery (task 9.2, 9.3):
+    there is nothing to detect, so this returns immediately rather than
+    running the Wayland/X11 candidate lists' installed-and-probed machinery
+    against a platform those tools do not exist on.
     """
     environment = env or os.environ
+    resolved = profile if profile is not None else resolve_platform(environment)
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        from murmly.win_clipboard import SEND_INPUT_METHOD
+
+        if SEND_INPUT_METHOD in set(excluded):
+            return PasteInjection(
+                None,
+                None,
+                reason=f"{SEND_INPUT_METHOD} failed to inject a paste earlier in this session",
+            )
+        return PasteInjection(SEND_INPUT_METHOD, (), confirms_delivery=False)
     wayland = is_wayland_session(environment)
     candidates = WAYLAND_INJECTORS if wayland else X11_INJECTORS
     remedy = injector_remedy(environment)
@@ -343,3 +385,41 @@ class ClipboardPaster:
             check=True,
             env=self._env,
         )
+
+
+def create_clipboard_paster(
+    env: dict[str, str] | None = None,
+    which: Which = shutil_which,
+    restore_clipboard: bool = True,
+    restore_delay_ms: int = 200,
+    profile: PlatformProfile | None = None,
+) -> Paster:
+    """Choose the platform's own clipboard-and-paste implementation.
+
+    Linux keeps `ClipboardPaster`'s subprocess-based `xclip`/`wl-copy` and
+    injector stack, constructed exactly as every existing caller already
+    constructs it -- this is the one branch that must not change what it
+    returns. Windows goes to `win_clipboard.WindowsClipboardPaster`, imported
+    from inside this function so the module stays importable without
+    `pywin32` on every other platform, the same deferred-import shape
+    `BackendRegistry`'s loaders use.
+
+    `profile` takes the place `env` cannot fill: `resolve_platform` reads the
+    operating system from `sys.platform`, not from `env`, so a caller
+    exercising the Windows branch from a non-Windows machine supplies a
+    `PlatformProfile` directly rather than an environment mapping.
+    """
+    environment = env or os.environ
+    resolved = profile if profile is not None else resolve_platform(environment)
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        from murmly.win_clipboard import WindowsClipboardPaster
+
+        return WindowsClipboardPaster(
+            restore_clipboard=restore_clipboard, restore_delay_ms=restore_delay_ms
+        )
+    return ClipboardPaster(
+        env=environment,
+        which=which,
+        restore_clipboard=restore_clipboard,
+        restore_delay_ms=restore_delay_ms,
+    )

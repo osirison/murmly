@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -24,7 +25,9 @@ from murmly.platform import (
     PermissionState,
     PlatformProfile,
     RuntimeGap,
+    WINDOWS_MICROPHONE_PERMISSION,
     _detected_libc,
+    _windows_microphone_permission_check,
     hotkey_mechanism_is_in_process,
     operating_system_for,
     resolve_platform,
@@ -265,22 +268,46 @@ class BackendRegistryTests(unittest.TestCase):
         self.assertTrue(choice.available)
         self.assertIs(socket.AF_UNIX, choice.load())
 
-    def test_command_channel_has_no_backend_on_windows_or_macos(self) -> None:
-        for profile in (windows(), macos()):
-            with self.subTest(profile=profile.operating_system):
-                choice = BACKEND_REGISTRIES["command_channel"].select(profile)
+    def test_command_channel_has_no_backend_on_macos(self) -> None:
+        # Not Windows too (task 7.1): a named-pipe transport now exists there.
+        # macOS keeps the UNIX socket eventually (design.md's "The command
+        # channel"; task 13.1), but that backend does not exist yet.
+        choice = BACKEND_REGISTRIES["command_channel"].select(macos())
 
-                self.assertFalse(choice.available)
-                self.assertIsNone(choice.mechanism)
-                self.assertIn(profile.operating_system.value, choice.reason)
+        self.assertFalse(choice.available)
+        self.assertIsNone(choice.mechanism)
+        self.assertIn(macos().operating_system.value, choice.reason)
 
-    def test_service_management_selects_systemd_on_linux_only(self) -> None:
+    def test_command_channel_selects_the_named_pipe_on_windows(self) -> None:
+        choice = BACKEND_REGISTRIES["command_channel"].select(windows())
+
+        self.assertEqual("named-pipe", choice.mechanism)
+        self.assertTrue(choice.available)
+        # Proves the loader -- and therefore `murmly.win_pipe` -- imports
+        # cleanly from this Linux machine, where `pywin32` is not installed at
+        # all: constructing the class itself touches no `pywin32` name, only
+        # calling its methods would.
+        from murmly.win_pipe import NamedPipeServer
+
+        self.assertIs(NamedPipeServer, choice.load())
+
+    def test_service_management_selects_systemd_on_linux(self) -> None:
         choice = BACKEND_REGISTRIES["service_management"].select(linux_plasma_x11())
 
         self.assertEqual("systemd", choice.mechanism)
         self.assertIs(UserService, choice.load())
 
-        self.assertFalse(BACKEND_REGISTRIES["service_management"].select(windows()).available)
+    def test_service_management_selects_task_scheduler_on_windows(self) -> None:
+        choice = BACKEND_REGISTRIES["service_management"].select(windows())
+
+        self.assertEqual("task-scheduler", choice.mechanism)
+        # Proves the loader -- and therefore `murmly.installer.WindowsUserService`
+        # -- imports cleanly from this Linux machine: constructing the class
+        # itself touches no `subprocess` call to `schtasks`, only calling its
+        # methods would.
+        from murmly.installer import WindowsUserService
+
+        self.assertIs(WindowsUserService, choice.load())
 
     def test_hotkey_registration_selects_plasma_on_a_plasma_desktop(self) -> None:
         choice = BACKEND_REGISTRIES["hotkey_registration"].select(linux_plasma_wayland())
@@ -304,11 +331,17 @@ class BackendRegistryTests(unittest.TestCase):
         self.assertIn("KDE Plasma", choice.reason)
         self.assertIn("GNOME", choice.reason)
 
-    def test_hotkey_registration_names_the_operating_system_on_windows(self) -> None:
+    def test_hotkey_registration_selects_the_in_process_backend_on_windows(self) -> None:
         choice = BACKEND_REGISTRIES["hotkey_registration"].select(windows())
 
-        self.assertFalse(choice.available)
-        self.assertIn("windows", choice.reason)
+        self.assertEqual("windows-hotkey", choice.mechanism)
+        self.assertTrue(choice.available)
+        # Proves the loader -- and therefore `murmly.win_hotkey` -- imports
+        # cleanly from this Linux machine, where no Win32 name is touched
+        # until one of the class's own methods runs.
+        from murmly.win_hotkey import WindowsHotkeyRegistrar
+
+        self.assertIs(WindowsHotkeyRegistrar, choice.load())
 
     def test_clipboard_and_injection_follow_the_session_display_protocol(self) -> None:
         wayland = BACKEND_REGISTRIES["clipboard"].select(linux_plasma_wayland())
@@ -329,6 +362,24 @@ class BackendRegistryTests(unittest.TestCase):
         self.assertFalse(BACKEND_REGISTRIES["clipboard"].select(macos()).available)
         self.assertFalse(BACKEND_REGISTRIES["paste_injection"].select(macos()).available)
 
+    def test_clipboard_and_injection_select_native_win32_on_windows(self) -> None:
+        """Task 9.1/9.2: the Win32 API, not a Linux clipboard command."""
+        from murmly.win_clipboard import SEND_INPUT_METHOD, WindowsClipboardPaster
+
+        clipboard = BACKEND_REGISTRIES["clipboard"].select(windows())
+        injection = BACKEND_REGISTRIES["paste_injection"].select(windows())
+
+        self.assertEqual("windows", clipboard.mechanism)
+        self.assertTrue(clipboard.available)
+        # Proves the loader -- and therefore `murmly.win_clipboard` -- imports
+        # cleanly from this Linux machine, where no `ctypes.windll` name is
+        # touched until one of the class's own methods runs.
+        self.assertIs(WindowsClipboardPaster, clipboard.load())
+
+        self.assertEqual("windows", injection.mechanism)
+        self.assertTrue(injection.available)
+        self.assertEqual(SEND_INPUT_METHOD, injection.load())
+
     def test_focus_observation_selects_x11_only_off_wayland(self) -> None:
         choice = BACKEND_REGISTRIES["focus_observation"].select(linux_plasma_x11())
 
@@ -338,6 +389,16 @@ class BackendRegistryTests(unittest.TestCase):
         wayland_choice = BACKEND_REGISTRIES["focus_observation"].select(linux_plasma_wayland())
         self.assertFalse(wayland_choice.available)
         self.assertIn("X11", wayland_choice.reason)
+
+    def test_focus_observation_selects_windows(self) -> None:
+        """Task 9.4: `GetForegroundWindow` and friends, needing no permission."""
+        from murmly.win_focus import WindowsFocusObserver
+
+        choice = BACKEND_REGISTRIES["focus_observation"].select(windows())
+
+        self.assertEqual("windows", choice.mechanism)
+        self.assertTrue(choice.available)
+        self.assertIs(WindowsFocusObserver, choice.load())
 
     def test_overlay_selects_gtk4_only_with_a_plasma_display(self) -> None:
         choice = BACKEND_REGISTRIES["overlay"].select(linux_plasma_x11())
@@ -402,15 +463,22 @@ class InProcessHotkeyMarkerTests(unittest.TestCase):
     """Task 5.4's design boundary: which mechanisms need `hotkey_record.py`'s
     rebind-at-startup path, rather than the desktop's own persisted state."""
 
-    def test_neither_real_hotkey_mechanism_is_in_process_today(self) -> None:
+    def test_desktop_hotkey_mechanisms_are_not_in_process(self) -> None:
         self.assertFalse(hotkey_mechanism_is_in_process(linux_plasma_x11()))
         self.assertFalse(hotkey_mechanism_is_in_process(linux_gnome_wayland()))
 
-    def test_the_real_table_is_empty(self) -> None:
-        """Nothing populates this until a Windows or macOS backend exists
-        (sections 8 and 13) -- an entry here today would claim a mechanism
-        this change never built."""
-        self.assertEqual(frozenset(), IN_PROCESS_HOTKEY_MECHANISMS)
+    def test_windows_hotkey_mechanism_is_in_process(self) -> None:
+        """Section 8's own backend: unlike Plasma and GNOME, Windows'
+        `RegisterHotKey` binds to the daemon's own thread, so
+        `hotkey_record.py`'s rebind-at-startup path is what a fresh session
+        needs (task 5.4's design boundary, now populated)."""
+        self.assertTrue(hotkey_mechanism_is_in_process(windows()))
+
+    def test_the_real_table_names_exactly_the_windows_mechanism(self) -> None:
+        """Nothing populates a macOS entry until section 13's backend exists
+        -- an entry here today would claim a mechanism this change never
+        built."""
+        self.assertEqual(frozenset({"windows-hotkey"}), IN_PROCESS_HOTKEY_MECHANISMS)
 
     def test_an_injected_in_process_mechanism_is_recognised(self) -> None:
         """The branch a future Windows or macOS candidate exercises, proven
@@ -440,7 +508,7 @@ class BackendChoiceRemedyTests(unittest.TestCase):
     def test_remedy_defaults_to_empty(self) -> None:
         """A registry that never names anything to install -- every one of
         them except `OVERLAY` -- need not construct an unused remedy."""
-        choice = BACKEND_REGISTRIES["command_channel"].select(windows())
+        choice = BACKEND_REGISTRIES["command_channel"].select(macos())
 
         self.assertFalse(choice.available)
         self.assertEqual((), choice.remedy)
@@ -456,14 +524,27 @@ class BackendChoiceRemedyTests(unittest.TestCase):
 
 
 class PermissionShapeTests(unittest.TestCase):
-    """6.4: the reporting shape three future permission checks plug into,
-    proved against a constructed `Permission` since none is registered yet."""
+    """6.4: the reporting shape, exercised against the real `windows-microphone`
+    entry (task 9.5) and a constructed `Permission` for the two future macOS
+    grants (sections 12, 14) that are not registered yet."""
 
-    def test_the_real_table_is_empty(self) -> None:
-        """Nothing populates this until a permission-gated backend exists
-        (Windows privacy settings, section 9; macOS grants, sections 12, 14)
-        -- an entry here today would claim a check this change never built."""
-        self.assertEqual({}, dict(PERMISSIONS))
+    def test_the_real_table_has_only_the_windows_microphone_permission(self) -> None:
+        """Section 9 populates the first entry -- Windows' microphone privacy
+        setting (task 9.5). macOS's microphone, Accessibility, and Input
+        Monitoring grants (sections 12, 14) do not exist yet, so this must
+        name exactly one entry, not claim a check this change never built."""
+        self.assertEqual({"windows-microphone"}, set(PERMISSIONS))
+
+    def test_the_windows_microphone_permission_applies_only_to_windows(self) -> None:
+        """`applies` is what keeps a Linux (or macOS) report from growing a
+        `permissions` entry for a grant that platform does not gate anything
+        behind -- `platform_diagnostics` filters on it before running `check`
+        at all."""
+        permission = PERMISSIONS["windows-microphone"]
+
+        self.assertTrue(permission.applies(windows()))
+        self.assertFalse(permission.applies(linux_plasma_x11()))
+        self.assertFalse(permission.applies(macos()))
 
     def test_a_platform_offering_no_way_to_ask_answers_undetermined(self) -> None:
         cannot_tell = Permission(
@@ -493,6 +574,78 @@ class PermissionShapeTests(unittest.TestCase):
         self.assertEqual(PermissionState.DENIED, denied.check(linux_plasma_x11()))
         self.assertNotEqual(PermissionState.GRANTED, PermissionState.UNDETERMINED)
         self.assertNotEqual(PermissionState.DENIED, PermissionState.UNDETERMINED)
+
+
+class WindowsMicrophonePermissionTests(unittest.TestCase):
+    """Task 9.5: the tri-state rule over an injected registry reader -- any
+    readable "Deny" is DENIED, both keys readable and neither "Deny" is
+    GRANTED, and anything left unreadable is UNDETERMINED, never GRANTED. The
+    exact registry path is documented in `_windows_microphone_permission_check`'s
+    docstring and is unconfirmed on a real Windows machine; what is proven
+    here is the rule this function applies to whatever that seam answers."""
+
+    def test_a_readable_deny_is_denied(self) -> None:
+        state = _windows_microphone_permission_check(
+            windows(), read_registry_value=lambda key, name: "Deny"
+        )
+
+        self.assertEqual(PermissionState.DENIED, state)
+
+    def test_the_master_toggle_denying_is_enough_even_if_the_per_app_key_is_absent(self) -> None:
+        """A person can flip the master "Microphone access" toggle off without
+        touching the `NonPackaged` desktop-apps toggle at all -- checking only
+        the per-app key would read that as no denial and report `GRANTED`,
+        which is exactly what the `platform-support` spec forbids."""
+
+        def read(key_path: str, _name: str) -> str | None:
+            return "Deny" if not key_path.endswith("NonPackaged") else None
+
+        state = _windows_microphone_permission_check(windows(), read_registry_value=read)
+
+        self.assertEqual(PermissionState.DENIED, state)
+
+    def test_a_readable_allow_is_granted(self) -> None:
+        state = _windows_microphone_permission_check(
+            windows(), read_registry_value=lambda key, name: "Allow"
+        )
+
+        self.assertEqual(PermissionState.GRANTED, state)
+
+    def test_nothing_readable_is_undetermined_not_granted(self) -> None:
+        """Neither consent-store key can be read -- the platform offers no
+        way to tell whether the grant was given, so this must answer
+        `UNDETERMINED`, never `GRANTED` (the `platform-support` spec's "A
+        permission whose state cannot be read")."""
+        state = _windows_microphone_permission_check(
+            windows(), read_registry_value=lambda key, name: None
+        )
+
+        self.assertEqual(PermissionState.UNDETERMINED, state)
+
+    def test_one_key_unreadable_is_undetermined_even_though_the_other_reads_allow(self) -> None:
+        """The master toggle reading "Allow" does not vouch for a
+        `NonPackaged` key this cannot read at all -- an unreadable key might
+        be hiding a denial, so this stays `UNDETERMINED` rather than trusting
+        the one key that did answer."""
+
+        def read(key_path: str, _name: str) -> str | None:
+            return None if key_path.endswith("NonPackaged") else "Allow"
+
+        state = _windows_microphone_permission_check(windows(), read_registry_value=read)
+
+        self.assertEqual(PermissionState.UNDETERMINED, state)
+
+    def test_denial_is_checked_case_insensitively(self) -> None:
+        state = _windows_microphone_permission_check(
+            windows(), read_registry_value=lambda key, name: "deny"
+        )
+
+        self.assertEqual(PermissionState.DENIED, state)
+
+    def test_registered_under_the_real_table_with_the_check_wired_in(self) -> None:
+        permission = PERMISSIONS[WINDOWS_MICROPHONE_PERMISSION]
+
+        self.assertIs(_windows_microphone_permission_check, permission.check)
 
 
 class RuntimeGapTests(unittest.TestCase):
@@ -556,6 +709,137 @@ class RuntimeGapTests(unittest.TestCase):
         """All three documented gaps take out transcription outright (design.md)."""
         self.assertEqual(3, len(RUNTIME_GAPS))
         self.assertTrue(all(gap.capability == TRANSCRIPTION_CAPABILITY for gap in RUNTIME_GAPS))
+
+
+class NamedPipeShapeTests(unittest.TestCase):
+    """Task 7.5's string check, exercised from any platform: `is_pipe_name`
+    decides which of the two wrong channel-shape combinations a configured
+    value is, independently of which operating system is asking."""
+
+    def test_the_configured_default_pipe_name_is_recognised(self) -> None:
+        from pathlib import Path
+
+        from murmly.win_pipe import is_pipe_name
+
+        # The exact round trip `MurmlyConfig.socket_path` and `daemon.py` put
+        # the configured value through: `Path(WINDOWS_PIPE_NAME)`, then
+        # `str(...)`. `pathlib.PurePosixPath` -- what `Path` resolves to on
+        # this machine -- treats backslashes as ordinary name characters
+        # rather than separators, so the string survives the round trip
+        # unchanged, which is what makes this assertion meaningful here.
+        from murmly.config import WINDOWS_PIPE_NAME
+
+        self.assertEqual(WINDOWS_PIPE_NAME, str(Path(WINDOWS_PIPE_NAME)))
+        self.assertTrue(is_pipe_name(str(Path(WINDOWS_PIPE_NAME))))
+
+    def test_case_is_ignored_because_the_pipe_namespace_ignores_it(self) -> None:
+        from murmly.win_pipe import is_pipe_name
+
+        self.assertTrue(is_pipe_name(r"\\.\PIPE\murmly"))
+        self.assertTrue(is_pipe_name(r"\\.\Pipe\Murmly"))
+
+    def test_a_filesystem_path_is_not_a_pipe_name(self) -> None:
+        from murmly.win_pipe import is_pipe_name
+
+        self.assertFalse(is_pipe_name("/run/user/1000/murmly.sock"))
+        self.assertFalse(is_pipe_name(r"C:\Users\person\AppData\murmly.sock"))
+
+
+class NamedPipeDacShapeTests(unittest.TestCase):
+    """Task 7.2's DACL, the half of it a machine without `pywin32` can check:
+    the pure function describing what the descriptor must contain, kept
+    separate in `win_pipe.py` from the `win32security` calls that build the
+    real thing. See `WindowsPipeSecurityDescriptorIntegrationTests` below for
+    the other half."""
+
+    def test_the_dacl_names_exactly_one_entry(self) -> None:
+        from murmly.win_pipe import owner_only_dacl_entries
+
+        sentinel = object()
+
+        entries = owner_only_dacl_entries(sentinel)
+
+        self.assertEqual(1, len(entries))
+
+    def test_the_one_entry_names_the_given_sid_and_nothing_else(self) -> None:
+        from murmly.win_pipe import owner_only_dacl_entries
+
+        sentinel = object()
+
+        (entry,) = owner_only_dacl_entries(sentinel)
+
+        self.assertIs(sentinel, entry.sid)
+
+    def test_the_one_entry_grants_full_control_not_read_and_write_alone(self) -> None:
+        """The access mask that avoids the classic named-pipe DACL defect:
+        read/write alone denies `FILE_CREATE_PIPE_INSTANCE` (0x00000004) to
+        the pipe's own creator, wedging the server the moment a second client
+        tries to connect. `GENERIC_ALL` is `0x10000000` -- see win32
+        `WinNT.h`."""
+        from murmly.win_pipe import GENERIC_ALL, owner_only_dacl_entries
+
+        (entry,) = owner_only_dacl_entries(object())
+
+        self.assertEqual(0x10000000, GENERIC_ALL)
+        self.assertEqual(GENERIC_ALL, entry.access_mask)
+
+    def test_two_different_sids_produce_two_different_single_entry_dacls(self) -> None:
+        """Not a fixed descriptor reused regardless of argument -- each
+        account's own DACL names that account and no other."""
+        from murmly.win_pipe import owner_only_dacl_entries
+
+        left, right = object(), object()
+
+        (left_entry,) = owner_only_dacl_entries(left)
+        (right_entry,) = owner_only_dacl_entries(right)
+
+        self.assertIs(left, left_entry.sid)
+        self.assertIs(right, right_entry.sid)
+        self.assertIsNot(left_entry.sid, right_entry.sid)
+
+
+class WindowsPipeSecurityDescriptorIntegrationTests(unittest.TestCase):
+    """18.6: read the real DACL back off a real pipe and assert it names only
+    the creating user's SID. Needs `pywin32` and a Windows kernel, neither of
+    which this machine has, so every test here skips itself immediately --
+    the `X11RuntimeIntegrationTests` pattern (`tests/test_focus.py`) applied
+    to the wrong-operating-system case (18.18) rather than a missing display.
+    This class has never executed anywhere this suite has run: the exact
+    `win32security.GetSecurityInfo` return shape used below is written from
+    the documented Win32 API and common `pywin32` usage, not from having run
+    it, and a Windows machine is the first real check of it. See this
+    session's return value for what that means for 18.6's checkbox."""
+
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("A Windows kernel is required to create a named pipe")
+
+    def test_the_dacl_names_only_the_creating_users_sid(self) -> None:
+        import win32security
+
+        from murmly.win_pipe import NamedPipeServer, current_user_sid_string
+
+        pipe_name = r"\\.\pipe\murmly-test-dacl-readback"
+        server = NamedPipeServer(pipe_name)
+        try:
+            # Read back by the *handle* Murmly already holds
+            # (`SE_KERNEL_OBJECT`), not by reopening the name
+            # (`GetNamedSecurityInfo`, `SE_FILE_OBJECT`): reopening the pipe's
+            # name is itself a client `CreateFile` against the one instance
+            # this server has waiting to accept a connection, and would
+            # consume that connection rather than merely inspect it.
+            _owner, _group, dacl, _sacl, _descriptor = win32security.GetSecurityInfo(
+                server.handle,
+                win32security.SE_KERNEL_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION,
+            )
+
+            self.assertIsNotNone(dacl)
+            self.assertEqual(1, dacl.GetAceCount())
+            _revision, _flags, _mask, sid = dacl.GetAce(0)
+            self.assertEqual(current_user_sid_string(), win32security.ConvertSidToStringSid(sid))
+        finally:
+            server.close()
 
 
 if __name__ == "__main__":

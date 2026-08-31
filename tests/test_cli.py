@@ -443,7 +443,7 @@ class CliTests(unittest.TestCase):
         with (
             patch("murmly.cli.SoundDeviceRecorder") as recorder,
             patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
-            patch("murmly.cli.ClipboardPaster") as paster,
+            patch("murmly.cli.create_clipboard_paster") as paster,
             patch("murmly.cli.create_focus_observer", return_value=Observer()),
             redirect_stdout(StringIO()),
         ):
@@ -1519,11 +1519,46 @@ class DoctorCompletenessTests(unittest.TestCase):
         )
         self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
         self.assertEqual("linux", report["platform"]["operating_system"])
+        # 9.5: the Windows microphone permission's `applies` keeps a Linux
+        # report from growing an entry for a grant Linux does not gate
+        # anything behind -- the field stays exactly as empty as it was
+        # before that permission existed.
+        self.assertEqual({}, report["platform"]["permissions"])
 
     def test_the_report_carries_the_same_field_names_on_a_platform_with_no_mechanisms(self) -> None:
         """18.17: an unserviceable concern is reported unavailable, not absent
-        -- proved by a platform (Windows) where every one of the eight
-        concerns currently has no mechanism at all."""
+        -- proved by a platform this change gives no backend at all (an
+        unrecognized operating system, `OperatingSystem.OTHER`), so every
+        concern reports unavailable rather than one being dropped."""
+        answered = {"ok": True, "state": "IDLE", "model_resident": False}
+        other_profile = PlatformProfile(operating_system=OperatingSystem.OTHER, architecture="x86_64")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with patch("murmly.cli.send_command", return_value=answered):
+                report = self._report(
+                    config, Mock(return_value=("cpu", "int8")), profile=other_profile
+                )
+
+        # Same top-level keys as the Linux report above (6.5), and the same
+        # eight concern keys inside `platform` (6.1) -- present and reporting
+        # unavailable, never dropped.
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
+        for concern, section in report["platform"]["concerns"].items():
+            with self.subTest(concern=concern):
+                self.assertFalse(section["available"])
+                self.assertIsNone(section["mechanism"])
+
+    def test_windows_reports_the_backends_this_change_built_for_it(self) -> None:
+        """The command channel (task 7.1), hotkey registration (task 8.3),
+        service management (task 8.1), clipboard (task 9.1), paste injection
+        (task 9.2) and focus observation (task 9.4) all have a Windows
+        mechanism now; the overlay and speech synthesis this change did not
+        build for Windows still report unavailable rather than dropped
+        (18.17)."""
         answered = {"ok": True, "state": "IDLE", "model_resident": False}
         windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1536,20 +1571,41 @@ class DoctorCompletenessTests(unittest.TestCase):
                     config, Mock(return_value=("cpu", "int8")), profile=windows_profile
                 )
 
-        # Same top-level keys as the Linux report above (6.5), and the same
-        # eight concern keys inside `platform` (6.1) -- present and reporting
-        # unavailable, never dropped.
         self.assertEqual(set(self.SECTIONS), set(report))
         self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
+        built = {
+            "command_channel": "named-pipe",
+            "hotkey_registration": "windows-hotkey",
+            "service_management": "task-scheduler",
+            "clipboard": "windows",
+            "paste_injection": "windows",
+            "focus_observation": "windows",
+        }
         for concern, section in report["platform"]["concerns"].items():
             with self.subTest(concern=concern):
-                self.assertFalse(section["available"])
-                self.assertIsNone(section["mechanism"])
-                self.assertTrue(section["reason"])
+                if concern in built:
+                    self.assertTrue(section["available"])
+                    self.assertEqual(built[concern], section["mechanism"])
+                else:
+                    self.assertFalse(section["available"])
+                    self.assertIsNone(section["mechanism"])
+                    self.assertTrue(section["reason"])
 
         # 6.3: a non-Linux session is not misreported as `wayland` or `x11`.
         self.assertNotIn(report["session"], {"wayland", "x11"})
         self.assertEqual("windows", report["session"])
+
+        # 9.5: the first `permissions` entry, present on a Windows profile.
+        self.assertIn("windows-microphone", report["platform"]["permissions"])
+        self.assertEqual(
+            "microphone capture",
+            report["platform"]["permissions"]["windows-microphone"]["capability"],
+        )
+
+        # `choose_clipboard_copy_command` has no Windows branch (task 9.1 is a
+        # Win32 API call, not a command); `_run_doctor` must not call it and
+        # report the wrong platform's remedy instead.
+        self.assertEqual("Win32 clipboard API (CF_UNICODETEXT)", report["clipboard_command"])
 
     def test_diagnostics_report_a_socket_path_the_daemon_would_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1586,7 +1642,7 @@ class DoctorCompletenessTests(unittest.TestCase):
                 report = command_socket_diagnostics(config)
 
         self.assertFalse(report["peer_identity_supported"])
-        self.assertIn("file permissions alone", report["peer_identity_detail"])
+        self.assertIn("access control alone", report["peer_identity_detail"])
 
     def test_a_private_socket_path_is_reported_as_private(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1600,6 +1656,38 @@ class DoctorCompletenessTests(unittest.TestCase):
         self.assertTrue(report["path_private"])
         self.assertNotIn("detail", report)
         self.assertTrue(report["peer_identity_supported"])
+
+    def test_a_pipe_shaped_path_is_reported_private_on_windows(self) -> None:
+        """Task 7.5: the filesystem path-privacy analysis is skipped entirely
+        for a pipe-shaped configured value -- the DACL `win_pipe.
+        create_named_pipe_server` builds is unconditionally owner-only, so
+        there is nothing else to check."""
+        from murmly.config import WINDOWS_PIPE_NAME
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        config = MurmlyConfig(
+            socket_path=Path(WINDOWS_PIPE_NAME),
+            config_path=Path("/nonexistent/config.toml"),
+        )
+        windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+        report = command_socket_diagnostics(config, windows_profile)
+
+        self.assertTrue(report["path_private"])
+        self.assertNotIn("detail", report)
+
+    def test_a_pipe_shaped_path_is_reported_not_private_off_windows(self) -> None:
+        from murmly.config import WINDOWS_PIPE_NAME
+
+        config = MurmlyConfig(
+            socket_path=Path(WINDOWS_PIPE_NAME),
+            config_path=Path("/nonexistent/config.toml"),
+        )
+
+        report = command_socket_diagnostics(config)
+
+        self.assertFalse(report["path_private"])
+        self.assertIn("filesystem socket", report["detail"])
 
     def test_an_unreadable_focus_probe_does_not_abandon_the_delivery_section(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

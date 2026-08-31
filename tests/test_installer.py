@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from murmly.installer import (
     SERVICE_NAME,
+    WINDOWS_TASK_NAME,
     InstallError,
     UserService,
+    WindowsUserService,
     resolve_entrypoint,
     service_unit_text,
     write_atomically,
@@ -83,6 +87,35 @@ class EntrypointResolutionTests(unittest.TestCase):
                 resolve_entrypoint(str(interpreter))
 
             self.assertIn("not executable", str(raised.exception))
+
+    def test_an_exe_interpreter_looks_for_an_exe_entrypoint(self) -> None:
+        """`uv`'s Windows venvs put `murmly.exe` beside `python.exe`
+        (task 8.1's install path has to find it, not `murmly` with no
+        suffix) -- a pure function of the interpreter path's own shape, so
+        it is testable from Linux with `executable=` alone."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            interpreter = Path(temp_dir) / "python.exe"
+            interpreter.write_text("", encoding="utf-8")
+            entrypoint = Path(temp_dir) / "murmly.exe"
+            entrypoint.write_text("", encoding="utf-8")
+            entrypoint.chmod(0o755)
+
+            resolved = resolve_entrypoint(str(interpreter))
+
+            self.assertEqual(Path(temp_dir).resolve() / "murmly.exe", resolved)
+
+    def test_an_exe_interpreter_does_not_find_a_suffixless_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            interpreter = Path(temp_dir) / "python.exe"
+            interpreter.write_text("", encoding="utf-8")
+            entrypoint = Path(temp_dir) / "murmly"
+            entrypoint.write_text("", encoding="utf-8")
+            entrypoint.chmod(0o755)
+
+            with self.assertRaises(InstallError) as raised:
+                resolve_entrypoint(str(interpreter))
+
+            self.assertIn("murmly.exe", str(raised.exception))
 
     def test_directory_entrypoint_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -312,6 +345,622 @@ class ServiceStatusTests(unittest.TestCase):
             self.assertIsNone(service.recorded_entrypoint())
 
 
+class FakeSchtasks:
+    """A minimal, stateful stand-in for `schtasks.exe`: enough of `/create`,
+    `/query`, `/run`, `/end`, `/delete` and `/change` to answer the way a real
+    Task Scheduler task would after each. Verb is `command[1]`, one past the
+    `schtasks` binary name itself -- `WindowsUserService` never varies the
+    binary name mid-argument-list the way `systemctl --user` does."""
+
+    def __init__(self, failures: dict[str, int] | None = None) -> None:
+        self.calls: list[list[str]] = []
+        self._failures = failures or {}
+        self._created = False
+        self._running = False
+        self._run_line: str | None = None
+
+    def __call__(self, command, **_kwargs):
+        self.calls.append(list(command))
+        verb = command[1] if len(command) > 1 else ""
+        if verb in self._failures:
+            return subprocess.CompletedProcess(command, self._failures[verb], "", "boom")
+        if verb == "/create":
+            self._run_line = command[command.index("/tr") + 1]
+            self._created = True
+            self._running = False
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if verb == "/query":
+            if not self._created:
+                return subprocess.CompletedProcess(command, 1, "", "ERROR: task not found")
+            if "/v" in command:
+                return subprocess.CompletedProcess(
+                    command, 0, f"Task To Run:                          {self._run_line}\n", ""
+                )
+            status = "Running" if self._running else "Ready"
+            return subprocess.CompletedProcess(
+                command, 0, f"Status:                               {status}\n", ""
+            )
+        if verb == "/run":
+            self._running = True
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if verb == "/end":
+            self._running = False
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if verb == "/delete":
+            self._created = False
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if verb == "/change":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    @property
+    def verbs(self) -> list[str]:
+        return [call[1] for call in self.calls if len(call) > 1]
+
+
+class WindowsServiceInstallTests(unittest.TestCase):
+    """Task 8.1: the Task Scheduler backend `SERVICE_MANAGEMENT` selects on
+    Windows. Task 8.2 (registers and starts without administrative rights)
+    can only be confirmed on Windows; what is proven here is the half that
+    can be proven anywhere -- `install()` never asks for elevation."""
+
+    def test_creates_a_logon_trigger_and_starts_it(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+
+        service.install(Path("C:/murmly/murmly.exe"))
+
+        self.assertEqual(["/create", "/run"], schtasks.verbs)
+        create_call = schtasks.calls[0]
+        self.assertIn("/sc", create_call)
+        self.assertEqual("onlogon", create_call[create_call.index("/sc") + 1])
+        self.assertTrue(service.is_installed)
+
+    def test_never_requests_elevation(self) -> None:
+        """Task 8.2's testable half: no `/ru` (run as a different account,
+        e.g. SYSTEM) and no `/rl HIGHEST` anywhere in the invocation --
+        omitting `/rl` entirely is what leaves the task at Task Scheduler's
+        default `LIMITED` privilege level."""
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+
+        service.install(Path("C:/murmly/murmly.exe"))
+
+        for call in schtasks.calls:
+            self.assertNotIn("/ru", call)
+            self.assertNotIn("/rl", call)
+
+    def test_the_run_line_ends_with_the_daemon_subcommand(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+
+        service.install(Path("C:/murmly/murmly.exe"))
+
+        create_call = schtasks.calls[0]
+        run_line = create_call[create_call.index("/tr") + 1]
+        self.assertEqual("C:/murmly/murmly.exe daemon", run_line)
+        self.assertEqual("C:/murmly/murmly.exe", service.recorded_entrypoint())
+
+    def test_an_entrypoint_containing_a_space_is_quoted(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+
+        service.install(Path("C:/Program Files/murmly/murmly.exe"))
+
+        create_call = schtasks.calls[0]
+        run_line = create_call[create_call.index("/tr") + 1]
+        self.assertEqual('"C:/Program Files/murmly/murmly.exe" daemon', run_line)
+
+    def test_reinstall_repairs_a_stale_path(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/old/murmly.exe"))
+
+        service.install(Path("C:/new/murmly.exe"))
+
+        self.assertEqual("C:/new/murmly.exe", service.recorded_entrypoint())
+
+    def test_failing_schtasks_raises_with_its_error(self) -> None:
+        schtasks = FakeSchtasks(failures={"/create": 1})
+        service = WindowsUserService(run_command=schtasks)
+
+        with self.assertRaises(InstallError) as raised:
+            service.install(Path("C:/murmly/murmly.exe"))
+
+        self.assertIn("boom", str(raised.exception))
+
+    def test_unavailable_schtasks_raises(self) -> None:
+        def explode(*_args, **_kwargs):
+            raise OSError("schtasks missing")
+
+        service = WindowsUserService(run_command=explode)
+
+        with self.assertRaises(InstallError) as raised:
+            service.install(Path("C:/murmly/murmly.exe"))
+
+        self.assertIn("schtasks missing", str(raised.exception))
+
+
+class WindowsServiceRemovalTests(unittest.TestCase):
+    def test_removal_ends_then_deletes(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+        schtasks.calls.clear()
+
+        existed = service.remove()
+
+        self.assertTrue(existed)
+        # `remove()` checks `is_installed` first (its own `/query`) to know
+        # whether to report `existed`, then ends and deletes the task.
+        self.assertEqual(["/query", "/end", "/delete"], schtasks.verbs)
+        self.assertFalse(service.is_installed)
+
+    def test_removal_succeeds_when_nothing_is_installed(self) -> None:
+        service = WindowsUserService(run_command=FakeSchtasks())
+
+        self.assertFalse(service.remove())
+
+    def test_removal_tolerates_schtasks_failures(self) -> None:
+        schtasks = FakeSchtasks(failures={"/end": 1})
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+
+        self.assertTrue(service.remove())
+
+    def test_removal_is_idempotent(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+
+        service.remove()
+
+        self.assertFalse(service.remove())
+
+
+class WindowsServiceLifecycleTests(unittest.TestCase):
+    """`is_active()` and `status()` have to answer from a live query -- a
+    task file existing says nothing about whether the process it names is
+    currently running, unlike a systemd unit's own `is-active`."""
+
+    def test_stop_and_start_toggle_is_active(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+
+        self.assertTrue(service.is_active())
+
+        service.stop()
+
+        self.assertFalse(service.is_active())
+
+    def test_enable_and_disable_do_not_raise(self) -> None:
+        service = WindowsUserService(run_command=FakeSchtasks())
+
+        self.assertTrue(service.enable())
+        self.assertTrue(service.disable())
+
+    def test_status_reports_not_installed(self) -> None:
+        service = WindowsUserService(run_command=FakeSchtasks())
+
+        status = service.status()
+
+        self.assertFalse(status.installed)
+        self.assertFalse(status.active)
+        self.assertIn("murmly install", status.detail)
+
+    def test_status_reports_installed_and_active(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+
+        status = service.status()
+
+        self.assertTrue(status.installed)
+        self.assertTrue(status.active)
+        self.assertEqual("C:/murmly/murmly.exe", status.entrypoint)
+
+    def test_status_reports_installed_but_inactive(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+        service.stop()
+
+        status = service.status()
+
+        self.assertTrue(status.installed)
+        self.assertFalse(status.active)
+        self.assertIn("not running", status.detail)
+
+    def test_recorded_entrypoint_is_none_without_a_task(self) -> None:
+        service = WindowsUserService(run_command=FakeSchtasks())
+
+        self.assertIsNone(service.recorded_entrypoint())
+
+    def test_task_name_is_distinct_from_the_systemd_unit_name(self) -> None:
+        self.assertNotEqual(SERVICE_NAME, WINDOWS_TASK_NAME)
+
+
+class FakeWindowsService:
+    """`WindowsUserService`'s duck-typed surface, with `active` settable
+    independently of `is_installed` -- unlike `FakeService` (systemd), a
+    Task Scheduler task can be installed and not running, which is exactly
+    the state task 8.7's scenarios turn on."""
+
+    def __init__(self, installed: bool = False, active: bool = False, entrypoint: str | None = None) -> None:
+        self.is_installed = installed
+        self.active = active
+        self.entrypoint = entrypoint
+        self.installs: list[Path] = []
+        self.removes = 0
+
+    def install(self, entrypoint: Path) -> None:
+        self.installs.append(entrypoint)
+        self.is_installed = True
+        self.active = True
+        self.entrypoint = str(entrypoint)
+
+    def remove(self) -> bool:
+        self.removes += 1
+        existed, self.is_installed = self.is_installed, False
+        self.active = False
+        return existed
+
+    def status(self):
+        from murmly.installer import ServiceStatus
+
+        return ServiceStatus(
+            installed=self.is_installed,
+            active=self.active,
+            entrypoint=self.entrypoint,
+            detail="installed" if self.is_installed else "Run 'murmly install <hotkey>'",
+        )
+
+    def start_command_text(self) -> str:
+        return "schtasks /run /tn MurmlyDaemon"
+
+
+class FakeDaemonChannel:
+    """A stand-in for `murmly.daemon.send_command`, scripted per command.
+
+    Patched in at `murmly.daemon.send_command` -- `Installer`'s in-process
+    methods import that name from inside their own function bodies, so
+    patching the module attribute is what every one of those deferred
+    imports actually sees.
+    """
+
+    def __init__(
+        self,
+        held: set[str] | None = None,
+        rebind_detail: str = "",
+        unreachable: bool = False,
+    ) -> None:
+        self.calls: list[str] = []
+        self.held = set(held) if held is not None else set()
+        self.rebind_detail = rebind_detail
+        self.unreachable = unreachable
+
+    def __call__(self, _socket_path, command, *_args, **_kwargs):
+        from murmly.daemon import COMMAND_REBIND_HOTKEYS, COMMAND_STATUS, DaemonNotRespondingError
+
+        self.calls.append(command)
+        if self.unreachable:
+            raise DaemonNotRespondingError("no daemon")
+        if command == COMMAND_REBIND_HOTKEYS:
+            return {"ok": True, "detail": self.rebind_detail}
+        if command == COMMAND_STATUS:
+            return {"ok": True, "hotkeys_held": sorted(self.held)}
+        raise AssertionError(f"unexpected command {command!r}")
+
+
+def _windows_installer(service=None, channel=None, temp_dir=None, **kwargs):
+    """An `Installer` dispatched to the in-process (Windows) branch, backed
+    by fakes for the service and the command channel -- never a real
+    `schtasks.exe` or `ctypes.windll` call."""
+    from murmly.config import MurmlyConfig, WINDOWS_PIPE_NAME
+    from murmly.hotkey_record import HotkeyRecordStore
+    from murmly.installer import Installer
+    from murmly.platform import OperatingSystem, PlatformProfile
+
+    profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+    config = MurmlyConfig(
+        socket_path=Path(WINDOWS_PIPE_NAME),
+        config_path=Path(temp_dir) / "config.toml",
+        overlay_enabled=False,
+    )
+    installer = Installer(
+        service=service if service is not None else FakeWindowsService(),
+        profile=profile,
+        config=config,
+        record_store=HotkeyRecordStore(Path(temp_dir) / "hotkeys.json"),
+        entrypoint_resolver=lambda: Path("C:/murmly/murmly.exe"),
+        sleep=lambda _seconds: None,
+        daemon_timeout=1.0,
+        poll_interval=0.01,
+        **kwargs,
+    )
+    return installer
+
+
+class WindowsInProcessInstallTests(unittest.TestCase):
+    """Task 8.6: installation starts the daemon before reporting a hotkey
+    bound, and reports the binding as held by the running daemon."""
+
+    def test_installs_and_starts_the_service_before_confirming(self) -> None:
+        from murmly.hotkey import parse_hotkey
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeWindowsService()
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+                outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual([Path("C:/murmly/murmly.exe")], service.installs)
+        self.assertTrue(outcome.hotkey_registered)
+        self.assertTrue(any("held by the running Murmly daemon" in message for message in outcome.messages))
+
+    def test_persists_the_record_before_reaching_the_daemon(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(temp_dir=temp_dir)
+                installer.install(parse_hotkey("Meta+X"))
+
+            record = HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").read()
+
+        self.assertEqual("Meta+X", record["window"])
+
+    def test_both_purposes_are_registered_and_reported_held(self) -> None:
+        from murmly.hotkey import parse_hotkey
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(held={"window", "session"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(temp_dir=temp_dir)
+                outcome = installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+Shift+X"))
+
+        self.assertTrue(outcome.hotkey_registered)
+        self.assertTrue(outcome.session_hotkey_registered)
+
+    def test_already_bound_is_reported_not_as_a_conflict(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(
+                    service=FakeWindowsService(installed=True, active=True, entrypoint="C:/murmly/murmly.exe"),
+                    temp_dir=temp_dir,
+                )
+                outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertTrue(outcome.already_bound)
+
+
+class WindowsInProcessConflictTests(unittest.TestCase):
+    """Task 8.4: the platform's own refusal is the collision. No service,
+    launcher, or hotkey registration is left behind."""
+
+    def test_a_refused_registration_rolls_back_the_record_and_the_new_service(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.hotkey_record import HotkeyRecordStore
+        from murmly.installer import HotkeyConflictError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeWindowsService()
+            # The daemon reports "window" as held (from the fake's own default
+            # rebind) but never reports it in `hotkeys_held` -- the platform
+            # refused it.
+            channel = FakeDaemonChannel(held=set(), rebind_detail="Meta+X is already claimed.")
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+
+                with self.assertRaises(HotkeyConflictError) as raised:
+                    installer.install(parse_hotkey("Meta+X"))
+
+            record = HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").read()
+
+        self.assertIn("Meta+X", str(raised.exception))
+        self.assertEqual({}, record)
+        self.assertEqual(1, service.removes)
+
+    def test_a_refused_second_purpose_does_not_leave_the_first_recorded(self) -> None:
+        """Mirrors the desktop-launcher flow's own two-hotkey rule: a
+        collision on the second purpose must not leave the first bound."""
+        from murmly.hotkey import parse_hotkey
+        from murmly.hotkey_record import HotkeyRecordStore
+        from murmly.installer import HotkeyConflictError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(held={"window"})  # "session" refused
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(temp_dir=temp_dir)
+
+                with self.assertRaises(HotkeyConflictError):
+                    installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+Shift+X"))
+
+            record = HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").read()
+
+        self.assertEqual({}, record)
+
+    def test_an_existing_service_survives_a_rolled_back_install(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import HotkeyConflictError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeWindowsService(installed=True, active=True, entrypoint="C:/murmly/murmly.exe")
+            channel = FakeDaemonChannel(held=set())
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+
+                with self.assertRaises(HotkeyConflictError):
+                    installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual(0, service.removes)
+
+    def test_same_key_for_both_purposes_is_refused_before_the_service_is_touched(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import HotkeyConflictError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeWindowsService()
+            installer = _windows_installer(service=service, temp_dir=temp_dir)
+
+            with self.assertRaises(HotkeyConflictError):
+                installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+X"))
+
+        self.assertEqual([], service.installs)
+
+    def test_a_key_windows_cannot_encode_is_refused_before_anything_is_written(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import InstallError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeWindowsService()
+            installer = _windows_installer(service=service, temp_dir=temp_dir)
+
+            with self.assertRaises(InstallError):
+                installer.install(parse_hotkey("Ctrl+Microphone Mute"))
+
+        self.assertEqual([], service.installs)
+
+
+class WindowsInProcessUnconfirmedTests(unittest.TestCase):
+    """A daemon that never becomes reachable is "not confirmed", not
+    "refused": the record stays, matching the desktop-launcher flow's own
+    `HotkeyNotConfirmedError` -- the binding is saved and picked up the next
+    time the service starts."""
+
+    def test_an_unreachable_daemon_is_not_confirmed_and_the_record_stays(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.hotkey_record import HotkeyRecordStore
+        from murmly.installer import HotkeyNotConfirmedError
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(unreachable=True)
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(temp_dir=temp_dir)
+
+                with self.assertRaises(HotkeyNotConfirmedError) as raised:
+                    installer.install(parse_hotkey("Meta+X"))
+
+            record = HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").read()
+
+        self.assertEqual("Meta+X", record["window"])
+        self.assertIn("Meta+X", raised.exception.hotkeys[0].portable)
+
+
+class WindowsInProcessUninstallTests(unittest.TestCase):
+    def test_uninstall_clears_the_record_and_removes_the_service(self) -> None:
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            service = FakeWindowsService(installed=True, active=True, entrypoint="C:/murmly/murmly.exe")
+            channel = FakeDaemonChannel(unreachable=True)
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+                outcome = installer.uninstall()
+
+            record = HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").read()
+
+        self.assertEqual({}, record)
+        self.assertEqual(1, service.removes)
+        self.assertTrue(any("Released" in message for message in outcome.messages))
+
+    def test_uninstall_with_nothing_installed_reports_nothing_to_remove(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(unreachable=True)
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(temp_dir=temp_dir)
+                outcome = installer.uninstall()
+
+        self.assertTrue(any("nothing to remove" in message for message in outcome.messages))
+
+
+class WindowsInProcessStatusTests(unittest.TestCase):
+    """Task 8.6/8.7 and 18.10: held by the running daemon while it runs and
+    holds the key; not held, naming the daemon and the start command, once
+    it is not."""
+
+    def test_held_while_the_daemon_reports_it(self) -> None:
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            service = FakeWindowsService(installed=True, active=True, entrypoint="C:/murmly/murmly.exe")
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+                status = installer.status()
+
+        self.assertTrue(status["hotkey_held"])
+        self.assertEqual("Meta+X", status["hotkey"])
+        window_entry = status["hotkeys"][0]
+        self.assertTrue(window_entry["held"])
+        self.assertIn("running Murmly daemon", window_entry["detail"])
+
+    def test_not_held_when_the_daemon_is_not_running(self) -> None:
+        """8.7 and 18.10: not held, naming the daemon as why, when the
+        daemon is not running -- and never even asked, since a stopped
+        service cannot hold anything."""
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            service = FakeWindowsService(installed=True, active=False, entrypoint="C:/murmly/murmly.exe")
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+                status = installer.status()
+
+        self.assertFalse(status["hotkey_held"])
+        window_entry = status["hotkeys"][0]
+        self.assertFalse(window_entry["held"])
+        self.assertIn("daemon is not running", window_entry["detail"])
+        self.assertIn("schtasks /run", window_entry["detail"])
+        self.assertEqual([], channel.calls)
+
+    def test_not_held_when_the_daemon_is_running_but_unreachable(self) -> None:
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            service = FakeWindowsService(installed=True, active=True, entrypoint="C:/murmly/murmly.exe")
+            channel = FakeDaemonChannel(unreachable=True)
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+                status = installer.status()
+
+        self.assertFalse(status["hotkey_held"])
+        self.assertIn("Unable to confirm", status["hotkeys"][0]["detail"])
+
+    def test_no_hotkey_bound_reports_no_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeWindowsService(installed=True, active=True, entrypoint="C:/murmly/murmly.exe")
+            channel = FakeDaemonChannel(held=set())
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _windows_installer(service=service, temp_dir=temp_dir)
+                status = installer.status()
+
+        self.assertIsNone(status["hotkey"])
+        self.assertFalse(status["hotkey_held"])
+
+    def test_not_installed_reports_not_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            installer = _windows_installer(temp_dir=temp_dir)
+            status = installer.status()
+
+        self.assertFalse(status["installed"])
+        self.assertIn("murmly install", status["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -347,6 +996,86 @@ class RecordingRun:
     def __call__(self, command, **_kwargs):
         self.calls.append(list(command))
         return subprocess.CompletedProcess(args=command, returncode=self._returncode, stdout="", stderr="")
+
+
+class FakePlasmaBus:
+    """A stand-in `busctl --user --json=short` for task 4's other gap: an
+    *unpinned* `Installer` driving the real `PlasmaShortcuts` and
+    `ShortcutLauncher` end to end, rather than only the two backends in
+    isolation the way `FakeShortcuts`/`RecordingRun` above do.
+
+    Answers every query by reading whatever `.desktop` launcher files
+    actually exist under `applications_dir` right now -- the same
+    relationship the real `kglobalacceld` has to the files `ShortcutLauncher`
+    writes -- so `register()` writing a file and `unregister()` removing one
+    is what changes this fake's answers, with nothing to keep in sync by
+    hand. Component name is the file name, exactly as `ShortcutLauncher`
+    already keys `launcher_path` on `purpose.desktop_id`.
+    """
+
+    def __init__(self, applications_dir: Path) -> None:
+        self._applications_dir = applications_dir
+        self.calls: list[list[str]] = []
+
+    def __call__(self, command, **_kwargs) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(command))
+        if len(command) == 1:
+            # `kbuildsycoca6`, the cache-rebuild nudge -- nothing to model.
+            return self._ok()
+        if len(command) < 8 or command[3] != "call":
+            return self._fail(command, f"unrecognized command shape {command!r}")
+        method = command[7]
+        if method == "getComponent":
+            component = command[9]
+            if self._path(component).is_file():
+                return self._ok()
+            return self._fail(command, f"Component {component!r} doesn't exist")
+        if method == "getGlobalShortcutsByKey":
+            keycode = int(command[9])
+            rows = [
+                self._row(component)
+                for component in self._components()
+                if self._keycode_of(component) == keycode
+            ]
+            return self._json({"type": "a(ssssssaiai)", "data": [rows]})
+        if method == "shortcutKeys":
+            component = command[10]
+            keycode = self._keycode_of(component)
+            sequences = [] if keycode is None else [[[keycode, 0, 0, 0]]]
+            return self._json({"type": "a(ai)", "data": [sequences]})
+        return self._fail(command, f"unhandled method {method!r}")
+
+    def _path(self, component: str) -> Path:
+        return self._applications_dir / component
+
+    def _components(self) -> list[str]:
+        if not self._applications_dir.is_dir():
+            return []
+        return [entry.name for entry in self._applications_dir.iterdir() if entry.is_file()]
+
+    def _keycode_of(self, component: str) -> int | None:
+        from murmly.hotkey import parse_hotkey
+
+        path = self._path(component)
+        if not path.is_file():
+            return None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("X-KDE-Shortcuts="):
+                value = line.removeprefix("X-KDE-Shortcuts=").strip()
+                return parse_hotkey(value).keycode if value else None
+        return None
+
+    def _row(self, component: str) -> list:
+        return ["_launch", component, component, component, "default", "Default Context", [], []]
+
+    def _ok(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _fail(self, command, stderr: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=command, returncode=1, stdout="", stderr=stderr)
+
+    def _json(self, payload: dict) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")
 
 
 def make_launcher(temp_dir: str, shortcuts, run=None, **kwargs):
@@ -1970,3 +2699,164 @@ class BackendDispatchTests(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertIs(first, third._shortcuts)
+
+
+class ServiceBackendDispatchTests(unittest.TestCase):
+    """`Installer(service=None)` -- what `cli.py` actually constructs --
+    must instantiate whatever `SERVICE_MANAGEMENT` selects, not hand back
+    the class itself: `BackendCandidate.load()` returns a class (proven in
+    `test_platform.py`), so `Installer` is the one seam that has to call it
+    again to get something with `install`/`is_installed`/`status` to call.
+    """
+
+    def test_an_unpinned_installer_on_linux_gets_a_working_systemd_instance(self) -> None:
+        from murmly.installer import Installer, UserService
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+        installer = Installer(profile=profile)
+
+        self.assertIsInstance(installer._service, UserService)
+        # The exact bug shape this guards: a bare class in `_service` makes
+        # `is_installed` the property *object* (truthy, not a bool) rather
+        # than evaluating it against a real instance.
+        self.assertIsInstance(installer._service.is_installed, bool)
+
+    def test_an_unpinned_installer_on_windows_gets_a_working_task_scheduler_instance(self) -> None:
+        """Not `.is_installed` here: the real `WindowsUserService` shells out
+        to `schtasks`, which does not exist on this machine -- exactly the
+        real Win32/`schtasks` half every other Windows test in this module
+        avoids by injecting a fake `run_command`. `isinstance` alone is
+        already the assertion the class-vs-instance bug corrupts: a bare
+        class is not an instance of itself."""
+        from murmly.installer import Installer, WindowsUserService
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        installer = Installer(profile=profile)
+
+        self.assertIsInstance(installer._service, WindowsUserService)
+
+
+class EndToEndBackendSelectionTests(unittest.TestCase):
+    """Task 4's other declared-but-unfixed gap: every test above either pins
+    `shortcuts`/`launcher` outright (bypassing `_backend_for`) or only checks
+    `isinstance` on what auto-selection resolved to. Nothing drove the real
+    path a GNOME or Plasma user takes -- `Installer()` with nothing pinned,
+    resolving the desktop, selecting the backend, and actually installing and
+    uninstalling through it. `run_command=`/`env=` are what make that
+    possible without touching a real desktop bus or a real home directory.
+    """
+
+    def test_gnome_backend_installs_and_uninstalls_end_to_end(self) -> None:
+        from murmly.desktop import Desktop, DesktopSession, GnomeShortcutLauncher, GnomeShortcuts, OverlayBackend
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import Installer
+        from test_desktop_gnome import FakeGsettings
+
+        fake = FakeGsettings()
+        session = DesktopSession(
+            is_plasma=False,
+            session_type="wayland",
+            backend=OverlayBackend.WAYLAND,
+            supported=True,
+            verified=False,
+            detail="GNOME on wayland.",
+            desktop=Desktop.GNOME,
+        )
+        record_store = FakeRecordStore()
+        installer = Installer(
+            service=FakeService(),
+            session=session,
+            entrypoint_resolver=lambda: Path("/bin/murmly"),
+            injection_selector=lambda: PasteInjection("xdotool", ("xdotool",)),
+            record_store=record_store,
+            run_command=fake,
+        )
+
+        # Resolved through `_backend_for`'s GNOME branch, not pinned.
+        self.assertIsInstance(installer._shortcuts, GnomeShortcuts)
+        self.assertIsInstance(installer._launcher, GnomeShortcutLauncher)
+        self.assertIsInstance(installer._session_launcher, GnomeShortcutLauncher)
+
+        outcome = installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        # Proves the injected fake was actually reached through `_backend_for`,
+        # not bypassed in favour of some default -- the thing this gap is
+        # about closing, not merely that the auto-selected type is right.
+        self.assertTrue(fake.calls)
+        self.assertTrue(outcome.hotkey_registered)
+        self.assertTrue(outcome.session_hotkey_registered)
+        self.assertEqual("<Super>x", fake.value(installer._launcher.path, "binding"))
+        self.assertEqual("<Super>a", fake.value(installer._session_launcher.path, "binding"))
+        self.assertEqual({"window": "Meta+X", "session": "Meta+A"}, record_store.bindings)
+
+        uninstall_outcome = installer.uninstall()
+
+        self.assertIn("Released the Murmly hotkey.", uninstall_outcome.messages)
+        self.assertIsNone(installer._launcher.declared_hotkey())
+        self.assertIsNone(installer._session_launcher.declared_hotkey())
+        self.assertIsNone(fake.value(installer._launcher.path, "binding"))
+        self.assertIsNone(record_store.bindings)
+
+    def test_plasma_backend_installs_and_uninstalls_end_to_end(self) -> None:
+        from murmly.desktop import Desktop, DesktopSession, OverlayBackend, PlasmaShortcuts
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, Installer, SESSION_DESKTOP_ID, ShortcutLauncher, default_applications_dir
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = {
+                "XDG_DATA_HOME": str(Path(temp_dir) / "data"),
+                "XDG_CONFIG_HOME": str(Path(temp_dir) / "config"),
+            }
+            applications_dir = default_applications_dir(env)
+            bus = FakePlasmaBus(applications_dir)
+            session = DesktopSession(
+                is_plasma=True,
+                session_type="x11",
+                backend=OverlayBackend.X11,
+                supported=True,
+                verified=True,
+                detail="KDE Plasma on x11.",
+                desktop=Desktop.PLASMA,
+            )
+            record_store = FakeRecordStore()
+            installer = Installer(
+                service=FakeService(),
+                session=session,
+                entrypoint_resolver=lambda: Path("/bin/murmly"),
+                injection_selector=lambda: PasteInjection("xdotool", ("xdotool",)),
+                record_store=record_store,
+                run_command=bus,
+                env=env,
+            )
+
+            # Resolved through `_backend_for`'s default (Plasma) branch, not
+            # pinned, and reading/writing the scratch directory `env` names
+            # rather than the developer's own `~/.local/share/applications`.
+            self.assertIsInstance(installer._shortcuts, PlasmaShortcuts)
+            self.assertIsInstance(installer._launcher, ShortcutLauncher)
+            self.assertEqual(applications_dir / DESKTOP_ID, installer._launcher.launcher_path)
+
+            outcome = installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+            # Proves the injected fake bus was actually reached through
+            # `_backend_for`, not bypassed for some default -- without this, a
+            # dropped `run_command=` kwarg would default to real
+            # `subprocess.run` and only fail loudly on a machine with no
+            # `busctl`, which CI may still have.
+            self.assertTrue(bus.calls)
+            self.assertTrue(outcome.hotkey_registered)
+            self.assertTrue(outcome.session_hotkey_registered)
+            self.assertTrue((applications_dir / DESKTOP_ID).is_file())
+            self.assertTrue((applications_dir / SESSION_DESKTOP_ID).is_file())
+            self.assertEqual("Meta+X", installer._launcher.declared_hotkey())
+            self.assertEqual("Meta+A", installer._session_launcher.declared_hotkey())
+            self.assertEqual({"window": "Meta+X", "session": "Meta+A"}, record_store.bindings)
+
+            uninstall_outcome = installer.uninstall()
+
+            self.assertIn("Released the Murmly hotkey.", uninstall_outcome.messages)
+            self.assertFalse((applications_dir / DESKTOP_ID).is_file())
+            self.assertFalse((applications_dir / SESSION_DESKTOP_ID).is_file())
+            self.assertIsNone(record_store.bindings)

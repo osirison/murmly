@@ -782,6 +782,52 @@ class InstallHooksTests(unittest.TestCase):
         self.assertTrue(backup.is_file())
         self.assertEqual({"model": "opus"}, json.loads(backup.read_text(encoding="utf-8")))
 
+    def test_socket_is_baked_into_the_claude_command_as_an_environment_prefix(self) -> None:
+        """Task 2.6: one resolution, baked in at install time, rather than the
+        hook guessing `XDG_RUNTIME_DIR` itself at run time."""
+        self.run_installer("--agents", "claude", "--socket", "/run/user/1000/murmly.sock")
+
+        commands = [entry["command"] for entry in self.stop_entries()]
+        self.assertEqual([f"MURMLY_SOCKET='/run/user/1000/murmly.sock' python3 '{self.script}'"], commands)
+
+    def test_socket_is_baked_into_the_copilot_command_too(self) -> None:
+        self.run_installer("--agents", "copilot", "--socket", "/run/user/1000/murmly.sock")
+
+        document = json.loads((self.copilot / install_hooks.COPILOT_HOOK_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(
+            f"MURMLY_SOCKET='/run/user/1000/murmly.sock' python3 '{self.script}'",
+            document["hooks"]["Stop"][0]["bash"],
+        )
+
+    def test_without_socket_the_command_is_bare_exactly_as_before(self) -> None:
+        """A caller with no way to resolve it (no venv yet) omits `--socket`
+        entirely; the registered command must not change shape for it."""
+        self.run_installer("--agents", "claude")
+
+        commands = [entry["command"] for entry in self.stop_entries()]
+        self.assertEqual([f"python3 '{self.script}'"], commands)
+
+    def test_a_socket_prefixed_command_is_still_recognised_as_murmlys_own(self) -> None:
+        """Idempotence must survive the prefix: a second install with a
+        (possibly different) socket has to replace the first, not double it."""
+        self.run_installer("--agents", "claude", "--socket", "/run/user/1000/murmly.sock")
+        self.run_installer("--agents", "claude", "--socket", "/run/user/1000/murmly.sock")
+
+        murmly = [entry for entry in self.stop_entries() if "murmly-announce" in entry["command"]]
+        self.assertEqual(1, len(murmly))
+
+    def test_a_reinstall_without_socket_does_not_leave_the_old_one_baked_in(self) -> None:
+        """The downgrade path: a first install resolved a socket (a synced
+        venv existed), a later one could not (the venv was removed and
+        `./setup.sh hooks` was rerun on its own). The stale `MURMLY_SOCKET=`
+        prefix must not survive -- `strip_murmly` matches on the
+        `murmly-announce` substring, which the prefix does not hide."""
+        self.run_installer("--agents", "claude", "--socket", "/run/user/1000/murmly.sock")
+        self.run_installer("--agents", "claude")
+
+        commands = [entry["command"] for entry in self.stop_entries()]
+        self.assertEqual([f"python3 '{self.script}'"], commands)
+
     def test_settings_that_are_not_json_are_refused_rather_than_overwritten(self) -> None:
         self.settings.write_text("{ this is not json", encoding="utf-8")
         finished = subprocess.run(

@@ -435,6 +435,27 @@ agent_label() {
     esac
 }
 
+#: The command socket's resolved path, straight from `murmly.config` --
+#: `murmly doctor` already reports it, running under the venv `murmly()` wraps
+#: -- rather than a second, shell-side copy of the fallback formula. Empty
+#: when it cannot be asked (no synced virtual environment yet, as when
+#: `./setup.sh hooks` runs before `./setup.sh install` ever has); a caller
+#: gets to decide what emptiness means rather than this guessing on its
+#: behalf.
+resolved_socket_path() {
+    murmly doctor 2>/dev/null | python3 -c '
+import json, sys
+
+try:
+    report = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+path = report.get("socket_path")
+if isinstance(path, str) and path:
+    print(path)
+' || true
+}
+
 install_announce_hook() {
     local agents="$1"
     local source="$REPO/hooks/murmly-announce.py"
@@ -467,7 +488,18 @@ install_announce_hook() {
         instruction_flag=(--instruction-script "$instruction_target")
     fi
 
-    python3 "$installer" --script "$target" "${instruction_flag[@]}" \
+    # Resolved once here and baked into the registration, so the hook itself
+    # never has to guess it at run time. Left unset -- rather than reimplemented
+    # in bash -- when it cannot be resolved; the hook's own last-resort
+    # fallback then applies, exactly as it always has.
+    local socket_flag=()
+    local socket
+    socket="$(resolved_socket_path)"
+    if [ -n "$socket" ]; then
+        socket_flag=(--socket "$socket")
+    fi
+
+    python3 "$installer" --script "$target" "${instruction_flag[@]}" "${socket_flag[@]}" \
         --agents "$agents" | while IFS= read -r line; do
         info "$line"
     done

@@ -345,6 +345,16 @@ def _load_unix_socket_family() -> object:
     return socket.AF_UNIX
 
 
+def _is_windows(profile: PlatformProfile) -> bool:
+    return profile.operating_system is OperatingSystem.WINDOWS
+
+
+def _load_named_pipe_server() -> object:
+    from murmly.win_pipe import NamedPipeServer
+
+    return NamedPipeServer
+
+
 def _load_systemd_service() -> object:
     from murmly.installer import UserService
 
@@ -361,6 +371,18 @@ def _load_gnome_hotkeys() -> object:
     from murmly.desktop import GnomeShortcuts
 
     return GnomeShortcuts
+
+
+def _load_windows_hotkey_registrar() -> object:
+    from murmly.win_hotkey import WindowsHotkeyRegistrar
+
+    return WindowsHotkeyRegistrar
+
+
+def _load_windows_service() -> object:
+    from murmly.installer import WindowsUserService
+
+    return WindowsUserService
 
 
 def _load_wayland_clipboard() -> object:
@@ -393,6 +415,24 @@ def _load_x11_focus_observer() -> object:
     return X11FocusObserver
 
 
+def _load_windows_focus_observer() -> object:
+    from murmly.win_focus import WindowsFocusObserver
+
+    return WindowsFocusObserver
+
+
+def _load_windows_clipboard() -> object:
+    from murmly.win_clipboard import WindowsClipboardPaster
+
+    return WindowsClipboardPaster
+
+
+def _load_windows_injector() -> object:
+    from murmly.win_clipboard import SEND_INPUT_METHOD
+
+    return SEND_INPUT_METHOD
+
+
 def _load_gtk4_overlay() -> object:
     from murmly.overlay import OverlayController
 
@@ -411,18 +451,38 @@ def _no_backend_for_operating_system(concern: str) -> Callable[[PlatformProfile]
 
 COMMAND_CHANNEL = BackendRegistry(
     "command channel",
-    candidates=(BackendCandidate("unix-socket", _is_linux, _load_unix_socket_family),),
+    candidates=(
+        BackendCandidate("unix-socket", _is_linux, _load_unix_socket_family),
+        # CPython exposes no `AF_UNIX` on Windows (design.md's "The command
+        # channel"): the named pipe is Windows' own channel, built by
+        # `win_pipe.py` with a security descriptor whose DACL grants only the
+        # creating user's SID (task 7.2), never `multiprocessing.connection`,
+        # whose Windows pipes carry the OS default DACL instead.
+        BackendCandidate("named-pipe", _is_windows, _load_named_pipe_server),
+    ),
     unavailable_reason=_no_backend_for_operating_system("command channel"),
 )
 
 SERVICE_MANAGEMENT = BackendRegistry(
     "service management",
-    candidates=(BackendCandidate("systemd", _is_linux, _load_systemd_service),),
+    candidates=(
+        BackendCandidate("systemd", _is_linux, _load_systemd_service),
+        # Task Scheduler over the Startup folder or `HKCU\...\Run`: it is the
+        # only one of the three with CLI verbs for start, stop, status,
+        # enable and disable (design.md's "Service management" table), which
+        # `installer.WindowsUserService.is_active()`/`status()` need to
+        # answer the same questions `UserService`'s systemd equivalents do.
+        BackendCandidate("task-scheduler", _is_windows, _load_windows_service),
+    ),
     unavailable_reason=_no_backend_for_operating_system("service management"),
 )
 
 
 def _hotkey_unavailable_reason(profile: PlatformProfile) -> str:
+    # Windows always matches the `windows-hotkey` candidate below, so this
+    # branch is unreached for it; kept as a plain Linux/Windows split rather
+    # than three branches, since only macOS and "other" still fall through to
+    # "no backend at all" here.
     if not _is_linux(profile):
         return f"No hotkey backend exists for {profile.operating_system.value} yet."
     return "Hotkey registration requires KDE Plasma or GNOME."
@@ -433,6 +493,10 @@ HOTKEY_REGISTRATION = BackendRegistry(
     candidates=(
         BackendCandidate("plasma", _is_plasma, _load_plasma_hotkeys),
         BackendCandidate("gnome", _is_gnome, _load_gnome_hotkeys),
+        # Registers in Murmly's own process rather than in any desktop-held
+        # state (design.md's "Four hotkey backends"): see
+        # `IN_PROCESS_HOTKEY_MECHANISMS` below, and `win_hotkey.py`.
+        BackendCandidate("windows-hotkey", _is_windows, _load_windows_hotkey_registrar),
     ),
     unavailable_reason=_hotkey_unavailable_reason,
 )
@@ -444,6 +508,11 @@ CLIPBOARD = BackendRegistry(
             "wayland", lambda profile: _is_linux(profile) and _wants_wayland(profile), _load_wayland_clipboard
         ),
         BackendCandidate("x11", _is_linux, _load_x11_clipboard),
+        # `CF_UNICODETEXT` through the Win32 API, never `clip.exe` (task 9.1,
+        # design.md's "Clipboard and paste injection") -- `clip.exe` reads
+        # stdin through the console's own OEM/ANSI codepage and mangles
+        # anything outside it.
+        BackendCandidate("windows", _is_windows, _load_windows_clipboard),
     ),
     unavailable_reason=_no_backend_for_operating_system("clipboard"),
 )
@@ -455,12 +524,20 @@ PASTE_INJECTION = BackendRegistry(
             "wayland", lambda profile: _is_linux(profile) and _wants_wayland(profile), _load_wayland_injectors
         ),
         BackendCandidate("x11", _is_linux, _load_x11_injectors),
+        # `SendInput` (task 9.2), registered as unconfirmable (task 9.3): UIPI
+        # silently discards synthetic input aimed at a higher-integrity
+        # window, so `win_clipboard.WindowsClipboardPaster` never restores the
+        # clipboard over what it just wrote -- see that module's docstring.
+        BackendCandidate("windows", _is_windows, _load_windows_injector),
     ),
     unavailable_reason=_no_backend_for_operating_system("paste injection"),
 )
 
 
 def _focus_unavailable_reason(profile: PlatformProfile) -> str:
+    # Windows always matches the `windows` candidate below, so this branch is
+    # unreached for it, the same shape `_hotkey_unavailable_reason` already
+    # has for the same reason.
     if not _is_linux(profile):
         return f"No focus observation backend exists for {profile.operating_system.value} yet."
     return "Delivery target verification requires an X11 session."
@@ -472,6 +549,10 @@ FOCUS_OBSERVATION = BackendRegistry(
         BackendCandidate(
             "x11", lambda profile: _is_linux(profile) and not _wants_wayland(profile), _load_x11_focus_observer
         ),
+        # `GetForegroundWindow`/`GetWindowThreadProcessId`/`QueryFullProcessImageName`
+        # (task 9.4) -- none needs a permission for a process the same user
+        # owns, which is exactly why design.md picks them.
+        BackendCandidate("windows", _is_windows, _load_windows_focus_observer),
     ),
     unavailable_reason=_focus_unavailable_reason,
 )
@@ -531,14 +612,15 @@ SPEECH_SYNTHESIS = BackendRegistry(
 )
 
 #: Hotkey mechanisms that register inside Murmly's own process rather than in
-#: the desktop's own persisted state. Empty today: neither `plasma` (a
-#: launcher file the desktop discovers) nor `gnome` (a dconf value the
-#: settings daemon watches) is one -- both are desktop-held state a fresh
-#: session already has without Murmly doing anything. Windows' `RegisterHotKey`
-#: (section 8) and macOS's Carbon `RegisterEventHotKey` (section 13) are the
-#: intended members once their candidates exist. See `hotkey_record.py` for
-#: what reads this.
-IN_PROCESS_HOTKEY_MECHANISMS: frozenset[str] = frozenset()
+#: the desktop's own persisted state. Neither `plasma` (a launcher file the
+#: desktop discovers) nor `gnome` (a dconf value the settings daemon watches)
+#: is one -- both are desktop-held state a fresh session already has without
+#: Murmly doing anything. `windows-hotkey` (section 8) is the first member;
+#: macOS's Carbon `RegisterEventHotKey` (section 13) is the intended second,
+#: once its candidate exists. See `hotkey_record.py` for what reads this, and
+#: `win_hotkey.WindowsHotkeyRegistrar` for what satisfies its `rebind`
+#: contract on this mechanism.
+IN_PROCESS_HOTKEY_MECHANISMS: frozenset[str] = frozenset({"windows-hotkey"})
 
 
 def hotkey_mechanism_is_in_process(
@@ -596,35 +678,136 @@ class PermissionState(StrEnum):
 class Permission:
     """One grant a person must give before a platform lets a mechanism work.
 
-    No candidate exists yet: Linux, the only operating system this phase
-    supports, gates nothing Murmly uses behind a person-granted permission --
-    every `BackendChoice` above is unavailable only for lacking a mechanism,
-    never for lacking a grant. This type and `PERMISSIONS` exist so Windows'
-    microphone privacy setting (section 9) and macOS's microphone,
-    Accessibility, and Input Monitoring grants (sections 12, 14) have a shape
-    to register into rather than each inventing its own, the same role
-    `IN_PROCESS_HOTKEY_MECHANISMS` plays for hotkeys before its first member
-    exists.
+    This type and `PERMISSIONS` exist so Windows' microphone privacy setting
+    (section 9, the first member) and macOS's microphone, Accessibility, and
+    Input Monitoring grants (sections 12, 14) have a shape to register into
+    rather than each inventing its own, the same role `IN_PROCESS_HOTKEY_MECHANISMS`
+    plays for hotkeys.
 
     `capability` names what the permission gates (e.g. "paste injection"), not
     the permission's own name, because that is what a denied-permission report
     must say was lost. `grant_location` is where a person goes to change it --
     a System Settings pane, a Group Policy path -- named specifically enough to
     act on, the same bar `BackendChoice.reason` is held to.
+
+    `applies` is what keeps `PERMISSIONS` one flat table across every platform
+    without a Linux report growing a `permissions` entry for a grant Linux does
+    not gate anything behind: `platform_diagnostics` (`cli.py`) filters this
+    mapping through it before rendering, the same role `BackendCandidate.supports`
+    plays for a registry candidate. Defaults to "applies everywhere" only
+    because nothing yet needs a permission every platform shares; every real
+    entry today names the one operating system that gates it.
     """
 
     name: str
     capability: str
     grant_location: str
     check: Callable[[PlatformProfile], PermissionState]
+    applies: Callable[[PlatformProfile], bool] = lambda profile: True
 
+
+#: The two per-user consent-store paths that can each independently deny
+#: microphone capture to an unpackaged desktop executable like Murmly: the
+#: master "Microphone access" toggle at the parent key, and the "Allow
+#: desktop apps to access your microphone" toggle at its `NonPackaged`
+#: subkey. Checking only the second is the bug a person who flipped the
+#: *master* toggle off would fall through -- read as no denial there, and
+#: reported `GRANTED`, which is exactly what the `platform-support` spec
+#: forbids. Read from Microsoft's own documentation of the consent store's
+#: shape, not confirmed on a Windows machine; see
+#: `_windows_microphone_permission_check`.
+_WINDOWS_MICROPHONE_CONSENT_KEYS = (
+    r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion"
+    r"\CapabilityAccessManager\ConsentStore\microphone",
+    r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion"
+    r"\CapabilityAccessManager\ConsentStore\microphone\NonPackaged",
+)
+
+
+def _windows_microphone_consent_values(
+    read_registry_value: Callable[[str, str], str | None],
+) -> tuple[str | None, ...]:
+    """Each consent-store key's raw readable value, in `_WINDOWS_MICROPHONE_CONSENT_KEYS` order.
+
+    Read once into a tuple rather than answered as a single yes/no, so the
+    caller can tell "every key read, none said deny" (a positive `GRANTED`)
+    apart from "at least one key could not be read at all" (`UNDETERMINED`,
+    per the `platform-support` spec's "does not claim it is granted" rule) --
+    a boolean collapses exactly that distinction.
+    """
+    return tuple(read_registry_value(key_path, "Value") for key_path in _WINDOWS_MICROPHONE_CONSENT_KEYS)
+
+
+def _real_read_registry_value(key_path: str, value_name: str) -> str | None:
+    """`winreg.QueryValueEx`, or `None` for any reason the value cannot be read.
+
+    Every failure mode -- the key does not exist, the value does not exist,
+    access is refused -- collapses to `None` rather than being told apart,
+    because `_windows_microphone_permission_check` already treats any
+    unreadable key as `UNDETERMINED`, never as `GRANTED`: it has no case that
+    would answer differently for one reason over another.
+    """
+    import winreg
+
+    hive_name, _, subkey = key_path.partition("\\")
+    hive = getattr(winreg, hive_name)
+    try:
+        with winreg.OpenKey(hive, subkey) as key:
+            value, _type = winreg.QueryValueEx(key, value_name)
+            return str(value)
+    except OSError:
+        return None
+
+
+def _windows_microphone_permission_check(
+    profile: PlatformProfile,
+    read_registry_value: Callable[[str, str], str | None] = _real_read_registry_value,
+) -> PermissionState:
+    """Task 9.5: the microphone privacy setting's state, where Windows lets it be read.
+
+    A readable "Deny" at either key is `DENIED` regardless of whether the
+    other key could be read -- there is no case where one says "deny" and the
+    other's "allow" overrides it. Short of that, any key that could not be
+    read at all (absent on a Windows version that predates it, or access
+    refused) answers `UNDETERMINED`, never `GRANTED`: an unreadable
+    `NonPackaged` key might be hiding a denial this check cannot see, and the
+    `platform-support` spec forbids claiming a grant on that silence. Only
+    when both keys were read, and neither said "deny", is this `GRANTED`.
+    This alone is what lets `murmly doctor` tell a blocked microphone apart
+    from an absent device (task 9.5): a denied permission shows up here, in
+    its own field, while an absent device shows up wherever capture itself
+    fails to open one -- the two are never the same report line, so nothing
+    here needs to enumerate audio devices to keep them distinct.
+    """
+    values = _windows_microphone_consent_values(read_registry_value)
+    if any(value is not None and value.casefold() == "deny" for value in values):
+        return PermissionState.DENIED
+    if any(value is None for value in values):
+        return PermissionState.UNDETERMINED
+    # Read from Microsoft's documented consent-store shape, not confirmed
+    # against a real Windows registry: an "Allow" value read from both keys
+    # is granted here. If a live Windows machine shows a case this collapses
+    # wrongly, this is the function to correct.
+    return PermissionState.GRANTED
+
+
+WINDOWS_MICROPHONE_PERMISSION = "windows-microphone"
 
 #: Every permission Murmly currently knows to ask about, keyed by `name`.
-#: Empty in this phase for the reason `Permission`'s docstring gives.
 #: `platform_diagnostics` (`cli.py`) renders this mapping into the `platform`
 #: section's `permissions` field regardless of whether it holds anything, so
-#: that field's shape does not change the day a first permission is added.
-PERMISSIONS: Mapping[str, Permission] = {}
+#: that field's shape does not change the day a permission is added, filtered
+#: through each entry's `applies` first so a platform this permission does not
+#: gate anything on never grows an entry for it.
+PERMISSIONS: Mapping[str, Permission] = {
+    WINDOWS_MICROPHONE_PERMISSION: Permission(
+        name=WINDOWS_MICROPHONE_PERMISSION,
+        capability="microphone capture",
+        grant_location="Settings > Privacy & security > Microphone",
+        check=_windows_microphone_permission_check,
+        applies=_is_windows,
+    ),
+}
 
 
 # --------------------------------------------------------------------------

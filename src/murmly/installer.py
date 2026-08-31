@@ -31,11 +31,16 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from murmly.desktop import DesktopQueryError, PlasmaShortcuts
 from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
-from murmly.hotkey import Hotkey, HotkeyError, parse_hotkey
+from murmly.hotkey import Hotkey, HotkeyError, parse_hotkey, windows_hotkey_for_portable
 from murmly.integrations import PasteInjection, select_paste_injection
+
+if TYPE_CHECKING:
+    from murmly.config import MurmlyConfig
+    from murmly.platform import PlatformProfile
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +62,12 @@ SESSION_DESKTOP_ID = "net.local.murmly-session.desktop"
 SESSION_APPLICATION_NAME = "murmly speech session"
 REGISTRATION_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.2
+#: How long an in-process-hotkey install (task 8.6) waits for the daemon it
+#: just started to accept a command, and how often it polls -- longer than
+#: `REGISTRATION_TIMEOUT_SECONDS`, which only waits for a desktop to notice a
+#: file, because this waits for a whole process (models and all) to start.
+WINDOWS_DAEMON_START_TIMEOUT_SECONDS = 10.0
+WINDOWS_DAEMON_POLL_INTERVAL_SECONDS = 0.2
 
 #: X-KDE-Shortcuts is the line that binds the key. X-KDE-GlobalAccel-CommandShortcut
 #: is cosmetic: only the System Settings editor reads it, to label the entry as a
@@ -143,7 +154,13 @@ def resolve_entrypoint(executable: str | None = None) -> Path:
     if not interpreter.name:
         raise InstallError("Unable to determine the running Python interpreter.")
 
-    candidate = interpreter.with_name(ENTRYPOINT_NAME)
+    # A pure function of the interpreter path's own shape, not of
+    # `sys.platform`: `uv`'s Windows venvs put `python.exe` in `Scripts/`
+    # beside `murmly.exe`, the console script `uv sync` generates there, so an
+    # interpreter ending in `.exe` is what says which name to look for --
+    # testable from Linux with `executable=` alone.
+    name = f"{ENTRYPOINT_NAME}.exe" if interpreter.suffix.casefold() == ".exe" else ENTRYPOINT_NAME
+    candidate = interpreter.with_name(name)
     if not candidate.exists():
         raise InstallError(
             f"Could not find the murmly entrypoint at {candidate}. Install the project "
@@ -363,6 +380,174 @@ class UserService:
             raise InstallError(f"systemctl --user {' '.join(arguments)} failed: {detail or 'unknown error'}")
 
 
+#: The Task Scheduler task name. Not `SERVICE_NAME` (`murmly.service`):
+#: Task Scheduler task names conventionally carry no file-extension-shaped
+#: suffix, and giving the two platforms visibly different names is a small
+#: mercy to anyone reading a task list who has never heard of systemd units.
+WINDOWS_TASK_NAME = "MurmlyDaemon"
+
+
+def _quoted_for_schtasks(value: str) -> str:
+    """Quote `value` only if it needs it -- `schtasks /tr` splits on spaces
+    outside quotes, so a bare `C:\\Program Files\\murmly.exe` would be read as
+    two arguments without this."""
+    return f'"{value}"' if " " in value else value
+
+
+class WindowsUserService:
+    """The Murmly Task Scheduler task (task 8.1).
+
+    Task Scheduler over the Startup folder or `HKCU\\...\\Run`: it is the only
+    one of the three with CLI verbs for start, stop, status, enable and
+    disable (design.md's "Service management" table), which `is_active()` and
+    `status()` below have to answer the same way `UserService`'s systemd
+    equivalents do -- a shortcut or a registry value can only say whether it
+    exists, never whether the process it names is currently running.
+
+    `install()` passes neither `/ru` nor `/rl HIGHEST`: omitting `/rl`
+    defaults the task to `LIMITED` -- the same privilege level the installing
+    user's own logon session has -- which is what keeps registration and
+    startup free of an administrative prompt (task 8.2). That claim can only
+    be confirmed by actually running `schtasks` on Windows; this class's own
+    tests confirm only that the invocation never *asks* for elevation, against
+    a fake `run_command`.
+
+    Every method takes the same shape `UserService` does -- `run_command`
+    injected, real `subprocess.run` by default -- so `Installer._backend_for`
+    can select between the two the same way it already selects a hotkey
+    backend, and so a test drives this class exactly like every other backend
+    in the codebase: against a fake runner, never a real `schtasks.exe`, which
+    does not exist on this machine.
+
+    `schtasks`' text output is localized, and this class's `/query` parsing
+    (`is_active`, `recorded_entrypoint`) matches only the English column
+    headers and status text (`"Status:"`, `"Running"`, `"Task To Run:"`) --
+    confirmed correct only on an English-language Windows install; a
+    non-English one is a real gap this class does not close.
+    """
+
+    def __init__(
+        self,
+        run_command: RunCommand = subprocess.run,
+        task_name: str = WINDOWS_TASK_NAME,
+        schtasks: str = "schtasks",
+    ) -> None:
+        self._run_command = run_command
+        self._task_name = task_name
+        self._binary = schtasks
+
+    @property
+    def is_installed(self) -> bool:
+        return self._schtasks("/query", "/tn", self._task_name).returncode == 0
+
+    def install(self, entrypoint: Path) -> None:
+        """Create the logon-trigger task and start it.
+
+        `/f` overwrites a task of this name from a previous install rather
+        than failing on one, matching `UserService.install`'s
+        `write_atomically` + `daemon-reload` -- both are "make it look like
+        this from now on", not "fail if it already existed".
+        """
+        run_line = f"{_quoted_for_schtasks(str(entrypoint))} daemon"
+        self._schtasks_checked(
+            "/create", "/tn", self._task_name, "/tr", run_line, "/sc", "onlogon", "/f"
+        )
+        self.start()
+
+    def remove(self) -> bool:
+        """Tear the task down. Succeeds when it is already absent."""
+        existed = self.is_installed
+        # Best effort, like `UserService.remove`: a task already stopped or
+        # never registered must not fail an uninstall.
+        self._schtasks("/end", "/tn", self._task_name)
+        self._schtasks("/delete", "/tn", self._task_name, "/f")
+        return existed
+
+    def start(self) -> bool:
+        return self._schtasks("/run", "/tn", self._task_name).returncode == 0
+
+    def stop(self) -> bool:
+        return self._schtasks("/end", "/tn", self._task_name).returncode == 0
+
+    def enable(self) -> bool:
+        return self._schtasks("/change", "/tn", self._task_name, "/enable").returncode == 0
+
+    def disable(self) -> bool:
+        return self._schtasks("/change", "/tn", self._task_name, "/disable").returncode == 0
+
+    def start_command_text(self) -> str:
+        """What a person can run to start the service by hand.
+
+        Named in diagnostics (task 8.7's "name the command that starts the
+        service") rather than a hotkey press: there is no press to recover
+        from on this platform (`Installer._status_in_process`'s own
+        docstring), so the report has to name something else.
+        """
+        return f"{self._binary} /run /tn {self._task_name}"
+
+    def is_active(self) -> bool:
+        result = self._schtasks("/query", "/tn", self._task_name, "/fo", "LIST")
+        if result.returncode != 0:
+            return False
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("Status:"):
+                return line.removeprefix("Status:").strip().casefold() == "running"
+        return False
+
+    def recorded_entrypoint(self) -> str | None:
+        """The command `/tr` names in the installed task, if any."""
+        result = self._schtasks("/query", "/tn", self._task_name, "/fo", "LIST", "/v")
+        if result.returncode != 0:
+            return None
+        for line in (result.stdout or "").splitlines():
+            if line.startswith("Task To Run:"):
+                value = line.removeprefix("Task To Run:").strip()
+                value = value.removesuffix(" daemon").strip()
+                if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+                    value = value[1:-1]
+                return value or None
+        return None
+
+    def status(self) -> ServiceStatus:
+        if not self.is_installed:
+            return ServiceStatus(
+                installed=False,
+                active=False,
+                entrypoint=None,
+                detail="Murmly is not installed. Run 'murmly install <hotkey>' to install it.",
+            )
+        active = self.is_active()
+        return ServiceStatus(
+            installed=True,
+            active=active,
+            entrypoint=self.recorded_entrypoint(),
+            detail=(
+                "The Murmly service is installed and running."
+                if active
+                else "The Murmly service is installed but not running."
+            ),
+        )
+
+    def _schtasks(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        command = [self._binary, *arguments]
+        try:
+            return self._run_command(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise InstallError(f"Unable to run '{' '.join(command)}': {error}") from error
+
+    def _schtasks_checked(self, *arguments: str) -> None:
+        result = self._schtasks(*arguments)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise InstallError(f"schtasks {' '.join(arguments)} failed: {detail or 'unknown error'}")
+
+
 class ShortcutLauncher:
     """The launcher entry whose ``X-KDE-Shortcuts`` line binds Murmly's hotkey."""
 
@@ -576,18 +761,76 @@ class Installer:
         injection_selector: Callable[[], PasteInjection] = select_paste_injection,
         session_launcher: ShortcutLauncher | None = None,
         record_store: HotkeyRecordStore | None = None,
+        run_command: RunCommand | None = None,
+        env: dict[str, str] | None = None,
+        profile: PlatformProfile | None = None,
+        config: MurmlyConfig | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+        daemon_timeout: float = WINDOWS_DAEMON_START_TIMEOUT_SECONDS,
+        poll_interval: float = WINDOWS_DAEMON_POLL_INTERVAL_SECONDS,
     ) -> None:
+        from murmly.platform import resolve_platform
+
         self._pinned_shortcuts = shortcuts
         self._pinned_launcher = launcher
         self._pinned_session_launcher = session_launcher
         self._backend: tuple[object, object, object] | None = None
-        self._service = service if service is not None else UserService()
+        # Resolved before `self._service` below, which a Windows profile
+        # dispatches on -- task 8.1's own selection, matching how
+        # `_backend_for` already dispatches the hotkey backend on the
+        # resolved session.
+        self._profile = profile if profile is not None else resolve_platform()
+        self._service = service if service is not None else self._default_service()
         self._session = session
         self._resolve_entrypoint = entrypoint_resolver
         self._select_injection = injection_selector
         self._record_store = (
             record_store if record_store is not None else HotkeyRecordStore(default_hotkey_record_path())
         )
+        # Reach the *auto-selected* backend's own command runner and
+        # environment -- `_backend_for` -- without touching a single existing
+        # caller: every one of them either pins `shortcuts`/`launcher`
+        # directly (bypassing `_backend_for` entirely) or leaves both `None`
+        # and gets today's exact `subprocess.run` and real filesystem paths,
+        # since `_backend_for` only overrides its defaults when these are not
+        # `None`. This is what lets a test drive an unpinned `Installer`
+        # through the real desktop-selection branch against a fake command
+        # runner and a scratch directory, instead of only the two backends in
+        # isolation.
+        self._run_command = run_command
+        self._env = env
+        # Only reached by `_install_in_process`/`_status_in_process`
+        # (task 8.6/8.7): the config that names the command channel a running
+        # daemon is reached through. Every real Linux caller never touches
+        # this, so it stays unresolved -- `load_config` opens a file the
+        # desktop-launcher flow has no reason to read.
+        self._config = config
+        self._sleep = sleep
+        self._clock = clock
+        self._daemon_timeout = daemon_timeout
+        self._poll_interval = poll_interval
+
+    def _default_service(self) -> object:
+        """The service backend `SERVICE_MANAGEMENT` selects for `self._profile`.
+
+        `UserService()` -- systemd -- is the fallback when no candidate
+        matches at all: `cli.main` already refuses a platform with no backend
+        here before `Installer` is ever constructed (task 1.7), so this branch
+        exists only for a caller (a test, or a future platform) that reaches
+        this class directly. It is not a claim that systemd works there.
+        """
+        from murmly.platform import SERVICE_MANAGEMENT
+
+        choice = SERVICE_MANAGEMENT.select(self._profile)
+        if choice.load is None:
+            return UserService()
+        # `load()` yields the backend *class* (`BackendCandidate.load`'s own
+        # contract -- see `test_platform.py`'s `assertIs(UserService,
+        # choice.load())`), so the class itself has to be instantiated here;
+        # returning `choice.load()` directly would hand `install()` an
+        # unbound class rather than a service to call methods on.
+        return choice.load()()
 
     def _current_session(self):
         if self._session is not None:
@@ -622,8 +865,7 @@ class Installer:
             self._backend = (shortcuts, launcher, session_launcher)
         return self._backend
 
-    @staticmethod
-    def _backend_for(session) -> tuple[object, object, object]:
+    def _backend_for(self, session) -> tuple[object, object, object]:
         """The (shortcuts, window launcher, session launcher) triple for the
         desktop `session` names.
 
@@ -633,20 +875,36 @@ class Installer:
         this method, because `install()` checks `session.supported` before any
         of the three properties are touched, and `status()`/`uninstall()` on
         such a desktop only ever read a launcher file that cannot exist there.
+
+        `self._run_command`/`self._env` are `None` for every real caller
+        (`cli.py` constructs a plain `Installer()`), so the constructor call
+        below passes nothing extra and each backend class's own default --
+        `subprocess.run`, the real XDG directories -- applies exactly as
+        before this injection point existed. A test naming both is the only
+        way either branch is reached with anything else.
         """
         from murmly.platform import Desktop
+
+        run_command_kwargs = {} if self._run_command is None else {"run_command": self._run_command}
 
         if getattr(session, "desktop", Desktop.OTHER) is Desktop.GNOME:
             from murmly.desktop import GnomeShortcuts, GnomeShortcutLauncher
 
-            shortcuts = GnomeShortcuts()
+            shortcuts = GnomeShortcuts(**run_command_kwargs)
             return (
                 shortcuts,
                 GnomeShortcutLauncher(shortcuts, purpose=WINDOW_HOTKEY),
                 GnomeShortcutLauncher(shortcuts, purpose=SESSION_HOTKEY),
             )
-        shortcuts = PlasmaShortcuts()
-        return shortcuts, ShortcutLauncher(shortcuts), ShortcutLauncher(shortcuts, purpose=SESSION_HOTKEY)
+        shortcuts = PlasmaShortcuts(**run_command_kwargs)
+        launcher_kwargs = dict(run_command_kwargs)
+        if self._env is not None:
+            launcher_kwargs["env"] = self._env
+        return (
+            shortcuts,
+            ShortcutLauncher(shortcuts, **launcher_kwargs),
+            ShortcutLauncher(shortcuts, purpose=SESSION_HOTKEY, **launcher_kwargs),
+        )
 
     @property
     def _shortcuts(self):
@@ -668,6 +926,16 @@ class Installer:
         sender that opens a session itself, which is what an existing
         installation upgrading in place gets.
         """
+        from murmly.platform import hotkey_mechanism_is_in_process
+
+        if hotkey_mechanism_is_in_process(self._profile):
+            # No desktop session to resolve and no launcher file to write:
+            # the binding lives inside the daemon's own process (design.md's
+            # "Four hotkey backends"). `_current_session()`/`_resolve_backend()`
+            # below are Linux/desktop concepts this platform has no analogue
+            # of, so they are never reached for it.
+            return self._install_in_process(hotkey, session_hotkey)
+
         entrypoint = self._resolve_entrypoint()
         session = self._current_session()
         # Seeded from the same session `install()` already resolved, so a run
@@ -1001,6 +1269,11 @@ class Installer:
 
     def uninstall(self) -> InstallOutcome:
         """Remove everything Murmly installed, tolerating anything already gone."""
+        from murmly.platform import hotkey_mechanism_is_in_process
+
+        if hotkey_mechanism_is_in_process(self._profile):
+            return self._uninstall_in_process()
+
         messages: list[str] = []
         problems: list[str] = []
 
@@ -1059,6 +1332,11 @@ class Installer:
         The top-level `hotkey` keys keep describing the focused-window binding,
         unchanged, and `hotkeys` lists every binding with the purpose it serves.
         """
+        from murmly.platform import hotkey_mechanism_is_in_process
+
+        if hotkey_mechanism_is_in_process(self._profile):
+            return self._status_in_process()
+
         service = self._service.status()
         declared = self._launcher.declared_hotkey()
         report: dict[str, object] = {
@@ -1130,3 +1408,323 @@ class Installer:
                 f"{hotkey.portable} is registered for Murmly but no owner is reported."
             )
         return entry
+
+    # ----------------------------------------------------------------
+    # In-process hotkey backends (task 8; the intended second member is
+    # macOS's Carbon registrar, section 13). No desktop session, no launcher
+    # file, no `_shortcuts.owners_of` query: the binding lives inside the
+    # daemon's own process, so the only way to bind, verify or release it is
+    # to reach that process over the command channel `self._socket_path()`
+    # names. `HotkeyRecordStore` (task 5.4) is what a fresh daemon start reads
+    # to re-create the binding, and what these methods themselves read and
+    # write as the one record of "what is supposed to be bound" -- there is
+    # no desktop-held copy to fall back on the way `declared_hotkey()` is for
+    # Plasma and GNOME.
+    # ----------------------------------------------------------------
+
+    def _socket_path(self) -> str:
+        if self._config is not None:
+            return str(self._config.socket_path)
+        from murmly.config import default_config_path, load_config
+
+        return str(load_config(default_config_path()).socket_path)
+
+    def _wait_for_daemon_command(self, socket_path: str, command: str) -> dict[str, object]:
+        """Send `command`, retrying while the daemon this run just started is
+        still coming up, bounded by `self._daemon_timeout`.
+
+        Raises `InstallError` naming the last failure on timeout -- callers
+        turn that into `HotkeyNotConfirmedError` rather than a hard failure,
+        the same distinction `ShortcutLauncher.register`'s own bounded wait
+        draws between "not yet confirmed" and "refused".
+        """
+        from murmly.daemon import DaemonNotRespondingError, send_command
+
+        deadline = self._clock() + self._daemon_timeout
+        last_error: Exception | None = None
+        while True:
+            try:
+                return send_command(socket_path, command)
+            except (OSError, DaemonNotRespondingError) as error:
+                last_error = error
+                if self._clock() >= deadline:
+                    raise InstallError(
+                        f"The Murmly daemon did not answer {command!r} within "
+                        f"{self._daemon_timeout:g} seconds: {last_error}."
+                    ) from last_error
+                self._sleep(self._poll_interval)
+
+    def _best_effort_rebind(self, socket_path: str) -> None:
+        """Ask a running daemon to re-read the record, without raising.
+
+        Used after a conflict is rolled back, to put the daemon's live
+        registration back in step with the record this run just restored --
+        a failure here is reported, never raised: the record itself is
+        already correct, and the daemon's own next start reads it regardless.
+        """
+        from murmly.daemon import DaemonNotRespondingError, send_command
+        from murmly.daemon import COMMAND_REBIND_HOTKEYS
+
+        try:
+            send_command(socket_path, COMMAND_REBIND_HOTKEYS)
+        except (OSError, DaemonNotRespondingError) as error:
+            logger.debug("Could not reach the running daemon to restore its previous hotkeys: %s", error)
+
+    def _restore_record(self, previous_record: dict[str, str]) -> None:
+        try:
+            if previous_record:
+                self._record_store.write(previous_record)
+            else:
+                self._record_store.remove()
+        except OSError as error:
+            logger.warning("Could not restore the previous hotkey record: %s", error)
+
+    def _rollback_service(self) -> None:
+        try:
+            self._service.remove()
+        except InstallError:
+            logger.warning("Could not remove the Murmly service during rollback.")
+
+    def _install_in_process(
+        self, hotkey: Hotkey, session_hotkey: Hotkey | None
+    ) -> InstallOutcome:
+        """`install()`'s whole body for a platform that registers the hotkey
+        inside the daemon's own process (design.md's "Windows and macOS
+        register in Murmly's own process").
+
+        Installation therefore starts the daemon *before* reporting a hotkey
+        bound (the `desktop-integration` spec's "Hotkey takes effect in the
+        running session"): the record is written, the service is installed
+        and started, and only a daemon that reports the requested purposes
+        actually held (`COMMAND_STATUS`'s `hotkeys_held`, task 8.6) is
+        reported as a successful bind. A refusal the platform itself raises
+        (task 8.4 -- `WindowsHotkeyRegistrar.rebind` surfacing
+        `RegisterHotKey`'s own collision) leaves no registration behind: the
+        record reverts and the daemon is told to pick the previous bindings
+        back up, mirroring the desktop-launcher flow's own rollback.
+        """
+        from murmly.daemon import COMMAND_REBIND_HOTKEYS, COMMAND_STATUS
+
+        entrypoint = self._resolve_entrypoint()
+
+        requested: dict[str, Hotkey] = {WINDOW_HOTKEY.key: hotkey}
+        if session_hotkey is not None:
+            if session_hotkey.keycode == hotkey.keycode:
+                raise HotkeyConflictError(
+                    f"{hotkey.portable} was requested for both the focused window and the "
+                    "speech session. Only one binding can ever receive the keypress, so "
+                    "choose a different key for one of them."
+                )
+            requested[SESSION_HOTKEY.key] = session_hotkey
+
+        # Refuse anything this platform cannot register at all, before
+        # anything is written -- the same "before anything is written" rule
+        # the desktop-launcher flow applies to its own two-hotkeys-one-key
+        # check just above.
+        for purpose_key, requested_hotkey in requested.items():
+            try:
+                windows_hotkey_for_portable(requested_hotkey.portable)
+            except HotkeyError as error:
+                raise InstallError(str(error)) from error
+
+        previous_record = self._record_store.read()
+        already_bound = previous_record.get(WINDOW_HOTKEY.key) == hotkey.portable
+        new_record = dict(previous_record)
+        new_record.update({key: value.portable for key, value in requested.items()})
+
+        service_existed = self._service.is_installed
+        self._service.install(entrypoint)
+
+        try:
+            self._record_store.write(new_record)
+        except OSError as error:
+            if not service_existed:
+                self._rollback_service()
+            raise InstallError(f"Could not persist the hotkey binding: {error}") from error
+
+        socket_path = self._socket_path()
+        portables = ", ".join(value.portable for value in requested.values())
+
+        try:
+            rebind_response = self._wait_for_daemon_command(socket_path, COMMAND_REBIND_HOTKEYS)
+            status_response = self._wait_for_daemon_command(socket_path, COMMAND_STATUS)
+        except InstallError as error:
+            # The record is left exactly as written: this is "not confirmed
+            # in this session", not "refused" -- the same distinction
+            # `HotkeyNotConfirmedError`'s own docstring draws for the
+            # desktop-launcher flow, whose launcher also stays on this path.
+            raise HotkeyNotConfirmedError(
+                f"{portables} could not be confirmed in this session: {error} The binding "
+                "is saved and will take effect the next time the Murmly service starts.",
+                tuple(requested.values()),
+            ) from error
+
+        held = set(status_response.get("hotkeys_held") or ())
+        missing = requested.keys() - held
+        if missing:
+            # The platform's own refusal is the collision (task 8.4): nothing
+            # was queried first. No registration is left behind (the
+            # `desktop-integration` spec's "no service, launcher, or hotkey
+            # registration is left behind") -- the record reverts and the
+            # still-running daemon is told to pick the previous bindings back
+            # up immediately, not only at its next start.
+            self._restore_record(previous_record)
+            self._best_effort_rebind(socket_path)
+            if not service_existed:
+                self._rollback_service()
+            names = ", ".join(requested[key].portable for key in sorted(missing))
+            detail = str(rebind_response.get("detail") or "").strip()
+            raise HotkeyConflictError(
+                f"{names} could not be bound: {detail or 'the platform refused the registration.'}"
+            )
+
+        messages: list[str] = []
+        if already_bound:
+            messages.append(
+                f"{hotkey.portable} is already bound to Murmly ({WINDOW_HOTKEY.description})."
+            )
+        else:
+            messages.append(
+                f"Registered {hotkey.portable}. It is held by the running Murmly daemon: the "
+                "binding exists only while the daemon runs, and is released if it stops."
+            )
+        if session_hotkey is not None:
+            messages.append(
+                f"Registered {session_hotkey.portable} to {SESSION_HOTKEY.description}. It is "
+                "held by the running Murmly daemon."
+            )
+        messages.extend(self._paste_injection_messages())
+
+        return InstallOutcome(
+            entrypoint=entrypoint,
+            hotkey=hotkey,
+            session_hotkey=session_hotkey,
+            service_installed=True,
+            hotkey_registered=True,
+            session_hotkey_registered=session_hotkey is not None,
+            already_bound=already_bound,
+            session_supported=True,
+            session_verified=True,
+            user_override=None,
+            messages=tuple(messages),
+        )
+
+    def _uninstall_in_process(self) -> InstallOutcome:
+        messages: list[str] = []
+        problems: list[str] = []
+
+        had_record = bool(self._record_store.read())
+        try:
+            self._record_store.remove()
+        except OSError as error:
+            problems.append(f"Could not clear the hotkey record: {error}")
+
+        # Best effort: drop what a still-running daemon holds right now,
+        # rather than only removing what a future start would have read.
+        # `remove()` below is about to stop that daemon anyway, so an
+        # unreachable one here is not a problem to report.
+        self._best_effort_rebind(self._socket_path())
+
+        try:
+            service_removed = self._service.remove()
+        except InstallError as error:
+            service_removed = False
+            problems.append(str(error))
+
+        if service_removed:
+            messages.append("Removed the Murmly service.")
+        if had_record:
+            messages.append("Released the Murmly hotkey.")
+        if not service_removed and not had_record:
+            messages.append("Murmly was not installed; there was nothing to remove.")
+        messages.extend(problems)
+
+        return InstallOutcome(
+            entrypoint=None,
+            hotkey=None,
+            session_hotkey=None,
+            service_installed=False,
+            hotkey_registered=False,
+            session_hotkey_registered=False,
+            already_bound=False,
+            session_supported=True,
+            session_verified=True,
+            user_override=None,
+            messages=tuple(messages),
+        )
+
+    def _held_purposes_from_daemon(self) -> frozenset[str] | None:
+        """`None` when this cannot be determined -- distinct from an empty
+        set, which means the daemon answered and holds nothing (18.13's
+        "undetermined rather than granted", applied to a live query instead
+        of a permission check)."""
+        from murmly.daemon import COMMAND_STATUS, DaemonNotRespondingError, send_command
+
+        try:
+            response = send_command(
+                self._socket_path(), COMMAND_STATUS, connect_timeout=1.0, response_timeout=3.0
+            )
+        except (OSError, DaemonNotRespondingError):
+            return None
+        held = response.get("hotkeys_held")
+        return None if held is None else frozenset(held)
+
+    def _status_in_process(self) -> dict[str, object]:
+        """`status()`'s whole body for an in-process hotkey backend.
+
+        Task 8.6/8.7 and the `desktop-integration` spec's own scenarios: held
+        by the running daemon when it is running and reports the purpose held
+        (`COMMAND_STATUS`'s `hotkeys_held`); not held, naming the daemon and
+        the command that starts it, whenever the daemon is not running or
+        cannot be reached -- there is no keypress to recover it the way a
+        stopped Linux daemon has, so the report has to say what will.
+        """
+        service = self._service.status()
+        record = self._record_store.read()
+        held = self._held_purposes_from_daemon() if service.active else frozenset()
+
+        starter = getattr(self._service, "start_command_text", None)
+        start_hint = starter() if starter is not None else "the command that starts the Murmly service"
+
+        entries: list[dict[str, object]] = []
+        for purpose in (WINDOW_HOTKEY, SESSION_HOTKEY):
+            declared = record.get(purpose.key)
+            entry: dict[str, object] = {
+                "purpose": purpose.key,
+                "description": purpose.description,
+                "command": purpose.command,
+                "hotkey": declared,
+                "held": False,
+                "detail": None,
+            }
+            if declared is None:
+                entry["detail"] = f"No hotkey is bound to {purpose.description}."
+            elif not service.active:
+                entry["detail"] = (
+                    f"{declared} is not currently held: it is registered inside the Murmly "
+                    f"daemon's own process, and the daemon is not running. Start it with "
+                    f"'{start_hint}'."
+                )
+            elif held is None:
+                entry["detail"] = f"Unable to confirm whether {declared} is currently held."
+            elif purpose.key in held:
+                entry["held"] = True
+                entry["detail"] = f"{declared} is held by the running Murmly daemon."
+            else:
+                entry["detail"] = f"{declared} is not currently held by the running Murmly daemon."
+            entries.append(entry)
+
+        report: dict[str, object] = {
+            "installed": service.installed,
+            "service_active": service.active,
+            "entrypoint": service.entrypoint,
+            "hotkey": record.get(WINDOW_HOTKEY.key),
+            "hotkey_held": entries[0]["held"],
+            "detail": service.detail,
+            "hotkeys": entries,
+        }
+        if entries[0].get("detail") is not None:
+            report["detail"] = entries[0]["detail"]
+        if not service.installed:
+            report["detail"] = "Murmly is not installed. Run 'murmly install <hotkey>' to install it."
+        return report

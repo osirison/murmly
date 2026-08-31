@@ -20,7 +20,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 2.3 Honour each platform's own environment override — `XDG_*` on Linux, and the platform equivalents elsewhere — and report the path actually in use rather than the default
 - [x] 2.4 Report a location Murmly needs but cannot create or write by naming that location and what failed, rather than failing later somewhere that does not mention it
 - [x] 2.5 Leave the transcription model cache where `huggingface_hub` puts it, and report the resolved path in diagnostics — moving it would strand the 1.6 GB already cached on every existing install
-- [ ] 2.6 Resolve the announce hook's socket path through the same platform resolution instead of its own copy of the `XDG_RUNTIME_DIR` fallback (`hooks/murmly-announce.py:58-60`)
+- [x] 2.6 Resolve the announce hook's socket path through the same platform resolution instead of its own copy of the `XDG_RUNTIME_DIR` fallback (`hooks/murmly-announce.py:58-60`)
 
 ## 3. Linux stops being Fedora
 
@@ -61,26 +61,26 @@ shippable on their own. See `design.md` — Migration Plan.
 
 - [ ] 7.1 Add a named-pipe transport, since CPython exposes no `AF_UNIX` on Windows and the open implementation targets 3.16
 - [ ] 7.2 Create the pipe with a security descriptor whose DACL grants only the creating user's SID — the OS default DACL grants `Everyone` read access, which is not the guarantee the requirement states
-- [ ] 7.3 Add `pywin32` to `pyproject.toml` behind `sys_platform == 'win32'`, pinned
+- [x] 7.3 Add `pywin32` to `pyproject.toml` behind `sys_platform == 'win32'`, pinned
 - [ ] 7.4 Read the peer's identity from the pipe's client process token, behind the existing `peer_identity_supported()` guard
-- [ ] 7.5 Refuse at startup a configured channel name that cannot be created privately, naming the reason and the correction, and skip the filesystem path-privacy analysis, which does not apply to a name that is not in the filesystem
-- [ ] 7.6 Keep the `daemon.socket_path` configuration key and its meaning: the channel Murmly serves on
+- [x] 7.5 Refuse at startup a configured channel name that cannot be created privately, naming the reason and the correction, and skip the filesystem path-privacy analysis, which does not apply to a name that is not in the filesystem
+- [x] 7.6 Keep the `daemon.socket_path` configuration key and its meaning: the channel Murmly serves on
 
 ## 8. Windows: desktop integration
 
-- [ ] 8.1 Add a service backend driving Task Scheduler with a logon trigger — the only per-user autostart of the three with CLI verbs for start, stop, status, enable and disable, which `UserService.is_active()` and `status()` have to answer
+- [x] 8.1 Add a service backend driving Task Scheduler with a logon trigger — the only per-user autostart of the three with CLI verbs for start, stop, status, enable and disable, which `UserService.is_active()` and `status()` have to answer
 - [ ] 8.2 Confirm it registers and starts without administrative rights
 - [ ] 8.3 Add a hotkey backend calling `RegisterHotKey` on a message-loop thread inside the daemon, pumping `GetMessageW`
-- [ ] 8.4 Treat the platform's own refusal to register a key another application holds as the collision, rather than querying first
-- [ ] 8.5 Release the hotkey when the daemon stops, so it is not left claimed against another application
-- [ ] 8.6 Have installation start the daemon before reporting a hotkey bound, and report the binding as held by the running daemon
-- [ ] 8.7 Report a hotkey as not currently held, naming the daemon as why, when the daemon is not running
+- [x] 8.4 Treat the platform's own refusal to register a key another application holds as the collision, rather than querying first
+- [x] 8.5 Release the hotkey when the daemon stops, so it is not left claimed against another application
+- [x] 8.6 Have installation start the daemon before reporting a hotkey bound, and report the binding as held by the running daemon
+- [x] 8.7 Report a hotkey as not currently held, naming the daemon as why, when the daemon is not running
 
 ## 9. Windows: clipboard, injection, focus
 
 - [ ] 9.1 Copy and read through the Win32 clipboard API with `CF_UNICODETEXT`, not `clip.exe`, which encodes through the console codepage and mangles anything outside it
 - [ ] 9.2 Inject the paste with `SendInput`
-- [ ] 9.3 Register `SendInput` as a method whose success cannot be observed, because UIPI silently discards synthetic input aimed at a higher-integrity window — so the transcript stays on the clipboard and the previous contents are not restored over it
+- [x] 9.3 Register `SendInput` as a method whose success cannot be observed, because UIPI silently discards synthetic input aimed at a higher-integrity window — so the transcript stays on the clipboard and the previous contents are not restored over it
 - [ ] 9.4 Add a focus observer using `GetForegroundWindow`, `GetWindowThreadProcessId` and `QueryFullProcessImageName`, behind the existing `FocusObserver` protocol
 - [ ] 9.5 Report the microphone privacy setting's state where it can be read, and distinguish a blocked microphone from an absent device — both present as no audio
 
@@ -162,10 +162,10 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 18.4 Test that a machine with no transcription runtime is refused at startup naming the runtime and the characteristic, and that a machine missing anything else starts with that capability reported unavailable
 - [x] 18.5 Test that the Linux configuration, data and runtime paths are byte-identical to what they are today, for every combination of `XDG_*` set and unset
 - [ ] 18.6 Test the Windows pipe's security descriptor by reading back its DACL and asserting it names only the creating user's SID — a second account is not available in CI
-- [ ] 18.7 Test that peer identity is read by the resolved platform's mechanism and that the same rule is applied to the result
+- [x] 18.7 Test that peer identity is read by the resolved platform's mechanism and that the same rule is applied to the result
 - [x] 18.8 Test the GNOME backend against a fake command runner: binding written, read back, conflict refused, and removal taking out exactly what was added
 - [x] 18.9 Test that one hotkey specification produces the same physical key on each platform's encoding, and that a modifier a platform does not have is refused by name
-- [ ] 18.10 Test that a hotkey held in-process is reported as not held when the daemon is not running, and released when it stops
+- [x] 18.10 Test that a hotkey held in-process is reported as not held when the daemon is not running, and released when it stops
 - [ ] 18.11 Test that `SendInput` and `CGEventPost` are treated as unconfirmable: the transcript stays on the clipboard and the previous contents are not restored over it
 - [ ] 18.12 Test that an injection method whose permission is ungranted is reported as not permitted, distinctly from absent and from installed-but-unusable, and is not reported as available
 - [x] 18.13 Test that a permission whose state cannot be read is reported as undetermined rather than granted

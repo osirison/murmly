@@ -55,15 +55,23 @@ import sys
 import tempfile
 import wave
 
-#: Deliberately its own copy of `murmly.config.default_socket_path`'s Linux
-#: branch rather than an import of it: `install_hooks.py` copies this script
-#: out of the checkout and registers it to run under the system Python with no
-#: virtual environment (see `setup.sh`'s `install_announce_hook`), so `murmly`
-#: is not on its import path -- and may not even exist on disk any more by the
-#: time this runs, since the checkout it was copied from is not required to
-#: survive the install. `openspec/changes/all-os-distributions/tasks.md` task
-#: 2.6 asked for this to resolve through the platform layer instead; it stays
-#: this way because there is no import path from here to reach it.
+#: `MURMLY_SOCKET` is set on every registration `setup.sh` makes: it resolves
+#: the path once, through `murmly doctor` running under the venv (the same
+#: `murmly.config.default_socket_path` authority everything else on Linux
+#: uses), and `install_hooks.py --socket` bakes the answer into the command it
+#: registers. That is the one resolution; this script never repeats it.
+#:
+#: The literal fallback below is what answers when no such registration was
+#: made -- this script run directly, or `install_hooks.py` invoked without
+#: `--socket` because no virtual environment existed yet to ask `murmly
+#: doctor` (`./setup.sh hooks` before `./setup.sh install`). This script has
+#: no import path to `murmly` to resolve it properly at that point: it runs
+#: under the system Python with no virtual environment (see `setup.sh`'s
+#: `install_announce_hook`), copied out of a checkout that is not required to
+#: still exist by the time this runs. `openspec/changes/all-os-distributions/
+#: tasks.md` task 2.6 is about this: closed by moving the resolution to
+#: install time rather than by ever reaching it from here, which stays
+#: impossible for the reason above.
 SOCKET_PATH = os.environ.get(
     "MURMLY_SOCKET", f"{os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/murmly.sock"
 )

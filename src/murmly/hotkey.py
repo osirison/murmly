@@ -413,6 +413,139 @@ def encode_for_gnome(spec: HotkeySpec, raw: str | None = None) -> str:
     return "".join(tokens) + _gnome_key_name(spec.key)
 
 
+#: `RegisterHotKey`'s `fsModifiers` bits (`winuser.h`). `MOD_NOREPEAT` is not a
+#: physical modifier -- it is folded into every registration `win_hotkey.py`
+#: makes, not into this table, because a spec never names it and refusing it
+#: by name would make no sense to a person who never wrote it.
+WINDOWS_MOD_ALT = 0x0001
+WINDOWS_MOD_CONTROL = 0x0002
+WINDOWS_MOD_SHIFT = 0x0004
+WINDOWS_MOD_WIN = 0x0008
+WINDOWS_MOD_NOREPEAT = 0x4000
+
+#: The bits Windows' `RegisterHotKey` has. `Hyper` is absent for the same
+#: reason it is absent from `KDE_MODIFIER_BITS`: there is no fifth modifier bit
+#: to give it, so a spec naming it is refused by name rather than dropped.
+WINDOWS_MODIFIER_BITS: dict[str, int] = {
+    "Meta": WINDOWS_MOD_WIN,
+    "Ctrl": WINDOWS_MOD_CONTROL,
+    "Alt": WINDOWS_MOD_ALT,
+    "Shift": WINDOWS_MOD_SHIFT,
+}
+
+#: Virtual-key codes (`winuser.h`) for the named keys Windows can register.
+#: Four of Murmly's named keys have no entry and are refused by
+#: `_windows_key_value` instead: `SysReq` and `Backtab` are not standalone
+#: virtual keys on Windows (the first is conventionally Alt+PrintScreen, the
+#: second is Shift+Tab), and `Microphone Mute` has no assigned virtual-key
+#: code at all. `Enter` and `Return` both map to `VK_RETURN` -- Windows does
+#: not distinguish the main and numpad Enter keys at the virtual-key level.
+_WINDOWS_NAMED_KEYS: dict[str, int] = {
+    "Escape": 0x1B,
+    "Tab": 0x09,
+    "Backspace": 0x08,
+    "Return": 0x0D,
+    "Enter": 0x0D,
+    "Insert": 0x2D,
+    "Delete": 0x2E,
+    "Pause": 0x13,
+    "Print": 0x2C,
+    "Clear": 0x0C,
+    "Home": 0x24,
+    "End": 0x23,
+    "Left": 0x25,
+    "Up": 0x26,
+    "Right": 0x27,
+    "Down": 0x28,
+    "PgUp": 0x21,
+    "PgDown": 0x22,
+    "Space": 0x20,
+    "Volume Down": 0xAE,
+    "Volume Mute": 0xAD,
+    "Volume Up": 0xAF,
+    "Media Play": 0xB3,
+    "Media Stop": 0xB2,
+    "Media Previous": 0xB1,
+    "Media Next": 0xB0,
+}
+
+#: `VK_F1`. Windows defines virtual keys only up to `VK_F24` (`0x87`), unlike
+#: KDE's Qt encoding and GNOME's keysyms, which both go to F35 -- so a spec
+#: naming F25 or higher parses fine and is refused here, by this platform,
+#: rather than by the platform-neutral parse that has no way to know Windows'
+#: own ceiling is lower than the other two.
+_WINDOWS_FUNCTION_KEY_BASE = 0x70
+_WINDOWS_MAX_FUNCTION_KEY = 24
+
+
+@dataclass(frozen=True, slots=True)
+class WindowsHotkey:
+    """A hotkey encoded for `RegisterHotKey`.
+
+    `modifiers` is the `fsModifiers` bitmask (never including
+    `WINDOWS_MOD_NOREPEAT`, which is not a property of the key combination
+    itself -- see that constant's docstring) and `vk` is the virtual-key code.
+    `portable` is the same untranslated text `Hotkey.portable` produces, so a
+    binding this encoder produced round-trips through `HotkeyRecordStore`
+    exactly like a KDE or GNOME one does.
+    """
+
+    modifiers: int
+    vk: int
+    portable: str
+
+
+def _windows_key_value(key: str, label: str) -> int:
+    if len(key) == 1:
+        return ord(key.upper())
+    if key.startswith("F") and key[1:].isdigit():
+        number = int(key[1:])
+        if number <= _WINDOWS_MAX_FUNCTION_KEY:
+            return _WINDOWS_FUNCTION_KEY_BASE + number - 1
+        raise HotkeyError(
+            f"Hotkey {label!r} names {key!r}, which is outside the range Windows can "
+            f"register: F1-F{_WINDOWS_MAX_FUNCTION_KEY}."
+        )
+    value = _WINDOWS_NAMED_KEYS.get(key)
+    if value is not None:
+        return value
+    raise HotkeyError(f"Hotkey {label!r} names {key!r}, which Windows has no key for.")
+
+
+def encode_for_windows(spec: HotkeySpec, raw: str | None = None) -> WindowsHotkey:
+    """Encode `spec` for `RegisterHotKey`.
+
+    Refuses `Hyper` and any key Windows cannot register (`_windows_key_value`),
+    naming it rather than dropping or substituting it, matching
+    `encode_for_kde` and `encode_for_gnome`.
+    """
+    label = raw if raw is not None else _spec_text(spec)
+    modifiers = 0
+    for name in NEUTRAL_MODIFIER_ORDER:
+        if name not in spec.modifiers:
+            continue
+        bit = WINDOWS_MODIFIER_BITS.get(name)
+        if bit is None:
+            raise HotkeyError(
+                f"Hotkey {label!r} uses {name!r}, which Windows has no key for. "
+                "Supported modifiers on this platform are Meta (also Super or Win), "
+                "Ctrl, Alt, and Shift."
+            )
+        modifiers |= bit
+    vk = _windows_key_value(spec.key, label)
+    return WindowsHotkey(modifiers=modifiers, vk=vk, portable=_spec_text(spec))
+
+
+def windows_hotkey_for_portable(portable: str) -> WindowsHotkey:
+    """The Windows encoding for a hotkey already stored as portable text.
+
+    `portable` is `Hotkey.portable` / `HotkeyRecordStore`'s own currency --
+    parsed back to a neutral spec and re-encoded, the same shape
+    `gnome_accelerator` already uses for GNOME's own storage.
+    """
+    return encode_for_windows(parse_specification(portable))
+
+
 def gnome_accelerator(portable: str) -> str:
     """The GTK accelerator for a hotkey already encoded as KDE portable text.
 
