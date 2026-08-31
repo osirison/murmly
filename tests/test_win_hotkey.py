@@ -319,44 +319,43 @@ class WindowsHotkeyRuntimeIntegrationTests(unittest.TestCase):
         Standing in for a physical keypress of the same chord this class
         registers: proving delivery this way, rather than asking a person to
         press the combination during a CI run, is what lets this test run
-        unattended. Deliberately not `win_clipboard._real_send_ctrl_v`, which
-        is hard-coded to Ctrl+V -- this needs an arbitrary, four-key chord
-        ending in a function key `win_clipboard.py` has no seam for.
+        unattended.
+
+        The structs come from `win_clipboard` rather than being declared here.
+        This helper originally declared its own, and they carried the same
+        defect the production ones did -- a union holding only `KEYBDINPUT`,
+        which makes `sizeof(INPUT)` 32 on Windows where the real size is 40 --
+        so when the product's copy was fixed this one was not, and the test
+        went on skipping itself with `GetLastError=87` while reporting the
+        runner as the reason. Two declarations of one Windows structure is
+        how that happens; there is now one.
+
+        `_real_send_ctrl_v` itself is still not reused: it is hard-coded to
+        Ctrl+V, and this needs an arbitrary four-key chord ending in a
+        function key it has no seam for.
         """
         import ctypes
-        from ctypes import wintypes
 
-        class KEYBDINPUT(ctypes.Structure):
-            _fields_ = (
-                ("wVk", wintypes.WORD),
-                ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
-                ("dwExtraInfo", wintypes.WPARAM),
-            )
+        from murmly.win_clipboard import (
+            INPUT_KEYBOARD,
+            KEYEVENTF_KEYUP,
+            _INPUT,
+            _KEYBDINPUT,
+            _user32,
+        )
 
-        class _InputUnion(ctypes.Union):
-            _fields_ = (("ki", KEYBDINPUT),)
-
-        class INPUT(ctypes.Structure):
-            _anonymous_ = ("_input",)
-            _fields_ = (("type", wintypes.DWORD), ("_input", _InputUnion))
-
-        INPUT_KEYBOARD = 1
-        KEYEVENTF_KEYUP = 0x0002
-
-        def entry(vk: int, key_up: bool) -> INPUT:
-            item = INPUT()
+        def entry(vk: int, key_up: bool) -> "_INPUT":
+            item = _INPUT()
             item.type = INPUT_KEYBOARD
-            item.ki = KEYBDINPUT(
+            item.ki = _KEYBDINPUT(
                 wVk=vk, wScan=0, dwFlags=KEYEVENTF_KEYUP if key_up else 0, time=0, dwExtraInfo=0
             )
             return item
 
         sequence = [entry(vk, key_up=False) for vk in cls._CHORD_VKS]
         sequence += [entry(vk, key_up=True) for vk in reversed(cls._CHORD_VKS)]
-        array = (INPUT * len(sequence))(*sequence)
-        sent = ctypes.windll.user32.SendInput(len(sequence), array, ctypes.sizeof(INPUT))
+        array = (_INPUT * len(sequence))(*sequence)
+        sent = _user32().SendInput(len(sequence), array, ctypes.sizeof(_INPUT))
         if sent != len(sequence):
             raise OSError(
                 f"SendInput accepted {sent} of {len(sequence)} events; "

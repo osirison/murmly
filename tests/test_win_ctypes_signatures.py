@@ -154,6 +154,33 @@ class PrivateLibraryHandleTests(unittest.TestCase):
                 )
 
 
+class OnlyOneDeclarationOfEachWindowsStructTests(unittest.TestCase):
+    """A Windows struct declared twice is a struct that will diverge once.
+
+    `tests/test_win_hotkey.py` declared its own `KEYBDINPUT`/`INPUT` to inject
+    a chord, carrying the same union defect the production copy did. When the
+    product's was fixed, the test's was not: it kept failing `SendInput` with
+    `GetLastError=87` and skipping itself, reporting the runner as the reason
+    while the fault was its own. Nothing off Windows could see either copy.
+
+    So the rule is that these structs are declared once, in
+    `murmly.win_clipboard`, and everything else imports them.
+    """
+
+    def test_no_test_module_declares_its_own_input_struct(self) -> None:
+        for path in sorted(Path(__file__).parent.glob("test_*.py")):
+            if path.name == Path(__file__).name:
+                continue
+            source = path.read_text(encoding="utf-8")
+            for struct in ("KEYBDINPUT", "MOUSEINPUT", "HARDWAREINPUT"):
+                with self.subTest(module=path.name, struct=struct):
+                    self.assertIsNone(
+                        re.search(rf"^\s*class _?{struct}\b", source, re.MULTILINE),
+                        f"{path.name} declares its own {struct}; import it from "
+                        "murmly.win_clipboard so the two cannot diverge",
+                    )
+
+
 class KeybdinputSharesOneClassTests(unittest.TestCase):
     """The bug `WindowsClipboardRuntimeIntegrationTests` never got to run:
     `_keybd_input` used to define `INPUT`/`KEYBDINPUT` as fresh classes on
