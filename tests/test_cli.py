@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -57,6 +57,29 @@ from murmly.platform import (
 from murmly.stt import FasterWhisperTranscriber
 
 
+@contextmanager
+def _pinned_overlay_platform(operating_system: OperatingSystem, backend: OverlayBackend | None):
+    """Pins what `overlay_diagnostics` sees for the platform and the overlay
+    backend, independent of the real host `sys.platform` genuinely resolves
+    to -- the same two-name patch `test_overlay_diagnostics_reports_the_qt_
+    renderer_on_windows` already uses for its Windows case, generalized so
+    every other scenario in this file can assert its own platform's
+    behaviour on any CI host, real Windows included.
+
+    Both names need patching, not just one: `overlay_diagnostics` calls
+    `resolve_platform` directly for its own `desktop`/`session` fields, but
+    `detect_overlay_backend` resolves the operating system through
+    `murmly.overlay`'s own module-level `resolve_platform` binding, which
+    patching `murmly.cli.resolve_platform` never touches.
+    """
+    profile = PlatformProfile(operating_system=operating_system, architecture="x86_64")
+    with (
+        patch("murmly.cli.resolve_platform", return_value=profile),
+        patch("murmly.cli.detect_overlay_backend", return_value=backend),
+    ):
+        yield
+
+
 class CliTests(unittest.TestCase):
     def test_daemon_exits_cleanly_on_sigterm(self) -> None:
         if not hasattr(os, "getuid") or not resolve_platform().supported:
@@ -92,6 +115,7 @@ class CliTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             try:
                 deadline = time.monotonic() + 5
@@ -303,15 +327,16 @@ class CliTests(unittest.TestCase):
             }
         )
 
-        report = overlay_diagnostics(
-            config,
-            env={
-                "XDG_SESSION_TYPE": "x11",
-                "DISPLAY": ":0",
-                "XDG_CURRENT_DESKTOP": "KDE",
-            },
-            run_command=lambda *_args, **_kwargs: completed,
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, OverlayBackend.X11):
+            report = overlay_diagnostics(
+                config,
+                env={
+                    "XDG_SESSION_TYPE": "x11",
+                    "DISPLAY": ":0",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                },
+                run_command=lambda *_args, **_kwargs: completed,
+            )
 
         self.assertTrue(report["available"])
         self.assertTrue(report["supported_session"])
@@ -330,11 +355,12 @@ class CliTests(unittest.TestCase):
         that cannot hand it a backend -- and the answer must stay what it always
         was rather than silently becoming `None`."""
         config = self._config()
-        report = overlay_diagnostics(
-            config,
-            env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
-            run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, None):
+            report = overlay_diagnostics(
+                config,
+                env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+                run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+            )
 
         self.assertIsNone(report["backend"])
         self.assertEqual(str(SYSTEM_PYTHON), report["system_python"])
@@ -348,16 +374,17 @@ class CliTests(unittest.TestCase):
             recorded.update(keywords)
             return completed
 
-        report = overlay_diagnostics(
-            config,
-            env={
-                "XDG_SESSION_TYPE": "wayland",
-                "WAYLAND_DISPLAY": "wayland-0",
-                "XDG_CURRENT_DESKTOP": "KDE",
-                "LD_PRELOAD": "/tmp/injected.so",
-            },
-            run_command=record,
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, OverlayBackend.WAYLAND):
+            report = overlay_diagnostics(
+                config,
+                env={
+                    "XDG_SESSION_TYPE": "wayland",
+                    "WAYLAND_DISPLAY": "wayland-0",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                    "LD_PRELOAD": "/tmp/injected.so",
+                },
+                run_command=record,
+            )
 
         self.assertTrue(report["available"])
         # Whatever the renderer will be launched with, down to the preload that
@@ -385,15 +412,16 @@ class CliTests(unittest.TestCase):
             returncode=1,
         )
 
-        report = overlay_diagnostics(
-            config,
-            env={
-                "XDG_SESSION_TYPE": "wayland",
-                "WAYLAND_DISPLAY": "wayland-0",
-                "XDG_CURRENT_DESKTOP": "KDE",
-            },
-            run_command=lambda *_args, **_kwargs: completed,
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, OverlayBackend.WAYLAND):
+            report = overlay_diagnostics(
+                config,
+                env={
+                    "XDG_SESSION_TYPE": "wayland",
+                    "WAYLAND_DISPLAY": "wayland-0",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                },
+                run_command=lambda *_args, **_kwargs: completed,
+            )
 
         self.assertFalse(report["available"])
         self.assertEqual("wayland", report["backend"])
@@ -403,11 +431,12 @@ class CliTests(unittest.TestCase):
 
     def test_overlay_diagnostics_rejects_unsupported_session(self) -> None:
         config = self._config()
-        report = overlay_diagnostics(
-            config,
-            env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
-            run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, None):
+            report = overlay_diagnostics(
+                config,
+                env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+                run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+            )
 
         self.assertFalse(report["available"])
         self.assertFalse(report["supported_session"])
@@ -416,11 +445,12 @@ class CliTests(unittest.TestCase):
 
     def test_overlay_diagnostics_reports_disabled_overlay_on_unsupported_session(self) -> None:
         config = self._config(overlay_enabled=False)
-        report = overlay_diagnostics(
-            config,
-            env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
-            run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, None):
+            report = overlay_diagnostics(
+                config,
+                env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+                run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+            )
 
         self.assertFalse(report["enabled"])
         self.assertFalse(report["available"])
@@ -2081,7 +2111,7 @@ class SecondHotkeyCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text("")
+            config_path.write_text("", encoding="utf-8")
             with (
                 patch("murmly.cli.send_command_with_recovery", fake_send),
                 patch(
@@ -2106,7 +2136,7 @@ class SecondHotkeyCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text("")
+            config_path.write_text("", encoding="utf-8")
             with (
                 patch("murmly.cli.send_command_with_recovery", fake_send),
                 patch(
@@ -2183,7 +2213,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('[tts]\nvoice = "morgan_freeman"\nrate = 900\n')
+            config_path.write_text('[tts]\nvoice = "morgan_freeman"\nrate = 900\n', encoding="utf-8")
             report = speech_output_diagnostics(load_config(config_path))
 
         self.assertEqual("af_heart", report["voice"])
@@ -2205,7 +2235,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text("[tts]\nrate = 1979-05-27\n")
+            config_path.write_text("[tts]\nrate = 1979-05-27\n", encoding="utf-8")
             report = speech_output_diagnostics(load_config(config_path))
 
         self.assertEqual(100, report["rate_percent"])
@@ -2293,7 +2323,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('[tts]\ndevice = "rocm"\n')
+            config_path.write_text('[tts]\ndevice = "rocm"\n', encoding="utf-8")
             report = speech_output_diagnostics(load_config(config_path))
 
         self.assertEqual("cpu", report["device"])

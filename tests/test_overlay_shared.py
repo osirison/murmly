@@ -151,7 +151,7 @@ class NoRendererHandlesAStateTheOtherIgnoresTests(unittest.TestCase):
 
     @classmethod
     def _referenced_members(cls, module: object) -> set[str]:
-        source = Path(module.__file__).read_text()
+        source = Path(module.__file__).read_text(encoding="utf-8")
         return set(cls._MEMBER_PATTERN.findall(source))
 
     def test_every_enum_member_is_referenced_by_name(self) -> None:

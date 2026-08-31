@@ -17,10 +17,11 @@ collision -- nothing here queries an owner first, because Windows offers no
 such query and the platform's own refusal is a stronger signal anyway (a
 query-then-register window is exactly the race a query can never close).
 
-As with `win_pipe.py`, every `ctypes.windll` call lives behind a small
-first-class seam (`register`, `unregister`, `pump`, `post_quit`,
-`current_thread_id`), each defaulted to a real Win32 implementation imported
-from inside its own function body so this module stays importable on Linux.
+As with `win_pipe.py`, every Win32 call lives behind a small first-class
+seam (`register`, `unregister`, `pump`, `post_quit`, `current_thread_id`),
+each defaulted to a real implementation that only touches `ctypes.WinDLL`
+from inside its own function body (via the module-private `_user32()`/
+`_kernel32()` below) so this module stays importable on Linux.
 `WindowsHotkeyRegistrar`'s policy -- rebuilding the whole binding set on one
 fresh thread per `rebind()`, refusing on the platform's own signal, unwinding
 a partial batch, releasing on `stop()` -- is exercised by the test suite
@@ -31,6 +32,8 @@ can only be confirmed on Windows.
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
@@ -53,6 +56,73 @@ STOP_TIMEOUT_SECONDS = 5.0
 #: `winuser.h`'s `WM_QUIT` and `WM_HOTKEY`.
 _WM_QUIT = 0x0012
 _WM_HOTKEY = 0x0312
+
+#: Every `user32`/`kernel32` entry point this module calls, with the
+#: `restype`/`argtypes` ctypes needs so it stops defaulting an undeclared
+#: function's `restype` to `c_int` -- 32 bits, the defect class
+#: `win_clipboard.py`'s `_KERNEL32_SIGNATURES` docstring explains in full.
+#: None of these particular calls return a pointer-sized value that an
+#: undeclared 32-bit default would silently truncate, but they are declared
+#: anyway so a future call added to either seam is checked, not assumed
+#: safe by the same reasoning. `test_win_ctypes_signatures.py` scans this
+#: module's source for every attribute call made on the `user32`/`kernel32`
+#: handles below and asserts each callee has an entry here.
+_USER32_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
+    "RegisterHotKey": (
+        wintypes.BOOL,
+        (wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT),
+    ),
+    "UnregisterHotKey": (wintypes.BOOL, (wintypes.HWND, ctypes.c_int)),
+    "GetMessageW": (
+        wintypes.BOOL,
+        (ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT),
+    ),
+    "TranslateMessage": (wintypes.BOOL, (ctypes.POINTER(wintypes.MSG),)),
+    # `DispatchMessageW` actually returns `LRESULT` (`LONG_PTR`, pointer-sized)
+    # -- unused here, but `c_ssize_t` is the correct width to declare it at
+    # rather than let it default to a truncating `c_int`.
+    "DispatchMessageW": (ctypes.c_ssize_t, (ctypes.POINTER(wintypes.MSG),)),
+    "PostThreadMessageW": (
+        wintypes.BOOL,
+        (wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM),
+    ),
+}
+
+_KERNEL32_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
+    "GetCurrentThreadId": (wintypes.DWORD, ()),
+}
+
+#: Lazily-loaded, module-private library handles -- never ctypes' own
+#: shared, process-wide loader cache, following `win_clipboard.py`'s
+#: precedent so declaring a signature here can never change behaviour for
+#: some other, unrelated caller of the same DLL (this module's own
+#: runtime-integration test builds its own `SendInput` call against that
+#: shared cache directly, and must not see these `argtypes`).
+_user32_dll: ctypes.WinDLL | None = None
+_kernel32_dll: ctypes.WinDLL | None = None
+
+
+def _configure(dll: ctypes.WinDLL, signatures: dict[str, tuple[object, tuple[object, ...]]]) -> None:
+    for name, (restype, argtypes) in signatures.items():
+        function = getattr(dll, name)
+        function.restype = restype
+        function.argtypes = argtypes
+
+
+def _user32() -> ctypes.WinDLL:
+    global _user32_dll
+    if _user32_dll is None:
+        _user32_dll = ctypes.WinDLL("user32")
+        _configure(_user32_dll, _USER32_SIGNATURES)
+    return _user32_dll
+
+
+def _kernel32() -> ctypes.WinDLL:
+    global _kernel32_dll
+    if _kernel32_dll is None:
+        _kernel32_dll = ctypes.WinDLL("kernel32")
+        _configure(_kernel32_dll, _KERNEL32_SIGNATURES)
+    return _kernel32_dll
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,15 +158,13 @@ def _real_register(id_: int, modifiers: int, vk: int) -> bool:
     this thread's own queue rather than requiring one more Win32 object
     (`CreateWindowEx`) to own.
     """
-    from ctypes import windll
-
-    return bool(windll.user32.RegisterHotKey(None, id_, modifiers, vk))
+    user32 = _user32()
+    return bool(user32.RegisterHotKey(None, id_, modifiers, vk))
 
 
 def _real_unregister(id_: int) -> None:
-    from ctypes import windll
-
-    windll.user32.UnregisterHotKey(None, id_)
+    user32 = _user32()
+    user32.UnregisterHotKey(None, id_)
 
 
 def _real_pump() -> PumpResult:
@@ -108,11 +176,9 @@ def _real_pump() -> PumpResult:
     would otherwise have no way to notice between hotkey presses that might
     be minutes apart.
     """
-    from ctypes import byref, windll, wintypes
-
-    user32 = windll.user32
+    user32 = _user32()
     msg = wintypes.MSG()
-    result = user32.GetMessageW(byref(msg), None, 0, 0)
+    result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
     if result == 0 or result == -1:
         # 0: WM_QUIT. -1: GetMessageW itself failed -- both end the loop; a
         # thread that cannot ask for its next message has nothing left to wait
@@ -121,21 +187,19 @@ def _real_pump() -> PumpResult:
         return _PumpQuit()
     if msg.message == _WM_HOTKEY:
         return _PumpHotkey(id=int(msg.wParam))
-    user32.TranslateMessage(byref(msg))
-    user32.DispatchMessageW(byref(msg))
+    user32.TranslateMessage(ctypes.byref(msg))
+    user32.DispatchMessageW(ctypes.byref(msg))
     return _PumpOther()
 
 
 def _real_post_quit(thread_id: int) -> None:
-    from ctypes import windll
-
-    windll.user32.PostThreadMessageW(thread_id, _WM_QUIT, 0, 0)
+    user32 = _user32()
+    user32.PostThreadMessageW(thread_id, _WM_QUIT, 0, 0)
 
 
 def _real_current_thread_id() -> int:
-    from ctypes import windll
-
-    return int(windll.kernel32.GetCurrentThreadId())
+    kernel32 = _kernel32()
+    return int(kernel32.GetCurrentThreadId())
 
 
 class WindowsHotkeyRegistrar:

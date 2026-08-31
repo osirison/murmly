@@ -1000,7 +1000,7 @@ class ProtocolDocumentationTests(unittest.TestCase):
         """
         page = (
             Path(__file__).parents[1] / "manual" / "for-developers.md"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         # Anchored on the heading above it: the page carries two
         # "| Frame | Meaning |" tables, and the first lists what a sender may
         # send rather than what it will receive.

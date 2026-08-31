@@ -19,7 +19,7 @@ on a machine (any Linux CI runner) where PySide6 is not installed at all,
 which is the whole point of keeping it an optional, `sys_platform == 'win32'`
 dependency (task 10.2). Every `PySide6` name is imported from inside a
 function or method body instead, the same discipline `win_hotkey.py` and
-`win_clipboard.py` already hold for `ctypes.windll`.
+`win_clipboard.py` already hold for their own Win32 loading.
 
 Task 10.3: `Qt.WindowTransparentForInput` and `Qt.WindowDoesNotAcceptFocus`
 are the documented, cross-platform Qt flags; `WS_EX_LAYERED |
@@ -44,6 +44,8 @@ See task 10.1/10.3 in `openspec/changes/all-os-distributions/tasks.md`.
 from __future__ import annotations
 
 import argparse
+import ctypes
+from ctypes import wintypes
 from collections.abc import Callable
 import json
 import socket
@@ -166,16 +168,56 @@ def missing_property_for_exstyle(exstyle: int) -> str | None:
     return None
 
 
-def _real_get_window_long(hwnd: int) -> int:
-    from ctypes import windll
+#: `GetWindowLongPtrW`/`SetWindowLongPtrW` both return `LONG_PTR` --
+#: pointer-sized, 64 bits on 64-bit Windows -- and `SetWindowLongPtrW`'s
+#: third argument is the same width. Left undeclared, ctypes defaults
+#: `restype` to a truncating 32-bit `c_int` and the second argument's
+#: `int` to a 32-bit `c_int` as well: the exact defect class
+#: `win_clipboard.py`'s `_KERNEL32_SIGNATURES` docstring explains in full,
+#: for `GlobalAlloc`/`GlobalLock`/`GlobalFree`. `test_win_ctypes_signatures.py`
+#: scans this module's source for every call made through the `user32`
+#: handle and asserts each callee has a declared, well-typed signature here.
+_USER32_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
+    "GetWindowLongPtrW": (
+        ctypes.c_ssize_t,
+        (wintypes.HWND, ctypes.c_int),
+    ),
+    "SetWindowLongPtrW": (
+        ctypes.c_ssize_t,
+        (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t),
+    ),
+}
 
-    return int(windll.user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
+#: Lazily-loaded, module-private library handle -- never ctypes' own
+#: shared, process-wide loader cache, following `win_clipboard.py`'s
+#: precedent so declaring a signature here can never change behaviour for
+#: some other, unrelated caller of `user32`.
+_user32_dll: ctypes.WinDLL | None = None
+
+
+def _configure(dll: ctypes.WinDLL, signatures: dict[str, tuple[object, tuple[object, ...]]]) -> None:
+    for name, (restype, argtypes) in signatures.items():
+        function = getattr(dll, name)
+        function.restype = restype
+        function.argtypes = argtypes
+
+
+def _user32() -> ctypes.WinDLL:
+    global _user32_dll
+    if _user32_dll is None:
+        _user32_dll = ctypes.WinDLL("user32")
+        _configure(_user32_dll, _USER32_SIGNATURES)
+    return _user32_dll
+
+
+def _real_get_window_long(hwnd: int) -> int:
+    user32 = _user32()
+    return int(user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE))
 
 
 def _real_set_window_long(hwnd: int, exstyle: int) -> int:
-    from ctypes import windll
-
-    return int(windll.user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle))
+    user32 = _user32()
+    return int(user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exstyle))
 
 
 def apply_and_verify_exstyle(

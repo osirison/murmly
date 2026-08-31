@@ -378,6 +378,8 @@ class UserService:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )
@@ -557,12 +559,30 @@ class WindowsUserService:
         )
 
     def _schtasks(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """Run `schtasks`, decoding its output without trusting the locale default.
+
+        With `text=True` and no `encoding=`, `subprocess` decodes with
+        `locale.getpreferredencoding()` -- the process's ANSI codepage on
+        Windows, e.g. `cp1252` -- while a legacy console tool like
+        `schtasks.exe` actually writes its output in the console's *OEM*
+        codepage, a different table this process has no reliable way to ask
+        for. Pinning `encoding="utf-8"` does not make that mismatch correct
+        either, but paired with `errors="replace"` it guarantees this can
+        never raise `UnicodeDecodeError` on a byte no codec recognises --
+        exactly the failure a bare `.read_text()` produced elsewhere in this
+        codebase on real Windows CI. Every caller of this method only checks
+        `returncode` or logs `stdout`/`stderr` as a diagnostic, so a
+        replacement character in place of an unmappable byte costs nothing
+        this code relies on.
+        """
         command = [self._binary, *arguments]
         try:
             return self._run_command(
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )
@@ -727,6 +747,8 @@ class ShortcutLauncher:
                 [self._cache_builder],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=COMMAND_TIMEOUT_SECONDS,
             )

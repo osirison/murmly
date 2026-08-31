@@ -19,10 +19,11 @@ pasting into an elevated window gets no error back at all. So
 them afterwards, only when `select_paste_injection`'s answer says the method
 running can confirm delivery -- which, for Windows today, is never `True`.
 
-As with `win_pipe.py` and `win_hotkey.py`, every `ctypes.windll` call lives
-behind a small first-class seam (`write_clipboard`, `read_clipboard`,
-`send_ctrl_v`), each defaulted to a real Win32 implementation imported from
-inside its own function body so this module stays importable on Linux. Only
+As with `win_pipe.py` and `win_hotkey.py`, every Win32 call lives behind a
+small first-class seam (`write_clipboard`, `read_clipboard`, `send_ctrl_v`),
+each defaulted to a real implementation that only loads `user32`/`kernel32`
+(via the module-private `_user32()`/`_kernel32()` below) from inside its own
+function body, so this module stays importable on Linux. Only
 the seams and `WindowsClipboardPaster`'s policy around them (never reading the
 clipboard before an unconfirmable paste, never restoring over one) are
 exercised by the test suite; the real Win32 calls -- `GlobalAlloc` actually
@@ -32,6 +33,8 @@ be confirmed on Windows.
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from collections.abc import Callable
 import logging
 import time
@@ -60,6 +63,108 @@ KEYEVENTF_KEYUP = 0x0002
 SEND_INPUT_METHOD = "send-input"
 
 
+class _KEYBDINPUT(ctypes.Structure):
+    """`winuser.h`'s `KEYBDINPUT`, defined once at module scope.
+
+    Defining this (and `_InputUnion`/`_INPUT` below) inside `_keybd_input`,
+    as a fresh class built on every call, was the module's second real bug:
+    each of the four calls `_real_send_ctrl_v` makes to build one chord
+    produced its *own* `INPUT` class -- structurally identical but a
+    different Python type every time -- and `ctypes.Array` construction
+    rejects mixing instances of "the same" structure from different class
+    objects with `TypeError: incompatible types`. That defect was masked by
+    the `GlobalLock` bug (`_real_write_clipboard` always raised first, so
+    `_real_send_ctrl_v` was never reached) and would have become the next CI
+    failure the moment that one was fixed. One shared class per process
+    fixes both problems at once.
+
+    `dwExtraInfo` is `ULONG_PTR` in `winuser.h` -- pointer-sized. `wintypes`
+    resolves `WPARAM` to whichever of `c_ulong`/`c_ulonglong` matches
+    `sizeof(c_void_p)` on the platform ctypes is running against (see
+    `Lib/ctypes/wintypes.py`), so it is already the correct substitute here
+    on every architecture ctypes targets, unlike a hand-picked `c_ulong`.
+    """
+
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", wintypes.WPARAM),
+    )
+
+
+class _InputUnion(ctypes.Union):
+    _fields_ = (("ki", _KEYBDINPUT),)
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("_input",)
+    _fields_ = (("type", wintypes.DWORD), ("_input", _InputUnion))
+
+
+#: Every `kernel32`/`user32` entry point this module calls, with the
+#: `restype`/`argtypes` ctypes needs to stop defaulting an undeclared
+#: function's `restype` to `c_int` -- 32 bits. That default is the module's
+#: first real bug: `GlobalAlloc`, `GlobalLock` and `GlobalFree` all return an
+#: `HGLOBAL`, a 64-bit pointer on 64-bit Windows, so an undeclared `restype`
+#: truncated the value `GlobalAlloc` returned before `GlobalLock` ever saw
+#: it -- the allocation succeeded; the handle reaching the next call was not
+#: the one it returned. `test_win_ctypes_signatures.py` scans this module's
+#: source for every attribute call made on the `kernel32`/`user32` handles
+#: below and asserts each callee has an entry here, so a future call added
+#: with no declared signature fails on Linux instead of on a Windows machine.
+_KERNEL32_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
+    "GlobalAlloc": (wintypes.HGLOBAL, (wintypes.UINT, ctypes.c_size_t)),
+    "GlobalLock": (wintypes.LPVOID, (wintypes.HGLOBAL,)),
+    "GlobalUnlock": (wintypes.BOOL, (wintypes.HGLOBAL,)),
+    "GlobalFree": (wintypes.HGLOBAL, (wintypes.HGLOBAL,)),
+}
+
+_USER32_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
+    "OpenClipboard": (wintypes.BOOL, (wintypes.HWND,)),
+    "EmptyClipboard": (wintypes.BOOL, ()),
+    "SetClipboardData": (wintypes.HANDLE, (wintypes.UINT, wintypes.HANDLE)),
+    "CloseClipboard": (wintypes.BOOL, ()),
+    "IsClipboardFormatAvailable": (wintypes.BOOL, (wintypes.UINT,)),
+    "GetClipboardData": (wintypes.HANDLE, (wintypes.UINT,)),
+    "SendInput": (wintypes.UINT, (wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int)),
+}
+
+#: Lazily-loaded, module-private library handles -- never ctypes' own
+#: shared, process-wide loader cache, so declaring a signature here can
+#: never change behaviour for some other, unrelated caller of the same DLL
+#: (`test_win_hotkey.py`'s own runtime-integration test builds its own
+#: `INPUT` array and calls `SendInput` through that shared cache; it must
+#: not see this module's `argtypes`). Loaded and configured once per
+#: process, the first time either is needed.
+_kernel32_dll: ctypes.WinDLL | None = None
+_user32_dll: ctypes.WinDLL | None = None
+
+
+def _configure(dll: ctypes.WinDLL, signatures: dict[str, tuple[object, tuple[object, ...]]]) -> None:
+    for name, (restype, argtypes) in signatures.items():
+        function = getattr(dll, name)
+        function.restype = restype
+        function.argtypes = argtypes
+
+
+def _kernel32() -> ctypes.WinDLL:
+    global _kernel32_dll
+    if _kernel32_dll is None:
+        _kernel32_dll = ctypes.WinDLL("kernel32")
+        _configure(_kernel32_dll, _KERNEL32_SIGNATURES)
+    return _kernel32_dll
+
+
+def _user32() -> ctypes.WinDLL:
+    global _user32_dll
+    if _user32_dll is None:
+        _user32_dll = ctypes.WinDLL("user32")
+        _configure(_user32_dll, _USER32_SIGNATURES)
+    return _user32_dll
+
+
 def _real_write_clipboard(text: str) -> None:
     """`OpenClipboard` / `EmptyClipboard` / `SetClipboardData(CF_UNICODETEXT)`.
 
@@ -69,11 +174,8 @@ def _real_write_clipboard(text: str) -> None:
     -- freeing it afterwards would free memory the clipboard still holds, so
     it is freed only on the failure path, where the system never took it.
     """
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.windll.kernel32
-    user32 = ctypes.windll.user32
+    kernel32 = _kernel32()
+    user32 = _user32()
 
     encoded = text.encode("utf-16-le") + b"\x00\x00"
     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
@@ -109,10 +211,8 @@ def _real_read_clipboard() -> str | None:
     without taking ownership of it -- that handle belongs to the clipboard for
     as long as the clipboard is open, and is never freed here.
     """
-    import ctypes
-
-    kernel32 = ctypes.windll.kernel32
-    user32 = ctypes.windll.user32
+    kernel32 = _kernel32()
+    user32 = _user32()
 
     if not user32.OpenClipboard(None):
         raise OSError("OpenClipboard failed; another process may hold it.")
@@ -133,36 +233,17 @@ def _real_read_clipboard() -> str | None:
         user32.CloseClipboard()
 
 
-def _keybd_input(vk: int, key_up: bool):
-    """One `INPUT` struct of type `INPUT_KEYBOARD` for `vk`."""
-    import ctypes
-    from ctypes import wintypes
+def _keybd_input(vk: int, key_up: bool) -> _INPUT:
+    """One `INPUT` struct of type `INPUT_KEYBOARD` for `vk`.
 
-    # `ULONG_PTR`: pointer-sized, which `wintypes.WPARAM` already is on every
-    # architecture ctypes targets -- the same substitution `win_hotkey.py`'s
-    # struct-free calls do not need but the `SendInput` array does, since
-    # `KEYBDINPUT.dwExtraInfo` is defined as `ULONG_PTR` in `winuser.h`.
-    ulong_ptr = wintypes.WPARAM
-
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = (
-            ("wVk", wintypes.WORD),
-            ("wScan", wintypes.WORD),
-            ("dwFlags", wintypes.DWORD),
-            ("time", wintypes.DWORD),
-            ("dwExtraInfo", ulong_ptr),
-        )
-
-    class _InputUnion(ctypes.Union):
-        _fields_ = (("ki", KEYBDINPUT),)
-
-    class INPUT(ctypes.Structure):
-        _anonymous_ = ("_input",)
-        _fields_ = (("type", wintypes.DWORD), ("_input", _InputUnion))
-
-    entry = INPUT()
+    Built from the module-level `_INPUT`/`_KEYBDINPUT` classes -- the same
+    class object on every call, which is what lets `_real_send_ctrl_v` pack
+    four of these into one `ctypes.Array` (see `_KEYBDINPUT`'s docstring for
+    the bug that shipped when each call minted its own class instead).
+    """
+    entry = _INPUT()
     entry.type = INPUT_KEYBOARD
-    entry.ki = KEYBDINPUT(
+    entry.ki = _KEYBDINPUT(
         wVk=vk,
         wScan=0,
         dwFlags=KEYEVENTF_KEYUP if key_up else 0,
@@ -182,8 +263,7 @@ def _real_send_ctrl_v() -> None:
     telling the sender, which is exactly why task 9.3 forbids trusting this
     call's success to mean the paste arrived.
     """
-    import ctypes
-    from ctypes import wintypes
+    user32 = _user32()
 
     inputs = (
         _keybd_input(VK_CONTROL, key_up=False),
@@ -191,11 +271,8 @@ def _real_send_ctrl_v() -> None:
         _keybd_input(VK_V, key_up=True),
         _keybd_input(VK_CONTROL, key_up=True),
     )
-    array_type = type(inputs[0]) * len(inputs)
-    array = array_type(*inputs)
-    sent = ctypes.windll.user32.SendInput(
-        len(inputs), array, ctypes.sizeof(type(inputs[0]))
-    )
+    array = (_INPUT * len(inputs))(*inputs)
+    sent = user32.SendInput(len(inputs), array, ctypes.sizeof(_INPUT))
     if sent != len(inputs):
         raise OSError(
             f"SendInput accepted {sent} of {len(inputs)} events; "

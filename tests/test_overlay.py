@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from murmly.overlay import (
     GTK4_RENDERER_PYTHON,
@@ -26,7 +28,28 @@ from murmly.overlay import (
     renderer_python,
     renderer_script,
 )
-from murmly.platform import Desktop, OperatingSystem, PlatformProfile
+from murmly.platform import Desktop, OperatingSystem, PlatformProfile, resolve_platform
+
+
+def _resolve_platform_pinned_to(operating_system: OperatingSystem):
+    """A `murmly.overlay.resolve_platform` stand-in that answers for a given
+    `env` exactly as the real resolver does -- same desktop/session_type/
+    wayland_display/x11_display -- except with `operating_system` pinned to
+    `operating_system` regardless of the host's real `sys.platform`.
+
+    `detect_overlay_backend` always resolves against the real platform
+    (`overlay_backend_for_profile`'s own docstring: `operating_system` "is
+    not one of the keys a caller can steer through `detect_overlay_backend`'s
+    `environment` parameter"), so a test that wants to assert one OS's
+    behaviour on every CI host -- Linux behaviour when CI happens to run on
+    Windows, or vice versa -- has to patch the resolver itself, the same
+    shape `test_cli.py` uses for `murmly.cli.resolve_platform`.
+    """
+
+    def _resolve(env: dict[str, str] | None = None) -> PlatformProfile:
+        return dataclasses.replace(resolve_platform(env), operating_system=operating_system)
+
+    return _resolve
 
 
 class RendererPythonTests(unittest.TestCase):
@@ -385,43 +408,69 @@ class OverlayTests(unittest.TestCase):
         self.assertNotIn("LD_PRELOAD", x11_environment)
 
     def test_backend_detection_requires_plasma_and_selects_display_protocol(self) -> None:
-        self.assertEqual(
-            OverlayBackend.X11,
-            detect_overlay_backend(
-                {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
-            ),
-        )
-        self.assertEqual(
-            OverlayBackend.WAYLAND,
-            detect_overlay_backend(
-                {
-                    "XDG_CURRENT_DESKTOP": "KDE",
-                    "XDG_SESSION_TYPE": "wayland",
-                    "WAYLAND_DISPLAY": "wayland-0",
-                }
-            ),
-        )
-        self.assertIsNone(
-            detect_overlay_backend(
-                {"XDG_CURRENT_DESKTOP": "GNOME", "XDG_SESSION_TYPE": "wayland"}
+        # Pinned to Linux: this asserts the Plasma/session-type gate
+        # `overlay_backend_for_profile` applies below its `WINDOWS` check
+        # (see that function's docstring), which is real on every host, not
+        # only one where `sys.platform` happens to already say Linux.
+        with patch(
+            "murmly.overlay.resolve_platform",
+            side_effect=_resolve_platform_pinned_to(OperatingSystem.LINUX),
+        ):
+            self.assertEqual(
+                OverlayBackend.X11,
+                detect_overlay_backend(
+                    {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
+                ),
             )
-        )
-        self.assertEqual(
-            OverlayBackend.X11,
-            detect_overlay_backend(
-                {
-                    "XDG_CURRENT_DESKTOP": "KDE",
-                    "XDG_SESSION_TYPE": "x11",
-                    "DISPLAY": ":0",
-                    "WAYLAND_DISPLAY": "wayland-stale",
-                }
-            ),
-        )
-        self.assertIsNone(
-            detect_overlay_backend(
-                {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11"}
+            self.assertEqual(
+                OverlayBackend.WAYLAND,
+                detect_overlay_backend(
+                    {
+                        "XDG_CURRENT_DESKTOP": "KDE",
+                        "XDG_SESSION_TYPE": "wayland",
+                        "WAYLAND_DISPLAY": "wayland-0",
+                    }
+                ),
             )
-        )
+            self.assertIsNone(
+                detect_overlay_backend(
+                    {"XDG_CURRENT_DESKTOP": "GNOME", "XDG_SESSION_TYPE": "wayland"}
+                )
+            )
+            self.assertEqual(
+                OverlayBackend.X11,
+                detect_overlay_backend(
+                    {
+                        "XDG_CURRENT_DESKTOP": "KDE",
+                        "XDG_SESSION_TYPE": "x11",
+                        "DISPLAY": ":0",
+                        "WAYLAND_DISPLAY": "wayland-stale",
+                    }
+                ),
+            )
+            self.assertIsNone(
+                detect_overlay_backend(
+                    {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11"}
+                )
+            )
+
+    def test_backend_detection_on_windows_ignores_desktop_fields(self) -> None:
+        # The Windows counterpart: `detect_overlay_backend` must answer
+        # `WINDOWS` unconditionally there, the same Linux-shaped-fields-don't-
+        # matter guarantee `OverlayBackendForProfileTests` already proves for
+        # the pure `overlay_backend_for_profile`, but exercised through the
+        # `environment`-driven wrapper `cli.overlay_diagnostics` actually calls.
+        with patch(
+            "murmly.overlay.resolve_platform",
+            side_effect=_resolve_platform_pinned_to(OperatingSystem.WINDOWS),
+        ):
+            self.assertEqual(
+                OverlayBackend.WINDOWS,
+                detect_overlay_backend(
+                    {"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
+                ),
+            )
+            self.assertEqual(OverlayBackend.WINDOWS, detect_overlay_backend({}))
 
     def test_controller_prioritizes_states_and_coalesces_levels(self) -> None:
         parent = FakeSocket(10)

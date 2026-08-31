@@ -1422,6 +1422,8 @@ def overlay_diagnostics(
             [str(renderer_python(backend)), str(renderer_path), "--check", "--backend", backend.value],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=5,
             # The environment the renderer is launched with, not this process's:

@@ -15,17 +15,20 @@ Windows equivalent, so this fills it with the executable's own basename instead
 -- the closest thing Windows has to "which application", and paired with `pid`
 exactly as `WindowIdentity.matches` already expects (see `focus.py`).
 
-As with `win_pipe.py`, `win_hotkey.py` and `win_clipboard.py`, every
-`ctypes.windll` call lives behind a first-class seam (`foreground_window`,
-`window_pid`, `process_image_path`), each defaulted to a real Win32
-implementation imported from inside its own function body so this module stays
-importable on Linux. Only `WindowsFocusObserver`'s assembly of a
+As with `win_pipe.py`, `win_hotkey.py` and `win_clipboard.py`, every Win32
+call lives behind a first-class seam (`foreground_window`, `window_pid`,
+`process_image_path`), each defaulted to a real implementation that only
+loads `user32`/`kernel32` (via the module-private `_user32()`/`_kernel32()`
+below) from inside its own function body, so this module stays importable
+on Linux. Only `WindowsFocusObserver`'s assembly of a
 `WindowIdentity` from those three answers is exercised by the test suite; the
 real Win32 calls can only be confirmed on Windows.
 """
 
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from collections.abc import Callable
 
 from murmly.focus import WindowIdentity
@@ -39,26 +42,82 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 #: (`C:\...`), not the native NT device path `dwFlags=1` would give.
 _WIN32_PATH_FORMAT = 0
 
+#: Every `kernel32`/`user32` entry point this module calls, with the
+#: `restype`/`argtypes` ctypes needs so it stops defaulting an undeclared
+#: function's `restype` to `c_int` -- 32 bits. `GetForegroundWindow`
+#: returns an `HWND` and `OpenProcess` returns a `HANDLE`, both 64-bit
+#: pointers on 64-bit Windows: an undeclared `restype` truncates either
+#: before this module ever uses it, the same defect class `win_clipboard.py`
+#: shipped with (see that module's `_KERNEL32_SIGNATURES` docstring).
+#: `test_win_ctypes_signatures.py` scans this module's source for every
+#: attribute call made on the `user32`/`kernel32` handles below and asserts
+#: each callee has an entry here, so a future call added with no declared
+#: signature fails on Linux.
+_USER32_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
+    "GetForegroundWindow": (wintypes.HWND, ()),
+    "GetWindowThreadProcessId": (
+        wintypes.DWORD,
+        (wintypes.HWND, ctypes.POINTER(wintypes.DWORD)),
+    ),
+}
+
+_KERNEL32_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
+    "OpenProcess": (
+        wintypes.HANDLE,
+        (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD),
+    ),
+    "QueryFullProcessImageNameW": (
+        wintypes.BOOL,
+        (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)),
+    ),
+    "CloseHandle": (wintypes.BOOL, (wintypes.HANDLE,)),
+}
+
+#: Lazily-loaded, module-private library handles -- never ctypes' own
+#: shared, process-wide loader cache, following `win_clipboard.py`'s
+#: precedent so declaring a signature here can never change behaviour for
+#: some other, unrelated caller of the same DLL.
+_user32_dll: ctypes.WinDLL | None = None
+_kernel32_dll: ctypes.WinDLL | None = None
+
+
+def _configure(dll: ctypes.WinDLL, signatures: dict[str, tuple[object, tuple[object, ...]]]) -> None:
+    for name, (restype, argtypes) in signatures.items():
+        function = getattr(dll, name)
+        function.restype = restype
+        function.argtypes = argtypes
+
+
+def _user32() -> ctypes.WinDLL:
+    global _user32_dll
+    if _user32_dll is None:
+        _user32_dll = ctypes.WinDLL("user32")
+        _configure(_user32_dll, _USER32_SIGNATURES)
+    return _user32_dll
+
+
+def _kernel32() -> ctypes.WinDLL:
+    global _kernel32_dll
+    if _kernel32_dll is None:
+        _kernel32_dll = ctypes.WinDLL("kernel32")
+        _configure(_kernel32_dll, _KERNEL32_SIGNATURES)
+    return _kernel32_dll
+
 
 def _real_foreground_window() -> int | None:
-    from ctypes import windll
-
-    hwnd = windll.user32.GetForegroundWindow()
+    hwnd = _user32().GetForegroundWindow()
     return int(hwnd) if hwnd else None
 
 
 def _real_window_pid(hwnd: int) -> int | None:
-    from ctypes import byref, windll, wintypes
-
     pid = wintypes.DWORD()
-    windll.user32.GetWindowThreadProcessId(hwnd, byref(pid))
+    _user32().GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return int(pid.value) or None
 
 
 def _real_process_image_path(pid: int) -> str | None:
-    from ctypes import byref, create_unicode_buffer, windll, wintypes
-
-    handle = windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         # No handle at all: the process exited between `GetWindowThreadProcessId`
         # answering and this call, or belongs to another user session. Either
@@ -66,15 +125,15 @@ def _real_process_image_path(pid: int) -> str | None:
         return None
     try:
         buffer_size = wintypes.DWORD(260)
-        buffer = create_unicode_buffer(buffer_size.value)
-        ok = windll.kernel32.QueryFullProcessImageNameW(
-            handle, _WIN32_PATH_FORMAT, buffer, byref(buffer_size)
+        buffer = ctypes.create_unicode_buffer(buffer_size.value)
+        ok = kernel32.QueryFullProcessImageNameW(
+            handle, _WIN32_PATH_FORMAT, buffer, ctypes.byref(buffer_size)
         )
         if not ok:
             return None
         return buffer.value
     finally:
-        windll.kernel32.CloseHandle(handle)
+        kernel32.CloseHandle(handle)
 
 
 def _basename(path: str) -> str:

@@ -293,6 +293,8 @@ def _espeak_data_path() -> str | None:
             [ESPEAK_COMMAND, "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=PROBE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):

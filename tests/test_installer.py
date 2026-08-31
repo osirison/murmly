@@ -2977,7 +2977,7 @@ class WindowsSchtasksIntegrationTests(unittest.TestCase):
             # long enough for `is_active()`'s `/query` to have something
             # running to observe, per this class's docstring.
             script_path = Path(temp_dir) / "murmly-integration-idle.bat"
-            script_path.write_text("@echo off\r\nping -n 120 127.0.0.1 >nul\r\n")
+            script_path.write_text("@echo off\r\nping -n 120 127.0.0.1 >nul\r\n", encoding="utf-8")
 
             self.assertIsNone(service.recorded_entrypoint())
             self.assertFalse(service.is_installed)

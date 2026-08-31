@@ -304,6 +304,7 @@ class LiveSessionTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
             timeout=5,
         )

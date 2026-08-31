@@ -396,6 +396,8 @@ def git_branch(directory: str) -> str:
             ["git", "-C", directory, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):

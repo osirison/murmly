@@ -203,7 +203,7 @@ class VoiceAndRateFallbackTests(unittest.TestCase):
     def _config_from(self, body: str) -> MurmlyConfig:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text(textwrap.dedent(body))
+            config_path.write_text(textwrap.dedent(body), encoding="utf-8")
             return load_config(config_path)
 
     def test_unrecognized_voice_falls_back_and_reports_what_was_asked_for(self) -> None:
@@ -745,7 +745,7 @@ class RuntimeResolutionTests(unittest.TestCase):
         # Parsed rather than grepped: adjacent string literals are joined by the
         # parser, and a line-wrapped remedy read as a bare command on the source
         # line where it happens to break.
-        tree = ast.parse(Path(murmly.tts.__file__).read_text())
+        tree = ast.parse(Path(murmly.tts.__file__).read_text(encoding="utf-8"))
         literals: list[str] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):

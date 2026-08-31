@@ -189,7 +189,7 @@ def input_consent_advisory(method: str, env: dict[str, str] | None = None) -> st
     config_home = environment.get("XDG_CONFIG_HOME") or f"{environment.get('HOME', '')}/.config"
     kwinrc = Path(config_home) / "kwinrc"
     try:
-        settings = kwinrc.read_text()
+        settings = kwinrc.read_text(encoding="utf-8")
     except OSError:
         # No kwinrc: not a KWin session, so this dialog is not in the way.
         return None
@@ -220,6 +220,8 @@ def probe_injector(
             list(candidate.probe),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             env=env or os.environ,
             timeout=PROBE_TIMEOUT_SECONDS,
@@ -385,6 +387,8 @@ class ClipboardPaster:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=self._env,
         )
         return result.stdout
@@ -394,6 +398,7 @@ class ClipboardPaster:
             command,
             input=stdin_text,
             text=True,
+            encoding="utf-8",
             check=True,
             env=self._env,
         )

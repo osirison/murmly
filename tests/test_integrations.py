@@ -366,7 +366,7 @@ class InputConsentAdvisoryTests(unittest.TestCase):
 
     def _env(self, temp_dir: str, kwinrc: str | None) -> dict[str, str]:
         if kwinrc is not None:
-            (Path(temp_dir) / "kwinrc").write_text(kwinrc)
+            (Path(temp_dir) / "kwinrc").write_text(kwinrc, encoding="utf-8")
         return dict(self.WAYLAND, XDG_CONFIG_HOME=temp_dir)
 
     def test_advises_while_the_grant_is_missing(self) -> None:

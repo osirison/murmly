@@ -99,7 +99,7 @@ class NoTopLevelPySide6ImportTests(unittest.TestCase):
     it -- the same guard `test_overlay_renderer.py` holds `gi`/`cairo` to."""
 
     def test_pyside6_is_never_imported_at_module_scope(self) -> None:
-        source = Path(sys.modules["murmly.overlay_renderer_qt"].__file__).read_text()
+        source = Path(sys.modules["murmly.overlay_renderer_qt"].__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         module_scope = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
         imported = set()

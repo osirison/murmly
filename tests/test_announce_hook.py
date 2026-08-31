@@ -366,6 +366,7 @@ class AnnouncementLogTests(unittest.TestCase):
             ),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
             env={
                 **os.environ,
@@ -418,6 +419,7 @@ class InstructionHookTests(unittest.TestCase):
             [sys.executable, str(REPO / "hooks" / "murmly-voice-note.py")],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             env={**os.environ, **environment},
         )
 
@@ -482,6 +484,7 @@ class SessionSentenceTests(unittest.TestCase):
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
         ).stdout.strip()
         subprocess.run(
             ["git", "-C", str(directory), "checkout", "--detach", head],
@@ -607,6 +610,7 @@ class InstallHooksTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=True,
         )
         return finished.stdout
@@ -843,6 +847,7 @@ class InstallHooksTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
         self.assertNotEqual(0, finished.returncode)
         self.assertIn("Refusing to touch", finished.stderr)
