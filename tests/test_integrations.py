@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -453,18 +454,44 @@ class MacosPasteInjectionDefaultTrustCheckTests(unittest.TestCase):
     the instant this branch was reached from anywhere but a real Mac.
     """
 
-    def test_the_default_trust_check_does_not_raise_off_macos(self) -> None:
+    def test_the_default_trust_check_collapses_to_untrusted_when_it_cannot_ask(self) -> None:
         # No `macos_accessibility_trusted=` here -- the one thing every other
         # macOS test of this function supplies, and the one thing that was
-        # masking this default from ever running on this machine.
-        injection = select_paste_injection(profile=macos_profile())
+        # masking this default from ever running.
+        #
+        # The framework failure is induced rather than assumed. This test
+        # first asserted it by relying on the host being unable to load
+        # `ApplicationServices`, which is true on Linux and false on the macOS
+        # runner -- where the framework loads, the runner is already trusted,
+        # and the assertion inverted. A test that names a platform has to pin
+        # the condition it means rather than read the host's.
+        with patch(
+            "murmly.mac_clipboard._applicationservices",
+            side_effect=OSError("ApplicationServices is not loadable here"),
+        ):
+            injection = select_paste_injection(profile=macos_profile())
 
-        # `ApplicationServices` cannot be loaded here, so the real check
-        # cannot tell -- collapsed to "not trusted", never treated as a
-        # grant, the same "silence is never claimed as a grant" rule every
-        # other permission check in this codebase applies to its own.
+        # The real check cannot tell, so it collapses to "not trusted", never
+        # to a grant -- the same "silence is never claimed as a grant" rule
+        # every other permission check in this codebase applies to its own.
         self.assertFalse(injection.available)
         self.assertIn("Accessibility", injection.reason)
+
+    def test_the_default_trust_check_answers_on_a_real_mac_without_raising(self) -> None:
+        """What only a Mac can show: the default reaches a real
+        `AXIsProcessTrusted` and comes back with an answer.
+
+        Which answer belongs to the runner, not to this test -- the macOS CI
+        runner turns out to have Accessibility already granted, the same way
+        it has a microphone and a granted microphone permission. So this
+        asserts that the call resolves rather than what it resolves to.
+        """
+        if sys.platform != "darwin":
+            self.skipTest("A macOS kernel is required to reach ApplicationServices")
+
+        injection = select_paste_injection(profile=macos_profile())
+
+        self.assertIsInstance(injection.available, bool)
 
 
 class ClipboardPasterFactoryTests(unittest.TestCase):

@@ -145,11 +145,24 @@ class _EventTypeSpec(ctypes.Structure):
 #: module's source for every attribute call made on the `hitoolbox` handle
 #: below and asserts each callee has an entry here.
 _HITOOLBOX_SIGNATURES: dict[str, tuple[object, tuple[object, ...]]] = {
-    "InstallApplicationEventHandler": (
+    # `InstallEventHandler`, not `InstallApplicationEventHandler`. The latter
+    # reads like an entry point and is not one: `CarbonEvents.h` defines it as
+    # a macro expanding to
+    # `InstallEventHandler(GetApplicationEventTarget(), ...)`, so no such
+    # symbol is exported and `dlsym` cannot find it. Asking for it raised
+    # `AttributeError: dlsym(..., InstallApplicationEventHandler): symbol not
+    # found` on the macOS runner -- inside the event-loop thread, where it
+    # failed no test and left the hotkey registered but permanently unable to
+    # fire, since nothing was listening for the event it raises.
+    #
+    # `inNumTypes` is an `ItemCount`, which `MacTypes.h` makes `unsigned long`
+    # -- 64 bits on every macOS Murmly supports, not the 32 this declared.
+    "InstallEventHandler": (
         _OS_STATUS,
         (
+            ctypes.c_void_p,
             _EVENT_HANDLER_UPP_TYPE,
-            ctypes.c_uint32,
+            ctypes.c_ulong,
             ctypes.POINTER(_EventTypeSpec),
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_void_p),
@@ -275,11 +288,20 @@ def _real_install_handler(on_fired: Callable[[int], None]) -> tuple[object, obje
         _EventTypeSpec(eventClass=_K_EVENT_CLASS_KEYBOARD, eventKind=_K_EVENT_HOTKEY_PRESSED)
     )
     handler_ref = ctypes.c_void_p()
-    status = hitoolbox.InstallApplicationEventHandler(
-        upp, 1, event_types, None, ctypes.byref(handler_ref)
+    # The application event target, passed explicitly: this is what the
+    # `InstallApplicationEventHandler` macro exists to supply, and it is the
+    # same target `_real_register` registers the hotkey against, which is what
+    # makes the handler the one that receives it.
+    status = hitoolbox.InstallEventHandler(
+        hitoolbox.GetApplicationEventTarget(),
+        upp,
+        1,
+        event_types,
+        None,
+        ctypes.byref(handler_ref),
     )
     if status != 0:
-        raise HotkeyError(f"InstallApplicationEventHandler failed with OSStatus {status}.")
+        raise HotkeyError(f"InstallEventHandler failed with OSStatus {status}.")
     return handler_ref.value, upp
 
 
