@@ -12,7 +12,6 @@ from __future__ import annotations
 from collections.abc import Iterator
 import ctypes.util
 import logging
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -117,7 +116,7 @@ def resolve_espeak() -> tuple[str, str]:
     except OSError as error:
         raise RuntimeError(f"espeak-ng ({soname}) could not be loaded: {error}") from error
 
-    library_path = _loaded_library_path(soname) or soname
+    library_path = _loaded_library_path(handle) or soname
     data_path = _espeak_data_path()
     if data_path is None:
         raise RuntimeError(
@@ -128,18 +127,29 @@ def resolve_espeak() -> tuple[str, str]:
     return library_path, data_path
 
 
-def _loaded_library_path(soname: str) -> str | None:
-    """Where the loader actually found a library it has already opened."""
-    stem = soname.split(".so")[0]
+def _loaded_library_path(handle: ctypes.CDLL) -> str | None:
+    """Where the loader actually found a library it has already opened.
+
+    Asked through `dlinfo` (a `phonemizer` dependency already in the lock, not
+    a stdlib module of the same name) rather than by parsing `/proc/self/maps`
+    for a line whose path ends in the library's name: that file is Linux-only,
+    and matching on a name fragment can pick up an unrelated library that
+    happens to share it. `dlinfo` asks the dynamic linker that resolved
+    `handle` directly, which is exact and answers on every platform the
+    `dlinfo` package supports (glibc and macOS both have their own backend
+    inside it).
+
+    None on any failure -- a handle patched out in a test, a platform `dlinfo`
+    has no backend for, a loader that refuses the question -- because the only
+    use of this is cosmetic: the caller already has a name to fall back to.
+    """
     try:
-        maps = Path("/proc/self/maps").read_text()
-    except OSError:
+        from dlinfo import DLInfo
+
+        return DLInfo(handle).path
+    except Exception as error:  # noqa: BLE001 - a best-effort diagnostic, not a requirement
+        logger.debug("Could not determine the loaded path of the phoneme library: %s", error)
         return None
-    for line in maps.splitlines():
-        path = line.rsplit(" ", 1)[-1]
-        if path.startswith("/") and os.path.basename(path).startswith(stem):
-            return path
-    return None
 
 
 def _espeak_data_path() -> str | None:

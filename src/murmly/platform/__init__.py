@@ -243,13 +243,25 @@ class BackendCandidate:
 class BackendChoice:
     """A registry's answer for one profile: the mechanism, or why none applies.
 
-    Section 6 (diagnostics) is what will render `mechanism` and `reason` into
-    `murmly doctor`'s `platform` section; this module only decides them.
+    Section 6 (diagnostics) is what will render `mechanism`, `reason` and
+    `remedy` into `murmly doctor`'s `platform` section; this module only
+    decides them.
+
+    `remedy` is the data that carries the distinction the `platform-support`
+    spec requires between a mechanism that does not exist on this platform and
+    one that exists here but could not be used: empty means "the platform
+    offers none" and the report must not name something to install, while a
+    non-empty tuple names exactly what to install, enable, or grant to make the
+    existing mechanism usable. A reader (or a future registry) decides which
+    case it is by testing `remedy`, never by pattern-matching `reason`'s
+    wording -- `reason` is prose for a person, `remedy` is the structured
+    answer for code.
     """
 
     mechanism: str | None
     reason: str | None = None
     load: Callable[[], object] | None = None
+    remedy: tuple[str, ...] = ()
 
     @property
     def available(self) -> bool:
@@ -274,16 +286,29 @@ class BackendRegistry:
         concern: str,
         candidates: Sequence[BackendCandidate],
         unavailable_reason: Callable[[PlatformProfile], str],
+        #: Defaults to "nothing to install" -- true for every candidate list
+        #: below except `OVERLAY`'s, where Plasma being present but undisplayed
+        #: is the one case today where the mechanism exists and something can
+        #: be named to fix it. Kept as its own callable, alongside
+        #: `unavailable_reason` rather than folded into it, so a registry that
+        #: has no such case (every other one today) need not return an unused
+        #: half of a pair every time.
+        unavailable_remedy: Callable[[PlatformProfile], tuple[str, ...]] = lambda profile: (),
     ) -> None:
         self.concern = concern
         self._candidates = tuple(candidates)
         self._unavailable_reason = unavailable_reason
+        self._unavailable_remedy = unavailable_remedy
 
     def select(self, profile: PlatformProfile) -> BackendChoice:
         for candidate in self._candidates:
             if candidate.supports(profile):
                 return BackendChoice(candidate.mechanism, load=candidate.load)
-        return BackendChoice(None, reason=self._unavailable_reason(profile))
+        return BackendChoice(
+            None,
+            reason=self._unavailable_reason(profile),
+            remedy=self._unavailable_remedy(profile),
+        )
 
 
 def _is_linux(profile: PlatformProfile) -> bool:
@@ -292,6 +317,10 @@ def _is_linux(profile: PlatformProfile) -> bool:
 
 def _is_plasma(profile: PlatformProfile) -> bool:
     return _is_linux(profile) and profile.desktop is Desktop.PLASMA
+
+
+def _is_gnome(profile: PlatformProfile) -> bool:
+    return _is_linux(profile) and profile.desktop is Desktop.GNOME
 
 
 def _wants_wayland(profile: PlatformProfile) -> bool:
@@ -326,6 +355,12 @@ def _load_plasma_hotkeys() -> object:
     from murmly.desktop import PlasmaShortcuts
 
     return PlasmaShortcuts
+
+
+def _load_gnome_hotkeys() -> object:
+    from murmly.desktop import GnomeShortcuts
+
+    return GnomeShortcuts
 
 
 def _load_wayland_clipboard() -> object:
@@ -390,12 +425,15 @@ SERVICE_MANAGEMENT = BackendRegistry(
 def _hotkey_unavailable_reason(profile: PlatformProfile) -> str:
     if not _is_linux(profile):
         return f"No hotkey backend exists for {profile.operating_system.value} yet."
-    return "Hotkey registration requires KDE Plasma."
+    return "Hotkey registration requires KDE Plasma or GNOME."
 
 
 HOTKEY_REGISTRATION = BackendRegistry(
     "hotkey registration",
-    candidates=(BackendCandidate("plasma", _is_plasma, _load_plasma_hotkeys),),
+    candidates=(
+        BackendCandidate("plasma", _is_plasma, _load_plasma_hotkeys),
+        BackendCandidate("gnome", _is_gnome, _load_gnome_hotkeys),
+    ),
     unavailable_reason=_hotkey_unavailable_reason,
 )
 
@@ -458,6 +496,23 @@ def _overlay_unavailable_reason(profile: PlatformProfile) -> str:
     return "Overlay requires an X11 or Wayland session with its display available."
 
 
+def _overlay_unavailable_remedy(profile: PlatformProfile) -> tuple[str, ...]:
+    """What to name for the overlay's one exists-but-could-not-be-used case.
+
+    Plasma present without a usable display is the only branch of this
+    registry's refusal where the mechanism exists on this platform -- every
+    other branch (not Linux, not Plasma) means no overlay backend has been
+    built for that desktop or operating system at all, which the spec's "does
+    not exist" scenario says must not name something to install. Reusing
+    `_is_plasma` here, the same predicate `_overlay_unavailable_reason` already
+    branches on, keeps the two callables from disagreeing about which case
+    this is.
+    """
+    if _is_plasma(profile):
+        return ("Start an X11 or Wayland session with its display available.",)
+    return ()
+
+
 OVERLAY = BackendRegistry(
     "overlay",
     candidates=(
@@ -466,6 +521,7 @@ OVERLAY = BackendRegistry(
         ),
     ),
     unavailable_reason=_overlay_unavailable_reason,
+    unavailable_remedy=_overlay_unavailable_remedy,
 )
 
 SPEECH_SYNTHESIS = BackendRegistry(
@@ -473,6 +529,35 @@ SPEECH_SYNTHESIS = BackendRegistry(
     candidates=(BackendCandidate("kokoro", _is_linux, _load_kokoro_synthesis),),
     unavailable_reason=_no_backend_for_operating_system("speech synthesis"),
 )
+
+#: Hotkey mechanisms that register inside Murmly's own process rather than in
+#: the desktop's own persisted state. Empty today: neither `plasma` (a
+#: launcher file the desktop discovers) nor `gnome` (a dconf value the
+#: settings daemon watches) is one -- both are desktop-held state a fresh
+#: session already has without Murmly doing anything. Windows' `RegisterHotKey`
+#: (section 8) and macOS's Carbon `RegisterEventHotKey` (section 13) are the
+#: intended members once their candidates exist. See `hotkey_record.py` for
+#: what reads this.
+IN_PROCESS_HOTKEY_MECHANISMS: frozenset[str] = frozenset()
+
+
+def hotkey_mechanism_is_in_process(
+    profile: PlatformProfile,
+    registry: "BackendRegistry | None" = None,
+    in_process: frozenset[str] | None = None,
+) -> bool:
+    """Whether `profile`'s hotkey mechanism needs `hotkey_record.py`'s
+    rebind-at-startup path, rather than the desktop's own persisted state.
+
+    `registry` and `in_process` default to the real registry and the real
+    table; both take a parameter for the same reason `runtime_gaps_for` does:
+    a test exercises the "in-process" branch against a constructed registry
+    with a fake candidate, without a real in-process backend existing yet.
+    """
+    active_registry = registry if registry is not None else HOTKEY_REGISTRATION
+    active_in_process = in_process if in_process is not None else IN_PROCESS_HOTKEY_MECHANISMS
+    return active_registry.select(profile).mechanism in active_in_process
+
 
 #: Every registry, keyed by the concern name used throughout the tasks and
 #: (later) the `platform` diagnostics section. Iterating this is how a test or
@@ -488,6 +573,58 @@ BACKEND_REGISTRIES: Mapping[str, BackendRegistry] = {
     "overlay": OVERLAY,
     "speech_synthesis": SPEECH_SYNTHESIS,
 }
+
+
+# --------------------------------------------------------------------------
+# Permissions a platform gates a capability behind (task 6.4)
+# --------------------------------------------------------------------------
+
+
+class PermissionState(StrEnum):
+    GRANTED = "granted"
+    DENIED = "denied"
+    #: What a `Permission.check` answers where the platform offers no way to
+    #: read whether the grant was given, and what `platform_diagnostics`
+    #: (`cli.py`) substitutes when `check` itself raises. Never rendered as
+    #: `GRANTED`: a check that cannot tell is not evidence a capability works,
+    #: and the `platform-support` spec forbids reporting one on the strength of
+    #: the mechanism alone when its permission state is unknown.
+    UNDETERMINED = "undetermined"
+
+
+@dataclass(frozen=True, slots=True)
+class Permission:
+    """One grant a person must give before a platform lets a mechanism work.
+
+    No candidate exists yet: Linux, the only operating system this phase
+    supports, gates nothing Murmly uses behind a person-granted permission --
+    every `BackendChoice` above is unavailable only for lacking a mechanism,
+    never for lacking a grant. This type and `PERMISSIONS` exist so Windows'
+    microphone privacy setting (section 9) and macOS's microphone,
+    Accessibility, and Input Monitoring grants (sections 12, 14) have a shape
+    to register into rather than each inventing its own, the same role
+    `IN_PROCESS_HOTKEY_MECHANISMS` plays for hotkeys before its first member
+    exists.
+
+    `capability` names what the permission gates (e.g. "paste injection"), not
+    the permission's own name, because that is what a denied-permission report
+    must say was lost. `grant_location` is where a person goes to change it --
+    a System Settings pane, a Group Policy path -- named specifically enough to
+    act on, the same bar `BackendChoice.reason` is held to.
+    """
+
+    name: str
+    capability: str
+    grant_location: str
+    check: Callable[[PlatformProfile], PermissionState]
+
+
+#: Every permission Murmly currently knows to ask about, keyed by `name`.
+#: Empty in this phase for the reason `Permission`'s docstring gives.
+#: `platform_diagnostics` (`cli.py`) renders this mapping into the `platform`
+#: section's `permissions` field regardless of whether it holds anything, so
+#: that field's shape does not change the day a first permission is added.
+PERMISSIONS: Mapping[str, Permission] = {}
 
 
 # --------------------------------------------------------------------------

@@ -5,20 +5,27 @@ import socket
 import unittest
 from unittest.mock import patch
 
-from murmly.desktop import PlasmaShortcuts
+from murmly.desktop import GnomeShortcuts, PlasmaShortcuts
 from murmly.focus import X11FocusObserver
 from murmly.installer import UserService
 from murmly.integrations import WAYLAND_INJECTORS, X11_INJECTORS, choose_clipboard_copy_command
 from murmly.overlay import OverlayController
 from murmly.platform import (
     BACKEND_REGISTRIES,
+    IN_PROCESS_HOTKEY_MECHANISMS,
+    PERMISSIONS,
     RUNTIME_GAPS,
     TRANSCRIPTION_CAPABILITY,
+    BackendCandidate,
+    BackendRegistry,
     Desktop,
     OperatingSystem,
+    Permission,
+    PermissionState,
     PlatformProfile,
     RuntimeGap,
     _detected_libc,
+    hotkey_mechanism_is_in_process,
     operating_system_for,
     resolve_platform,
     runtime_gaps_for,
@@ -54,6 +61,19 @@ def linux_gnome_wayland() -> PlatformProfile:
         session_type="wayland",
         wayland_display=True,
         desktop=Desktop.GNOME,
+    )
+
+
+def linux_xfce_x11() -> PlatformProfile:
+    """A desktop with no hotkey backend at all, distinct from `Desktop.OTHER`
+    meaning "declared nothing": this one declared something Murmly simply does
+    not register hotkeys on."""
+    return PlatformProfile(
+        operating_system=OperatingSystem.LINUX,
+        architecture="x86_64",
+        session_type="x11",
+        x11_display=True,
+        desktop=Desktop.OTHER,
     )
 
 
@@ -262,17 +282,27 @@ class BackendRegistryTests(unittest.TestCase):
 
         self.assertFalse(BACKEND_REGISTRIES["service_management"].select(windows()).available)
 
-    def test_hotkey_registration_selects_plasma_only_on_a_plasma_desktop(self) -> None:
+    def test_hotkey_registration_selects_plasma_on_a_plasma_desktop(self) -> None:
         choice = BACKEND_REGISTRIES["hotkey_registration"].select(linux_plasma_wayland())
 
         self.assertEqual("plasma", choice.mechanism)
         self.assertIs(PlasmaShortcuts, choice.load())
 
-    def test_hotkey_registration_names_the_desktops_own_limitation_on_gnome(self) -> None:
+    def test_hotkey_registration_selects_gnome_on_a_gnome_desktop(self) -> None:
         choice = BACKEND_REGISTRIES["hotkey_registration"].select(linux_gnome_wayland())
+
+        self.assertEqual("gnome", choice.mechanism)
+        self.assertIs(GnomeShortcuts, choice.load())
+
+    def test_hotkey_registration_names_the_desktops_own_limitation_elsewhere(self) -> None:
+        # Task 4.6: distinct from the platform having no backend at all --
+        # naming the desktops Murmly does support is what a person on this
+        # desktop can act on, unlike "no hotkey backend for linux".
+        choice = BACKEND_REGISTRIES["hotkey_registration"].select(linux_xfce_x11())
 
         self.assertFalse(choice.available)
         self.assertIn("KDE Plasma", choice.reason)
+        self.assertIn("GNOME", choice.reason)
 
     def test_hotkey_registration_names_the_operating_system_on_windows(self) -> None:
         choice = BACKEND_REGISTRIES["hotkey_registration"].select(windows())
@@ -328,12 +358,20 @@ class BackendRegistryTests(unittest.TestCase):
             desktop=Desktop.PLASMA,
         )
         choice = BACKEND_REGISTRIES["overlay"].select(headless)
-        not_plasma_reason = BACKEND_REGISTRIES["overlay"].select(linux_gnome_wayland()).reason
+        not_plasma_choice = BACKEND_REGISTRIES["overlay"].select(linux_gnome_wayland())
 
         self.assertFalse(choice.available)
         self.assertIn("display", choice.reason)
         self.assertNotIn("KDE Plasma", choice.reason)
-        self.assertNotEqual(not_plasma_reason, choice.reason)
+        self.assertNotEqual(not_plasma_choice.reason, choice.reason)
+
+        # 6.2: the mechanism exists here (Plasma is present) and could not be
+        # used, so this is the one case in this registry that must name
+        # something to fix -- as data (`remedy`), not by re-parsing `reason`.
+        self.assertTrue(choice.remedy)
+        # Whereas GNOME has no overlay backend at all: nothing exists to name
+        # something to install for, so `remedy` must stay empty.
+        self.assertEqual((), not_plasma_choice.remedy)
 
     def test_speech_synthesis_selects_kokoro_on_linux_only(self) -> None:
         choice = BACKEND_REGISTRIES["speech_synthesis"].select(linux_plasma_x11())
@@ -358,6 +396,103 @@ class BackendRegistryTests(unittest.TestCase):
                         self.assertIsNotNone(choice.load())
                     else:
                         self.assertTrue(choice.reason)
+
+
+class InProcessHotkeyMarkerTests(unittest.TestCase):
+    """Task 5.4's design boundary: which mechanisms need `hotkey_record.py`'s
+    rebind-at-startup path, rather than the desktop's own persisted state."""
+
+    def test_neither_real_hotkey_mechanism_is_in_process_today(self) -> None:
+        self.assertFalse(hotkey_mechanism_is_in_process(linux_plasma_x11()))
+        self.assertFalse(hotkey_mechanism_is_in_process(linux_gnome_wayland()))
+
+    def test_the_real_table_is_empty(self) -> None:
+        """Nothing populates this until a Windows or macOS backend exists
+        (sections 8 and 13) -- an entry here today would claim a mechanism
+        this change never built."""
+        self.assertEqual(frozenset(), IN_PROCESS_HOTKEY_MECHANISMS)
+
+    def test_an_injected_in_process_mechanism_is_recognised(self) -> None:
+        """The branch a future Windows or macOS candidate exercises, proven
+        against a constructed registry rather than a stub in production code."""
+        fake_registry = BackendRegistry(
+            "hotkey registration",
+            candidates=(BackendCandidate("windows-hotkey", lambda profile: True, lambda: object()),),
+            unavailable_reason=lambda profile: "unreachable",
+        )
+
+        self.assertTrue(
+            hotkey_mechanism_is_in_process(
+                windows(), registry=fake_registry, in_process=frozenset({"windows-hotkey"})
+            )
+        )
+
+    def test_a_mechanism_outside_the_injected_table_is_not_in_process(self) -> None:
+        self.assertFalse(
+            hotkey_mechanism_is_in_process(linux_plasma_x11(), in_process=frozenset({"windows-hotkey"}))
+        )
+
+
+class BackendChoiceRemedyTests(unittest.TestCase):
+    """6.2: `remedy` is the data that distinguishes "no mechanism" from
+    "exists but could not be used", not `reason`'s wording."""
+
+    def test_remedy_defaults_to_empty(self) -> None:
+        """A registry that never names anything to install -- every one of
+        them except `OVERLAY` -- need not construct an unused remedy."""
+        choice = BACKEND_REGISTRIES["command_channel"].select(windows())
+
+        self.assertFalse(choice.available)
+        self.assertEqual((), choice.remedy)
+
+    def test_a_registry_can_be_constructed_with_no_remedy_callable_at_all(self) -> None:
+        registry = BackendRegistry(
+            "test concern",
+            candidates=(),
+            unavailable_reason=lambda profile: "no mechanism for this test concern",
+        )
+
+        self.assertEqual((), registry.select(windows()).remedy)
+
+
+class PermissionShapeTests(unittest.TestCase):
+    """6.4: the reporting shape three future permission checks plug into,
+    proved against a constructed `Permission` since none is registered yet."""
+
+    def test_the_real_table_is_empty(self) -> None:
+        """Nothing populates this until a permission-gated backend exists
+        (Windows privacy settings, section 9; macOS grants, sections 12, 14)
+        -- an entry here today would claim a check this change never built."""
+        self.assertEqual({}, dict(PERMISSIONS))
+
+    def test_a_platform_offering_no_way_to_ask_answers_undetermined(self) -> None:
+        cannot_tell = Permission(
+            name="test-permission",
+            capability="test capability",
+            grant_location="Settings > Test",
+            check=lambda profile: PermissionState.UNDETERMINED,
+        )
+
+        self.assertEqual(PermissionState.UNDETERMINED, cannot_tell.check(linux_plasma_x11()))
+
+    def test_granted_and_denied_are_distinct_from_undetermined(self) -> None:
+        granted = Permission(
+            name="test-permission",
+            capability="test capability",
+            grant_location="Settings > Test",
+            check=lambda profile: PermissionState.GRANTED,
+        )
+        denied = Permission(
+            name="test-permission",
+            capability="test capability",
+            grant_location="Settings > Test",
+            check=lambda profile: PermissionState.DENIED,
+        )
+
+        self.assertEqual(PermissionState.GRANTED, granted.check(linux_plasma_x11()))
+        self.assertEqual(PermissionState.DENIED, denied.check(linux_plasma_x11()))
+        self.assertNotEqual(PermissionState.GRANTED, PermissionState.UNDETERMINED)
+        self.assertNotEqual(PermissionState.DENIED, PermissionState.UNDETERMINED)
 
 
 class RuntimeGapTests(unittest.TestCase):

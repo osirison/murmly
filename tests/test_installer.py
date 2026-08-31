@@ -114,6 +114,31 @@ class UnitTextTests(unittest.TestCase):
 
         self.assertIn("After=pipewire.service wireplumber.service", text)
 
+    def test_the_audio_server_ordering_is_never_a_dependency(self) -> None:
+        """Task 3.7: an optimisation on Linux, not something Murmly depends on.
+
+        Murmly already has to survive the audio server disappearing first --
+        that is what `disable_portaudio_exit_teardown()` is for -- so the unit
+        must never escalate `After=` into `Requires=`, `BindsTo=` or `Wants=`
+        naming the audio server: any of those would refuse to start, or would
+        stop, Murmly alongside a unit it is required to outlive.
+        """
+        text = service_unit_text(Path("/opt/murmly/.venv/bin/murmly"))
+
+        for directive in ("Requires=", "BindsTo=", "Wants="):
+            for line in text.splitlines():
+                if line.startswith(directive):
+                    self.assertNotIn(
+                        "pipewire",
+                        line,
+                        f"{line!r} makes the audio server a dependency, not an ordering",
+                    )
+                    self.assertNotIn(
+                        "wireplumber",
+                        line,
+                        f"{line!r} makes the audio server a dependency, not an ordering",
+                    )
+
     def test_does_not_activate_on_default_target(self) -> None:
         # The superseded template used WantedBy=default.target, which activates
         # before the session environment exists.
@@ -707,6 +732,24 @@ def owner(component: str, friendly: str = "other"):
     return ShortcutOwner("_launch", friendly, component, friendly)
 
 
+class FakeRecordStore:
+    """Task 5.4's record, faked: a real `HotkeyRecordStore` would write to the
+    developer's own `~/.config/murmly/hotkeys.json` from every test in this
+    file that calls `install()` or `uninstall()`, since none of them pins one."""
+
+    def __init__(self) -> None:
+        self.bindings: dict[str, str] | None = None
+
+    def write(self, bindings: dict[str, str]) -> None:
+        self.bindings = dict(bindings)
+
+    def read(self) -> dict[str, str]:
+        return dict(self.bindings or {})
+
+    def remove(self) -> None:
+        self.bindings = None
+
+
 def make_installer(
     service=None,
     launcher=None,
@@ -715,6 +758,7 @@ def make_installer(
     entrypoint="/bin/murmly",
     injection=None,
     session_launcher=None,
+    record_store=None,
 ):
     from murmly.installer import DESKTOP_ID, SESSION_HOTKEY, Installer
 
@@ -731,6 +775,7 @@ def make_installer(
         session=session or FakeSession(),
         entrypoint_resolver=lambda: Path(entrypoint),
         injection_selector=lambda: selected,
+        record_store=record_store or FakeRecordStore(),
     )
 
 
@@ -1168,6 +1213,30 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(0, service.removes, "a service this run did not create must survive rollback")
         self.assertTrue(service.is_installed)
 
+    def test_rollback_tolerates_a_gnome_launchers_desktop_query_error(self) -> None:
+        """`_rollback` must catch `DesktopQueryError` too: GNOME's launcher
+        raises it, not `InstallError`, for a gsettings failure while
+        unregistering the very entry rollback is trying to undo."""
+        from murmly.desktop import DesktopQueryError
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, InstallError
+
+        class FailsToUnregister(FakeLauncher):
+            def unregister(self):
+                raise DesktopQueryError("gsettings is unreachable")
+
+        shortcuts = OwnerRegistry(keys={DESKTOP_ID: [268435544]}, owners={})
+        launcher = FailsToUnregister()
+        installer = make_installer(shortcuts=shortcuts, launcher=launcher)
+
+        # `_verify` raises InstallError ("no owner reported"); rollback then
+        # tries to undo the just-written launcher and must not let the
+        # launcher's own DesktopQueryError replace that original failure.
+        with self.assertRaises(InstallError) as raised:
+            installer.install(parse_hotkey("Meta+X"))
+
+        self.assertIn("no owner", str(raised.exception))
+
     def test_unconfirmed_binding_keeps_the_launcher(self) -> None:
         from murmly.hotkey import parse_hotkey
         from murmly.installer import HotkeyNotConfirmedError
@@ -1323,6 +1392,24 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(1, service.removes)
         self.assertIn("still held", " ".join(outcome.messages))
 
+    def test_a_gnome_launchers_desktop_query_error_still_removes_the_service(self) -> None:
+        """GNOME's launcher raises `DesktopQueryError`, not `InstallError`, for
+        a gsettings failure -- uninstall must catch that too, not just the
+        Plasma-flavoured exception."""
+        from murmly.desktop import DesktopQueryError
+
+        class FailingGnomeLikeLauncher(FakeLauncher):
+            def unregister(self):
+                raise DesktopQueryError("gsettings is unreachable")
+
+        service = FakeService(installed=True)
+        installer = make_installer(service=service, launcher=FailingGnomeLikeLauncher(declared="Meta+X"))
+
+        outcome = installer.uninstall()
+
+        self.assertEqual(1, service.removes)
+        self.assertIn("gsettings is unreachable", " ".join(outcome.messages))
+
 
 class InstallerStatusTests(unittest.TestCase):
     def test_reports_not_installed(self) -> None:
@@ -1442,6 +1529,7 @@ class PasteInjectionReportTests(unittest.TestCase):
             session=FakeSession(),
             entrypoint_resolver=lambda: Path("/bin/murmly"),
             injection_selector=explode,
+            record_store=FakeRecordStore(),
         )
 
         outcome = installer.install(parse_hotkey("Meta+X"))
@@ -1689,3 +1777,196 @@ class TwoHotkeyTests(unittest.TestCase):
         self.assertTrue(purposes["window"]["held"])
         self.assertFalse(purposes["session"]["held"])
         self.assertEqual("Klipper", purposes["session"]["holder"])
+
+
+class HotkeyRecordPersistenceTests(unittest.TestCase):
+    """Task 5.4: `install`/`uninstall` keep the record in step with what is
+    actually bound, on every platform -- not read from yet anywhere, but ready
+    the day an in-process backend (sections 8, 13) needs it."""
+
+    def test_install_writes_the_bound_purpose_to_the_record(self) -> None:
+        from murmly.hotkey import parse_hotkey
+
+        record = FakeRecordStore()
+        installer = make_installer(record_store=record)
+
+        installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual({"window": "Meta+X"}, record.read())
+
+    def test_install_of_both_hotkeys_records_both(self) -> None:
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import DESKTOP_ID, SESSION_DESKTOP_ID, SESSION_HOTKEY
+
+        record = FakeRecordStore()
+        window_code, session_code = 268435544, 268435521
+        shortcuts = OwnerRegistry(
+            keys={DESKTOP_ID: [window_code], SESSION_DESKTOP_ID: [session_code]},
+            owners={window_code: [owner(DESKTOP_ID, "murmly")], session_code: [owner(SESSION_DESKTOP_ID, "murmly")]},
+        )
+        installer = make_installer(
+            launcher=FakeLauncher(),
+            session_launcher=FakeLauncher(purpose=SESSION_HOTKEY),
+            shortcuts=shortcuts,
+            record_store=record,
+        )
+
+        installer.install(parse_hotkey("Meta+X"), parse_hotkey("Meta+A"))
+
+        self.assertEqual({"window": "Meta+X", "session": "Meta+A"}, record.read())
+
+    def test_installing_one_purpose_does_not_drop_the_others_recorded_entry(self) -> None:
+        """The record reflects actual bound state, built from both launchers'
+        `declared_hotkey()` -- not only the keys this run requested."""
+        from murmly.hotkey import parse_hotkey
+        from murmly.installer import SESSION_HOTKEY
+
+        record = FakeRecordStore()
+        # The session purpose is already bound before this run, as if an
+        # earlier `install` had claimed it -- with a matching entrypoint, so
+        # it is not treated as stale and re-registered by this run.
+        session_launcher = FakeLauncher(
+            declared="Meta+A", purpose=SESSION_HOTKEY, entrypoint="/bin/murmly toggle-session"
+        )
+        installer = make_installer(record_store=record, session_launcher=session_launcher)
+
+        installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual({"window": "Meta+X", "session": "Meta+A"}, record.read())
+
+    def test_uninstall_clears_the_record(self) -> None:
+        from murmly.hotkey import parse_hotkey
+
+        record = FakeRecordStore()
+        installer = make_installer(record_store=record)
+        installer.install(parse_hotkey("Meta+X"))
+        self.assertEqual({"window": "Meta+X"}, record.read())
+
+        installer.uninstall()
+
+        self.assertEqual({}, record.read())
+
+    def test_uninstall_clears_the_record_even_with_nothing_installed(self) -> None:
+        record = FakeRecordStore()
+        installer = make_installer(service=FakeService(installed=False), launcher=FakeLauncher(declared=None), record_store=record)
+
+        installer.uninstall()
+
+        self.assertEqual({}, record.read())
+
+    def test_a_record_that_cannot_be_written_does_not_fail_an_otherwise_successful_install(self) -> None:
+        """A hotkey is already bound and verified by the time the record is
+        written -- an unwritable config directory must not turn that into a
+        reported failure, for a file nothing on Linux reads yet."""
+        from murmly.hotkey import parse_hotkey
+
+        class RaisingRecordStore(FakeRecordStore):
+            def write(self, bindings):
+                raise OSError("Read-only file system")
+
+        installer = make_installer(record_store=RaisingRecordStore())
+
+        outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertTrue(outcome.hotkey_registered)
+
+    def test_a_record_that_cannot_be_cleared_does_not_fail_an_otherwise_successful_uninstall(self) -> None:
+        class RaisingRecordStore(FakeRecordStore):
+            def remove(self):
+                raise OSError("Read-only file system")
+
+        installer = make_installer(record_store=RaisingRecordStore())
+
+        outcome = installer.uninstall()
+
+        self.assertIn("Read-only file system", " ".join(outcome.messages))
+
+
+class BackendDispatchTests(unittest.TestCase):
+    """Which desktop `install`/`status`/`uninstall` actually talk to is chosen
+    once, from the resolved session, only when nothing was pinned -- every
+    other test in this file pins `shortcuts`/`launcher`/`session_launcher`
+    directly and never touches this path at all."""
+
+    def test_a_pinned_backend_is_used_exactly_as_given_regardless_of_session(self) -> None:
+        """Task 4's dispatch must not change a single existing test's
+        behaviour: pinning any of the three is still the whole story."""
+        from murmly.installer import Installer
+
+        shortcuts = OwnerRegistry()
+        launcher = FakeLauncher()
+        installer = Installer(
+            service=FakeService(),
+            launcher=launcher,
+            shortcuts=shortcuts,
+            session=FakeSession(),
+            entrypoint_resolver=lambda: Path("/bin/murmly"),
+        )
+
+        self.assertIs(launcher, installer._launcher)
+        self.assertIs(shortcuts, installer._shortcuts)
+
+    def test_gnome_session_resolves_to_the_gnome_backend(self) -> None:
+        from murmly.desktop import GnomeShortcutLauncher, GnomeShortcuts, detect_desktop_session
+        from murmly.installer import Installer, SESSION_HOTKEY
+
+        session = detect_desktop_session(
+            {"XDG_CURRENT_DESKTOP": "GNOME", "XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"}
+        )
+        self.assertTrue(session.supported)  # the fixture actually exercises the GNOME branch
+        installer = Installer(service=FakeService(), session=session)
+
+        self.assertIsInstance(installer._shortcuts, GnomeShortcuts)
+        self.assertIsInstance(installer._launcher, GnomeShortcutLauncher)
+        self.assertIsInstance(installer._session_launcher, GnomeShortcutLauncher)
+        self.assertIs(installer._shortcuts, installer._launcher._shortcuts)
+        self.assertIs(installer._shortcuts, installer._session_launcher._shortcuts)
+        self.assertEqual(SESSION_HOTKEY, installer._session_launcher.purpose)
+
+    def test_plasma_session_still_resolves_to_the_plasma_backend(self) -> None:
+        from murmly.desktop import PlasmaShortcuts, detect_desktop_session
+        from murmly.installer import Installer, ShortcutLauncher
+
+        session = detect_desktop_session({"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"})
+        installer = Installer(service=FakeService(), session=session)
+
+        self.assertIsInstance(installer._shortcuts, PlasmaShortcuts)
+        self.assertIsInstance(installer._launcher, ShortcutLauncher)
+
+    def test_an_unsupported_desktop_also_resolves_to_the_plasma_shapes(self) -> None:
+        """Unchanged from before per-desktop selection existed: `install()`
+        never reaches these properties for an unsupported desktop (it checks
+        `session.supported` first), and `status()`/`uninstall()` on such a
+        desktop only ever read a launcher file that cannot exist there."""
+        from murmly.desktop import PlasmaShortcuts, detect_desktop_session
+        from murmly.installer import Installer, ShortcutLauncher
+
+        session = detect_desktop_session(
+            {"XDG_CURRENT_DESKTOP": "XFCE", "XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
+        )
+        installer = Installer(service=FakeService(), session=session)
+
+        self.assertIsInstance(installer._shortcuts, PlasmaShortcuts)
+        self.assertIsInstance(installer._launcher, ShortcutLauncher)
+
+    def test_the_backend_is_resolved_once_and_cached(self) -> None:
+        from murmly.desktop import DesktopSession, Desktop, OverlayBackend
+        from murmly.installer import Installer
+
+        base = DesktopSession(
+            is_plasma=False,
+            session_type="wayland",
+            backend=OverlayBackend.WAYLAND,
+            supported=True,
+            verified=False,
+            detail="GNOME on wayland.",
+            desktop=Desktop.GNOME,
+        )
+        installer = Installer(service=FakeService(), session=base)
+
+        first = installer._shortcuts
+        second = installer._shortcuts
+        third = installer._launcher
+
+        self.assertIs(first, second)
+        self.assertIs(first, third._shortcuts)

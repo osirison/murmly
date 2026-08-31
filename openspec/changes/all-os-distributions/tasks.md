@@ -24,38 +24,38 @@ shippable on their own. See `design.md` — Migration Plan.
 
 ## 3. Linux stops being Fedora
 
-- [ ] 3.1 Replace `_loaded_library_path`'s `/proc/self/maps` read (`src/murmly/tts.py:135`) with `dlinfo`, already in the lock as a transitive dependency, which answers the same question on every platform
-- [ ] 3.2 Make `_malloc_trim` (`src/murmly/idle.py:22-44`) report that the platform's allocator cannot be asked to return memory, rather than silently doing nothing, and surface that in the residency diagnostics
-- [ ] 3.3 Turn `SYSTEM_PYTHON` (`src/murmly/overlay.py:27`) into the interpreter the selected renderer needs, keeping `/usr/bin/python3` for the GTK4 renderer and its reason with it
+- [x] 3.1 Replace `_loaded_library_path`'s `/proc/self/maps` read (`src/murmly/tts.py:135`) with `dlinfo`, already in the lock as a transitive dependency, which answers the same question on every platform
+- [x] 3.2 Make `_malloc_trim` (`src/murmly/idle.py:22-44`) report that the platform's allocator cannot be asked to return memory, rather than silently doing nothing, and surface that in the residency diagnostics
+- [x] 3.3 Turn `SYSTEM_PYTHON` (`src/murmly/overlay.py:27`) into the interpreter the selected renderer needs, keeping `/usr/bin/python3` for the GTK4 renderer and its reason with it
 - [ ] 3.4 Detect the package manager — `dnf`, `apt`, `pacman`, `zypper`, `apk` — and name the packages for it, printing the list plainly where none is recognised, which is what the script already does without `dnf`
-- [ ] 3.5 Name `libportaudio2` or its equivalent among the Linux system packages: `sounddevice` bundles PortAudio on Windows and macOS but not on Linux
-- [ ] 3.6 Stop reading `/proc/driver/nvidia/version` to detect a GPU; ask through a mechanism that answers on every platform
-- [ ] 3.7 Keep the systemd unit's `After=pipewire.service wireplumber.service` ordering where systemd is the service manager, and stop treating it as something Murmly depends on elsewhere
+- [x] 3.5 Name `libportaudio2` or its equivalent among the Linux system packages: `sounddevice` bundles PortAudio on Windows and macOS but not on Linux
+- [x] 3.6 Stop reading `/proc/driver/nvidia/version` to detect a GPU; ask through a mechanism that answers on every platform
+- [x] 3.7 Keep the systemd unit's `After=pipewire.service wireplumber.service` ordering where systemd is the service manager, and stop treating it as something Murmly depends on elsewhere
 
 ## 4. GNOME hotkey registration
 
-- [ ] 4.1 Add a GNOME hotkey backend writing to `org.gnome.settings-daemon.plugins.media-keys` `custom-keybindings`, with `name`, `command` and `binding` on the per-binding relocatable schema
-- [ ] 4.2 Take the command runner and the `gsettings` binary name as constructor parameters, matching `PlasmaShortcuts(run_command=, busctl=)`, so it is testable without GNOME
-- [ ] 4.3 Read back the binding to verify it took effect, and confirm it applies without a logout — it is a live dconf value
-- [ ] 4.4 Determine whether another application already claims the key, and fail closed naming the owner where GNOME can report one
-- [ ] 4.5 Confine writes to the entries Murmly created: append to `custom-keybindings` and remove exactly what was appended, never rewriting the list wholesale
-- [ ] 4.6 Report a desktop Murmly cannot register on as this desktop's limitation rather than the platform's, and install everything else
+- [x] 4.1 Add a GNOME hotkey backend writing to `org.gnome.settings-daemon.plugins.media-keys` `custom-keybindings`, with `name`, `command` and `binding` on the per-binding relocatable schema
+- [x] 4.2 Take the command runner and the `gsettings` binary name as constructor parameters, matching `PlasmaShortcuts(run_command=, busctl=)`, so it is testable without GNOME
+- [x] 4.3 Read back the binding to verify it took effect, and confirm it applies without a logout — it is a live dconf value
+- [x] 4.4 Determine whether another application already claims the key, and fail closed naming the owner where GNOME can report one
+- [x] 4.5 Confine writes to the entries Murmly created: append to `custom-keybindings` and remove exactly what was appended, never rewriting the list wholesale
+- [x] 4.6 Report a desktop Murmly cannot register on as this desktop's limitation rather than the platform's, and install everything else
 
 ## 5. Hotkey parsing across platforms
 
-- [ ] 5.1 Split `hotkey.py` into one parse producing a platform-neutral hotkey, and one encoding per platform — Qt key codes stay as the KDE encoding rather than as the representation
-- [ ] 5.2 Accept each platform's own modifier names, including `Command` and `Cmd`, and normalise them so one specification means the same physical key everywhere
-- [ ] 5.3 Refuse a modifier the resolved platform does not have, naming it, rather than dropping or substituting it
-- [ ] 5.4 Persist which keys are bound and what each is for, where the platform registers them in Murmly's own process — the desktop holds no record there, so the daemon has to re-register them at every session start and `doctor` has to read them from somewhere
-- [ ] 5.5 Have `murmly install <hotkey>` reach a running daemon to rebind, since an in-process registration cannot be changed by writing a file the desktop reads; a daemon that is not running picks the new keys up from the record at 5.4 when it next starts
+- [x] 5.1 Split `hotkey.py` into one parse producing a platform-neutral hotkey, and one encoding per platform — Qt key codes stay as the KDE encoding rather than as the representation
+- [x] 5.2 Accept each platform's own modifier names, including `Command` and `Cmd`, and normalise them so one specification means the same physical key everywhere
+- [x] 5.3 Refuse a modifier the resolved platform does not have, naming it, rather than dropping or substituting it
+- [x] 5.4 Persist which keys are bound and what each is for, where the platform registers them in Murmly's own process — the desktop holds no record there, so the daemon has to re-register them at every session start and `doctor` has to read them from somewhere
+- [x] 5.5 Have `murmly install <hotkey>` reach a running daemon to rebind, since an in-process registration cannot be changed by writing a file the desktop reads; a daemon that is not running picks the new keys up from the record at 5.4 when it next starts
 
 ## 6. Diagnostics
 
-- [ ] 6.1 Add a `platform` section naming the resolved platform and, for each platform-dependent concern, the mechanism selected or the reason none was
-- [ ] 6.2 Distinguish a mechanism that does not exist on this platform from one that exists and could not be used — only the second is worth naming something to install for
-- [ ] 6.3 Widen `session` beyond `wayland` and `x11` so a non-Linux session is not misreported as one of them (`src/murmly/cli.py:463`)
-- [ ] 6.4 Report, for each permission the platform requires, whether it is granted, denied, or could not be determined, and never report a capability as available on the strength of the mechanism alone
-- [ ] 6.5 Keep every existing field name and shape, so a report from one platform has the same keys as a report from another
+- [x] 6.1 Add a `platform` section naming the resolved platform and, for each platform-dependent concern, the mechanism selected or the reason none was
+- [x] 6.2 Distinguish a mechanism that does not exist on this platform from one that exists and could not be used — only the second is worth naming something to install for
+- [x] 6.3 Widen `session` beyond `wayland` and `x11` so a non-Linux session is not misreported as one of them (`src/murmly/cli.py:463`)
+- [x] 6.4 Report, for each permission the platform requires, whether it is granted, denied, or could not be determined, and never report a capability as available on the strength of the mechanism alone
+- [x] 6.5 Keep every existing field name and shape, so a report from one platform has the same keys as a report from another
 
 ## 7. Windows: the command channel
 
@@ -163,16 +163,16 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 18.5 Test that the Linux configuration, data and runtime paths are byte-identical to what they are today, for every combination of `XDG_*` set and unset
 - [ ] 18.6 Test the Windows pipe's security descriptor by reading back its DACL and asserting it names only the creating user's SID — a second account is not available in CI
 - [ ] 18.7 Test that peer identity is read by the resolved platform's mechanism and that the same rule is applied to the result
-- [ ] 18.8 Test the GNOME backend against a fake command runner: binding written, read back, conflict refused, and removal taking out exactly what was added
-- [ ] 18.9 Test that one hotkey specification produces the same physical key on each platform's encoding, and that a modifier a platform does not have is refused by name
+- [x] 18.8 Test the GNOME backend against a fake command runner: binding written, read back, conflict refused, and removal taking out exactly what was added
+- [x] 18.9 Test that one hotkey specification produces the same physical key on each platform's encoding, and that a modifier a platform does not have is refused by name
 - [ ] 18.10 Test that a hotkey held in-process is reported as not held when the daemon is not running, and released when it stops
 - [ ] 18.11 Test that `SendInput` and `CGEventPost` are treated as unconfirmable: the transcript stays on the clipboard and the previous contents are not restored over it
 - [ ] 18.12 Test that an injection method whose permission is ungranted is reported as not permitted, distinctly from absent and from installed-but-unusable, and is not reported as available
-- [ ] 18.13 Test that a permission whose state cannot be read is reported as undetermined rather than granted
+- [x] 18.13 Test that a permission whose state cannot be read is reported as undetermined rather than granted
 - [ ] 18.14 Test that both overlay renderers handle the same protocol messages and present the same enumerated states, without a display
 - [ ] 18.15 Test that the overlay is not presented, and the missing property named, where the platform cannot give a surface that takes no focus and intercepts no pointer input
-- [ ] 18.16 Test that releasing a model reports system memory as not returned where the allocator cannot be asked, and still drops the model on schedule
-- [ ] 18.17 Test that the diagnostics report carries the same field names on every platform, with an unserviceable concern reported unavailable rather than absent
+- [x] 18.16 Test that releasing a model reports system memory as not returned where the allocator cannot be asked, and still drops the model on schedule
+- [x] 18.17 Test that the diagnostics report carries the same field names on every platform, with an unserviceable concern reported unavailable rather than absent
 - [ ] 18.18 Keep the runtime `self.skipTest(...)` pattern for anything needing a live session, extending it to skip on the wrong operating system, as `X11RuntimeIntegrationTests` already does for a missing display
 - [ ] 18.19 Add Windows and macOS CI runners running everything that does not need a session
 

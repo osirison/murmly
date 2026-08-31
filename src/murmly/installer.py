@@ -4,11 +4,21 @@ Two pieces of state, both owned by Murmly and both removable:
 
 * a systemd user unit anchored on ``graphical-session.target``, so the daemon
   runs for the lifetime of the graphical session rather than from boot, and
-* a launcher entry carrying ``X-KDE-Shortcuts``, which is how the hotkey is
-  registered.
+* the hotkey binding itself, on whichever mechanism the resolved desktop uses
+  -- a launcher entry carrying ``X-KDE-Shortcuts`` on KDE Plasma, an entry
+  Murmly appends to GNOME's ``custom-keybindings`` list on GNOME.
 
-Murmly writes nothing else. In particular it never edits the user's global
-shortcut configuration; see ``docs/agent-notes/plasma-global-shortcut-binding.md``.
+Murmly writes nothing else beyond the one entry each binding owns. In
+particular it never edits the user's global shortcut configuration wholesale;
+see ``docs/agent-notes/plasma-global-shortcut-binding.md`` and
+``docs/agent-notes/gnome-custom-keybindings.md``.
+
+``Installer`` decides which desktop's shapes to build only when the caller has
+not pinned them -- see `Installer._backend_for`. Everything below that names
+``PlasmaShortcuts``/``ShortcutLauncher`` by their KDE-specific names because
+that is what this module has always driven directly; GNOME's counterparts
+(`desktop.GnomeShortcuts`, `desktop.GnomeShortcutLauncher`) implement the same
+duck-typed surface and are driven through the very same code.
 """
 
 from __future__ import annotations
@@ -22,7 +32,8 @@ import subprocess
 import sys
 import time
 
-from murmly.desktop import PlasmaShortcuts
+from murmly.desktop import DesktopQueryError, PlasmaShortcuts
+from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
 from murmly.hotkey import Hotkey, HotkeyError, parse_hotkey
 from murmly.integrations import PasteInjection, select_paste_injection
 
@@ -542,7 +553,18 @@ class InstallOutcome:
 
 
 class Installer:
-    """Orchestrates the service and the hotkey as one operation."""
+    """Orchestrates the service and the hotkey as one operation.
+
+    Which hotkey backend `self._shortcuts`/`self._launcher`/`self._session_launcher`
+    resolve to is a desktop question, not something decided at construction:
+    a caller that pins any of the three (every existing test does, to run
+    against a fake) gets exactly what it pinned, unchanged from before this
+    class supported more than one desktop. A caller that pins none -- the real
+    `Installer()` `cli.py` constructs -- gets the backend `_backend_for`
+    selects from the session resolved when it is first needed, cached for the
+    rest of this instance's life so `install`, `uninstall` and `status` never
+    disagree about which desktop they are talking to.
+    """
 
     def __init__(
         self,
@@ -553,18 +575,19 @@ class Installer:
         entrypoint_resolver: Callable[[], Path] = resolve_entrypoint,
         injection_selector: Callable[[], PasteInjection] = select_paste_injection,
         session_launcher: ShortcutLauncher | None = None,
+        record_store: HotkeyRecordStore | None = None,
     ) -> None:
-        self._shortcuts = shortcuts if shortcuts is not None else PlasmaShortcuts()
+        self._pinned_shortcuts = shortcuts
+        self._pinned_launcher = launcher
+        self._pinned_session_launcher = session_launcher
+        self._backend: tuple[object, object, object] | None = None
         self._service = service if service is not None else UserService()
-        self._launcher = launcher if launcher is not None else ShortcutLauncher(self._shortcuts)
-        self._session_launcher = (
-            session_launcher
-            if session_launcher is not None
-            else ShortcutLauncher(self._shortcuts, purpose=SESSION_HOTKEY)
-        )
         self._session = session
         self._resolve_entrypoint = entrypoint_resolver
         self._select_injection = injection_selector
+        self._record_store = (
+            record_store if record_store is not None else HotkeyRecordStore(default_hotkey_record_path())
+        )
 
     def _current_session(self):
         if self._session is not None:
@@ -572,6 +595,70 @@ class Installer:
         from murmly.desktop import detect_desktop_session
 
         return detect_desktop_session()
+
+    def _resolve_backend(self, session=None) -> tuple[object, object, object]:
+        if self._backend is None:
+            if (
+                self._pinned_shortcuts is not None
+                or self._pinned_launcher is not None
+                or self._pinned_session_launcher is not None
+            ):
+                # At least partially pinned: resolve exactly as this class did
+                # before per-desktop selection existed, filling any unpinned
+                # slot with Plasma's shapes built on whichever `shortcuts`
+                # this run ended up with.
+                shortcuts = self._pinned_shortcuts if self._pinned_shortcuts is not None else PlasmaShortcuts()
+                launcher = (
+                    self._pinned_launcher if self._pinned_launcher is not None else ShortcutLauncher(shortcuts)
+                )
+                session_launcher = (
+                    self._pinned_session_launcher
+                    if self._pinned_session_launcher is not None
+                    else ShortcutLauncher(shortcuts, purpose=SESSION_HOTKEY)
+                )
+            else:
+                resolved_session = session if session is not None else self._current_session()
+                shortcuts, launcher, session_launcher = self._backend_for(resolved_session)
+            self._backend = (shortcuts, launcher, session_launcher)
+        return self._backend
+
+    @staticmethod
+    def _backend_for(session) -> tuple[object, object, object]:
+        """The (shortcuts, window launcher, session launcher) triple for the
+        desktop `session` names.
+
+        Every desktop besides GNOME -- including one Murmly does not register
+        hotkeys on at all -- gets Plasma's shapes, unchanged from what this
+        class always built: a desktop with no hotkey backend never reaches
+        this method, because `install()` checks `session.supported` before any
+        of the three properties are touched, and `status()`/`uninstall()` on
+        such a desktop only ever read a launcher file that cannot exist there.
+        """
+        from murmly.platform import Desktop
+
+        if getattr(session, "desktop", Desktop.OTHER) is Desktop.GNOME:
+            from murmly.desktop import GnomeShortcuts, GnomeShortcutLauncher
+
+            shortcuts = GnomeShortcuts()
+            return (
+                shortcuts,
+                GnomeShortcutLauncher(shortcuts, purpose=WINDOW_HOTKEY),
+                GnomeShortcutLauncher(shortcuts, purpose=SESSION_HOTKEY),
+            )
+        shortcuts = PlasmaShortcuts()
+        return shortcuts, ShortcutLauncher(shortcuts), ShortcutLauncher(shortcuts, purpose=SESSION_HOTKEY)
+
+    @property
+    def _shortcuts(self):
+        return self._resolve_backend()[0]
+
+    @property
+    def _launcher(self):
+        return self._resolve_backend()[1]
+
+    @property
+    def _session_launcher(self):
+        return self._resolve_backend()[2]
 
     def install(self, hotkey: Hotkey, session_hotkey: Hotkey | None = None) -> InstallOutcome:
         """Install the service and bind one or both hotkeys.
@@ -583,6 +670,11 @@ class Installer:
         """
         entrypoint = self._resolve_entrypoint()
         session = self._current_session()
+        # Seeded from the same session `install()` already resolved, so a run
+        # that reaches the properties below never resolves the desktop a
+        # second time and cannot disagree with the `session.supported` check
+        # just below.
+        self._resolve_backend(session)
         messages: list[str] = []
 
         # Before anything is written. Two Murmly bindings on one key cannot be
@@ -727,6 +819,8 @@ class Installer:
                 tuple(unconfirmed),
             )
 
+        self._write_hotkey_record()
+
         override = self._launcher.user_override()
         if override is not None and override != hotkey.portable:
             messages.append(
@@ -756,6 +850,31 @@ class Installer:
             user_override=override,
             messages=tuple(messages),
         )
+
+    def _write_hotkey_record(self) -> None:
+        """Persist which purposes are actually bound, for task 5.4's record.
+
+        Built from `declared_hotkey()` on both launchers -- the bound state --
+        rather than only the keys this run requested: an install naming one
+        purpose alone must not drop the other purpose's still-bound entry from
+        the record. Written unconditionally, on every platform: the record
+        costs nothing to keep where nothing reads it yet, and is exactly what
+        an in-process backend (Windows, section 8; macOS, section 13) needs
+        the day one exists. See `hotkey_record.py`.
+        """
+        bindings: dict[str, str] = {}
+        for launcher in (self._launcher, self._session_launcher):
+            declared = launcher.declared_hotkey()
+            if declared is not None:
+                bindings[self._purpose_of(launcher).key] = declared
+        try:
+            self._record_store.write(bindings)
+        except OSError as error:
+            # A hotkey is already bound and verified by this point -- the
+            # record is a convenience nothing on Linux reads yet, and must
+            # never be the reason an otherwise successful install reports
+            # failure. See `hotkey_record.py`'s own "must never raise" rule.
+            logger.warning("Could not write the hotkey record: %s", error)
 
     def _paste_injection_messages(self) -> tuple[str, ...]:
         """Say whether a transcript will reach the focused window.
@@ -864,12 +983,15 @@ class Installer:
 
         Only the launchers this run wrote. Removing both would delete a hotkey
         that was bound and working before the command started and that the
-        failure never touched.
+        failure never touched. Catches `DesktopQueryError` alongside
+        `InstallError`: GNOME's launcher raises the former for a gsettings
+        failure, where Plasma's raises the latter -- rollback must not let
+        either backend's own failure replace the error that triggered it.
         """
         for launcher in written:
             try:
                 launcher.unregister()
-            except InstallError:
+            except (InstallError, DesktopQueryError):
                 logger.warning("Could not remove a Murmly launcher during rollback.")
         if not service_existed:
             try:
@@ -884,11 +1006,14 @@ class Installer:
 
         # Each binding released on its own, so an installation carrying only
         # one of them succeeds and does not report the absent one as a failure.
+        # Catches `DesktopQueryError` alongside `InstallError` for the same
+        # reason `_rollback` does: GNOME's launcher can raise either, from the
+        # same gsettings call KDE's launcher has no equivalent of.
         hotkey_removed = False
         for launcher in (self._launcher, self._session_launcher):
             try:
                 hotkey_removed = launcher.unregister() or hotkey_removed
-            except InstallError as error:
+            except (InstallError, DesktopQueryError) as error:
                 hotkey_removed = True
                 problems.append(str(error))
 
@@ -897,6 +1022,14 @@ class Installer:
         except InstallError as error:
             service_removed = False
             problems.append(str(error))
+
+        try:
+            self._record_store.remove()
+        except OSError as error:
+            # Same rule as `_write_hotkey_record`: the record is not something
+            # any platform this change targets reads, so a failure to clear it
+            # must not turn an otherwise-successful uninstall into a failure.
+            problems.append(f"Could not clear the hotkey record: {error}")
 
         if service_removed:
             messages.append("Removed the Murmly service.")

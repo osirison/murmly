@@ -26,7 +26,21 @@ MIN_ERROR_DURATION_MS = 100
 MAX_ERROR_DURATION_MS = 10_000
 MAX_PARTIAL_CHARS = 200
 PARTIAL_MESSAGE_PREFIX = b'{"type":"partial"'
-SYSTEM_PYTHON = Path("/usr/bin/python3")
+#: PyGObject and GTK4 are distribution packages, not wheels -- there is no
+#: `pip install pygobject` that works the way `pip install PySide6` does -- so
+#: the renderer that imports them has to run under the interpreter those
+#: packages were actually installed into, which is the system one, not
+#: whatever interpreter Murmly's own daemon happens to be running under (a
+#: `uv`-managed virtualenv on every machine this ships to today). A renderer
+#: added later for a platform whose toolkit *is* a wheel (see
+#: `renderer_python` below) is not bound by this and should run under the
+#: project's own interpreter instead.
+GTK4_RENDERER_PYTHON = Path("/usr/bin/python3")
+#: Kept as an alias -- not a second name for a second thing -- because nothing
+#: today has more than one renderer, and every caller that predates
+#: `renderer_python` still reads plainly as "the interpreter the overlay
+#: renderer needs".
+SYSTEM_PYTHON = GTK4_RENDERER_PYTHON
 COMMON_RENDERER_ENVIRONMENT_KEYS = {
     "DBUS_SESSION_BUS_ADDRESS",
     "DESKTOP_SESSION",
@@ -51,6 +65,20 @@ class OverlayState(StrEnum):
 class OverlayBackend(StrEnum):
     X11 = "x11"
     WAYLAND = "wayland"
+
+
+def renderer_python(backend: OverlayBackend) -> Path:
+    """The interpreter the renderer chosen for `backend` needs to run under.
+
+    Asked per backend rather than read off one constant, because the two
+    backends today share one answer for the same reason -- both launch the
+    GTK4 renderer, only the display protocol underneath it differs -- and that
+    stops being true the day a renderer with no distribution-package
+    dependency exists for some other platform. This is the seam that renderer
+    will hang its own answer on without every existing call site changing.
+    """
+    del backend  # every backend today is the GTK4 renderer
+    return GTK4_RENDERER_PYTHON
 
 
 class LevelSink(Protocol):
@@ -366,7 +394,7 @@ class OverlayController:
         try:
             parent_transport, child_transport = self._socket_pair_factory()
             command = [
-                str(SYSTEM_PYTHON),
+                str(renderer_python(self._backend)),
                 str(self._helper_path),
                 "--fd",
                 str(child_transport.fileno()),

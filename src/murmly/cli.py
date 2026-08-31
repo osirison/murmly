@@ -23,6 +23,7 @@ from murmly.audio import (
 )
 from murmly.config import MurmlyConfig, default_config_path, load_config
 from murmly.daemon import (
+    COMMAND_REBIND_HOTKEYS,
     COMMAND_STATUS,
     DaemonNotRespondingError,
     DaemonStartupError,
@@ -47,10 +48,21 @@ from murmly.integrations import (
     select_paste_injection,
 )
 from murmly.focus import FocusObserver, create_focus_observer, record_target, should_deliver
-from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend, renderer_environment
+from murmly.idle import system_memory_returnable, system_memory_unreturnable_reason
+from murmly.overlay import (
+    SYSTEM_PYTHON,
+    detect_overlay_backend,
+    renderer_environment,
+    renderer_python,
+)
 from murmly.platform import (
+    BACKEND_REGISTRIES,
+    PERMISSIONS,
+    PermissionState,
     PlatformProfile,
     SUPPORTED_OPERATING_SYSTEMS,
+    OperatingSystem,
+    hotkey_mechanism_is_in_process,
     resolve_platform,
     transcription_runtime_gap,
     runtime_gaps_for,
@@ -257,13 +269,13 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         # subcommand with a hyphen and the wire protocol does not.
         return _run_client_command(config, DAEMON_COMMANDS.get(args.command, args.command))
     if args.command == "install":
-        return _run_install(args.hotkey, args.session_hotkey)
+        return _run_install(args.hotkey, args.session_hotkey, profile=profile, config=config)
     if args.command == "uninstall":
         return _run_uninstall()
     if args.command == "spike":
         return _run_spike(config, args.seconds, args.paste)
     if args.command == "doctor":
-        _run_doctor(config)
+        _run_doctor(config, profile)
         return 0
     parser.error(f"Unsupported command: {args.command}")
     return 2
@@ -355,7 +367,12 @@ def _wait_for_socket(
         sleep(DAEMON_POLL_INTERVAL_SECONDS)
 
 
-def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> int:
+def _run_install(
+    hotkey_text: str,
+    session_hotkey_text: str | None = None,
+    profile: PlatformProfile | None = None,
+    config: MurmlyConfig | None = None,
+) -> int:
     try:
         hotkey = parse_hotkey(hotkey_text)
         session_hotkey = parse_hotkey(session_hotkey_text) if session_hotkey_text else None
@@ -384,7 +401,34 @@ def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> in
 
     for message in outcome.messages:
         print(message)
+
+    if outcome.hotkey_registered:
+        _request_hotkey_rebind(profile, config)
     return 0
+
+
+def _request_hotkey_rebind(
+    profile: PlatformProfile | None = None,
+    config: MurmlyConfig | None = None,
+) -> None:
+    """Task 5.5: reach a running daemon to rebind, since an in-process
+    registration cannot be changed by writing a file the desktop reads.
+
+    A no-op on every platform this change targets: `Installer.install` already
+    wrote the record `hotkey_record.py` reads, and `hotkey_mechanism_is_in_process`
+    is false for both `plasma` and `gnome`, so nothing is sent. Best-effort
+    where it is not a no-op: a daemon that is not running picks the new keys up
+    from the record when it next starts, so a failure to reach one now is not
+    reported as an install failure.
+    """
+    resolved_profile = profile if profile is not None else resolve_platform()
+    if not hotkey_mechanism_is_in_process(resolved_profile):
+        return
+    resolved_config = config if config is not None else load_config(default_config_path())
+    try:
+        send_command(str(resolved_config.socket_path), COMMAND_REBIND_HOTKEYS)
+    except (OSError, DaemonNotRespondingError) as error:
+        logger.debug("Could not reach the running daemon to rebind hotkeys: %s", error)
 
 
 def _run_uninstall() -> int:
@@ -494,7 +538,15 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
     return 0
 
 
-def _run_doctor(config: MurmlyConfig) -> None:
+def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) -> None:
+    # Resolved once, like `_dispatch` resolves it once for every other command
+    # (task 1.3): a second `resolve_platform()` call here could in principle
+    # read a different environment than the one that decided everything else
+    # this process did. `profile` still defaults so the existing call sites --
+    # this module's own tests among them -- do not have to supply one just to
+    # exercise the machine they already run on.
+    resolved_profile = profile if profile is not None else resolve_platform()
+
     # Asked first, before any section runs and long before the report is
     # assembled. `live_transcription_diagnostics` below loads the model when live
     # transcription is enabled, and the speech probe opens the output device;
@@ -533,7 +585,17 @@ def _run_doctor(config: MurmlyConfig) -> None:
 
     session_detail: str | None = None
     try:
-        session: str | None = "wayland" if is_wayland_session() else "x11"
+        # Unchanged on Linux: `is_wayland_session()`'s own precedence still
+        # decides between the two values this field has always reported.
+        # Off Linux there is no wayland/x11 distinction to make -- Windows and
+        # macOS sessions are not display protocols in that sense -- so the
+        # field names the operating system itself rather than misreporting a
+        # non-Linux session as one of the two Linux values (task 6.3; this is
+        # the field the proposal's BREAKING note names).
+        if resolved_profile.operating_system is OperatingSystem.LINUX:
+            session: str | None = "wayland" if is_wayland_session() else "x11"
+        else:
+            session = resolved_profile.operating_system.value
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         session = None
         session_detail = f"Unable to determine the session type: {error}"
@@ -568,6 +630,7 @@ def _run_doctor(config: MurmlyConfig) -> None:
         "config_path": str(config.config_path),
         "socket_path": str(config.socket_path),
         "command_socket": command_socket_diagnostics(config),
+        "platform": platform_diagnostics(resolved_profile),
         "session": session,
         "clipboard_command": clipboard_command,
         "paste_injection": injection_report,
@@ -585,6 +648,10 @@ def _run_doctor(config: MurmlyConfig) -> None:
         # a reader who cannot see the value cannot tell a model that will never
         # be released from one this report forgot to mention.
         "unload_after_idle_s": config.unload_after_idle_s,
+        # One answer for both models: they share a process and an allocator, so
+        # whether a release's freed memory reaches the system is the same fact
+        # for the transcription model and the synthesis session alike.
+        "system_memory_returnable": system_memory_returnable(),
         "live_transcription": live_transcription_diagnostics(config),
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
@@ -597,6 +664,8 @@ def _run_doctor(config: MurmlyConfig) -> None:
         report["runtime_detail"] = runtime_detail
     if model_resident_detail is not None:
         report["model_resident_detail"] = model_resident_detail
+    if not report["system_memory_returnable"]:
+        report["system_memory_returnable_detail"] = system_memory_unreturnable_reason()
     if model_cache_detail is not None:
         report["model_cache_detail"] = model_cache_detail
     print(json.dumps(report, indent=2))
@@ -621,6 +690,77 @@ def transcription_model_cache_path() -> tuple[str | None, str | None]:
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         return None, f"Unable to determine the transcription model cache: {error}"
     return HF_HUB_CACHE, None
+
+
+def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
+    """The `platform` section of `murmly doctor` (task 6.1).
+
+    Names the resolved platform, and for each of the eight platform-dependent
+    concerns in `BACKEND_REGISTRIES`, the mechanism it selected or the reason
+    none was. `BackendChoice.remedy` is what decides whether an unavailable
+    concern's report may say what to install: empty renders as "the platform
+    offers none", non-empty as what to install, enable, or grant -- the
+    distinction is read off that field, never re-derived by inspecting
+    `reason`'s wording (see `BackendChoice`'s docstring).
+
+    Every concern is a key in the returned `concerns` mapping on every
+    platform, present whether or not this platform can serve it, which is what
+    keeps this section's shape identical everywhere (task 6.5, 18.17): a
+    concern this platform cannot serve is `available: False` with a reason,
+    never a key the report omits.
+
+    A concern whose mechanism is gated behind a permission (none are, yet --
+    see `PERMISSIONS`) must AND that permission's state into its own
+    `available` once one exists: a present mechanism whose permission is
+    denied is not an available concern, and deriving `available` from
+    `BackendChoice.available` alone, as this does today, would report it as
+    one. Nothing in `BACKEND_REGISTRIES` is permission-gated yet, so that rule
+    has no case to apply to here.
+    """
+    concerns: dict[str, object] = {}
+    for concern, registry in BACKEND_REGISTRIES.items():
+        choice = registry.select(profile)
+        concern_report: dict[str, object] = {
+            "mechanism": choice.mechanism,
+            "available": choice.available,
+        }
+        if not choice.available:
+            concern_report["reason"] = choice.reason
+            concern_report["remedy"] = list(choice.remedy)
+        concerns[concern] = concern_report
+
+    permissions: dict[str, object] = {}
+    for name, permission in PERMISSIONS.items():
+        try:
+            state = permission.check(profile)
+        except Exception as error:  # noqa: BLE001 - a permission check must not raise
+            # Coerced to undetermined rather than propagated: a check that
+            # fails to run is exactly as uninformative about the grant as a
+            # platform that offers no way to read it, and the spec forbids
+            # reporting either as granted.
+            state = PermissionState.UNDETERMINED
+            permissions[name] = {
+                "capability": permission.capability,
+                "state": state.value,
+                "grant_location": permission.grant_location,
+                "detail": f"Unable to determine whether {name} is granted: {error}",
+            }
+            continue
+        permissions[name] = {
+            "capability": permission.capability,
+            "state": state.value,
+            "grant_location": permission.grant_location,
+        }
+
+    return {
+        "operating_system": profile.operating_system.value,
+        "supported": profile.supported,
+        "architecture": profile.architecture,
+        "libc": profile.libc,
+        "desktop": profile.desktop.value,
+        "concerns": concerns,
+        "permissions": permissions,
+    }
 
 
 def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
@@ -1152,7 +1292,11 @@ def overlay_diagnostics(
         "session": session,
         "backend": backend.value if backend is not None else None,
         "supported_session": supported_session,
-        "system_python": str(SYSTEM_PYTHON),
+        # Backend-specific once there is a second renderer to disagree with
+        # this: no backend has been selected yet where `backend` is None, so
+        # this reports the interpreter Linux's own renderer needs, same as it
+        # always has.
+        "system_python": str(renderer_python(backend) if backend is not None else SYSTEM_PYTHON),
         "pygobject": False,
         "gtk4": None,
         "gdk_x11": False,
@@ -1168,7 +1312,7 @@ def overlay_diagnostics(
         return report
     try:
         result = run_command(
-            [str(SYSTEM_PYTHON), str(renderer_path), "--check", "--backend", backend.value],
+            [str(renderer_python(backend)), str(renderer_path), "--check", "--backend", backend.value],
             capture_output=True,
             text=True,
             check=False,

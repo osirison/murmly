@@ -7,6 +7,7 @@ import time
 import unittest
 
 from murmly.overlay import (
+    GTK4_RENDERER_PYTHON,
     MAX_MESSAGE_BYTES,
     MAX_PARTIAL_CHARS,
     NullOverlayController,
@@ -17,7 +18,24 @@ from murmly.overlay import (
     detect_overlay_backend,
     encode_overlay_message,
     renderer_environment,
+    renderer_python,
 )
+
+
+class RendererPythonTests(unittest.TestCase):
+    """Task 3.3: the interpreter turns on the renderer, not a bare constant."""
+
+    def test_every_backend_today_needs_the_gtk4_renderers_interpreter(self) -> None:
+        # Both backends launch the same GTK4-based renderer; only the display
+        # protocol underneath it differs, so both answer the same interpreter.
+        self.assertEqual(GTK4_RENDERER_PYTHON, renderer_python(OverlayBackend.X11))
+        self.assertEqual(GTK4_RENDERER_PYTHON, renderer_python(OverlayBackend.WAYLAND))
+
+    def test_the_gtk4_interpreter_is_the_system_ones_not_the_projects_own(self) -> None:
+        # PyGObject and GTK4 are distribution packages, not wheels: they exist
+        # only inside the system interpreter, and `sys.executable` -- Murmly's
+        # own, `uv`-managed -- has never had them.
+        self.assertEqual(Path("/usr/bin/python3"), GTK4_RENDERER_PYTHON)
 
 
 class FakeSocket:

@@ -23,6 +23,7 @@ from murmly.focus import (
     record_target,
     should_deliver,
 )
+from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path, rebind_from_record
 from murmly.idle import IdleRelease
 from murmly.integrations import ClipboardPaster
 from murmly.overlay import (
@@ -66,6 +67,11 @@ COMMAND_SPEECH_SESSION = "speech_session"
 COMMAND_TOGGLE = "toggle"
 COMMAND_TOGGLE_SESSION = "toggle_session"
 COMMAND_STATUS = "status"
+#: Task 5.5: what `murmly install` reaches a running daemon for, since an
+#: in-process hotkey registration cannot be changed by writing a file the
+#: desktop reads. See `hotkey_record.py` -- a no-op reply on every platform
+#: this change targets, since neither Plasma nor GNOME registers in-process.
+COMMAND_REBIND_HOTKEYS = "rebind_hotkeys"
 # A speech session's own bound. `MAX_COMMAND_BYTES` stays 4096 for every
 # existing command: a sender streaming a reply carries paragraphs, and a state
 # query does not.
@@ -955,6 +961,14 @@ class MurmlyDaemon:
         # Shutdown answers a command that outlives the drain, so the claim is what
         # keeps it and the worker from both writing to the same connection.
         self._claimed: set[socket.socket] = set()
+        # Task 5.4/5.5's design boundary: whatever object holds an in-process
+        # hotkey registration, if this platform's mechanism is one -- `None`
+        # on every platform today, since neither Plasma's launcher file nor
+        # GNOME's dconf value registers here. Windows' `RegisterHotKey`
+        # (section 8) and macOS's Carbon `RegisterEventHotKey` (section 13)
+        # are the intended populators, each creating its registrar at startup
+        # and assigning it here before `_rebind_hotkeys` is first called.
+        self._hotkey_registrar: object | None = None
 
     @property
     def state(self) -> str:
@@ -1019,6 +1033,14 @@ class MurmlyDaemon:
                             f"Refusing to serve at {self._config.socket_path}. Its socket "
                             f"could not be created: {error}."
                         ) from error
+                    # Task 5.4: re-registers every recorded hotkey on a platform
+                    # whose mechanism lives in this process -- a no-op today on
+                    # every platform, since neither backend registers here. A
+                    # rebind failure must never keep the command channel from
+                    # coming up, which is why this call cannot raise (see
+                    # `_rebind_hotkeys`) and why it runs after the channel is
+                    # already listening, not before.
+                    logger.debug("Hotkey rebind at startup: %s", self._rebind_hotkeys())
                     server.settimeout(0.2)
                     while not self._shutdown.is_set():
                         try:
@@ -1731,7 +1753,26 @@ class MurmlyDaemon:
             )
         return residency
 
+    def _rebind_hotkeys(self) -> str:
+        """Re-register every recorded hotkey, where this platform needs it.
+
+        Never raises: called both from a command a sender is waiting on and
+        from the daemon's own startup, and a hotkey rebind failing must not be
+        why either one stops answering.
+        """
+        try:
+            from murmly.platform import resolve_platform
+
+            profile = resolve_platform()
+            record = HotkeyRecordStore(default_hotkey_record_path())
+            return rebind_from_record(profile, record, self._hotkey_registrar)
+        except Exception as error:  # noqa: BLE001 - see docstring
+            logger.warning("Hotkey rebind failed: %s", error)
+            return f"Hotkey rebind failed: {error}"
+
     def handle_command(self, command: str) -> dict[str, object]:
+        if command == COMMAND_REBIND_HOTKEYS:
+            return {"ok": True, "detail": self._rebind_hotkeys()}
         if command == COMMAND_STATUS:
             # Residency travels with the state rather than under a command of
             # its own. `status` already means "what is the daemon doing right

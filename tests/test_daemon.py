@@ -2152,6 +2152,79 @@ class FailureCodeTests(unittest.TestCase):
             self.assertNotIn("code", response)
 
 
+class RebindHotkeysCommandTests(unittest.TestCase):
+    """Task 5.5: `rebind_hotkeys` is what `murmly install` reaches a running
+    daemon for. On every platform this change targets it is a reported no-op,
+    since neither Plasma nor GNOME registers a hotkey in this process."""
+
+    def _daemon(self, temp_dir: str) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+        )
+        return MurmlyDaemon(config, session=DummySession())
+
+    def test_reports_the_desktop_holds_the_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response = self._daemon(temp_dir).handle_command("rebind_hotkeys")
+
+        self.assertTrue(response["ok"])
+        self.assertIn("held by the desktop", response["detail"])
+
+    def test_never_raises_even_if_resolving_the_platform_explodes(self) -> None:
+        """A hotkey rebind failing must never be why a command -- or, at
+        startup, the whole daemon -- stops answering."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir)
+
+            with patch("murmly.platform.resolve_platform", side_effect=RuntimeError("boom")):
+                response = daemon.handle_command("rebind_hotkeys")
+
+        self.assertTrue(response["ok"])
+        self.assertIn("Hotkey rebind failed", response["detail"])
+
+    def test_a_default_daemon_holds_no_in_process_registrar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir)
+
+        self.assertIsNone(daemon._hotkey_registrar)
+
+
+class RebindAtStartupTests(unittest.TestCase):
+    def test_startup_calls_rebind_once_before_the_daemon_serves_a_command(self) -> None:
+        """Exercises the actual `serve_forever` startup path, not just the
+        command handler -- a daemon that never receives `rebind_hotkeys` still
+        rebinds once, on its own, right after its command channel comes up.
+
+        Patched before the thread starts, so there is no race with
+        `serve_forever`'s own call to it: whichever runs first, the count
+        settles at exactly one once the socket answers a real command.
+        """
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir.name) / "murmly.sock",
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+        daemon = MurmlyDaemon(config, session=DummySession())
+        calls: list[bool] = []
+        original = daemon._rebind_hotkeys
+        daemon._rebind_hotkeys = lambda: (calls.append(True), original())[1]
+
+        thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(daemon.shutdown)
+
+        deadline = time.time() + 3
+        while not calls and time.time() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(1, len(calls))
+
+
 class RequestShapeTests(ServedDaemonTests):
     def test_a_payload_that_is_not_an_object_is_answered(self) -> None:
         _daemon, socket_path = self.serve()

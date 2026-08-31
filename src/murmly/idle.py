@@ -19,22 +19,41 @@ import threading
 logger = logging.getLogger(__name__)
 
 
+#: Why `_MALLOC_TRIM` is None, for a platform that has no way to answer the
+#: question `system_memory_returnable()` exists to ask. Set alongside it, by
+#: `_malloc_trim()`, so the two can never disagree about which is true.
+_SYSTEM_MEMORY_UNRETURNABLE_REASON: str | None = None
+
+
 def _malloc_trim():
     """glibc's `malloc_trim`, or None where the libc in use has no such call.
 
-    Looked up once. A build against musl, or anything else without it, gets None
-    and the release simply stops after freeing, which is all it could do there
-    anyway.
+    Looked up once, into `_MALLOC_TRIM` below, alongside the reason recorded
+    into `_SYSTEM_MEMORY_UNRETURNABLE_REASON` when the answer is None -- a build
+    against musl, or anything else without it, and the release simply stops
+    after freeing, which is all it could do there anyway. That reason is what
+    `return_free_heap` used to leave unsaid: it tried nothing and reported
+    nothing, so a person who set an idle period to get memory back had no way
+    to learn the platform never gave any back at all.
     """
+    global _SYSTEM_MEMORY_UNRETURNABLE_REASON
     name = ctypes.util.find_library("c")
     if name is None:
+        _SYSTEM_MEMORY_UNRETURNABLE_REASON = "No C library could be located on this platform."
         return None
     try:
         libc = ctypes.CDLL(name)
-    except OSError:
+    except OSError as error:
+        _SYSTEM_MEMORY_UNRETURNABLE_REASON = f"The C library ({name}) could not be loaded: {error}"
         return None
     trim = getattr(libc, "malloc_trim", None)
     if trim is None:
+        _SYSTEM_MEMORY_UNRETURNABLE_REASON = (
+            f"The C library in use ({name}) has no malloc_trim. This is glibc's own "
+            "extension for returning freed heap memory to the system; musl and "
+            "other C libraries provide no equivalent, so freed memory stays in "
+            "this process's own allocator rather than reaching the system."
+        )
         return None
     trim.argtypes = [ctypes.c_size_t]
     trim.restype = ctypes.c_int
@@ -44,7 +63,31 @@ def _malloc_trim():
 _MALLOC_TRIM = _malloc_trim()
 
 
-def return_free_heap() -> None:
+def system_memory_returnable() -> bool:
+    """Whether this platform's allocator can be asked to return freed memory.
+
+    Static for the life of the process -- it depends only on which C library
+    this interpreter is linked against, resolved once above alongside
+    `_MALLOC_TRIM`. Read by `murmly doctor` and by the daemon's own residency
+    diagnostics, neither of which should have to know `_MALLOC_TRIM` exists to
+    ask the same question.
+    """
+    return _MALLOC_TRIM is not None
+
+
+def system_memory_unreturnable_reason() -> str | None:
+    """Why `system_memory_returnable()` is False, or None where it is True.
+
+    A function rather than the module constant itself, so a caller that
+    imports it by name (as `murmly.cli` does with everything else from this
+    package) gets the current answer through the call rather than a copy of
+    whatever `_SYSTEM_MEMORY_UNRETURNABLE_REASON` held at import time -- the
+    same reason `return_free_heap` is a function and not a cached bool.
+    """
+    return _SYSTEM_MEMORY_UNRETURNABLE_REASON
+
+
+def return_free_heap() -> bool:
     """Hand what a release just freed back to the operating system.
 
     Dropping a model frees its host allocations into glibc's arenas, which is
@@ -64,16 +107,25 @@ def return_free_heap() -> None:
     Called after the model's own lock has been dropped. It walks the arenas,
     which is not free, and no caller should wait behind it holding a lock a
     transcription needs.
+
+    Returns whether the platform's allocator could be asked at all -- not
+    whether the call found anything to hand back, which `malloc_trim`'s own
+    return value describes and this has never surfaced. A platform that cannot
+    be asked still gets the model dropped above and `gc.collect()` run here;
+    what it does not get is memory reaching the system, and this is how the
+    caller learns that happened so it can say so rather than stay silent.
     """
     gc.collect()
     if _MALLOC_TRIM is None:
-        return
+        return False
     try:
         _MALLOC_TRIM(0)
     except Exception as error:  # noqa: BLE001 - a failed trim is not a failed release
         # The memory was freed either way. Reporting this as a release failure
         # would say the model is still resident when it is not.
         logger.debug("Trimming the heap after a release failed: %s", error)
+        return False
+    return True
 
 
 class IdleRelease:

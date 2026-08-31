@@ -323,6 +323,53 @@ class AvailabilityTests(unittest.TestCase):
         self.assertTrue(synthesizer.available)
         self.assertIsNone(synthesizer.unavailable_reason)
 
+    def test_the_loaded_library_path_comes_from_dlinfo_not_proc_self_maps(self) -> None:
+        """The replacement for the `/proc/self/maps` read task 3.1 removed.
+
+        Asserted against a fake `DLInfo` whose answer disagrees with the plain
+        soname, so a `library_path == soname` pass could not happen by
+        accident -- it would only happen if `dlinfo` were consulted and
+        returned this exact, distinguishable value.
+        """
+        fake_handle = object()
+
+        class FakeDLInfo:
+            def __init__(self, handle: object) -> None:
+                self.handle = handle
+
+            @property
+            def path(self) -> str:
+                assert self.handle is fake_handle
+                return "/run/loader-resolved/libespeak-ng.so.1"
+
+        with (
+            patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
+            patch("ctypes.CDLL", return_value=fake_handle),
+            patch("dlinfo.DLInfo", FakeDLInfo),
+            patch(
+                "murmly.tts._espeak_data_path", return_value="/usr/share/espeak-ng-data"
+            ),
+        ):
+            library_path, data_path = resolve_espeak()
+
+        self.assertEqual("/run/loader-resolved/libespeak-ng.so.1", library_path)
+        self.assertEqual("/usr/share/espeak-ng-data", data_path)
+
+    def test_dlinfo_failing_falls_back_to_the_bare_soname(self) -> None:
+        """Cosmetic-only: a loader that will not answer costs a nicer path, not a refusal."""
+        with (
+            patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
+            patch("ctypes.CDLL", return_value=object()),
+            patch("dlinfo.DLInfo", side_effect=RuntimeError("dlinfo failed")),
+            patch(
+                "murmly.tts._espeak_data_path", return_value="/usr/share/espeak-ng-data"
+            ),
+        ):
+            library_path, data_path = resolve_espeak()
+
+        self.assertEqual("libespeak-ng.so.1", library_path)
+        self.assertEqual("/usr/share/espeak-ng-data", data_path)
+
 
 class AvailabilityNowTests(unittest.TestCase):
     """The startup answer goes stale; this is the one asked at the declaration."""
@@ -921,6 +968,29 @@ class SynthesisResidencyTests(unittest.TestCase):
 
         trim.assert_called_once_with()
         self.assertEqual([False], held, "the heap was trimmed while a lock was held")
+
+    def test_a_release_still_drops_the_session_where_the_allocator_cannot_be_asked(
+        self,
+    ) -> None:
+        """18.16: the model-residency spec's own scenario, against a real holder.
+
+        `return_free_heap` is not mocked here, so this goes through the real
+        function down to `_MALLOC_TRIM` -- patched to None to stand in for a
+        platform whose allocator offers no way to return freed memory -- and
+        proves the two halves of the requirement together: the session is
+        still dropped on schedule, and the platform still (correctly) reports
+        that it cannot return system memory, rather than the release silently
+        claiming success on both counts.
+        """
+        from murmly import idle
+
+        synthesizer = self._synthesizer()
+
+        with patch.object(idle, "_MALLOC_TRIM", None):
+            self.assertFalse(idle.system_memory_returnable())
+            self.assertTrue(synthesizer.release())
+
+        self.assertFalse(synthesizer.resident)
 
     def test_a_release_that_frees_nothing_does_not_trim(self) -> None:
         """An idle timer firing against an already released session walks no arenas."""

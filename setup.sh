@@ -119,7 +119,13 @@ murmly() { uv run --no-sync --project "$REPO" murmly "$@"; }
 installed_package() { uv pip show --project "$REPO" "$1" >/dev/null 2>&1; }
 
 has_nvidia_driver() {
-    [ -e /proc/driver/nvidia/version ] || have nvidia-smi
+    # Task 3.6: /proc/driver/nvidia/version is Linux-only by construction, and
+    # this script's install-time detection has to answer the same question
+    # `murmly.packages.has_nvidia_gpu` does elsewhere -- nvidia-smi on PATH,
+    # which the NVIDIA installer places there on every platform it ships for.
+    # A machine with the kernel driver but not the package that ships the
+    # tool now answers the same way `have nvidia-smi` alone always would.
+    have nvidia-smi
 }
 
 is_wayland() { [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; }
@@ -146,7 +152,11 @@ require_uv() {
 # Murmly reports a missing one through `murmly doctor` and carries on without
 # the feature it serves, so a machine that cannot install them still works.
 wanted_system_packages() {
-    local -a packages=(gtk4 python3-gobject libX11 libXext)
+    # portaudio: `sounddevice` bundles PortAudio into its own wheel on Windows
+    # and macOS, but not on Linux, so it is the one package here nothing else
+    # in the dependency tree pulls in. Confirmed present under this name in
+    # docs/agent-notes/portaudio-jack-exit-abort.md.
+    local -a packages=(gtk4 python3-gobject libX11 libXext portaudio)
 
     if is_wayland; then
         packages+=(wl-clipboard)
