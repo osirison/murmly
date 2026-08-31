@@ -15,16 +15,24 @@ import unittest
 from murmly.hotkey import (
     HotkeyError,
     HotkeySpec,
+    MACOS_CMD_KEY,
+    MACOS_CONTROL_KEY,
+    MACOS_OPTION_KEY,
+    MACOS_SHIFT_KEY,
     WINDOWS_MOD_ALT,
     WINDOWS_MOD_CONTROL,
     WINDOWS_MOD_SHIFT,
     WINDOWS_MOD_WIN,
+    _MACOS_LETTER_DIGIT_KEYS,
+    _MACOS_MAX_FUNCTION_KEY,
     decode_kde_keycode,
     encode_for_gnome,
     encode_for_kde,
+    encode_for_macos,
     encode_for_windows,
     gnome_accelerator,
     gnome_accelerator_for_keycode,
+    macos_hotkey_for_portable,
     parse_gnome_accelerator,
     parse_specification,
     windows_hotkey_for_portable,
@@ -42,6 +50,9 @@ class SamePhysicalKeyTests(unittest.TestCase):
         windows = encode_for_windows(spec)
         self.assertEqual(WINDOWS_MOD_WIN | WINDOWS_MOD_SHIFT, windows.modifiers)
         self.assertEqual(ord("X"), windows.vk)
+        macos = encode_for_macos(spec)
+        self.assertEqual(MACOS_CMD_KEY | MACOS_SHIFT_KEY, macos.modifiers)
+        self.assertEqual(0x07, macos.key_code)  # kVK_ANSI_X
 
     def test_digit(self) -> None:
         spec = parse_specification("Ctrl+7")
@@ -51,6 +62,9 @@ class SamePhysicalKeyTests(unittest.TestCase):
         windows = encode_for_windows(spec)
         self.assertEqual(WINDOWS_MOD_CONTROL, windows.modifiers)
         self.assertEqual(ord("7"), windows.vk)
+        macos = encode_for_macos(spec)
+        self.assertEqual(MACOS_CONTROL_KEY, macos.modifiers)
+        self.assertEqual(0x1A, macos.key_code)  # kVK_ANSI_7
 
     def test_function_key(self) -> None:
         # Verified live as Ctrl+F9 -> 83886136 (see tests/test_hotkey.py).
@@ -60,6 +74,7 @@ class SamePhysicalKeyTests(unittest.TestCase):
         self.assertEqual("<Control>F9", encode_for_gnome(spec))
         # VK_F1 is 0x70; VK_F9 is eight past it.
         self.assertEqual(0x70 + 8, encode_for_windows(spec).vk)
+        self.assertEqual(0x65, encode_for_macos(spec).key_code)  # kVK_F9
 
     def test_named_key(self) -> None:
         spec = parse_specification("Meta+Volume Mute")
@@ -67,6 +82,7 @@ class SamePhysicalKeyTests(unittest.TestCase):
         self.assertEqual("Meta+Volume Mute", encode_for_kde(spec).portable)
         self.assertEqual("<Super>XF86AudioMute", encode_for_gnome(spec))
         self.assertEqual(0xAD, encode_for_windows(spec).vk)
+        self.assertEqual(0x4A, encode_for_macos(spec).key_code)  # kVK_Mute
 
     def test_all_four_shared_modifiers_combine(self) -> None:
         spec = parse_specification("Shift+Alt+Ctrl+Meta+X")
@@ -74,6 +90,7 @@ class SamePhysicalKeyTests(unittest.TestCase):
         kde = encode_for_kde(spec)
         gnome = encode_for_gnome(spec)
         windows = encode_for_windows(spec)
+        macos = encode_for_macos(spec)
 
         # Both encodings name the same physical key: decoding KDE's own
         # integer back to a spec reproduces exactly what GNOME encoded from.
@@ -82,6 +99,10 @@ class SamePhysicalKeyTests(unittest.TestCase):
         self.assertEqual(
             WINDOWS_MOD_SHIFT | WINDOWS_MOD_ALT | WINDOWS_MOD_CONTROL | WINDOWS_MOD_WIN,
             windows.modifiers,
+        )
+        self.assertEqual(
+            MACOS_SHIFT_KEY | MACOS_OPTION_KEY | MACOS_CONTROL_KEY | MACOS_CMD_KEY,
+            macos.modifiers,
         )
 
     def test_command_and_cmd_mean_the_same_key_as_meta_on_every_encoder(self) -> None:
@@ -93,6 +114,7 @@ class SamePhysicalKeyTests(unittest.TestCase):
             self.assertEqual(encode_for_kde(meta), encode_for_kde(spec))
             self.assertEqual(encode_for_gnome(meta), encode_for_gnome(spec))
             self.assertEqual(encode_for_windows(meta), encode_for_windows(spec))
+            self.assertEqual(encode_for_macos(meta), encode_for_macos(spec))
 
 
 class PlatformMissingModifierTests(unittest.TestCase):
@@ -122,6 +144,16 @@ class PlatformMissingModifierTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("'Hyper'", message)
         self.assertIn("Windows", message)
+
+    def test_macos_refuses_hyper_by_name(self) -> None:
+        spec = parse_specification("Hyper+X")
+
+        with self.assertRaises(HotkeyError) as raised:
+            encode_for_macos(spec)
+
+        message = str(raised.exception)
+        self.assertIn("'Hyper'", message)
+        self.assertIn("macOS", message)
 
     def test_kde_refusal_names_the_platform_not_a_generic_unknown(self) -> None:
         """Distinct from an unrecognized modifier: `Hyper` is a real modifier
@@ -211,6 +243,86 @@ class WindowsEncodingTests(unittest.TestCase):
         self.assertEqual(WINDOWS_MOD_WIN | WINDOWS_MOD_SHIFT, windows.modifiers)
         self.assertEqual(0x70 + 2, windows.vk)
         self.assertEqual(kde.portable, windows.portable)
+
+
+class MacosEncodingTests(unittest.TestCase):
+    """macOS has the lowest function-key ceiling of any encoder (F20, not
+    Windows' F24 or KDE/GNOME's F35), and Carbon's `kVK_*` codes name a
+    physical keyboard position rather than a character, so letters and digits
+    are looked up by table rather than derived with `ord()` -- both real gaps
+    task 18.9 asks to be refused, or handled, by name."""
+
+    def test_every_letter_and_digit_has_a_distinct_key_code(self) -> None:
+        """`_MACOS_LETTER_DIGIT_KEYS` is transcribed by hand from Apple's
+        published header (`encode_for_macos`'s own docstring flags it as
+        unconfirmed on a real Mac); this is the invariant a transcription
+        error -- a duplicated or missing code -- would break."""
+        self.assertEqual(36, len(_MACOS_LETTER_DIGIT_KEYS))
+        self.assertEqual(
+            set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"), set(_MACOS_LETTER_DIGIT_KEYS)
+        )
+        self.assertEqual(36, len(set(_MACOS_LETTER_DIGIT_KEYS.values())))
+
+    def test_letters_use_their_table_value_not_ascii(self) -> None:
+        # kVK_ANSI_A is 0x00, not `ord("A")` -- the whole point of the table.
+        spec = parse_specification("Ctrl+A")
+
+        self.assertEqual(0x00, encode_for_macos(spec).key_code)
+
+    def test_f20_is_the_last_function_key_macos_has(self) -> None:
+        spec = parse_specification(f"Ctrl+F{_MACOS_MAX_FUNCTION_KEY}")
+
+        self.assertEqual(0x5A, encode_for_macos(spec).key_code)  # kVK_F20
+
+    def test_f21_is_refused_by_name(self) -> None:
+        spec = parse_specification("Ctrl+F21")
+
+        with self.assertRaises(HotkeyError) as raised:
+            encode_for_macos(spec)
+
+        self.assertIn("F21", str(raised.exception))
+        self.assertIn("macOS", str(raised.exception))
+
+    def test_insert_pause_print_sysreq_have_no_macos_key(self) -> None:
+        """Apple keyboards have none of these four keys at all."""
+        for spelling in ("Ctrl+Insert", "Ctrl+Pause", "Ctrl+Print", "Ctrl+SysReq"):
+            spec = parse_specification(spelling)
+            with self.assertRaises(HotkeyError):
+                encode_for_macos(spec)
+
+    def test_media_keys_and_microphone_mute_have_no_macos_key(self) -> None:
+        """Delivered as `NX_KEYTYPE` special-key events, not ordinary `kVK_`
+        presses -- see `_MACOS_NAMED_KEYS`'s own docstring."""
+        for spelling in ("Ctrl+Media Play", "Ctrl+Media Stop", "Ctrl+Microphone Mute"):
+            spec = parse_specification(spelling)
+            with self.assertRaises(HotkeyError):
+                encode_for_macos(spec)
+
+    def test_backspace_is_the_mac_delete_key_and_delete_is_forward_delete(self) -> None:
+        """The one naming trap this platform has: what every Apple keyboard
+        itself labels "delete" is what every other platform calls Backspace."""
+        self.assertEqual(0x33, encode_for_macos(parse_specification("Ctrl+Backspace")).key_code)
+        self.assertEqual(0x75, encode_for_macos(parse_specification("Ctrl+Delete")).key_code)
+
+    def test_enter_and_return_encode_to_different_key_codes(self) -> None:
+        """Unlike Windows, which has one virtual key for both -- macOS
+        distinguishes the numpad Enter (`kVK_ANSI_KeypadEnter`) from the main
+        Return key (`kVK_Return`), matching GNOME's own distinction."""
+        return_code = encode_for_macos(parse_specification("Ctrl+Return")).key_code
+        enter_code = encode_for_macos(parse_specification("Ctrl+Enter")).key_code
+
+        self.assertEqual(0x24, return_code)
+        self.assertEqual(0x4C, enter_code)
+        self.assertNotEqual(return_code, enter_code)
+
+    def test_portable_round_trip_from_stored_text(self) -> None:
+        kde = encode_for_kde(parse_specification("Meta+Shift+F3"))
+
+        macos = macos_hotkey_for_portable(kde.portable)
+
+        self.assertEqual(MACOS_CMD_KEY | MACOS_SHIFT_KEY, macos.modifiers)
+        self.assertEqual(0x63, macos.key_code)  # kVK_F3
+        self.assertEqual(kde.portable, macos.portable)
 
 
 if __name__ == "__main__":

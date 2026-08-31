@@ -43,19 +43,22 @@ cuda = [
     "nvidia-nvjitlink-cu12>=12,<13 ; sys_platform != 'darwin'",
 ]
 
-# The Windows overlay renderer's toolkit (task 10.2). An extra, not a default
-# dependency the way `pywin32` is: the overlay already degrades to
-# `NullOverlayController` when its backend has no usable mechanism -- the
-# same thing that happens today on every non-Plasma Linux desktop -- so
-# nothing about starting Murmly or serving a command needs it. PySide6 is a
-# large wheel; marking it `sys_platform == 'win32'` on a *default*
-# dependency, the way `pywin32` is marked, would still put it in every
-# Windows install and CI run whether or not the overlay is wanted, and macOS
-# is not marked in at all -- its own overlay (section 15) is an open spike,
-# not a shipped renderer, so nothing here should resolve for it yet. Installed
-# with `uv sync --extra overlay` on Windows.
+# The Windows and macOS overlay renderers' toolkit (task 10.2/15.1). An
+# extra, not a default dependency the way `pywin32` is: the overlay already
+# degrades to `NullOverlayController` when its backend has no usable
+# mechanism -- the same thing that happens today on every non-Plasma Linux
+# desktop -- so nothing about starting Murmly or serving a command needs it.
+# PySide6 is a large wheel; marking it `sys_platform == 'win32'` (or
+# `'darwin'`) on a *default* dependency, the way `pywin32` is marked, would
+# still put it in every Windows or macOS install and CI run whether or not
+# the overlay is wanted. macOS is marked in now: design.md's own spike order
+# is "against Qt's own flags first" (task 15.1), so the macOS renderer
+# attempts this exact toolkit before task 15.2's `NSPanel` fallback is even
+# reached -- see `overlay.py`'s `OverlayBackend.MACOS` for the reasoning and
+# what would change here if the spike concludes Qt is not enough. Installed
+# with `uv sync --extra overlay` on Windows or macOS.
 overlay = [
-    "PySide6>=6.7,<7 ; sys_platform == 'win32'",
+    "PySide6>=6.7,<7 ; sys_platform == 'win32' or sys_platform == 'darwin'",
 ]
 
 # Speech output on the CPU. Also needs espeak-ng from the distribution, and the

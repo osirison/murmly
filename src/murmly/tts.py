@@ -88,6 +88,16 @@ ONNX_CUDA_DLL_DIRECTORIES = CTRANSLATE2_CUDA_DLL_DIRECTORIES + (
 )
 CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
+#: Task 15.4: the accelerator the stock macOS `onnxruntime` wheel carries.
+#: CTranslate2 has no macOS GPU backend at all (`stt.py`'s own `[stt] device`
+#: resolution correctly finds none there), which is exactly why `[tts]
+#: device` and `[stt] device` are separate settings -- "the accelerator" is
+#: whatever this platform's is, and on macOS that is this provider rather
+#: than `CUDA_PROVIDER`. It is never a value `[tts] device` itself accepts
+#: (`config.VALID_DEVICES` stays `{"auto", "cpu", "cuda"}`; nobody configures
+#: "coreml" by name) -- only `auto`'s own resolution reaches for it, the same
+#: way `auto` already reaches for `CUDA_PROVIDER` on a machine that has one.
+COREML_PROVIDER = "CoreMLExecutionProvider"
 
 # A swap rather than an addition: onnxruntime-gpu installs into the same package
 # namespace as the CPU build faster-whisper and kokoro-onnx depend on, and an
@@ -235,6 +245,14 @@ def resolve_espeak(profile: PlatformProfile | None = None) -> tuple[str, str]:
     try:
         handle = ctypes.CDLL(soname)
     except OSError as error:
+        if resolved.operating_system is OperatingSystem.MACOS:
+            # macOS has no `dnf`/`apt` equivalent Murmly can name generically
+            # (task 15.5): Homebrew is the remedy, the same as the Linux
+            # branch above names a distribution package for the same absence.
+            raise RuntimeError(
+                f"espeak-ng ({soname}) could not be loaded: {error}. Install it "
+                "with `brew install espeak-ng`."
+            ) from error
         raise RuntimeError(f"espeak-ng ({soname}) could not be loaded: {error}") from error
 
     library_path = _loaded_library_path(handle, resolved) or soname
@@ -361,6 +379,13 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         # someone to replace a working runtime to fix nothing.
         if config.tts_device == "cuda" or (cuda_device_count_available() or 0) > 0:
             logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
+            return [CPU_PROVIDER]
+        # `cuda` was never asked for and no NVIDIA device is present -- the
+        # `auto` path task 15.4 is about. CoreML is the accelerator this
+        # runtime build carries on macOS specifically; on every other
+        # platform `available` never contains it, so this is a no-op there.
+        if COREML_PROVIDER in available:
+            return [COREML_PROVIDER, CPU_PROVIDER]
         return [CPU_PROVIDER]
 
     try:

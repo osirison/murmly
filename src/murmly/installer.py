@@ -23,11 +23,12 @@ duck-typed surface and are driven through the very same code.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path, PureWindowsPath
+import plistlib
 import subprocess
 import sys
 import time
@@ -35,7 +36,13 @@ from typing import TYPE_CHECKING
 
 from murmly.desktop import DesktopQueryError, PlasmaShortcuts
 from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
-from murmly.hotkey import Hotkey, HotkeyError, parse_hotkey, windows_hotkey_for_portable
+from murmly.hotkey import (
+    Hotkey,
+    HotkeyError,
+    macos_hotkey_for_portable,
+    parse_hotkey,
+    windows_hotkey_for_portable,
+)
 from murmly.integrations import PasteInjection, select_paste_injection
 
 if TYPE_CHECKING:
@@ -218,6 +225,19 @@ def default_applications_dir(env: dict[str, str] | None = None) -> Path:
     return base / "applications"
 
 
+def default_launch_agents_dir(env: dict[str, str] | None = None) -> Path:
+    """`~/Library/LaunchAgents`, the per-user launchd agent directory
+    (design.md's "Service management" table). Not an XDG path -- macOS has no
+    concept of one -- so this reads `HOME` directly rather than following
+    `default_unit_dir`'s `XDG_CONFIG_HOME` precedent, the same way
+    `Path.home()` is `default_unit_dir`'s own fallback when nothing is set.
+    """
+    environment = env if env is not None else os.environ
+    home = environment.get("HOME")
+    base = Path(home) if home else Path.home()
+    return base / "Library" / "LaunchAgents"
+
+
 def default_shortcut_config_path(env: dict[str, str] | None = None) -> Path:
     environment = env if env is not None else os.environ
     config_home = environment.get("XDG_CONFIG_HOME")
@@ -256,6 +276,20 @@ SESSION_HOTKEY = HotkeyPurpose(
     description="dictate into the open speech session",
 )
 HOTKEY_PURPOSES = (WINDOW_HOTKEY, SESSION_HOTKEY)
+
+#: Task 13.7: the one real limitation Carbon's `RegisterEventHotKey` carries
+#: that no other hotkey backend in this codebase does -- design.md's own
+#: text for it, reported rather than hidden. Surfaced in `_status_in_process`'s
+#: report whenever the resolved platform is macOS, unconditionally rather
+#: than only when a binding is currently unheld: the limitation is a standing
+#: property of the mechanism itself (a combination can be held by Murmly and
+#: still never fire, because the frontmost application consumed it first),
+#: not a symptom `held`/`detail` above already captures.
+MACOS_HOTKEY_MECHANISM_LIMITATION = (
+    "RegisterEventHotKey does not fire when the frontmost application consumes the "
+    "key combination itself, and it cannot express a modifier-only chord (there is "
+    "no key code for \"no key\", only for a modifier combined with one)."
+)
 
 
 def launcher_text(
@@ -422,6 +456,261 @@ def _windows_path_text(path: Path) -> str:
     makes the two agree on every host.
     """
     return str(PureWindowsPath(str(path)))
+
+
+def macos_launchd_agent_plist(
+    label: str,
+    program_arguments: Sequence[str],
+    associated_bundle_identifiers: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """The property-list content for a per-user launchd agent (design.md's
+    service-management table): `Label`, `ProgramArguments`, `RunAtLoad`,
+    `KeepAlive`, and -- task 12.3's remedy for the TCC microphone risk --
+    `AssociatedBundleIdentifiers` when one is given.
+
+    A bare Python process started by launchd has no bundle and no
+    `NSMicrophoneUsageDescription`, so TCC has nothing to attribute a
+    microphone request to and the reported failure is silent: no dialog, no
+    exception, a stream delivering zeroes (design.md's largest risk). Setting
+    `AssociatedBundleIdentifiers` to a bundle identifier that already holds
+    the grant is the first thing task 12.3 asks to try before task 12.4's
+    fallback -- a minimal `.app` wrapper of Murmly's own. Murmly ships no
+    signed bundle of its own yet, so this only has something real to name
+    once one exists (12.4) or once some other already-granted bundle is
+    deliberately reused for the spike; until then the parameter is left
+    unset by every caller that has not confirmed a value works, which is why
+    it defaults to `None` and is omitted from the plist entirely rather than
+    written as an empty list -- an empty `AssociatedBundleIdentifiers` is not
+    documented as "no association" the way omitting the key is.
+
+    This function only shapes the dictionary `plistlib.dump` writes -- it
+    does not call `launchctl` and does not write a file. `docs/`'s macOS
+    microphone spike script is the first caller; `LaunchdUserService` (task
+    13.3, below) is the second. Kept here, next to
+    `WindowsUserService`, rather than in `murmly.platform`: it is a
+    service-management shape exactly like that class and `UserService`, not
+    a platform-resolution concern that module's own docstring restricts
+    itself to.
+
+    `program_arguments` is taken as given -- the caller decides the
+    interpreter and every argument, matching `WindowsUserService`'s
+    `_run_line` building its own command line rather than this function
+    guessing at one. It is stored as a plain `list` because `plistlib`
+    requires a concrete sequence type it recognises, not an arbitrary
+    `Sequence`.
+    """
+    plist: dict[str, object] = {
+        "Label": label,
+        "ProgramArguments": list(program_arguments),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+    }
+    if associated_bundle_identifiers:
+        plist["AssociatedBundleIdentifiers"] = list(associated_bundle_identifiers)
+    return plist
+
+
+#: The launchd label -- `Label` in the plist and the last path component of
+#: every `launchctl` domain target this class builds. Not `SERVICE_NAME`
+#: (`murmly.service`): a launchd label is conventionally reverse-DNS, matching
+#: `DESKTOP_ID`'s own "net.local." prefix rather than a systemd unit's `.service`
+#: suffix, which would read as a copy-paste from the wrong platform to anyone
+#: who has seen a launchd plist before.
+LAUNCHD_LABEL = "net.local.murmly"
+
+
+class LaunchdUserService:
+    """The Murmly launchd agent (task 13.3), driven by `launchctl bootstrap`,
+    `print`, `kickstart -k` and `bootout` -- never `load` (task 13.4).
+
+    `load` has been deprecated since the 10.10 launchd rewrite, and its
+    failure mode is the disqualifying one for this codebase's own rule that a
+    binding must be verified before success is reported (design.md's "Service
+    management" section, this class's own docstring history): on a malformed
+    plist it exits 0 and does nothing, which would make `install()` report
+    success for a service that will never run. `bootstrap` fails loudly on
+    the same malformed plist instead, and `print`'s parsed `state = running`
+    line is what `install()` checks before it reports success at all --
+    `is_active()` reads the very same line, so a `status()` call after
+    install can never disagree with what install itself just verified.
+
+    Every method takes the same shape `UserService` and `WindowsUserService`
+    do -- `run_command` injected, real `subprocess.run` by default -- so
+    `Installer._default_service` (`SERVICE_MANAGEMENT`'s own selection) can
+    construct this the same way it constructs either of them,
+    and so a test drives this class exactly like every other backend in the
+    codebase: against a fake runner and a scratch `agents_dir`, never a real
+    `launchctl`, which does not exist on this machine.
+
+    `launchctl print`'s text output is explicitly undocumented and not a
+    stable interface (`man launchctl` itself carries no format contract for
+    it) -- confirmed only by inspecting real `launchctl print` output on a
+    Mac, which this development machine cannot do. `is_active`/`recorded_
+    entrypoint` parse it conservatively (`state = running`, `ProgramArguments`
+    read back from the plist file itself rather than reparsing `print`'s own
+    `arguments = { ... }` block) for the same reason `WindowsUserService`'s
+    own docstring flags `schtasks`' localized text as a real gap this class
+    does not close either.
+    """
+
+    def __init__(
+        self,
+        run_command: RunCommand = subprocess.run,
+        agents_dir: Path | None = None,
+        env: dict[str, str] | None = None,
+        launchctl: str = "launchctl",
+        label: str = LAUNCHD_LABEL,
+        uid: int | None = None,
+    ) -> None:
+        self._run_command = run_command
+        self._agents_dir = agents_dir if agents_dir is not None else default_launch_agents_dir(env)
+        self._binary = launchctl
+        self._label = label
+        # `os.getuid()`, not a hardcoded fallback: this class is only ever
+        # constructed for a resolved macOS profile, where `os.getuid` always
+        # exists (`installer.Installer._default_service`'s own dispatch), and
+        # a test names a `uid` directly rather than needing a real one.
+        self._uid = uid if uid is not None else os.getuid()
+
+    @property
+    def _domain_target(self) -> str:
+        return f"gui/{self._uid}"
+
+    @property
+    def _service_target(self) -> str:
+        return f"{self._domain_target}/{self._label}"
+
+    @property
+    def plist_path(self) -> Path:
+        return self._agents_dir / f"{self._label}.plist"
+
+    @property
+    def is_installed(self) -> bool:
+        return self.plist_path.is_file()
+
+    def install(self, entrypoint: Path) -> None:
+        """Write the plist and bring the agent up, verifying it before
+        returning (task 13.4's own "never `load`" reasoning, applied here).
+
+        `bootout` runs first, best-effort: `bootstrap` refuses to replace a
+        domain target that is already bootstrapped, so a reinstall (a moved
+        checkout, a repeated `murmly install`) has to clear any previous
+        registration before making a fresh one, exactly as `UserService.install`'s
+        `daemon-reload` step is what lets systemd notice a rewritten unit file
+        rather than keep serving its old, cached copy.
+        """
+        plist = macos_launchd_agent_plist(self._label, [entrypoint.as_posix(), "daemon"])
+        write_atomically(self.plist_path, plistlib.dumps(plist).decode("utf-8"))
+        self._launchctl("bootout", self._service_target)
+        self._launchctl_checked("bootstrap", self._domain_target, str(self.plist_path))
+        self._launchctl_checked("kickstart", "-k", self._service_target)
+        if not self.is_active():
+            raise InstallError(
+                f"launchctl reports {self._service_target} is not running after "
+                f"bootstrap; run 'launchctl print {self._service_target}' to see why."
+            )
+
+    def remove(self) -> bool:
+        """Tear the agent down. Succeeds when it is already absent."""
+        existed = self.is_installed
+        # Best effort: an agent already booted out, or never bootstrapped at
+        # all, must not fail an uninstall -- `UserService.remove`'s own rule.
+        self._launchctl("bootout", self._service_target)
+        self.plist_path.unlink(missing_ok=True)
+        return existed
+
+    def start(self) -> bool:
+        """`kickstart -k`, falling back to a fresh `bootstrap` first.
+
+        Task 13.4 names exactly four verbs -- `bootstrap`, `print`,
+        `kickstart -k`, `bootout` -- with no lighter-weight "stop but stay
+        registered" verb among them the way `systemctl stop`/`schtasks /end`
+        each are for their own platforms. `stop()` below uses `bootout`,
+        which removes the domain target entirely, so a `kickstart -k` after
+        it fails (there is nothing left to kick) until this method
+        re-bootstraps from the plist already on disk.
+        """
+        if self._launchctl("kickstart", "-k", self._service_target).returncode == 0:
+            return True
+        if not self.is_installed:
+            return False
+        self._launchctl("bootstrap", self._domain_target, str(self.plist_path))
+        return self._launchctl("kickstart", "-k", self._service_target).returncode == 0
+
+    def stop(self) -> bool:
+        return self._launchctl("bootout", self._service_target).returncode == 0
+
+    def is_active(self) -> bool:
+        result = self._launchctl("print", self._service_target)
+        if result.returncode != 0:
+            return False
+        for line in (result.stdout or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("state = "):
+                return stripped.removeprefix("state = ").strip() == "running"
+        return False
+
+    def recorded_entrypoint(self) -> str | None:
+        """The first `ProgramArguments` entry in the installed plist, if any.
+
+        Read from the plist file this class itself wrote, not from `launchctl
+        print`'s own `arguments = { ... }` block: the plist's shape is this
+        class's own contract (`macos_launchd_agent_plist`), while `print`'s is
+        undocumented and not confirmed on a real Mac -- see this class's own
+        docstring.
+        """
+        if not self.is_installed:
+            return None
+        try:
+            data = plistlib.loads(self.plist_path.read_bytes())
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            return None
+        arguments = data.get("ProgramArguments")
+        if not arguments:
+            return None
+        value = str(arguments[0]).strip()
+        return value or None
+
+    def status(self) -> ServiceStatus:
+        if not self.is_installed:
+            return ServiceStatus(
+                installed=False,
+                active=False,
+                entrypoint=None,
+                detail="Murmly is not installed. Run 'murmly install <hotkey>' to install it.",
+            )
+        active = self.is_active()
+        return ServiceStatus(
+            installed=True,
+            active=active,
+            entrypoint=self.recorded_entrypoint(),
+            detail=(
+                "The Murmly service is installed and running."
+                if active
+                else "The Murmly service is installed but not running."
+            ),
+        )
+
+    def _launchctl(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        command = [self._binary, *arguments]
+        try:
+            return self._run_command(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=COMMAND_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise InstallError(f"Unable to run '{' '.join(command)}': {error}") from error
+
+    def _launchctl_checked(self, *arguments: str) -> None:
+        result = self._launchctl(*arguments)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise InstallError(f"launchctl {' '.join(arguments)} failed: {detail or 'unknown error'}")
 
 
 class WindowsUserService:
@@ -976,7 +1265,17 @@ class Installer:
         sender that opens a session itself, which is what an existing
         installation upgrading in place gets.
         """
-        from murmly.platform import hotkey_mechanism_is_in_process
+        from murmly.platform import OperatingSystem, hotkey_mechanism_is_in_process
+
+        # Task 14.5: raise the Accessibility consent dialog exactly once, from
+        # this explicit `murmly install` invocation, before either install
+        # path below reports whether a paste can be injected -- never from
+        # `status()`, `uninstall()`, or the daemon, none of which reach this
+        # method at all. See `mac_clipboard.request_accessibility_permission`'s
+        # own docstring for why this is the one call site in the whole
+        # codebase allowed to prompt.
+        if self._profile.operating_system is OperatingSystem.MACOS:
+            self._request_macos_accessibility_permission()
 
         if hotkey_mechanism_is_in_process(self._profile):
             # No desktop session to resolve and no launcher file to write:
@@ -1168,6 +1467,21 @@ class Installer:
             user_override=override,
             messages=tuple(messages),
         )
+
+    def _request_macos_accessibility_permission(self) -> None:
+        """Task 14.5's one call site. Never raises: a failed *request* to
+        raise a dialog must not fail an installation that would otherwise
+        succeed and report the permission as ungranted on its own, through
+        `select_paste_injection`'s `macos_accessibility_trusted` check
+        (`integrations.py`) -- exactly the same "a report must never fail an
+        install" rule `_paste_injection_messages` states for itself.
+        """
+        try:
+            from murmly.mac_clipboard import request_accessibility_permission
+
+            request_accessibility_permission()
+        except Exception as error:  # noqa: BLE001 - a permission request must never fail an install
+            logger.debug("Could not request the macOS Accessibility permission: %s", error)
 
     def _write_hotkey_record(self) -> None:
         """Persist which purposes are actually bound, for task 5.4's record.
@@ -1460,8 +1774,8 @@ class Installer:
         return entry
 
     # ----------------------------------------------------------------
-    # In-process hotkey backends (task 8; the intended second member is
-    # macOS's Carbon registrar, section 13). No desktop session, no launcher
+    # In-process hotkey backends (task 8's Windows registrar and task 13's
+    # macOS Carbon registrar). No desktop session, no launcher
     # file, no `_shortcuts.owners_of` query: the binding lives inside the
     # daemon's own process, so the only way to bind, verify or release it is
     # to reach that process over the command channel `self._socket_path()`
@@ -1535,6 +1849,21 @@ class Installer:
         except InstallError:
             logger.warning("Could not remove the Murmly service during rollback.")
 
+    def _in_process_hotkey_encoder(self) -> Callable[[str], object]:
+        """The per-portable-text encoder that validates a hotkey for
+        whichever in-process platform `self._profile` names.
+
+        Only ever reached from `_install_in_process`, which is itself only
+        ever reached when `hotkey_mechanism_is_in_process(self._profile)` is
+        true -- today, Windows and macOS -- so macOS is the only case besides
+        the Windows default that needs naming here.
+        """
+        from murmly.platform import OperatingSystem
+
+        if self._profile.operating_system is OperatingSystem.MACOS:
+            return macos_hotkey_for_portable
+        return windows_hotkey_for_portable
+
     def _install_in_process(
         self, hotkey: Hotkey, session_hotkey: Hotkey | None
     ) -> InstallOutcome:
@@ -1570,10 +1899,16 @@ class Installer:
         # Refuse anything this platform cannot register at all, before
         # anything is written -- the same "before anything is written" rule
         # the desktop-launcher flow applies to its own two-hotkeys-one-key
-        # check just above.
+        # check just above. Dispatched on the resolved operating system
+        # rather than always validating against Windows' own encoder: the two
+        # in-process platforms genuinely disagree (macOS's function-key
+        # ceiling is F20, Windows' is F24), so a macOS key past F20 would
+        # otherwise pass this check and only fail later, inside the daemon,
+        # with a less useful error.
+        encode_for_platform = self._in_process_hotkey_encoder()
         for purpose_key, requested_hotkey in requested.items():
             try:
-                windows_hotkey_for_portable(requested_hotkey.portable)
+                encode_for_platform(requested_hotkey.portable)
             except HotkeyError as error:
                 raise InstallError(str(error)) from error
 
@@ -1729,6 +2064,8 @@ class Installer:
         cannot be reached -- there is no keypress to recover it the way a
         stopped Linux daemon has, so the report has to say what will.
         """
+        from murmly.platform import OperatingSystem
+
         service = self._service.status()
         record = self._record_store.read()
         held = self._held_purposes_from_daemon() if service.active else frozenset()
@@ -1777,4 +2114,6 @@ class Installer:
             report["detail"] = entries[0]["detail"]
         if not service.installed:
             report["detail"] = "Murmly is not installed. Run 'murmly install <hotkey>' to install it."
+        if self._profile.operating_system is OperatingSystem.MACOS:
+            report["hotkey_mechanism_limitation"] = MACOS_HOTKEY_MECHANISM_LIMITATION
         return report

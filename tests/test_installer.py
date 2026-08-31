@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -11,11 +12,14 @@ import unittest.mock
 from pathlib import Path
 
 from murmly.installer import (
+    LAUNCHD_LABEL,
     SERVICE_NAME,
     WINDOWS_TASK_NAME,
     InstallError,
+    LaunchdUserService,
     UserService,
     WindowsUserService,
+    macos_launchd_agent_plist,
     resolve_entrypoint,
     service_unit_text,
     write_atomically,
@@ -406,6 +410,415 @@ class FakeSchtasks:
     @property
     def verbs(self) -> list[str]:
         return [call[1] for call in self.calls if len(call) > 1]
+
+
+class MacosLaunchdAgentPlistTests(unittest.TestCase):
+    """Task 12.3: `macos_launchd_agent_plist` shapes the plist content --
+    `launchctl` is never invoked here, and neither is a file written; that is
+    section 13's `LaunchdUserService`. What this pins is the dictionary
+    `plistlib.dump` would serialize, including `AssociatedBundleIdentifiers`,
+    which is the documented first remedy for design.md's largest risk: TCC
+    attributing a launchd-started process's microphone request to a bundle
+    that already holds the grant.
+    """
+
+    def test_the_baseline_keys_are_always_present(self) -> None:
+        plist = macos_launchd_agent_plist("com.murmly.daemon", ["/usr/bin/python3", "-m", "murmly", "daemon"])
+
+        self.assertEqual("com.murmly.daemon", plist["Label"])
+        self.assertEqual(["/usr/bin/python3", "-m", "murmly", "daemon"], plist["ProgramArguments"])
+        self.assertIs(True, plist["RunAtLoad"])
+        self.assertIs(True, plist["KeepAlive"])
+
+    def test_no_bundle_identifier_omits_the_key_entirely(self) -> None:
+        """Omitted, not an empty list: `AssociatedBundleIdentifiers: []` is
+        not documented as "no association" the way leaving the key out is,
+        and Murmly ships no bundle to name until task 12.4 or a confirmed
+        12.3 spike produces one."""
+        plist = macos_launchd_agent_plist("com.murmly.daemon", ["/usr/bin/python3"])
+
+        self.assertNotIn("AssociatedBundleIdentifiers", plist)
+
+    def test_a_bundle_identifier_is_carried_as_a_list(self) -> None:
+        plist = macos_launchd_agent_plist(
+            "com.murmly.daemon",
+            ["/usr/bin/python3"],
+            associated_bundle_identifiers=["com.example.murmly-carrier"],
+        )
+
+        self.assertEqual(["com.example.murmly-carrier"], plist["AssociatedBundleIdentifiers"])
+
+    def test_the_plist_round_trips_through_plistlib(self) -> None:
+        """The real consumer -- `plistlib.dump` -- has to accept this
+        dictionary's shape without complaint; a dict `plistlib` cannot
+        serialize would only be discovered on a real Mac otherwise."""
+        plist = macos_launchd_agent_plist(
+            "com.murmly.daemon",
+            ["/usr/bin/python3", "daemon"],
+            associated_bundle_identifiers=["com.example.murmly-carrier"],
+        )
+
+        serialized = plistlib.dumps(plist)
+        round_tripped = plistlib.loads(serialized)
+
+        self.assertEqual(plist, round_tripped)
+
+
+class FakeLaunchctl:
+    """A minimal, stateful stand-in for `launchctl`: enough of `bootstrap`,
+    `bootout`, `kickstart -k` and `print` to answer the way a real launchd
+    domain target would after each -- and nothing at all for `load`, so a
+    test asserting task 13.4's "never `load`" rule has a fake that would
+    itself fail loudly (`AttributeError`-shaped, via the `KeyError` a bad
+    verb falls through to) rather than silently accepting one. Verb is
+    `command[1]`, one past the `launchctl` binary name itself.
+    """
+
+    def __init__(self, failures: dict[str, int] | None = None, never_runs: bool = False) -> None:
+        self.calls: list[list[str]] = []
+        self._failures = failures or {}
+        self._never_runs = never_runs
+        self._bootstrapped = False
+        self._running = False
+
+    def __call__(self, command, **_kwargs):
+        self.calls.append(list(command))
+        verb = command[1] if len(command) > 1 else ""
+        if verb in self._failures:
+            return subprocess.CompletedProcess(command, self._failures[verb], "", "boom")
+        if verb == "bootstrap":
+            self._bootstrapped = True
+            self._running = not self._never_runs
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if verb == "bootout":
+            self._bootstrapped = False
+            self._running = False
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if verb == "kickstart":
+            if not self._bootstrapped:
+                return subprocess.CompletedProcess(command, 3, "", "Could not find service")
+            self._running = not self._never_runs
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if verb == "print":
+            if not self._bootstrapped:
+                return subprocess.CompletedProcess(command, 3, "", "Could not find service")
+            state = "running" if self._running else "not running"
+            return subprocess.CompletedProcess(command, 0, f"\tstate = {state}\n", "")
+        raise AssertionError(f"FakeLaunchctl was asked for an unmodelled verb: {verb!r}")
+
+    @property
+    def verbs(self) -> list[str]:
+        return [call[1] for call in self.calls if len(call) > 1]
+
+
+class LaunchdServiceInstallTests(unittest.TestCase):
+    """Task 13.3/13.4: `LaunchdUserService` writes the plist and drives
+    `bootstrap`/`kickstart -k`/`print`, verifying the agent is running before
+    reporting success -- never `load`, whose disqualifying failure mode
+    (exits 0, does nothing, on a malformed plist) is exactly what a binding
+    verified before success is reported (this task's own spec-level concern)
+    exists to rule out."""
+
+    def _service(self, launchctl: FakeLaunchctl, agents_dir: Path) -> LaunchdUserService:
+        return LaunchdUserService(run_command=launchctl, agents_dir=agents_dir, uid=501)
+
+    def test_install_writes_the_plist_bootstraps_and_verifies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            agents_dir = Path(tmp) / "LaunchAgents"
+            launchctl = FakeLaunchctl()
+            service = self._service(launchctl, agents_dir)
+
+            service.install(Path("/opt/murmly/murmly"))
+
+            self.assertTrue(service.is_installed)
+            plist = plistlib.loads(service.plist_path.read_bytes())
+            self.assertEqual(LAUNCHD_LABEL, plist["Label"])
+            self.assertEqual(["/opt/murmly/murmly", "daemon"], plist["ProgramArguments"])
+            self.assertIs(True, plist["RunAtLoad"])
+            self.assertIs(True, plist["KeepAlive"])
+            self.assertTrue(service.is_active())
+
+    def test_never_calls_load(self) -> None:
+        """Every code path in this class, including `start()`'s own
+        re-bootstrap fallback after a `bootout` -- the one path most tempted
+        to reach for `load` instead of a fresh `bootstrap`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = self._service(launchctl, Path(tmp) / "LaunchAgents")
+
+            service.install(Path("/opt/murmly/murmly"))
+            service.status()
+            service.stop()
+            service.start()
+            service.remove()
+
+            self.assertNotIn("load", launchctl.verbs)
+
+    def test_domain_and_service_targets_use_gui_and_uid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = self._service(launchctl, Path(tmp) / "LaunchAgents")
+
+            service.install(Path("/opt/murmly/murmly"))
+
+            bootstrap_call = next(call for call in launchctl.calls if call[1] == "bootstrap")
+            self.assertEqual("gui/501", bootstrap_call[2])
+            kickstart_call = next(call for call in launchctl.calls if call[1] == "kickstart")
+            self.assertEqual(f"gui/501/{LAUNCHD_LABEL}", kickstart_call[3])
+
+    def test_install_bootouts_first_to_clear_a_stale_registration(self) -> None:
+        """`bootstrap` refuses to replace an already-bootstrapped domain
+        target, so a reinstall has to clear the previous one first -- the
+        same role `daemon-reload` plays for `UserService.install`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = self._service(launchctl, Path(tmp) / "LaunchAgents")
+
+            service.install(Path("/opt/murmly/murmly"))
+            service.install(Path("/opt/murmly/murmly"))
+
+            self.assertEqual(["bootout", "bootstrap", "kickstart", "print", "bootout", "bootstrap", "kickstart", "print"], launchctl.verbs)
+
+    def test_reinstall_repairs_a_stale_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = self._service(launchctl, Path(tmp) / "LaunchAgents")
+            service.install(Path("/opt/old/murmly"))
+
+            service.install(Path("/opt/new/murmly"))
+
+            self.assertEqual("/opt/new/murmly", service.recorded_entrypoint())
+
+    def test_failing_bootstrap_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl(failures={"bootstrap": 1})
+            service = self._service(launchctl, Path(tmp) / "LaunchAgents")
+
+            with self.assertRaises(InstallError) as raised:
+                service.install(Path("/opt/murmly/murmly"))
+
+            self.assertIn("boom", str(raised.exception))
+
+    def test_unavailable_launchctl_raises(self) -> None:
+        def explode(*_args, **_kwargs):
+            raise OSError("launchctl missing")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            service = LaunchdUserService(run_command=explode, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+
+            with self.assertRaises(InstallError) as raised:
+                service.install(Path("/opt/murmly/murmly"))
+
+            self.assertIn("launchctl missing", str(raised.exception))
+
+    def test_install_raises_when_the_agent_never_reports_running(self) -> None:
+        """13.4's own verification rule, the case `load` would have hidden:
+        `bootstrap` and `kickstart` both report success, but the agent never
+        actually comes up (a malformed plist, in the case this rule exists
+        for) -- `install()` must not report success anyway."""
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl(never_runs=True)
+            service = self._service(launchctl, Path(tmp) / "LaunchAgents")
+
+            with self.assertRaises(InstallError) as raised:
+                service.install(Path("/opt/murmly/murmly"))
+
+            self.assertIn("not running", str(raised.exception))
+
+
+class LaunchdServiceRemovalTests(unittest.TestCase):
+    def test_removal_boots_out_then_deletes_the_plist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = LaunchdUserService(run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+            service.install(Path("/opt/murmly/murmly"))
+            launchctl.calls.clear()
+
+            existed = service.remove()
+
+            self.assertTrue(existed)
+            self.assertEqual(["bootout"], launchctl.verbs)
+            self.assertFalse(service.is_installed)
+
+    def test_removal_succeeds_when_nothing_is_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = LaunchdUserService(
+                run_command=FakeLaunchctl(), agents_dir=Path(tmp) / "LaunchAgents", uid=501
+            )
+
+            self.assertFalse(service.remove())
+
+    def test_removal_tolerates_launchctl_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl(failures={"bootout": 1})
+            service = LaunchdUserService(run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+            service.install(Path("/opt/murmly/murmly"))
+
+            self.assertTrue(service.remove())
+            self.assertFalse(service.is_installed)
+
+    def test_removal_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = LaunchdUserService(run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+            service.install(Path("/opt/murmly/murmly"))
+
+            service.remove()
+
+            self.assertFalse(service.remove())
+
+
+class LaunchdServiceLifecycleTests(unittest.TestCase):
+    def test_stop_and_start_toggle_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = LaunchdUserService(run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+            service.install(Path("/opt/murmly/murmly"))
+
+            self.assertTrue(service.is_active())
+
+            service.stop()
+
+            self.assertFalse(service.is_active())
+
+            service.start()
+
+            self.assertTrue(service.is_active())
+
+    def test_status_reports_not_installed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = LaunchdUserService(
+                run_command=FakeLaunchctl(), agents_dir=Path(tmp) / "LaunchAgents", uid=501
+            )
+
+            status = service.status()
+
+            self.assertFalse(status.installed)
+            self.assertFalse(status.active)
+            self.assertIn("murmly install", status.detail)
+
+    def test_status_reports_installed_and_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = LaunchdUserService(run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+            service.install(Path("/opt/murmly/murmly"))
+
+            status = service.status()
+
+            self.assertTrue(status.installed)
+            self.assertTrue(status.active)
+            self.assertEqual("/opt/murmly/murmly", status.entrypoint)
+
+    def test_status_reports_installed_but_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = LaunchdUserService(run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+            service.install(Path("/opt/murmly/murmly"))
+            service.stop()
+
+            status = service.status()
+
+            self.assertTrue(status.installed)
+            self.assertFalse(status.active)
+            self.assertIn("not running", status.detail)
+
+    def test_recorded_entrypoint_is_read_from_the_plist_not_launchctl_print(self) -> None:
+        """`launchctl print`'s output is undocumented and not a stable
+        interface (this class's own docstring) -- `recorded_entrypoint`
+        reads the plist file this class itself wrote instead, so it answers
+        correctly even though this fake's own `print` output carries no
+        `arguments = { ... }` block a real one would."""
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = LaunchdUserService(run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501)
+            service.install(Path("/opt/murmly/murmly"))
+
+            self.assertEqual("/opt/murmly/murmly", service.recorded_entrypoint())
+
+
+class LaunchdServiceRuntimeIntegrationTests(unittest.TestCase):
+    """Task 13.3/13.4 against real `launchctl`: everything above this class
+    proves `LaunchdUserService`'s policy against `FakeLaunchctl`, which
+    answers exactly the way this class's own docstring says a real domain
+    target would -- an assumption nothing on this Linux development machine
+    can confirm. This is what turns that assumption into a proof, the same
+    role `GetpeereidRuntimeIntegrationTests` (`test_daemon.py`) and
+    `MacosHotkeyRuntimeIntegrationTests` (`test_mac_hotkey.py`) play for their
+    own mechanisms, applied to `bootstrap`/`print`/`kickstart -k`/`bootout`
+    themselves.
+
+    A scratch label (`net.local.murmly-test-<pid>`) and a scratch
+    `agents_dir` keep this from ever touching a real Murmly install that
+    happens to be registered on the same account -- `bootstrap` takes the
+    plist path directly, so the plist never has to live under the real
+    `~/Library/LaunchAgents` for `launchctl` to load it. The entrypoint is a
+    tiny shell script that ignores the `daemon` argument `install()` always
+    appends and execs `sleep 300` instead, so the agent has something to
+    still be running when `is_active()`/`print` reads its state, rather than
+    an instantly-exiting process racing the read.
+
+    `addCleanup` boots the label out and deletes the plist unconditionally,
+    so a failed assertion never leaves a scratch agent registered against a
+    real account.
+
+    `setUp` probes `gui/<uid>` itself (`launchctl print gui/<uid>`) before any
+    test body runs, and skips only on that probe's own refusal -- naming the
+    capability the host lacks, per the suite's own rule. `install()` itself is
+    never wrapped in a `try`/`skipTest`: once the domain is confirmed present,
+    any failure from `install()` is `is_active()`'s `state = running` parser
+    disagreeing with what real `launchctl print` actually emits -- exactly the
+    unconfirmed assumption this class exists to prove or disprove -- and must
+    fail loudly rather than be swallowed as an environment gap.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("A macOS kernel is required to call launchctl")
+        probe = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if probe.returncode != 0:
+            self.skipTest(f"This runner has no gui/{os.getuid()} launchd domain to bootstrap into")
+
+    def _make_service(self, agents_dir: Path) -> LaunchdUserService:
+        label = f"net.local.murmly-test-{os.getpid()}"
+        service = LaunchdUserService(agents_dir=agents_dir, label=label)
+        self.addCleanup(service.remove)
+        return service
+
+    def _make_entrypoint(self, directory: Path) -> Path:
+        script = directory / "murmly-test-agent.sh"
+        script.write_text("#!/bin/sh\nexec sleep 300\n")
+        os.chmod(script, 0o755)
+        return script
+
+    def test_install_status_stop_start_remove_against_real_launchctl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            agents_dir = Path(tmp) / "LaunchAgents"
+            service = self._make_service(agents_dir)
+            entrypoint = self._make_entrypoint(Path(tmp))
+
+            service.install(entrypoint)
+
+            self.assertTrue(service.is_active())
+            status = service.status()
+            self.assertTrue(status.installed)
+            self.assertTrue(status.active)
+            self.assertEqual(entrypoint.as_posix(), status.entrypoint)
+
+            self.assertTrue(service.stop())
+            self.assertFalse(service.is_active())
+
+            self.assertTrue(service.start())
+            self.assertTrue(service.is_active())
+
+            existed = service.remove()
+            self.assertTrue(existed)
+            self.assertFalse(service.is_installed)
+            self.assertFalse(service.is_active())
 
 
 class WindowsServiceInstallTests(unittest.TestCase):
@@ -975,6 +1388,236 @@ class WindowsInProcessStatusTests(unittest.TestCase):
 
         self.assertFalse(status["installed"])
         self.assertIn("murmly install", status["detail"])
+
+
+class FakeMacosService:
+    """`LaunchdUserService`'s duck-typed surface -- the same shape
+    `FakeWindowsService` gives `WindowsUserService`, with `start_command_text`
+    naming a `launchctl kickstart` line instead of a `schtasks /run` one."""
+
+    def __init__(self, installed: bool = False, active: bool = False, entrypoint: str | None = None) -> None:
+        self.is_installed = installed
+        self.active = active
+        self.entrypoint = entrypoint
+        self.installs: list[Path] = []
+        self.removes = 0
+
+    def install(self, entrypoint: Path) -> None:
+        self.installs.append(entrypoint)
+        self.is_installed = True
+        self.active = True
+        self.entrypoint = str(entrypoint)
+
+    def remove(self) -> bool:
+        self.removes += 1
+        existed, self.is_installed = self.is_installed, False
+        self.active = False
+        return existed
+
+    def status(self):
+        from murmly.installer import ServiceStatus
+
+        return ServiceStatus(
+            installed=self.is_installed,
+            active=self.active,
+            entrypoint=self.entrypoint,
+            detail="installed" if self.is_installed else "Run 'murmly install <hotkey>'",
+        )
+
+    def start_command_text(self) -> str:
+        return "launchctl kickstart -k gui/501/net.local.murmly"
+
+
+def _macos_installer(service=None, temp_dir=None, **kwargs):
+    """An `Installer` dispatched to the in-process (macOS) branch, backed by
+    fakes for the service and the command channel -- never a real
+    `launchctl` or framework call. Mirrors `_windows_installer` exactly,
+    substituting a macOS profile and `FakeMacosService`."""
+    from murmly.config import MurmlyConfig
+    from murmly.hotkey_record import HotkeyRecordStore
+    from murmly.installer import Installer
+    from murmly.platform import OperatingSystem, PlatformProfile
+
+    profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+    config = MurmlyConfig(
+        socket_path=Path(temp_dir) / "murmly.sock",
+        config_path=Path(temp_dir) / "config.toml",
+        overlay_enabled=False,
+    )
+    installer = Installer(
+        service=service if service is not None else FakeMacosService(),
+        profile=profile,
+        config=config,
+        record_store=HotkeyRecordStore(Path(temp_dir) / "hotkeys.json"),
+        entrypoint_resolver=lambda: Path("/opt/murmly/murmly"),
+        sleep=lambda _seconds: None,
+        daemon_timeout=1.0,
+        poll_interval=0.01,
+        **kwargs,
+    )
+    return installer
+
+
+class MacosInProcessInstallTests(unittest.TestCase):
+    """Task 13.5's own `_install_in_process` dispatch, mirroring
+    `WindowsInProcessInstallTests`: the pre-flight refusal must validate
+    against macOS's own encoder (F1-F20, not Windows' F1-F24), and requesting
+    the Accessibility permission (task 14.5) must happen exactly once, before
+    the record is written or the service touched."""
+
+    def test_a_key_macos_cannot_encode_is_refused_before_anything_is_written(self) -> None:
+        """macOS's function-key ceiling is F20 -- Windows' own analogous test
+        (`WindowsInProcessConflictTests`) uses a key past *Windows'* ceiling;
+        this uses one between the two platforms' ceilings (F21: valid on
+        Windows and on KDE/GNOME, refused only here) to prove the dispatch
+        genuinely reaches macOS's own encoder rather than Windows' by
+        accident."""
+        from murmly.hotkey import HotkeyError, parse_hotkey
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeMacosService()
+            channel = FakeDaemonChannel()
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _macos_installer(service=service, temp_dir=temp_dir)
+
+                with self.assertRaises(InstallError) as raised:
+                    installer.install(parse_hotkey("Ctrl+F21"))
+
+            self.assertIn("F21", str(raised.exception))
+            self.assertIn("macOS", str(raised.exception))
+            self.assertEqual(0, len(service.installs))
+            self.assertEqual({}, HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").read())
+
+    def test_install_requests_the_accessibility_permission_exactly_once(self) -> None:
+        """Task 14.5: `murmly install` is the one call site allowed to
+        prompt, and it must do so regardless of which install path this
+        platform takes -- macOS reaches `_install_in_process`, not the
+        desktop-launcher body every other platform's `install()` runs."""
+        from murmly.hotkey import parse_hotkey
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _macos_installer(temp_dir=temp_dir)
+                requests = []
+                installer._request_macos_accessibility_permission = lambda: requests.append(True)
+
+                installer.install(parse_hotkey("Meta+X"))
+
+        self.assertEqual(1, len(requests))
+
+    def test_a_successful_install_registers_and_reports_held(self) -> None:
+        from murmly.hotkey import parse_hotkey
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = FakeMacosService()
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _macos_installer(service=service, temp_dir=temp_dir)
+                outcome = installer.install(parse_hotkey("Meta+X"))
+
+        self.assertTrue(outcome.hotkey_registered)
+        self.assertEqual(1, len(service.installs))
+
+
+class MacosInProcessStatusTests(unittest.TestCase):
+    """Task 13.6/13.7 and 18.10: held by the running daemon while it runs and
+    holds the key; not held, naming the daemon and the start command, once it
+    is not; and the Carbon mechanism's own limitation named unconditionally
+    (task 13.7), mirroring `WindowsInProcessStatusTests` test-for-test plus
+    the one macOS-only assertion neither Windows class needs."""
+
+    def test_held_while_the_daemon_reports_it(self) -> None:
+        from murmly.hotkey_record import HotkeyRecordStore
+        from murmly.installer import MACOS_HOTKEY_MECHANISM_LIMITATION
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            service = FakeMacosService(installed=True, active=True, entrypoint="/opt/murmly/murmly")
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _macos_installer(service=service, temp_dir=temp_dir)
+                status = installer.status()
+
+        self.assertTrue(status["hotkey_held"])
+        self.assertEqual("Meta+X", status["hotkey"])
+        window_entry = status["hotkeys"][0]
+        self.assertTrue(window_entry["held"])
+        self.assertIn("running Murmly daemon", window_entry["detail"])
+        # Task 13.7: named unconditionally, not only when a binding is
+        # currently unheld -- a combination can be held by Murmly and still
+        # never fire, because the frontmost application consumed it first.
+        self.assertEqual(MACOS_HOTKEY_MECHANISM_LIMITATION, status["hotkey_mechanism_limitation"])
+
+    def test_not_held_when_the_daemon_is_not_running(self) -> None:
+        from murmly.hotkey_record import HotkeyRecordStore
+        from murmly.installer import MACOS_HOTKEY_MECHANISM_LIMITATION
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            service = FakeMacosService(installed=True, active=False, entrypoint="/opt/murmly/murmly")
+            channel = FakeDaemonChannel(held={"window"})
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _macos_installer(service=service, temp_dir=temp_dir)
+                status = installer.status()
+
+        self.assertFalse(status["hotkey_held"])
+        window_entry = status["hotkeys"][0]
+        self.assertFalse(window_entry["held"])
+        self.assertIn("daemon is not running", window_entry["detail"])
+        self.assertIn("launchctl kickstart", window_entry["detail"])
+        self.assertEqual([], channel.calls)
+        # Still named even when nothing is held: it is a standing property of
+        # the mechanism, not a symptom of the current unheld state.
+        self.assertEqual(MACOS_HOTKEY_MECHANISM_LIMITATION, status["hotkey_mechanism_limitation"])
+
+    def test_not_installed_still_names_the_limitation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            installer = _macos_installer(temp_dir=temp_dir)
+            status = installer.status()
+
+        self.assertFalse(status["installed"])
+        self.assertIn("hotkey_mechanism_limitation", status)
+
+    def test_windows_status_carries_no_macos_limitation_key(self) -> None:
+        """The field is macOS-only -- a Windows report must not gain it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            installer = _windows_installer(temp_dir=temp_dir)
+            status = installer.status()
+
+        self.assertNotIn("hotkey_mechanism_limitation", status)
+
+
+class MacosInProcessUninstallTests(unittest.TestCase):
+    def test_uninstall_clears_the_record_and_removes_the_service(self) -> None:
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").write({"window": "Meta+X"})
+            service = FakeMacosService(installed=True, active=True, entrypoint="/opt/murmly/murmly")
+            channel = FakeDaemonChannel(unreachable=True)
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _macos_installer(service=service, temp_dir=temp_dir)
+                outcome = installer.uninstall()
+
+        self.assertEqual({}, HotkeyRecordStore(Path(temp_dir) / "hotkeys.json").read())
+        self.assertEqual(1, service.removes)
+        self.assertFalse(outcome.hotkey_registered)
+
+    def test_uninstall_never_requests_the_accessibility_permission(self) -> None:
+        """Task 14.5: only `install()` may prompt -- `uninstall()` must never
+        reach `_request_macos_accessibility_permission` at all."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            channel = FakeDaemonChannel(unreachable=True)
+            with unittest.mock.patch("murmly.daemon.send_command", channel):
+                installer = _macos_installer(temp_dir=temp_dir)
+                requests = []
+                installer._request_macos_accessibility_permission = lambda: requests.append(True)
+
+                installer.uninstall()
+
+        self.assertEqual([], requests)
 
 
 if __name__ == "__main__":

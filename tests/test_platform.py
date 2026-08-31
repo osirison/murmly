@@ -7,6 +7,7 @@ import threading
 import time
 import types
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from murmly.desktop import GnomeShortcuts, PlasmaShortcuts
@@ -18,6 +19,8 @@ from murmly.platform import (
     BACKEND_REGISTRIES,
     ENVIRONMENT_PRECONDITIONS,
     IN_PROCESS_HOTKEY_MECHANISMS,
+    MACOS_ACCESSIBILITY_PERMISSION,
+    MACOS_MICROPHONE_PERMISSION,
     PERMISSIONS,
     RUNTIME_GAPS,
     TRANSCRIPTION_CAPABILITY,
@@ -34,6 +37,9 @@ from murmly.platform import (
     RuntimeGap,
     WINDOWS_MICROPHONE_PERMISSION,
     _detected_libc,
+    _macos_accessibility_permission_check,
+    _macos_microphone_permission_check,
+    _real_macos_microphone_authorization_status,
     _windows_developer_mode_enabled,
     _windows_long_paths_enabled,
     _windows_microphone_permission_check,
@@ -44,6 +50,7 @@ from murmly.platform import (
     runtime_gaps_for,
     transcription_runtime_gap,
 )
+from murmly.cli import platform_diagnostics
 from murmly.tts import KokoroSynthesizer
 
 
@@ -310,15 +317,14 @@ class BackendRegistryTests(unittest.TestCase):
         # attribute for a bare reference here to find either.
         self.assertIs(getattr(socket, "AF_UNIX", 1), choice.load())
 
-    def test_command_channel_has_no_backend_on_macos(self) -> None:
-        # Not Windows too (task 7.1): a named-pipe transport now exists there.
-        # macOS keeps the UNIX socket eventually (design.md's "The command
-        # channel"; task 13.1), but that backend does not exist yet.
+    def test_command_channel_selects_the_unix_socket_on_macos(self) -> None:
+        """Task 13.1: macOS keeps the UNIX socket exactly as Linux has it,
+        including the whole path-privacy analysis in `command-interface`."""
         choice = BACKEND_REGISTRIES["command_channel"].select(macos())
 
-        self.assertFalse(choice.available)
-        self.assertIsNone(choice.mechanism)
-        self.assertIn(macos().operating_system.value, choice.reason)
+        self.assertEqual("unix-socket", choice.mechanism)
+        self.assertTrue(choice.available)
+        self.assertIs(getattr(socket, "AF_UNIX", 1), choice.load())
 
     def test_command_channel_selects_the_named_pipe_on_windows(self) -> None:
         choice = BACKEND_REGISTRIES["command_channel"].select(windows())
@@ -400,9 +406,24 @@ class BackendRegistryTests(unittest.TestCase):
         self.assertIs(WAYLAND_INJECTORS, wayland_injection.load())
         self.assertIs(X11_INJECTORS, x11_injection.load())
 
-    def test_clipboard_and_injection_do_not_apply_off_linux(self) -> None:
-        self.assertFalse(BACKEND_REGISTRIES["clipboard"].select(macos()).available)
-        self.assertFalse(BACKEND_REGISTRIES["paste_injection"].select(macos()).available)
+    def test_clipboard_and_injection_select_native_apis_on_macos(self) -> None:
+        """Task 14.1/14.2: `NSPasteboard` and `CGEventPost`, never a `pbcopy`
+        subprocess -- see `mac_clipboard.py`."""
+        from murmly.mac_clipboard import CGEVENT_POST_METHOD, MacosClipboardPaster
+
+        clipboard = BACKEND_REGISTRIES["clipboard"].select(macos())
+        injection = BACKEND_REGISTRIES["paste_injection"].select(macos())
+
+        self.assertEqual("macos", clipboard.mechanism)
+        self.assertTrue(clipboard.available)
+        # Proves the loader -- and therefore `murmly.mac_clipboard` -- imports
+        # cleanly from this Linux machine, where no framework is touched
+        # until one of the class's own methods runs.
+        self.assertIs(MacosClipboardPaster, clipboard.load())
+
+        self.assertEqual("macos", injection.mechanism)
+        self.assertTrue(injection.available)
+        self.assertEqual(CGEVENT_POST_METHOD, injection.load())
 
     def test_clipboard_and_injection_select_native_win32_on_windows(self) -> None:
         """Task 9.1/9.2: the Win32 API, not a Linux clipboard command."""
@@ -486,12 +507,31 @@ class BackendRegistryTests(unittest.TestCase):
         self.assertTrue(choice.available)
         self.assertIs(OverlayController, choice.load())
 
-    def test_speech_synthesis_selects_kokoro_on_linux_only(self) -> None:
-        choice = BACKEND_REGISTRIES["speech_synthesis"].select(linux_plasma_x11())
+    def test_speech_synthesis_selects_kokoro_on_every_named_operating_system(self) -> None:
+        """The one registry that does not vary by platform, and must not.
 
-        self.assertEqual("kokoro", choice.mechanism)
-        self.assertIs(KokoroSynthesizer, choice.load())
-        self.assertFalse(BACKEND_REGISTRIES["speech_synthesis"].select(windows()).available)
+        This test previously asserted the opposite -- kokoro on Linux and
+        nothing anywhere else -- which is what 1.6 left behind when it
+        registered "every backend that exists today, unchanged" and Linux was
+        the only platform there was. It made `doctor` tell a macOS or Windows
+        user that Murmly has no speech synthesis at all, which is false:
+        `onnxruntime` and `espeakng-loader` publish wheels for all three, and
+        the accelerator is whatever the platform has. It is the same fact that
+        let `speech-output` go through this change with no spec delta.
+        """
+        for profile in (linux_plasma_x11(), macos(), windows()):
+            with self.subTest(operating_system=profile.operating_system.value):
+                choice = BACKEND_REGISTRIES["speech_synthesis"].select(profile)
+
+                self.assertEqual("kokoro", choice.mechanism)
+                self.assertIs(KokoroSynthesizer, choice.load())
+
+    def test_speech_synthesis_has_no_backend_on_an_unnamed_operating_system(self) -> None:
+        choice = BACKEND_REGISTRIES["speech_synthesis"].select(
+            replace(linux_plasma_x11(), operating_system=OperatingSystem.OTHER)
+        )
+
+        self.assertFalse(choice.available)
 
     def test_every_registry_answers_for_every_constructed_platform_without_raising(self) -> None:
         """The exhaustive sweep across concerns and platforms task 18.1 asks for."""
@@ -526,11 +566,14 @@ class InProcessHotkeyMarkerTests(unittest.TestCase):
         needs (task 5.4's design boundary, now populated)."""
         self.assertTrue(hotkey_mechanism_is_in_process(windows()))
 
-    def test_the_real_table_names_exactly_the_windows_mechanism(self) -> None:
-        """Nothing populates a macOS entry until section 13's backend exists
-        -- an entry here today would claim a mechanism this change never
-        built."""
-        self.assertEqual(frozenset({"windows-hotkey"}), IN_PROCESS_HOTKEY_MECHANISMS)
+    def test_the_real_table_names_exactly_the_windows_and_macos_mechanisms(self) -> None:
+        """Section 13 populates the second entry: Carbon `RegisterEventHotKey`
+        registers inside the daemon's own process exactly as `RegisterHotKey`
+        does, so it needs `hotkey_record.py`'s rebind-at-startup path too."""
+        self.assertEqual(frozenset({"windows-hotkey", "macos-hotkey"}), IN_PROCESS_HOTKEY_MECHANISMS)
+
+    def test_macos_hotkey_mechanism_is_in_process(self) -> None:
+        self.assertTrue(hotkey_mechanism_is_in_process(macos()))
 
     def test_an_injected_in_process_mechanism_is_recognised(self) -> None:
         """The branch a future Windows or macOS candidate exercises, proven
@@ -559,8 +602,16 @@ class BackendChoiceRemedyTests(unittest.TestCase):
 
     def test_remedy_defaults_to_empty(self) -> None:
         """A registry that never names anything to install -- every one of
-        them except `OVERLAY` -- need not construct an unused remedy."""
-        choice = BACKEND_REGISTRIES["command_channel"].select(macos())
+        them except `OVERLAY` -- need not construct an unused remedy.
+
+        Driven off an operating system Murmly does not name, because every
+        concern that once stood in for "genuinely unavailable" here has since
+        gained a real backend: `command_channel` first, then
+        `speech_synthesis`, whose macOS absence was a defect rather than a
+        fact about macOS."""
+        choice = BACKEND_REGISTRIES["speech_synthesis"].select(
+            replace(linux_plasma_x11(), operating_system=OperatingSystem.OTHER)
+        )
 
         self.assertFalse(choice.available)
         self.assertEqual((), choice.remedy)
@@ -576,16 +627,24 @@ class BackendChoiceRemedyTests(unittest.TestCase):
 
 
 class PermissionShapeTests(unittest.TestCase):
-    """6.4: the reporting shape, exercised against the real `windows-microphone`
-    entry (task 9.5) and a constructed `Permission` for the two future macOS
-    grants (sections 12, 14) that are not registered yet."""
+    """6.4: the reporting shape, exercised against the real
+    `windows-microphone` (task 9.5) and `macos-microphone` (task 12.5)
+    entries, and a constructed `Permission` for the two future macOS grants
+    (section 14: Accessibility, Input Monitoring) that are not registered
+    yet."""
 
-    def test_the_real_table_has_only_the_windows_microphone_permission(self) -> None:
+    def test_the_real_table_has_exactly_these_permissions(self) -> None:
         """Section 9 populates the first entry -- Windows' microphone privacy
-        setting (task 9.5). macOS's microphone, Accessibility, and Input
-        Monitoring grants (sections 12, 14) do not exist yet, so this must
-        name exactly one entry, not claim a check this change never built."""
-        self.assertEqual({"windows-microphone"}, set(PERMISSIONS))
+        setting (task 9.5) -- task 12.5 populates the second -- macOS's
+        `AVCaptureDevice` authorization status -- and task 14.4 populates the
+        third -- macOS's Accessibility grant. macOS's Input Monitoring grant
+        gates nothing this change builds (Carbon's `RegisterEventHotKey`
+        needs no permission at all, which is the whole point of choosing it
+        over a `CGEventTap`), so this must name exactly these three, not claim
+        a check this change never built."""
+        self.assertEqual(
+            {"windows-microphone", "macos-microphone", "macos-accessibility"}, set(PERMISSIONS)
+        )
 
     def test_the_windows_microphone_permission_applies_only_to_windows(self) -> None:
         """`applies` is what keeps a Linux (or macOS) report from growing a
@@ -746,6 +805,201 @@ class WindowsMicrophonePermissionRuntimeIntegrationTests(unittest.TestCase):
             self.assertEqual(PermissionState.DENIED, state, f"raw values: {raw_values!r}")
         else:
             self.assertEqual(PermissionState.GRANTED, state, f"raw values: {raw_values!r}")
+
+
+class MacosMicrophonePermissionTests(unittest.TestCase):
+    """Task 12.5: the `AVAuthorizationStatus` -> `PermissionState` mapping,
+    over an injected reader -- the same shape `WindowsMicrophonePermissionTests`
+    proves for the registry seam. `authorized` (3) is the only `GRANTED`
+    value; `denied` (2) and `restricted` (1) both collapse to `DENIED`;
+    `notDetermined` (0), `None` (the ctypes call could not be made at all),
+    and any value this mapping does not name are all `UNDETERMINED`, never
+    `GRANTED` -- the same rule the `platform-support` spec states for an
+    unreadable Windows registry key, applied here to a status TCC has not
+    yet decided or a read that never reached AVFoundation at all.
+    """
+
+    def test_authorized_is_granted(self) -> None:
+        state = _macos_microphone_permission_check(macos(), read_authorization_status=lambda: 3)
+
+        self.assertEqual(PermissionState.GRANTED, state)
+
+    def test_denied_is_denied(self) -> None:
+        state = _macos_microphone_permission_check(macos(), read_authorization_status=lambda: 2)
+
+        self.assertEqual(PermissionState.DENIED, state)
+
+    def test_restricted_is_also_denied(self) -> None:
+        """A parental-controls or MDM restriction is not a person's own
+        choice, but the capability does not work either way, and the report
+        names only where a grant is normally changed -- not who imposed the
+        block -- so this collapses to the same `DENIED` a person's own
+        refusal does."""
+        state = _macos_microphone_permission_check(macos(), read_authorization_status=lambda: 1)
+
+        self.assertEqual(PermissionState.DENIED, state)
+
+    def test_not_determined_is_undetermined_not_granted(self) -> None:
+        """TCC has not yet asked -- nothing has been granted, so this must
+        not read as `GRANTED` (the `platform-support` spec's "A permission
+        whose state cannot be read", applied to a status that is answerable
+        but simply has not been decided yet)."""
+        state = _macos_microphone_permission_check(macos(), read_authorization_status=lambda: 0)
+
+        self.assertEqual(PermissionState.UNDETERMINED, state)
+
+    def test_a_call_that_could_not_be_made_is_undetermined_not_granted(self) -> None:
+        state = _macos_microphone_permission_check(macos(), read_authorization_status=lambda: None)
+
+        self.assertEqual(PermissionState.UNDETERMINED, state)
+
+    def test_an_unrecognised_status_is_undetermined_not_granted(self) -> None:
+        state = _macos_microphone_permission_check(macos(), read_authorization_status=lambda: 99)
+
+        self.assertEqual(PermissionState.UNDETERMINED, state)
+
+    def test_registered_under_the_real_table_with_the_check_wired_in(self) -> None:
+        permission = PERMISSIONS[MACOS_MICROPHONE_PERMISSION]
+
+        self.assertIs(_macos_microphone_permission_check, permission.check)
+        self.assertEqual("microphone capture", permission.capability)
+
+    def test_applies_only_to_macos(self) -> None:
+        permission = PERMISSIONS[MACOS_MICROPHONE_PERMISSION]
+
+        self.assertTrue(permission.applies(macos()))
+        self.assertFalse(permission.applies(windows()))
+        self.assertFalse(permission.applies(linux_plasma_x11()))
+
+    def test_a_linux_report_grows_no_entry_for_the_macos_permission(self) -> None:
+        """The same rule task 9.5 established for the Windows entry: a
+        platform this permission does not gate anything on must not grow a
+        field for it."""
+        report = platform_diagnostics(linux_plasma_x11())
+
+        self.assertNotIn(MACOS_MICROPHONE_PERMISSION, report["permissions"])
+
+
+class MacosMicrophonePermissionRuntimeIntegrationTests(unittest.TestCase):
+    """Task 12.5, against the real Objective-C runtime call: everything
+    above this class proves the status-mapping rule against an injected fake
+    reader. This follows `WindowsMicrophonePermissionRuntimeIntegrationTests`'s
+    pattern exactly -- skip in `setUp` on every platform but the one with the
+    mechanism, then assert only what a real, unknown-state runner can prove.
+
+    The macOS CI runner this is meant to run on is headless: no microphone
+    device at all, and "its TCC state is not a normal user's" (this task's
+    own brief). So no assertion here pins a specific `PermissionState` --
+    which one comes back depends on facts this class does not control, most
+    plausibly `UNDETERMINED` (TCC never having been asked to attribute a
+    request to whatever unsigned interpreter runs this suite) but not
+    provably so from a machine that cannot run this at all. What is pinned:
+    the real call returns a `PermissionState` member without raising, and
+    the raw status is printed into the failure message so a real run's
+    actual value lands in the CI log even when the test passes -- exactly
+    `WindowsMicrophonePermissionRuntimeIntegrationTests`'s own convention.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("AVFoundation and the Objective-C runtime require a macOS kernel")
+
+    def test_reads_a_permission_state_from_the_real_avfoundation_call(self) -> None:
+        raw_status = _real_macos_microphone_authorization_status()
+        state = _macos_microphone_permission_check(macos())
+
+        self.assertIn(
+            state,
+            (PermissionState.GRANTED, PermissionState.DENIED, PermissionState.UNDETERMINED),
+            f"raw AVAuthorizationStatus on this runner: {raw_status!r}",
+        )
+        if raw_status == 3:
+            self.assertEqual(PermissionState.GRANTED, state, f"raw status: {raw_status!r}")
+        elif raw_status in (1, 2):
+            self.assertEqual(PermissionState.DENIED, state, f"raw status: {raw_status!r}")
+        else:
+            self.assertEqual(PermissionState.UNDETERMINED, state, f"raw status: {raw_status!r}")
+
+
+class MacosAccessibilityPermissionTests(unittest.TestCase):
+    """Task 14.4: `AXIsProcessTrusted()` -> `PermissionState`, over an
+    injected reader -- the same shape `MacosMicrophonePermissionTests` proves
+    for the microphone check. Unlike that check, `AXIsProcessTrusted` has
+    only two answers (`True`/`False`), so `False` maps straight to `DENIED`
+    -- there is no third "not asked yet" reading to give `UNDETERMINED`
+    instead, unlike `notDetermined`'s role in the microphone mapping."""
+
+    def test_trusted_is_granted(self) -> None:
+        state = _macos_accessibility_permission_check(macos(), is_trusted=lambda: True)
+
+        self.assertEqual(PermissionState.GRANTED, state)
+
+    def test_untrusted_is_denied_not_undetermined(self) -> None:
+        state = _macos_accessibility_permission_check(macos(), is_trusted=lambda: False)
+
+        self.assertEqual(PermissionState.DENIED, state)
+
+    def test_a_call_that_could_not_be_made_is_undetermined_not_granted(self) -> None:
+        """The one case this does map to `UNDETERMINED`: the platform could
+        not even be asked, distinct from being asked and answering `False`."""
+        state = _macos_accessibility_permission_check(macos(), is_trusted=lambda: None)
+
+        self.assertEqual(PermissionState.UNDETERMINED, state)
+
+    def test_registered_under_the_real_table_with_the_check_wired_in(self) -> None:
+        permission = PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]
+
+        self.assertIs(_macos_accessibility_permission_check, permission.check)
+        self.assertEqual("paste injection", permission.capability)
+        self.assertIn("Accessibility", permission.grant_location)
+
+    def test_applies_only_to_macos(self) -> None:
+        permission = PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]
+
+        self.assertTrue(permission.applies(macos()))
+        self.assertFalse(permission.applies(windows()))
+        self.assertFalse(permission.applies(linux_plasma_x11()))
+
+    def test_a_linux_report_grows_no_entry_for_the_macos_permission(self) -> None:
+        report = platform_diagnostics(linux_plasma_x11())
+
+        self.assertNotIn(MACOS_ACCESSIBILITY_PERMISSION, report["permissions"])
+
+
+class MacosAccessibilityPermissionRuntimeIntegrationTests(unittest.TestCase):
+    """Task 14.4, against the real `AXIsProcessTrusted()` call: everything
+    above this class proves the status-mapping rule against an injected fake
+    reader. Follows `MacosMicrophonePermissionRuntimeIntegrationTests`'s
+    pattern exactly -- skip in `setUp` on every platform but the one with the
+    mechanism, then assert only what a real, unknown-grant-state runner can
+    prove: this test's own process is very unlikely to be trusted (an ad hoc
+    `uv run` interpreter, not a signed, granted bundle), so no assertion here
+    pins `DENIED` specifically -- what is pinned is that the real call
+    answers a plain `bool` without raising or prompting, matching this
+    function's own documented "never prompts" contract (task 14.4).
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("ApplicationServices requires a macOS kernel")
+
+    def test_reads_a_permission_state_from_the_real_ax_call(self) -> None:
+        from murmly.mac_clipboard import _real_is_process_trusted
+
+        raw_trusted = _real_is_process_trusted()
+        state = _macos_accessibility_permission_check(macos())
+
+        self.assertIsInstance(raw_trusted, bool)
+        self.assertIn(
+            state,
+            (PermissionState.GRANTED, PermissionState.DENIED, PermissionState.UNDETERMINED),
+            f"raw AXIsProcessTrusted() on this runner: {raw_trusted!r}",
+        )
+        self.assertEqual(
+            PermissionState.GRANTED if raw_trusted else PermissionState.DENIED,
+            state,
+            f"raw trusted: {raw_trusted!r}",
+        )
 
 
 class EnvironmentPreconditionShapeTests(unittest.TestCase):
@@ -1027,15 +1281,23 @@ class NamedPipeDacShapeTests(unittest.TestCase):
 
 class WindowsPipeSecurityDescriptorIntegrationTests(unittest.TestCase):
     """18.6: read the real DACL back off a real pipe and assert it names only
-    the creating user's SID. Needs `pywin32` and a Windows kernel, neither of
-    which this machine has, so every test here skips itself immediately --
-    the `X11RuntimeIntegrationTests` pattern (`tests/test_focus.py`) applied
-    to the wrong-operating-system case (18.18) rather than a missing display.
-    This class has never executed anywhere this suite has run: the exact
-    `win32security.GetSecurityInfo` return shape used below is written from
-    the documented Win32 API and common `pywin32` usage, not from having run
-    it, and a Windows machine is the first real check of it. See this
-    session's return value for what that means for 18.6's checkbox."""
+    the creating user's SID. Needs `pywin32` and a Windows kernel, so every
+    test here skips itself off Windows -- the `X11RuntimeIntegrationTests`
+    pattern (`tests/test_focus.py`) applied to the wrong-operating-system
+    case (18.18) rather than a missing display.
+
+    This is the class that closed 18.6 and 7.2. It was written from the
+    documented Win32 API rather than from having run it, and the first
+    Windows run said so: `GetSecurityInfo` returns one
+    `PySECURITY_DESCRIPTOR`, not the tuple its C out-parameters suggest, and
+    `PyACL.GetAce` returns `((type, flags), mask, sid)` rather than four flat
+    values. Both are corrected below and both are noted where they bite.
+
+    It now runs on the `windows-latest` job of every CI run and passes, which
+    is what makes 7.2 a checked box rather than an assumed one. Absence from
+    that job's "List what this platform skipped" output is the evidence it
+    executed; a green Windows run on its own would not be, because this class
+    skips itself everywhere else."""
 
     def setUp(self) -> None:
         if sys.platform != "win32":

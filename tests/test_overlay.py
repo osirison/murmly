@@ -12,6 +12,7 @@ from unittest.mock import patch
 from murmly.overlay import (
     GTK4_RENDERER_PYTHON,
     GTK4_RENDERER_SCRIPT_NAME,
+    MACOS_RENDERER_ENVIRONMENT_KEYS,
     MAX_MESSAGE_BYTES,
     MAX_PARTIAL_CHARS,
     NullOverlayController,
@@ -73,6 +74,12 @@ class RendererPythonTests(unittest.TestCase):
         # system one the GTK4 renderer needs.
         self.assertEqual(Path(sys.executable), renderer_python(OverlayBackend.WINDOWS))
 
+    def test_macos_needs_the_projects_own_interpreter(self) -> None:
+        # Task 15.1: macOS shares Windows' answer today for the same reason
+        # -- PySide6 is a wheel there too. See `OverlayBackend.MACOS`'s own
+        # docstring for why this sharing is not assumed to last.
+        self.assertEqual(Path(sys.executable), renderer_python(OverlayBackend.MACOS))
+
 
 class RendererScriptTests(unittest.TestCase):
     """Task 10.1: `OverlayController` launches a different script per backend."""
@@ -84,6 +91,10 @@ class RendererScriptTests(unittest.TestCase):
     def test_windows_launches_the_qt_script(self) -> None:
         self.assertEqual(QT_RENDERER_SCRIPT_NAME, renderer_script(OverlayBackend.WINDOWS).name)
 
+    def test_macos_launches_the_qt_script(self) -> None:
+        """Task 15.1/15.2: the same renderer Windows uses, attempted first."""
+        self.assertEqual(QT_RENDERER_SCRIPT_NAME, renderer_script(OverlayBackend.MACOS).name)
+
     def test_both_scripts_live_beside_this_module(self) -> None:
         from murmly import overlay as overlay_module
 
@@ -93,11 +104,12 @@ class RendererScriptTests(unittest.TestCase):
 
 
 class OverlayBackendForProfileTests(unittest.TestCase):
-    """Task 10.1: Windows always gets the Qt backend, independent of the
-    Linux-only desktop/session fields `detect_overlay_backend` otherwise
-    gates on -- and independent of `env=`, which cannot steer
-    `PlatformProfile.operating_system` (that comes from `sys.platform`), so
-    the Windows branch is exercised by constructing a profile directly.
+    """Task 10.1/15.1: Windows and macOS always get the Qt backend,
+    independent of the Linux-only desktop/session fields
+    `detect_overlay_backend` otherwise gates on -- and independent of `env=`,
+    which cannot steer `PlatformProfile.operating_system` (that comes from
+    `sys.platform`), so each branch is exercised by constructing a profile
+    directly.
     """
 
     def test_windows_selects_the_windows_backend_regardless_of_desktop_fields(self) -> None:
@@ -115,8 +127,23 @@ class OverlayBackendForProfileTests(unittest.TestCase):
         )
         self.assertEqual(OverlayBackend.WINDOWS, overlay_backend_for_profile(odd_profile))
 
-    def test_macos_and_unsupported_platforms_have_no_backend(self) -> None:
-        self.assertIsNone(overlay_backend_for_profile(PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")))
+    def test_macos_selects_the_macos_backend_regardless_of_desktop_fields(self) -> None:
+        """Same shape as the Windows test above -- see task 15.1's own
+        `OverlayBackend.MACOS` docstring for why this shares the Qt renderer
+        rather than getting a `NullOverlayController` the way an unsupported
+        operating system does."""
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        self.assertEqual(OverlayBackend.MACOS, overlay_backend_for_profile(profile))
+
+        odd_profile = PlatformProfile(
+            operating_system=OperatingSystem.MACOS,
+            architecture="arm64",
+            desktop=Desktop.OTHER,
+            session_type="x11",
+        )
+        self.assertEqual(OverlayBackend.MACOS, overlay_backend_for_profile(odd_profile))
+
+    def test_unsupported_platforms_have_no_backend(self) -> None:
         self.assertIsNone(overlay_backend_for_profile(PlatformProfile(operating_system=OperatingSystem.OTHER, architecture="x86_64")))
 
 
@@ -150,6 +177,39 @@ class RendererEnvironmentWindowsTests(unittest.TestCase):
 
     def test_missing_keys_are_simply_absent_not_empty(self) -> None:
         self.assertEqual({}, renderer_environment(OverlayBackend.WINDOWS, {}))
+
+
+class RendererEnvironmentMacosTests(unittest.TestCase):
+    """Task 15.1: the macOS Qt renderer's environment is its own vocabulary --
+    no XDG/D-Bus/GDK, and no Win32 either."""
+
+    def test_only_macos_keys_pass_through(self) -> None:
+        source = {
+            "HOME": "/Users/person",
+            "TMPDIR": "/var/folders/xy/T/",
+            "PATH": "/usr/bin:/bin",
+            "LANG": "en_US.UTF-8",
+            # Neither the GTK4/XDG vocabulary nor the Win32 one has a place
+            # here; must not leak through.
+            "WAYLAND_DISPLAY": "wayland-0",
+            "DISPLAY": ":0",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "SYSTEMROOT": r"C:\Windows",
+        }
+
+        environment = renderer_environment(OverlayBackend.MACOS, source)
+
+        self.assertEqual(set(MACOS_RENDERER_ENVIRONMENT_KEYS) & set(source), set(environment))
+        self.assertNotIn("WAYLAND_DISPLAY", environment)
+        self.assertNotIn("DISPLAY", environment)
+        self.assertNotIn("XDG_RUNTIME_DIR", environment)
+        self.assertNotIn("SYSTEMROOT", environment)
+        self.assertNotIn("GDK_BACKEND", environment)
+        self.assertNotIn("PYTHONNOUSERSITE", environment)
+        self.assertEqual("/Users/person", environment["HOME"])
+
+    def test_missing_keys_are_simply_absent_not_empty(self) -> None:
+        self.assertEqual({}, renderer_environment(OverlayBackend.MACOS, {}))
 
 
 class FakeSocket:

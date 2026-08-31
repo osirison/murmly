@@ -137,7 +137,7 @@ shippable on their own. See `design.md` — Migration Plan.
 - [ ] 15.2 If they do not, build the renderer directly on `NSPanel` through PyObjC — `NSWindowStyleMaskNonactivatingPanel`, `setLevel_`, `setIgnoresMouseEvents_`, and an all-Spaces `collectionBehavior` — rather than reflecting AppKit calls onto Qt's `NSWindow`, which is a community technique with no documented confirmation
 - [ ] 15.3 Present nothing and report the reason where neither route gives the required properties
 - [ ] 15.4 Confirm synthesis resolves the CoreML execution provider, which the stock `onnxruntime` macOS wheel carries, and that `[tts] device = "auto"` uses it while `[stt] device` correctly finds no accelerator — CTranslate2 has no GPU backend on macOS
-- [ ] 15.5 Spike the bundled `espeakng-loader` macOS wheel for the same data-path defect, and name Homebrew's `espeak-ng` in the remedy if it carries it
+- [x] 15.5 Spike the bundled `espeakng-loader` macOS wheel for the same data-path defect, and name Homebrew's `espeak-ng` in the remedy if it carries it
 
 ## 16. The installer
 
@@ -166,8 +166,8 @@ shippable on their own. See `design.md` — Migration Plan.
 - [x] 18.8 Test the GNOME backend against a fake command runner: binding written, read back, conflict refused, and removal taking out exactly what was added
 - [x] 18.9 Test that one hotkey specification produces the same physical key on each platform's encoding, and that a modifier a platform does not have is refused by name
 - [x] 18.10 Test that a hotkey held in-process is reported as not held when the daemon is not running, and released when it stops
-- [ ] 18.11 Test that `SendInput` and `CGEventPost` are treated as unconfirmable: the transcript stays on the clipboard and the previous contents are not restored over it
-- [ ] 18.12 Test that an injection method whose permission is ungranted is reported as not permitted, distinctly from absent and from installed-but-unusable, and is not reported as available
+- [x] 18.11 Test that `SendInput` and `CGEventPost` are treated as unconfirmable: the transcript stays on the clipboard and the previous contents are not restored over it
+- [x] 18.12 Test that an injection method whose permission is ungranted is reported as not permitted, distinctly from absent and from installed-but-unusable, and is not reported as available
 - [x] 18.13 Test that a permission whose state cannot be read is reported as undetermined rather than granted
 - [x] 18.14 Test that both overlay renderers handle the same protocol messages and present the same enumerated states, without a display
 - [ ] 18.15 Test that the overlay is not presented, and the missing property named, where the platform cannot give a surface that takes no focus and intercepts no pointer input

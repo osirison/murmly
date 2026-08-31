@@ -75,6 +75,22 @@ WINDOWS_RENDERER_ENVIRONMENT_KEYS = {
     "USERPROFILE",
     "WINDIR",
 }
+#: The macOS Qt renderer's own environment, built the same way
+#: `WINDOWS_RENDERER_ENVIRONMENT_KEYS` is: no XDG/D-Bus/GDK vocabulary (none
+#: of that exists on macOS), and no Win32 vocabulary either. `HOME` and `PATH`
+#: are what a Cocoa process needs present at all; `LANG`/`LC_ALL`/`LC_CTYPE`
+#: are carried the same way the POSIX renderers already carry them (see
+#: `COMMON_RENDERER_ENVIRONMENT_KEYS`) because Qt's text layout consults them
+#: regardless of platform; `TMPDIR` is where macOS actually points temporary
+#: files, unlike Linux's `/tmp`, which needs no environment variable to reach.
+MACOS_RENDERER_ENVIRONMENT_KEYS = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "TMPDIR",
+}
 
 
 class OverlayState(StrEnum):
@@ -88,17 +104,51 @@ class OverlayBackend(StrEnum):
     WAYLAND = "wayland"
     #: Windows' overlay renderer (task 10): a Qt process presenting the same
     #: newline-delimited JSON protocol and the same `overlay_shared` states as
-    #: the GTK4 one. Named for the platform, not the toolkit, because the
-    #: macOS renderer this design also calls for (section 15, not built here)
-    #: may end up on PyObjC rather than Qt -- design.md's own recorded risk --
-    #: and a member spelled `qt` would misdescribe that renderer too.
+    #: the GTK4 one. Named for the platform, not the toolkit, because a member
+    #: spelled `qt` would misdescribe `MACOS` below, which shares this same
+    #: script and interpreter today but is not guaranteed to keep doing so
+    #: (see `MACOS`'s own docstring).
     WINDOWS = "windows"
+    #: macOS's overlay renderer (task 15.1/15.2). Reuses the Qt renderer and
+    #: `WINDOWS`'s launch shape -- POSIX `socketpair`/`pass_fds` work on macOS
+    #: exactly as they do on Linux, so nothing here needs `WINDOWS`'s own
+    #: `share()`/`fromshare()` workaround -- because design.md's own spike
+    #: order is "against Qt's own flags first": `Qt.WindowTransparentForInput`
+    #: and `Qt.WindowDoesNotAcceptFocus` are requested identically to every
+    #: other backend already (`overlay_renderer_qt.py`'s window-flags code is
+    #: shared, not backend-specific), and `overlay_renderer_qt._verify_and_show`
+    #: reads back the real `NSWindow` state through `ctypes`/`objc_msgSend`
+    #: rather than assuming those flags took -- the same read-back-don't-assume
+    #: discipline `apply_and_verify_exstyle` already holds for Windows'
+    #: `SetWindowLongPtr`. It never *mutates* the Qt-created `NSWindow`:
+    #: design.md's Risks section calls reflecting AppKit calls onto Qt's own
+    #: `NSWindow` "a community technique with no citable confirmation", and
+    #: that caution applies to writing through the handle, not to reading it
+    #: back for verification. If that read-back ever reports a window missing
+    #: one of the spec's required properties on a real Mac -- unconfirmed from
+    #: here; a headless CI runner cannot show whether a click genuinely passes
+    #: through a live window, see `scripts/macos_overlay_spike.py` -- task
+    #: 15.2's fallback is a renderer built directly on `NSPanel`, through the
+    #: same raw-`ctypes`-`objc_msgSend` convention `mac_clipboard.py` and
+    #: `mac_focus.py` already established for this codebase and never PyObjC,
+    #: which design.md's own task text names but which nothing else in this
+    #: change uses -- see that convention's docstring for why arm64-only scope
+    #: makes plain `objc_msgSend` enough. At that point `MACOS` would very
+    #: likely want its own script and interpreter answers below, the same way
+    #: `WINDOWS` differs from the GTK4 backends'.
+    MACOS = "macos"
 
 
-#: The Qt renderer script `renderer_script` returns for `OverlayBackend.WINDOWS`.
+#: The Qt renderer script `renderer_script` returns for `OverlayBackend.WINDOWS`
+#: and `OverlayBackend.MACOS`.
 QT_RENDERER_SCRIPT_NAME = "overlay_renderer_qt.py"
 #: The GTK4 renderer script every other backend returns.
 GTK4_RENDERER_SCRIPT_NAME = "overlay_renderer.py"
+
+#: Backends whose renderer is the Qt one, sharing `renderer_python`'s and
+#: `renderer_script`'s answers today -- see `OverlayBackend.MACOS`'s
+#: docstring for why that sharing is not assumed to last.
+QT_BACKENDS = (OverlayBackend.WINDOWS, OverlayBackend.MACOS)
 
 
 def renderer_python(backend: OverlayBackend) -> Path:
@@ -107,12 +157,12 @@ def renderer_python(backend: OverlayBackend) -> Path:
     Asked per backend rather than read off one constant, because the two
     Linux backends share one answer for the reason recorded on
     `GTK4_RENDERER_PYTHON` -- both launch the GTK4 renderer, only the display
-    protocol underneath it differs -- while Windows answers differently:
-    PySide6 is a wheel, so its renderer runs under the interpreter Murmly's
-    own daemon is already running under (`sys.executable`), never the system
-    one.
+    protocol underneath it differs -- while the two `QT_BACKENDS` answer
+    differently: PySide6 is a wheel, so its renderer runs under the
+    interpreter Murmly's own daemon is already running under
+    (`sys.executable`), never the system one.
     """
-    if backend is OverlayBackend.WINDOWS:
+    if backend in QT_BACKENDS:
         return Path(sys.executable)
     return GTK4_RENDERER_PYTHON
 
@@ -127,7 +177,7 @@ def renderer_script(backend: OverlayBackend) -> Path:
     module and `cli.overlay_diagnostics`), rather than the file name being
     guessed again wherever a renderer gets launched.
     """
-    name = QT_RENDERER_SCRIPT_NAME if backend is OverlayBackend.WINDOWS else GTK4_RENDERER_SCRIPT_NAME
+    name = QT_RENDERER_SCRIPT_NAME if backend in QT_BACKENDS else GTK4_RENDERER_SCRIPT_NAME
     return Path(__file__).with_name(name)
 
 
@@ -254,6 +304,13 @@ def overlay_backend_for_profile(profile: PlatformProfile) -> OverlayBackend | No
         # split kept below between "Plasma is here" and "this session's
         # display is usable".
         return OverlayBackend.WINDOWS
+    if profile.operating_system is OperatingSystem.MACOS:
+        # Same split as Windows immediately above: every interactive macOS
+        # session has a desktop to draw on, and whether it can actually host
+        # a layered, click-through, non-activating surface is what
+        # `overlay_renderer_qt.py`'s own `--check` and native-window read-back
+        # answer (task 15.1/15.3), not this pure mapping.
+        return OverlayBackend.MACOS
     if profile.desktop is not Desktop.PLASMA:
         return None
     if profile.session_type == "wayland":
@@ -284,6 +341,8 @@ def renderer_environment(
         # and Win32 need present to initialize at all -- see
         # `WINDOWS_RENDERER_ENVIRONMENT_KEYS`.
         return {key: source[key] for key in WINDOWS_RENDERER_ENVIRONMENT_KEYS if key in source}
+    if backend is OverlayBackend.MACOS:
+        return {key: source[key] for key in MACOS_RENDERER_ENVIRONMENT_KEYS if key in source}
     keys = set(COMMON_RENDERER_ENVIRONMENT_KEYS)
     if backend is OverlayBackend.WAYLAND:
         keys.add("WAYLAND_DISPLAY")
@@ -496,13 +555,13 @@ class OverlayController:
     def _renderer_path_argument(self, path: Path) -> str:
         """Render `path` the way this backend's real launch would.
 
-        `.as_posix()` for the POSIX renderers (X11/Wayland): they are launched
-        only on Linux in real use, so their command line is a POSIX path
-        regardless of which host's flavour `Path` would otherwise render -- a
-        Windows runner exercising this same Linux-only launch logic would
-        otherwise get backslashes here. Windows takes `str(path)` instead,
-        because there its command line genuinely is rendered by a
-        `WindowsPath` on the host that actually launches it.
+        `.as_posix()` for every POSIX renderer -- X11 and Wayland run only on
+        Linux in real use, and macOS is POSIX too, so all three always render
+        a POSIX path regardless of which host's flavour `Path` would
+        otherwise render -- a Windows runner exercising this same launch
+        logic for any of them would otherwise get backslashes here. Windows
+        takes `str(path)` instead, because there its command line genuinely
+        is rendered by a `WindowsPath` on the host that actually launches it.
         """
         if self._backend is OverlayBackend.WINDOWS:
             return str(path)

@@ -240,6 +240,7 @@ def select_paste_injection(
     run: Run = subprocess.run,
     excluded: Iterable[str] = (),
     profile: PlatformProfile | None = None,
+    macos_accessibility_trusted: Callable[[], bool] | None = None,
 ) -> PasteInjection:
     """Pick an injection method this session can actually execute.
 
@@ -257,6 +258,17 @@ def select_paste_injection(
     there is nothing to detect, so this returns immediately rather than
     running the Wayland/X11 candidate lists' installed-and-probed machinery
     against a platform those tools do not exist on.
+
+    macOS also has exactly one method, `CGEventPost`, but unlike Windows'
+    `SendInput` it is gated behind a real, checkable permission -- the
+    Accessibility grant `AXIsProcessTrusted()` reports (task 14.4). Task 18.12
+    and the `transcript-delivery` spec's "a method the platform gates behind a
+    permission MUST NOT be reported as available while that permission is
+    ungranted" is what `macos_accessibility_trusted` exists to make testable
+    from Linux: it defaults to the real `AXIsProcessTrusted()` call, and a
+    test supplies a fake instead, exactly as `_windows_microphone_permission_
+    check`'s own `read_registry_value` parameter does for a different
+    platform's permission.
     """
     environment = env or os.environ
     resolved = profile if profile is not None else resolve_platform(environment)
@@ -270,6 +282,33 @@ def select_paste_injection(
                 reason=f"{SEND_INPUT_METHOD} failed to inject a paste earlier in this session",
             )
         return PasteInjection(SEND_INPUT_METHOD, (), confirms_delivery=False)
+    if resolved.operating_system is OperatingSystem.MACOS:
+        from murmly.mac_clipboard import CGEVENT_POST_METHOD, _real_is_process_trusted
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, PERMISSIONS
+
+        if CGEVENT_POST_METHOD in set(excluded):
+            return PasteInjection(
+                None,
+                None,
+                reason=f"{CGEVENT_POST_METHOD} failed to inject a paste earlier in this session",
+            )
+        is_trusted = macos_accessibility_trusted if macos_accessibility_trusted is not None else _real_is_process_trusted
+        if not is_trusted():
+            permission = PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]
+            # Named as the permission this genuinely is (distinct from "no
+            # injector is installed", the absent case the branches below
+            # report, and from "installed but cannot inject in this session",
+            # the X11/Wayland probe-failure case) -- 18.12 and the
+            # `transcript-delivery` spec's own scenario both require this
+            # case to be told apart from the other two, not folded into
+            # `reason`'s free text alone.
+            return PasteInjection(
+                None,
+                None,
+                reason="The Accessibility permission has not been granted to Murmly.",
+                remedy=(f"Grant it in {permission.grant_location}.",),
+            )
+        return PasteInjection(CGEVENT_POST_METHOD, (), confirms_delivery=False)
     wayland = is_wayland_session(environment)
     candidates = WAYLAND_INJECTORS if wayland else X11_INJECTORS
     remedy = injector_remedy(environment)
@@ -432,6 +471,12 @@ def create_clipboard_paster(
         from murmly.win_clipboard import WindowsClipboardPaster
 
         return WindowsClipboardPaster(
+            restore_clipboard=restore_clipboard, restore_delay_ms=restore_delay_ms
+        )
+    if resolved.operating_system is OperatingSystem.MACOS:
+        from murmly.mac_clipboard import MacosClipboardPaster
+
+        return MacosClipboardPaster(
             restore_clipboard=restore_clipboard, restore_delay_ms=restore_delay_ms
         )
     return ClipboardPaster(

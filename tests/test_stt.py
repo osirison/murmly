@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -947,3 +948,28 @@ class TranscriberResidencyTests(unittest.TestCase):
         self.assertEqual(
             "an older runtime", transcriber.transcribe_pcm16(b"\x01\x00" * 16_000)
         )
+
+
+class MacosAcceleratorRuntimeIntegrationTests(unittest.TestCase):
+    """Task 15.4, against the real CTranslate2 build: design.md's claim is
+    that CTranslate2 has no macOS GPU backend at all, so `[stt] device =
+    "auto"` must resolve to the CPU there even though `[tts] device`'s own
+    `auto` finds an accelerator on the same machine (`test_tts.py`'s
+    `MacosCoreMLRuntimeIntegrationTests`) -- the reason the two settings are
+    independent in the first place. `ctranslate2.get_cuda_device_count()` is
+    the real call, not a fake, so this only proves anything run on the
+    machine it claims to be about.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("Only macOS's own CTranslate2 build is what this claim is about")
+
+    def test_auto_finds_no_accelerator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+        self.assertEqual(("cpu", "int8"), FasterWhisperTranscriber.resolve_runtime(config))

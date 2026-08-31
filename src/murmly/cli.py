@@ -59,6 +59,7 @@ from murmly.overlay import (
 )
 from murmly.platform import (
     BACKEND_REGISTRIES,
+    MACOS_ACCESSIBILITY_PERMISSION,
     PERMISSIONS,
     PermissionState,
     PlatformProfile,
@@ -66,6 +67,7 @@ from murmly.platform import (
     OperatingSystem,
     environment_preconditions_for,
     hotkey_mechanism_is_in_process,
+    microphone_permission_for,
     resolve_platform,
     transcription_runtime_gap,
     runtime_gaps_for,
@@ -73,7 +75,7 @@ from murmly.platform import (
 )
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
-from murmly.tts import CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
+from murmly.tts import COREML_PROVIDER, CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
 from murmly.win_pipe import is_pipe_name
 
 
@@ -617,6 +619,20 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         overlay = {"available": False, "detail": f"Unable to check the overlay: {error}"}
 
+    # Task 12.5: guarded like every other probe. `device_present: None` is
+    # `microphone_diagnostics`'s own answer for "could not be determined" --
+    # a probe that cannot even run must not collapse into that same value,
+    # which is why this still names the distinct top-level failure instead.
+    try:
+        microphone = microphone_diagnostics(resolved_profile)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        microphone = {
+            "device_present": None,
+            "permission": None,
+            "available": False,
+            "detail": f"Unable to check the microphone: {error}",
+        }
+
     # Guarded on its own, like every other probe: a speech stack that cannot be
     # inspected must not take the rest of the report with it.
     try:
@@ -668,6 +684,7 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
         "speech_output": speech,
+        "microphone": microphone,
         "installation": installation_diagnostics(),
     }
     if session_detail is not None:
@@ -724,13 +741,20 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
     A concern whose mechanism is gated behind a permission must AND that
     permission's state into its own `available`: a present mechanism whose
     permission is denied is not an available concern, and deriving
-    `available` from `BackendChoice.available` alone, as this does today,
-    would report it as one. None of the eight registries in
-    `BACKEND_REGISTRIES` is permission-gated yet -- `PERMISSIONS`' first entry
-    (Windows' microphone privacy setting, task 9.5) gates microphone capture,
-    which is not one of the eight -- so that rule still has no case to apply
-    to here, and `permissions` is rendered as its own section below rather
-    than folded into any concern.
+    `available` from `BackendChoice.available` alone would report it as one.
+    `paste_injection` on macOS is the first, and so far only, case: `macos`
+    is genuinely a registered candidate there (`BackendChoice.available` is
+    correctly `True` -- the mechanism, `CGEventPost`, exists on this
+    platform), but whether it can be *used* also depends on the Accessibility
+    grant `MACOS_ACCESSIBILITY_PERMISSION` names, which is not something
+    `BackendCandidate.supports` can express: that predicate answers "does
+    this platform have this mechanism at all", a fact about the platform, not
+    "has this person granted it", a fact about this installation that can
+    change without the platform changing. `permissions` below still renders
+    every applicable entry as its own section regardless -- this AND is
+    additional, not a replacement for it, since a person reading `doctor`
+    should see *which* permission is the reason `paste_injection` reads
+    unavailable, not just that it does.
     """
     concerns: dict[str, object] = {}
     for concern, registry in BACKEND_REGISTRIES.items():
@@ -743,6 +767,22 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
             concern_report["reason"] = choice.reason
             concern_report["remedy"] = list(choice.remedy)
         concerns[concern] = concern_report
+
+    if profile.operating_system is OperatingSystem.MACOS and concerns["paste_injection"]["available"]:
+        accessibility = PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]
+        try:
+            accessibility_state = accessibility.check(profile)
+        except Exception:  # noqa: BLE001 - a permission check must not raise
+            accessibility_state = PermissionState.UNDETERMINED
+        # Never reported available on an ungranted *or* an undetermined
+        # grant -- the same "silence is never claimed as a grant" rule this
+        # function already applies to `permissions` below, applied here to
+        # the concern the grant gates rather than only to the grant itself.
+        if accessibility_state is not PermissionState.GRANTED:
+            paste_injection = concerns["paste_injection"]
+            paste_injection["available"] = False
+            paste_injection["reason"] = "The Accessibility permission has not been granted to Murmly."
+            paste_injection["remedy"] = [f"Grant it in {accessibility.grant_location}."]
 
     permissions: dict[str, object] = {}
     for name, permission in PERMISSIONS.items():
@@ -795,6 +835,112 @@ def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
         # it also reports.
         "environment": environment_preconditions_for(profile),
     }
+
+
+def microphone_diagnostics(profile: PlatformProfile) -> dict[str, object]:
+    """Task 12.5: distinguish a denied microphone from an absent device.
+
+    The two are identical from inside a stream: both are an open device that
+    delivers nothing, or on macOS under TCC, a device that never opens and
+    raises nothing either. Neither fact is legible from inside the capture
+    path itself (`audio.py`'s `SoundDeviceRecorder`), so this reads both from
+    outside it, the same way design.md's "the whole difficulty" is framed:
+
+    * `device_present` -- whether PortAudio enumerates any input-capable
+      device at all, through `sounddevice.query_devices()`. This is pure
+      hardware enumeration and needs no permission on any of the three
+      platforms; it answers even where the permission check below cannot.
+    * `permission` -- the platform's own microphone grant, via
+      `microphone_permission_for`, `None` on a platform (Linux, today) that
+      gates nothing behind one.
+
+    `available` is the two combined, and the priority order between them
+    matters: a runner with no device at all and an unreadable or denied
+    permission -- a headless macOS CI runner is exactly this machine -- MUST
+    report "no device", never "denied". Reporting "denied" there would claim
+    a false thing: that a working microphone exists but is locked away,
+    when the truer and more useful fact is that there is no microphone to
+    lock. Device absence is therefore checked first and, when true, is the
+    whole reason -- the permission's state is still included in the report
+    for completeness, but never overrides the device-absence detail.
+
+    Task 12.6: even where every readable fact is good -- a device is present
+    and the permission reads granted -- this does not say the capture path
+    works. That is exactly the case design.md's largest risk hides in: a
+    launchd-started daemon can have both a granted permission and a real
+    device enumerable and still receive nothing, because TCC's grant was
+    never attributed to the process launchd started in the first place
+    (tasks 12.1-12.4, none of them provable from a headless CI runner or a
+    Linux machine). So the good case still carries a `detail` naming that,
+    on macOS specifically, rather than reporting `available: true` as if
+    end-to-end capture were confirmed.
+    """
+    device_present: bool | None
+    device_detail: str | None = None
+    try:
+        import sounddevice
+
+        devices = sounddevice.query_devices()
+        device_present = any(int(device["max_input_channels"]) > 0 for device in devices)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        device_present = None
+        device_detail = f"Unable to enumerate audio devices: {error}"
+
+    permission_entry: dict[str, object] | None = None
+    permission = microphone_permission_for(profile)
+    if permission is not None:
+        try:
+            state = permission.check(profile)
+        except Exception as error:  # noqa: BLE001 - a permission check must not raise
+            state = PermissionState.UNDETERMINED
+            permission_entry = {
+                "capability": permission.capability,
+                "state": state.value,
+                "grant_location": permission.grant_location,
+                "detail": f"Unable to determine whether the microphone permission is granted: {error}",
+            }
+        else:
+            permission_entry = {
+                "capability": permission.capability,
+                "state": state.value,
+                "grant_location": permission.grant_location,
+            }
+
+    report: dict[str, object] = {
+        "device_present": device_present,
+        "permission": permission_entry,
+    }
+    if device_detail is not None:
+        report["device_detail"] = device_detail
+
+    if device_present is False:
+        report["available"] = False
+        report["detail"] = "No microphone input device was found."
+    elif device_present is None:
+        report["available"] = False
+        report["detail"] = "Unable to determine whether a microphone input device is present."
+    elif permission_entry is not None and permission_entry["state"] == PermissionState.DENIED.value:
+        report["available"] = False
+        report["detail"] = (
+            f"Microphone access is denied. Grant it at {permission_entry['grant_location']}."
+        )
+    elif permission_entry is not None and permission_entry["state"] == PermissionState.UNDETERMINED.value:
+        report["available"] = False
+        report["detail"] = "Whether microphone access is granted could not be determined."
+    elif profile.operating_system is OperatingSystem.MACOS:
+        # A device is present and the permission reads granted (or macOS
+        # gates nothing this check found undetermined) -- but that is not
+        # proof a launchd-started daemon actually receives audio (task
+        # 12.6). Reported available, since every readable fact is good, but
+        # named as unverified rather than confirmed end to end.
+        report["available"] = True
+        report["detail"] = (
+            "A microphone device is present and its permission is not denied, but capture under "
+            "a launchd-started daemon is not yet verified end to end (tasks 12.1-12.4)."
+        )
+    else:
+        report["available"] = True
+    return report
 
 
 def command_socket_diagnostics(
@@ -1099,12 +1245,21 @@ def synthesis_providers(config: MurmlyConfig) -> tuple[list[str], str | None]:
 
 
 def _processor_name(provider: str) -> str:
-    """An execution provider in the vocabulary `[tts] device` is written in.
+    """The processor an execution provider actually ran on, for `device_in_use`.
 
-    So the two can be read as a pair -- what was asked for, and what is in use.
-    A provider name does not compare against a device setting.
+    `cuda` and `cpu` are also `[tts] device`'s own vocabulary, so those two
+    read as a pair against what was asked for. `coreml` is not: nobody sets
+    `[tts] device = "coreml"` (`config.VALID_DEVICES` never grew that value,
+    task 15.4), only `auto`'s own resolution reaches for it on macOS -- so
+    this name exists to report faithfully what ran, not to echo a setting
+    back. Reporting a CoreML session as `cpu` would hide the one accelerator
+    macOS synthesis has.
     """
-    return "cuda" if provider == CUDA_PROVIDER else "cpu"
+    if provider == CUDA_PROVIDER:
+        return "cuda"
+    if provider == COREML_PROVIDER:
+        return "coreml"
+    return "cpu"
 
 
 def negotiated_output(

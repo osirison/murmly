@@ -1,4 +1,4 @@
-"""Windows' overlay renderer: the same protocol and states, drawn with Qt.
+"""Windows' and macOS's overlay renderer: the same protocol and states, drawn with Qt.
 
 Task 10.1: a second renderer process, speaking the same newline-delimited
 JSON protocol over the inherited socket that `overlay_renderer.py` (GTK4)
@@ -39,6 +39,40 @@ the missing property is what gets reported, the same choice
 Unverified on real Windows -- everything past argument parsing and the pure
 functions below needs a real `HWND` and a real Qt installation to confirm.
 See task 10.1/10.3 in `openspec/changes/all-os-distributions/tasks.md`.
+
+Task 15.1/15.2/15.3: macOS is attempted through this exact same renderer
+first, per design.md's own spike order ("against Qt's own flags first"). The
+window-flags code above is already backend-neutral -- every window this
+module creates requests `Qt.WindowTransparentForInput` and
+`Qt.WindowDoesNotAcceptFocus` regardless of platform -- so nothing about
+*asking* differs for macOS. What differs is verification:
+`missing_property_for_macos_window` reads the real `NSWindow`'s `level`,
+`ignoresMouseEvents` and `canBecomeKeyWindow` back through raw `ctypes`
+`objc_msgSend` calls (the same convention `mac_clipboard.py` and
+`mac_focus.py` already established for this codebase, and never PyObjC --
+see either module's docstring for the arm64-only reasoning) rather than
+assuming Qt's flags reached AppKit. It only *reads*: design.md's Risks
+section calls reflecting AppKit calls onto Qt's own `NSWindow` "a community
+technique with no citable confirmation", and that caution is about writing
+through the handle, which this never does, not about observing what is
+already there. Where the read-back finds a property missing, the overlay is
+refused exactly as `_verify_and_show`'s Windows branch already refuses one,
+which is task 15.3's honest outcome on a machine that cannot provide the
+missing property -- and if the property is not actually missing, section
+15's own spike (15.1) is answered without needing a second renderer (task
+15.2's `NSPanel` fallback) at all.
+
+Unverified on real macOS, the same as the Windows half above -- and for an
+additional reason there too: this module's real window (unlike `--check`'s
+`-platform offscreen` probe) needs an actual Cocoa window server, which a
+headless CI runner does not have. Whether the macOS CI runner this project
+uses has one at all is itself unconfirmed from here; either way, "a synthetic
+click genuinely passes through the live window underneath this one" is not
+something any CI run -- headless or not -- can show without a person present
+to click. `scripts/macos_overlay_spike.py` is the one-step check for someone
+with a Mac and a screen: it prints the three read-back values below plus
+what to click to confirm click-through and non-activation directly. See task
+15.1 in `openspec/changes/all-os-distributions/tasks.md`.
 """
 
 from __future__ import annotations
@@ -123,7 +157,7 @@ from murmly.overlay_shared import (
 )
 
 
-SUPPORTED_BACKENDS = {"windows"}
+SUPPORTED_BACKENDS = {"windows", "macos"}
 
 # --------------------------------------------------------------------------
 # Task 10.3/10.5: the native window-style bits, and whether they took.
@@ -238,6 +272,125 @@ def apply_and_verify_exstyle(
     current = get_window_long(hwnd)
     set_window_long(hwnd, current | NATIVE_EXSTYLE_BITS)
     return missing_property_for_exstyle(get_window_long(hwnd))
+
+
+# --------------------------------------------------------------------------
+# Task 15.1/15.3: the native `NSWindow` state, read back and never mutated.
+# --------------------------------------------------------------------------
+
+#: `NSNormalWindowLevel` (`AppKit/NSWindow.h`). Any window Qt's own
+#: `Qt.WindowStaysOnTopHint` actually raised above ordinary application
+#: windows reads back a `level` higher than this -- `NSFloatingWindowLevel`
+#: is `3`, and Qt requests at least that much for the hint -- so the
+#: comparison below never needs the higher levels' own names.
+NS_NORMAL_WINDOW_LEVEL = 0
+
+#: In the same order `REQUIRED_EXSTYLE_PROPERTIES` states them, so the first
+#: missing property named here means the same thing it means there: the
+#: first one the `recording-overlay` spec's "Non-disruptive placement on
+#: every platform" requirement lists.
+REQUIRED_MACOS_WINDOW_PROPERTIES: tuple[tuple[str, Callable[[MacosWindowProperties], bool]], ...] = (
+    ("staying above ordinary application windows", lambda properties: properties.level > NS_NORMAL_WINDOW_LEVEL),
+    ("not taking keyboard focus", lambda properties: not properties.can_become_key_window),
+    ("not intercepting pointer input", lambda properties: properties.ignores_mouse_events),
+)
+
+
+class MacosWindowProperties:
+    """The three `NSWindow` readings task 15.1's spike is actually about.
+
+    A plain container rather than a `dataclass`: this file has no top-level
+    `dataclasses` import today and adding one for three fields used in
+    exactly one place is not worth it. Constructed by `_real_macos_window_properties`
+    from a real read-back, and directly by `missing_property_for_macos_window`'s
+    own tests with no `ctypes` or macOS involved at all -- the same
+    real-call/pure-function split `apply_and_verify_exstyle`/
+    `missing_property_for_exstyle` keeps for Windows.
+    """
+
+    __slots__ = ("level", "ignores_mouse_events", "can_become_key_window")
+
+    def __init__(self, level: int, ignores_mouse_events: bool, can_become_key_window: bool) -> None:
+        self.level = level
+        self.ignores_mouse_events = ignores_mouse_events
+        self.can_become_key_window = can_become_key_window
+
+
+def missing_property_for_macos_window(properties: MacosWindowProperties) -> str | None:
+    """Which spec-required property `properties` lacks, or `None` if it has all three.
+
+    Pure, and the whole reason task 15.1's spike is checkable without a real
+    `NSWindow`: given the three readings a real `objc_msgSend` round-trip
+    would produce, this is the entire decision of whether the overlay may be
+    shown -- the macOS twin of `missing_property_for_exstyle`.
+    """
+    for name, holds in REQUIRED_MACOS_WINDOW_PROPERTIES:
+        if not holds(properties):
+            return name
+    return None
+
+
+#: Lazily-loaded, module-private `libobjc` handle -- the same
+#: `_libobjc()`/`_send()` pair `mac_clipboard.py` and `mac_focus.py` each
+#: keep privately for the same reason their own docstrings give: never
+#: ctypes' shared, process-wide loader cache, and never PyObjC. Duplicated
+#: here rather than imported from either of those modules because each one
+#: keeps its own copy already -- `mac_focus.py`'s is a byte-for-byte repeat
+#: of `mac_clipboard.py`'s, credited in its own docstring rather than
+#: imported -- and this module has to stay importable with neither of those
+#: two modules present, on any platform, at that.
+_libobjc_dll: ctypes.CDLL | None = None
+
+
+def _libobjc() -> ctypes.CDLL:
+    global _libobjc_dll
+    if _libobjc_dll is None:
+        import ctypes.util
+
+        path = ctypes.util.find_library("objc")
+        if path is None:
+            raise OSError("libobjc is required to read the overlay window's native state.")
+        _libobjc_dll = ctypes.CDLL(path)
+        _libobjc_dll.sel_registerName.restype = ctypes.c_void_p
+        _libobjc_dll.sel_registerName.argtypes = [ctypes.c_char_p]
+    return _libobjc_dll
+
+
+def _send(restype: object, argtypes: tuple[object, ...], receiver: int, selector: int) -> object:
+    """One `objc_msgSend` call, cast fresh for this call alone -- see
+    `mac_clipboard._send`'s docstring for exactly why, unchanged here."""
+    libobjc = _libobjc()
+    function = ctypes.cast(
+        libobjc.objc_msgSend, ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)
+    )
+    return function(receiver, selector)
+
+
+def _real_macos_window_properties(nsview: int) -> MacosWindowProperties:
+    """Read a Qt window's real `NSWindow` state through `nsview = winId()`.
+
+    `QWidget.winId()` on macOS returns the view's `NSView*`, not its
+    `NSWindow*` -- `[nsview window]` is what reaches the window itself.
+    Everything from here on only *reads*: `level`, `ignoresMouseEvents` and
+    `canBecomeKeyWindow` are all read-only-in-spirit queries this module
+    never calls the paired setter for (`setLevel:`, `setIgnoresMouseEvents:`,
+    overriding `canBecomeKeyWindow` all require subclassing or a private
+    `NSWindow` category this module does not create) -- see this file's own
+    module docstring for why mutating Qt's `NSWindow` is deliberately never
+    attempted here.
+    """
+    libobjc = _libobjc()
+    window = _send(ctypes.c_void_p, (), nsview, libobjc.sel_registerName(b"window"))
+    if not window:
+        raise RuntimeError("The Qt view has no native NSWindow yet.")
+    level = _send(ctypes.c_long, (), window, libobjc.sel_registerName(b"level"))
+    ignores_mouse_events = _send(ctypes.c_bool, (), window, libobjc.sel_registerName(b"ignoresMouseEvents"))
+    can_become_key_window = _send(ctypes.c_bool, (), window, libobjc.sel_registerName(b"canBecomeKeyWindow"))
+    return MacosWindowProperties(
+        level=int(level),
+        ignores_mouse_events=bool(ignores_mouse_events),
+        can_become_key_window=bool(can_become_key_window),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -435,17 +588,30 @@ class OverlayApplication:
         window.setGeometry(x, y, WINDOW_WIDTH * monitor.scale, WINDOW_HEIGHT * monitor.scale)
 
     def _verify_and_show(self, window: Any) -> None:
-        """Task 10.5: refuse to keep presenting a window missing a required property.
+        """Task 10.5/15.1/15.3: refuse to keep presenting a window missing a
+        required property.
 
         Runs once the window has a native handle (`winId()` forces creation
         of one), which is why this happens after `show()` rather than in
         `__init__` -- the same "only once realized" timing
         `overlay_renderer.OverlayApplication._on_realize`/`_on_map` already
-        use for the X11 adapter calls.
+        use for the X11 adapter calls. Windows *mutates* the native handle
+        before reading it back (`apply_and_verify_exstyle`); macOS only
+        reads (`_real_macos_window_properties`) -- see this module's own
+        docstring for why the two backends differ there. Neither branch runs
+        for any other backend, which reaches here with `missing` staying
+        `None` -- Qt's own flags are all the GTK4/X11/Wayland renderer's
+        equivalent (`overlay_renderer.py`'s adapter calls) ever had to rely
+        on either, so this is not a regression for them.
         """
         try:
-            hwnd = int(window.winId())
-            missing = apply_and_verify_exstyle(hwnd)
+            native_id = int(window.winId())
+            if self._backend == "windows":
+                missing = apply_and_verify_exstyle(native_id)
+            elif self._backend == "macos":
+                missing = missing_property_for_macos_window(_real_macos_window_properties(native_id))
+            else:
+                missing = None
         except Exception as error:  # noqa: BLE001 - any failure here means "cannot verify, refuse"
             self._fail_visual("placement verification", error)
             return
@@ -453,7 +619,8 @@ class OverlayApplication:
             self._fail_visual("placement", OSError(f"The platform did not grant: {missing}."))
 
     def _fail_visual(self, operation: str, error: Exception) -> None:
-        print(f"Error: Windows overlay {operation} failed: {error}", file=sys.stderr)
+        label = {"windows": "Windows", "macos": "macOS"}.get(self._backend, self._backend)
+        print(f"Error: {label} overlay {operation} failed: {error}", file=sys.stderr)
         self._window.hide()
         if self._panel_window is not None:
             self._panel_window.hide()

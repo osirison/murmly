@@ -32,6 +32,8 @@ place.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import ctypes
+import ctypes.util
 from dataclasses import dataclass
 from enum import StrEnum
 import os
@@ -363,6 +365,32 @@ def _is_windows(profile: PlatformProfile) -> bool:
     return profile.operating_system is OperatingSystem.WINDOWS
 
 
+def _is_macos(profile: PlatformProfile) -> bool:
+    return profile.operating_system is OperatingSystem.MACOS
+
+
+def _is_a_named_operating_system(profile: PlatformProfile) -> bool:
+    """True on Linux, macOS and Windows; false on anything else.
+
+    For a concern whose implementation genuinely does not vary by platform,
+    which is rarer than it looks: it means not only that the code is portable
+    but that everything it depends on publishes a build everywhere. Gating
+    such a concern on one operating system makes `murmly doctor` report it as
+    having no mechanism on the others, which is worse than reporting nothing
+    -- it is a specific claim, and a false one.
+
+    Deliberately not `profile.operating_system is not OperatingSystem.OTHER`,
+    which would say the same thing today and quietly start including a fourth
+    operating system the day one is added, without anyone having checked that
+    the concern actually works there.
+    """
+    return profile.operating_system in (
+        OperatingSystem.LINUX,
+        OperatingSystem.MACOS,
+        OperatingSystem.WINDOWS,
+    )
+
+
 def _load_named_pipe_server() -> object:
     from murmly.win_pipe import NamedPipeServer
 
@@ -373,6 +401,36 @@ def _load_systemd_service() -> object:
     from murmly.installer import UserService
 
     return UserService
+
+
+def _load_launchd_service() -> object:
+    from murmly.installer import LaunchdUserService
+
+    return LaunchdUserService
+
+
+def _load_macos_hotkey_registrar() -> object:
+    from murmly.mac_hotkey import MacosHotkeyRegistrar
+
+    return MacosHotkeyRegistrar
+
+
+def _load_macos_clipboard() -> object:
+    from murmly.mac_clipboard import MacosClipboardPaster
+
+    return MacosClipboardPaster
+
+
+def _load_macos_injector() -> object:
+    from murmly.mac_clipboard import CGEVENT_POST_METHOD
+
+    return CGEVENT_POST_METHOD
+
+
+def _load_macos_focus_observer() -> object:
+    from murmly.mac_focus import MacosFocusObserver
+
+    return MacosFocusObserver
 
 
 def _load_plasma_hotkeys() -> object:
@@ -477,7 +535,12 @@ def _no_backend_for_operating_system(concern: str) -> Callable[[PlatformProfile]
 COMMAND_CHANNEL = BackendRegistry(
     "command channel",
     candidates=(
-        BackendCandidate("unix-socket", _is_linux, _load_unix_socket_family),
+        # macOS shares Linux's candidate rather than getting its own: task
+        # 13.1 keeps the UNIX socket exactly as it is there, including the
+        # whole path-privacy analysis in `command-interface` -- both
+        # platforms genuinely have `AF_UNIX` and load the same family from
+        # the same running interpreter's own `socket` module.
+        BackendCandidate("unix-socket", lambda profile: _is_linux(profile) or _is_macos(profile), _load_unix_socket_family),
         # CPython exposes no `AF_UNIX` on Windows (design.md's "The command
         # channel"): the named pipe is Windows' own channel, built by
         # `win_pipe.py` with a security descriptor whose DACL grants only the
@@ -492,6 +555,10 @@ SERVICE_MANAGEMENT = BackendRegistry(
     "service management",
     candidates=(
         BackendCandidate("systemd", _is_linux, _load_systemd_service),
+        # `~/Library/LaunchAgents/<label>.plist`, driven by `launchctl
+        # bootstrap`/`print`/`kickstart -k`/`bootout`, never `load` (task
+        # 13.3/13.4, design.md's "Service management" table).
+        BackendCandidate("launchd", _is_macos, _load_launchd_service),
         # Task Scheduler over the Startup folder or `HKCU\...\Run`: it is the
         # only one of the three with CLI verbs for start, stop, status,
         # enable and disable (design.md's "Service management" table), which
@@ -522,6 +589,12 @@ HOTKEY_REGISTRATION = BackendRegistry(
         # state (design.md's "Four hotkey backends"): see
         # `IN_PROCESS_HOTKEY_MECHANISMS` below, and `win_hotkey.py`.
         BackendCandidate("windows-hotkey", _is_windows, _load_windows_hotkey_registrar),
+        # Carbon `RegisterEventHotKey` through HIToolbox (task 13.5) -- the
+        # second in-process mechanism `IN_PROCESS_HOTKEY_MECHANISMS` names,
+        # for the same structural reason `windows-hotkey` is one: the binding
+        # lives inside the daemon's own event-loop thread, not in any
+        # desktop-held state. See `mac_hotkey.py`.
+        BackendCandidate("macos-hotkey", _is_macos, _load_macos_hotkey_registrar),
     ),
     unavailable_reason=_hotkey_unavailable_reason,
 )
@@ -538,6 +611,9 @@ CLIPBOARD = BackendRegistry(
         # stdin through the console's own OEM/ANSI codepage and mangles
         # anything outside it.
         BackendCandidate("windows", _is_windows, _load_windows_clipboard),
+        # `NSPasteboard` (task 14.1), never a `pbcopy` subprocess -- see
+        # `mac_clipboard.py`.
+        BackendCandidate("macos", _is_macos, _load_macos_clipboard),
     ),
     unavailable_reason=_no_backend_for_operating_system("clipboard"),
 )
@@ -554,6 +630,10 @@ PASTE_INJECTION = BackendRegistry(
         # window, so `win_clipboard.WindowsClipboardPaster` never restores the
         # clipboard over what it just wrote -- see that module's docstring.
         BackendCandidate("windows", _is_windows, _load_windows_injector),
+        # `CGEventPost` of Cmd+V (task 14.2), registered as unconfirmable for
+        # the same reason and gated behind the Accessibility grant
+        # (`MACOS_ACCESSIBILITY_PERMISSION` below) -- see `mac_clipboard.py`.
+        BackendCandidate("macos", _is_macos, _load_macos_injector),
     ),
     unavailable_reason=_no_backend_for_operating_system("paste injection"),
 )
@@ -578,15 +658,19 @@ FOCUS_OBSERVATION = BackendRegistry(
         # (task 9.4) -- none needs a permission for a process the same user
         # owns, which is exactly why design.md picks them.
         BackendCandidate("windows", _is_windows, _load_windows_focus_observer),
+        # `NSWorkspace.sharedWorkspace().frontmostApplication()` (task 14.6),
+        # never `CGWindowListCopyWindowInfo` (task 14.7) -- see `mac_focus.py`.
+        BackendCandidate("macos", _is_macos, _load_macos_focus_observer),
     ),
     unavailable_reason=_focus_unavailable_reason,
 )
 
 
 def _overlay_unavailable_reason(profile: PlatformProfile) -> str:
-    # Windows always matches the `qt` candidate below, so this branch is
-    # unreached for it -- the same shape `_hotkey_unavailable_reason` and
-    # `_focus_unavailable_reason` already have for the same reason.
+    # Windows and macOS both always match one of the `qt` candidates below,
+    # so this branch is unreached for either -- the same shape
+    # `_hotkey_unavailable_reason` and `_focus_unavailable_reason` already
+    # have for the same reason.
     if not _is_linux(profile):
         return f"No overlay backend exists for {profile.operating_system.value} yet."
     if not _is_plasma(profile):
@@ -630,13 +714,15 @@ OVERLAY = BackendRegistry(
         ),
         # A Qt renderer speaking the same newline-delimited JSON protocol
         # (task 10.1, design.md's "The overlay: keep GTK4 on Linux, add a Qt
-        # renderer for Windows and macOS"). Every interactive Windows session
-        # has a desktop to draw on; whether it can actually host a layered,
-        # click-through, non-activating surface is what the renderer's own
-        # `--check` answers, the same split the GTK4 candidate already keeps
-        # between "Plasma is here" and "this session's display is usable"
-        # (`_has_overlay_display`).
+        # renderer for Windows and macOS"). Every interactive Windows or
+        # macOS session has a desktop to draw on; whether it can actually
+        # host a layered, click-through, non-activating surface is what the
+        # renderer's own `--check` (and, for macOS, its native `NSWindow`
+        # read-back -- task 15.1/15.3) answers, the same split the GTK4
+        # candidate already keeps between "Plasma is here" and "this
+        # session's display is usable" (`_has_overlay_display`).
         BackendCandidate("qt", _is_windows, _load_qt_overlay),
+        BackendCandidate("qt", _is_macos, _load_qt_overlay),
     ),
     unavailable_reason=_overlay_unavailable_reason,
     unavailable_remedy=_overlay_unavailable_remedy,
@@ -644,7 +730,22 @@ OVERLAY = BackendRegistry(
 
 SPEECH_SYNTHESIS = BackendRegistry(
     "speech synthesis",
-    candidates=(BackendCandidate("kokoro", _is_linux, _load_kokoro_synthesis),),
+    # Not gated on one operating system, unlike every other registry here.
+    # `KokoroSynthesizer` names no platform: `onnxruntime` and
+    # `espeakng-loader` publish wheels for all three, `resolve_espeak()` looks
+    # up the library by each platform's own name, and the accelerator it picks
+    # is whatever that platform has -- CoreML on macOS, CUDA where there is a
+    # GPU, the CPU otherwise. That is exactly why `speech-output` needed no
+    # spec delta in this change, and gating it on `_is_linux` -- which is what
+    # 1.6 left behind, when Linux was the only platform there was -- made
+    # `doctor` report macOS and Windows as having no synthesis at all.
+    #
+    # Whether synthesis can actually run here is a separate question this
+    # registry does not answer: `KokoroSynthesizer._probe()` already reports a
+    # missing espeak-ng or an absent model with what to do about it.
+    candidates=(
+        BackendCandidate("kokoro", _is_a_named_operating_system, _load_kokoro_synthesis),
+    ),
     unavailable_reason=_no_backend_for_operating_system("speech synthesis"),
 )
 
@@ -653,11 +754,11 @@ SPEECH_SYNTHESIS = BackendRegistry(
 #: desktop discovers) nor `gnome` (a dconf value the settings daemon watches)
 #: is one -- both are desktop-held state a fresh session already has without
 #: Murmly doing anything. `windows-hotkey` (section 8) is the first member;
-#: macOS's Carbon `RegisterEventHotKey` (section 13) is the intended second,
-#: once its candidate exists. See `hotkey_record.py` for what reads this, and
-#: `win_hotkey.WindowsHotkeyRegistrar` for what satisfies its `rebind`
-#: contract on this mechanism.
-IN_PROCESS_HOTKEY_MECHANISMS: frozenset[str] = frozenset({"windows-hotkey"})
+#: `macos-hotkey` (section 13, Carbon `RegisterEventHotKey`) is the second.
+#: See `hotkey_record.py` for what reads this, and `win_hotkey.WindowsHotkeyRegistrar`/
+#: `mac_hotkey.MacosHotkeyRegistrar` for what satisfies its `rebind` contract
+#: on each mechanism.
+IN_PROCESS_HOTKEY_MECHANISMS: frozenset[str] = frozenset({"windows-hotkey", "macos-hotkey"})
 
 
 def hotkey_mechanism_is_in_process(
@@ -830,6 +931,185 @@ def _windows_microphone_permission_check(
 
 WINDOWS_MICROPHONE_PERMISSION = "windows-microphone"
 
+
+# --------------------------------------------------------------------------
+# macOS microphone permission (task 12.5)
+# --------------------------------------------------------------------------
+
+#: `AVAuthorizationStatus` (`AVFoundation/AVCaptureDevice.h`). Apple's own
+#: constants, not Murmly's -- kept here only so `_macos_microphone_permission_check`
+#: can name them instead of comparing against bare integers.
+_AV_AUTHORIZATION_STATUS_NOT_DETERMINED = 0
+_AV_AUTHORIZATION_STATUS_RESTRICTED = 1
+_AV_AUTHORIZATION_STATUS_DENIED = 2
+_AV_AUTHORIZATION_STATUS_AUTHORIZED = 3
+
+_AVFOUNDATION_FRAMEWORK_PATH = "/System/Library/Frameworks/AVFoundation.framework/AVFoundation"
+
+
+def _real_macos_microphone_authorization_status() -> int | None:
+    """The raw `AVAuthorizationStatus` for audio capture, read through `ctypes`
+    into the Objective-C runtime -- no PyObjC dependency, matching the rest of
+    this codebase's `ctypes.CDLL` calls into system libraries (`focus.py`'s
+    X11, `tts.py`'s espeak-ng).
+
+    `[AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]` is
+    the call. Apple's documentation for it is explicit that this never
+    prompts and never creates or opens a capture device -- it reads the TCC
+    database's already-recorded decision for this process, the same read
+    `AXIsProcessTrusted()` (task 14.4) is for Accessibility. Nothing here
+    constructs an `AVCaptureDevice`, so this answers even when no microphone
+    is attached at all; device presence is a separate question, answered in
+    `cli.py`'s `microphone_diagnostics` by enumerating devices instead.
+
+    The media-type argument is read as the `AVMediaTypeAudio` symbol itself
+    (`ctypes.c_void_p.in_dll`) rather than built from its known string value
+    (`@"soun"`): the exported symbol is public API this reads exactly as any
+    Objective-C caller would, so nothing here depends on a four-character
+    code being remembered correctly.
+
+    `objc_msgSend` is declared fresh for this one call, through
+    `ctypes.cast` rather than by setting `.restype`/`.argtypes` on the shared
+    `libobjc.objc_msgSend` attribute -- that attribute is one cached function
+    object, and assigning a signature to it would clobber any other call
+    through the same object elsewhere in the process. On arm64 this is not
+    stylistic: a call made through a prototype that does not exactly match
+    the real one crashes there, where x86_64 tends to forgive it. `NSInteger`
+    (`AVAuthorizationStatus`'s underlying type) is 8 bytes on 64-bit Darwin,
+    so `restype=ctypes.c_long` is declared explicitly rather than left at
+    ctypes' 32-bit-truncating default -- the same rule that caught the
+    Windows `restype` defect this design's notes call out.
+
+    Every failure this can hit -- `libobjc` or the framework not found, a
+    symbol missing, the call itself raising -- collapses to `None` rather
+    than propagating, because the caller (`_macos_microphone_permission_check`)
+    treats `None` exactly like an unreadable Windows registry key: mapped to
+    `PermissionState.UNDETERMINED`, never treated as a reason to guess
+    `GRANTED`. `ctypes.c_void_p.in_dll` in particular raises `ValueError` on a
+    missing symbol rather than `OSError`, which is why this catches broadly
+    instead of naming `OSError` alone.
+
+    Not run on a real Mac: this is 12.5's implementation, and it is why the
+    runtime integration test alongside it exists -- to prove, on the macOS CI
+    runner, that this returns *some* valid status without raising, not to
+    prove which status a person's own Mac would show.
+    """
+    try:
+        libobjc_path = ctypes.util.find_library("objc")
+        if libobjc_path is None:
+            return None
+        libobjc = ctypes.CDLL(libobjc_path)
+        # Loading the framework registers its Objective-C classes with the
+        # runtime. `ctypes.util.find_library("AVFoundation")` will not find
+        # it: frameworks are bundles, not flat .dylibs on the loader path.
+        avfoundation = ctypes.CDLL(_AVFOUNDATION_FRAMEWORK_PATH)
+
+        libobjc.objc_getClass.restype = ctypes.c_void_p
+        libobjc.objc_getClass.argtypes = [ctypes.c_char_p]
+        libobjc.sel_registerName.restype = ctypes.c_void_p
+        libobjc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        av_capture_device = libobjc.objc_getClass(b"AVCaptureDevice")
+        selector = libobjc.sel_registerName(b"authorizationStatusForMediaType:")
+        media_type_audio = ctypes.c_void_p.in_dll(avfoundation, "AVMediaTypeAudio").value
+        if not av_capture_device or not selector or not media_type_audio:
+            return None
+
+        send = ctypes.cast(
+            libobjc.objc_msgSend,
+            ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p),
+        )
+        return send(av_capture_device, selector, media_type_audio)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _macos_microphone_permission_check(
+    profile: PlatformProfile,
+    read_authorization_status: Callable[[], int | None] = _real_macos_microphone_authorization_status,
+) -> PermissionState:
+    """Task 12.5: map the raw `AVAuthorizationStatus` to `PermissionState`.
+
+    `restricted` (MDM or parental-controls policy, not a person's own choice)
+    is folded into `DENIED` rather than given a third outcome: either way the
+    capability does not work and the report's job is to say so and name where
+    a grant is normally changed, not to distinguish who imposed the block.
+    `notDetermined` -- TCC has not yet asked -- is `UNDETERMINED`, not
+    `GRANTED`: nothing has been granted yet, and the `platform-support` spec's
+    rule against claiming a grant on a silence applies exactly as it does to
+    an unreadable Windows registry key. Any value this has not named,
+    present or future, also falls to `UNDETERMINED` for the same reason.
+
+    `read_authorization_status` is the injected seam
+    `WindowsMicrophonePermissionTests` established for `read_registry_value`:
+    every state-mapping test below calls this with a fake returning a fixed
+    int, and only `MacosMicrophonePermissionRuntimeIntegrationTests` calls it
+    with the real one, on a real macOS kernel.
+    """
+    status = read_authorization_status()
+    if status == _AV_AUTHORIZATION_STATUS_AUTHORIZED:
+        return PermissionState.GRANTED
+    if status in (_AV_AUTHORIZATION_STATUS_DENIED, _AV_AUTHORIZATION_STATUS_RESTRICTED):
+        return PermissionState.DENIED
+    # `_AV_AUTHORIZATION_STATUS_NOT_DETERMINED`, `None` (the call could not be
+    # made at all), or anything this mapping does not recognise.
+    return PermissionState.UNDETERMINED
+
+
+MACOS_MICROPHONE_PERMISSION = "macos-microphone"
+
+
+# --------------------------------------------------------------------------
+# macOS Accessibility permission (task 14.4)
+# --------------------------------------------------------------------------
+
+
+def _real_macos_accessibility_trusted() -> bool | None:
+    """`AXIsProcessTrusted()`, imported from `mac_clipboard.py` rather than
+    reimplemented here: task 14.4's check and task 14.5's
+    `AXIsProcessTrustedWithOptions(prompt: true)` request share the same
+    framework loader and the same "declare every ctypes signature" table, and
+    keeping both in one module is what keeps that table declared once.
+    `None` on any failure to even make the call, collapsed from whatever
+    exception `mac_clipboard._applicationservices`'s loader raises (a missing
+    framework, a missing symbol) -- deferred-imported so this module never
+    touches `mac_clipboard.py`'s framework paths at import time, the same
+    deferred-import shape every other loader in this file uses.
+    """
+    try:
+        from murmly.mac_clipboard import _real_is_process_trusted
+
+        return _real_is_process_trusted()
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _macos_accessibility_permission_check(
+    profile: PlatformProfile,
+    is_trusted: Callable[[], bool | None] = _real_macos_accessibility_trusted,
+) -> PermissionState:
+    """Task 14.4: map `AXIsProcessTrusted()`'s answer to `PermissionState`.
+
+    Unlike the microphone check's `notDetermined` state, `AXIsProcessTrusted`
+    has only two answers, `True` or `False` -- there is no third "not asked
+    yet" reading TCC exposes for Accessibility the way it does for media
+    capture, so `False` maps directly to `DENIED` rather than to
+    `UNDETERMINED`: whether the grant was never given or was revoked, the
+    capability does not work right now either way, and that is what this
+    check's callers need to know. Only a failed *call* -- `is_trusted`
+    answering `None`, meaning the platform could not even be asked -- maps to
+    `UNDETERMINED`, the same "silence is never claimed as a grant" rule
+    `_macos_microphone_permission_check` and `_windows_microphone_permission_
+    check` both already apply to their own platforms.
+    """
+    trusted = is_trusted()
+    if trusted is None:
+        return PermissionState.UNDETERMINED
+    return PermissionState.GRANTED if trusted else PermissionState.DENIED
+
+
+MACOS_ACCESSIBILITY_PERMISSION = "macos-accessibility"
+
 #: Every permission Murmly currently knows to ask about, keyed by `name`.
 #: `platform_diagnostics` (`cli.py`) renders this mapping into the `platform`
 #: section's `permissions` field regardless of whether it holds anything, so
@@ -844,7 +1124,39 @@ PERMISSIONS: Mapping[str, Permission] = {
         check=_windows_microphone_permission_check,
         applies=_is_windows,
     ),
+    MACOS_MICROPHONE_PERMISSION: Permission(
+        name=MACOS_MICROPHONE_PERMISSION,
+        capability="microphone capture",
+        grant_location="System Settings > Privacy & Security > Microphone",
+        check=_macos_microphone_permission_check,
+        applies=_is_macos,
+    ),
+    MACOS_ACCESSIBILITY_PERMISSION: Permission(
+        name=MACOS_ACCESSIBILITY_PERMISSION,
+        capability="paste injection",
+        grant_location="System Settings > Privacy & Security > Accessibility",
+        check=_macos_accessibility_permission_check,
+        applies=_is_macos,
+    ),
 }
+
+#: The one microphone-gating permission for a given operating system, if any
+#: -- Linux has none, and no operating system in scope gates it with more
+#: than one. `cli.py`'s `microphone_diagnostics` (task 12.5) reads this
+#: rather than searching `PERMISSIONS` by `capability` string, so a second,
+#: unrelated permission that happened to reuse that same capability text
+#: could never be picked up by accident.
+_MICROPHONE_PERMISSION_NAMES: Mapping[OperatingSystem, str] = {
+    OperatingSystem.WINDOWS: WINDOWS_MICROPHONE_PERMISSION,
+    OperatingSystem.MACOS: MACOS_MICROPHONE_PERMISSION,
+}
+
+
+def microphone_permission_for(profile: PlatformProfile) -> Permission | None:
+    """The permission gating microphone capture on `profile`'s platform, or
+    `None` where nothing gates it -- Linux today."""
+    name = _MICROPHONE_PERMISSION_NAMES.get(profile.operating_system)
+    return PERMISSIONS.get(name) if name is not None else None
 
 
 # --------------------------------------------------------------------------

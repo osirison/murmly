@@ -463,6 +463,28 @@ renderer is a separate process behind a JSON protocol, so this choice does not
 reach the daemon either way. The spec already requires no overlay rather than one
 that takes input, so the worst outcome is a reported absence.
 
+**Status (task 15.1/15.2):** the spike against Qt's own flags could not be run
+from a machine with no macOS window server, so it is embedded as a runtime
+check instead of settled once by a developer beforehand: `overlay_renderer_qt.py`
+requests the same `Qt.WindowTransparentForInput`/`Qt.WindowDoesNotAcceptFocus`
+flags on macOS it already requests everywhere, then reads the real `NSWindow`
+back through raw `ctypes`/`objc_msgSend` (never PyObjC — see below) to confirm
+whether those flags actually took, exactly as `apply_and_verify_exstyle`
+already reads Windows' `HWND` back rather than assuming. A window missing a
+property is refused and the property named, which is this risk's own "worst
+outcome is a reported absence" playing out honestly rather than being
+special-cased. What remains genuinely unconfirmed from here is the answer
+itself — whether a real Mac's window server grants all three — and whether a
+synthetic click actually passes through the window underneath, which needs a
+person present regardless of what any CI runner can show;
+`scripts/macos_overlay_spike.py` is the one-step check for that. If a real Mac
+ever shows a property missing, task 15.2's `NSPanel` fallback is called for —
+and that fallback is raw `ctypes`/`objc_msgSend`, the convention
+`mac_clipboard.py`, `mac_focus.py` and `mac_hotkey.py` already established for
+this codebase, not the PyObjC this note names: PyObjC would be a second large,
+platform-specific dependency decision on top of PySide6's, and nothing else in
+phase 3 uses it.
+
 **macOS hotkeys can be swallowed by the foreground application.**
 `RegisterEventHotKey` only fires when the frontmost app does not consume the
 combination itself, and cannot express modifier-only chords. → Accept it, and make
@@ -560,8 +582,8 @@ registry entries: no other platform's path runs through them.
 
 ## Open Questions
 
-The Windows half of the espeak-ng question below is resolved rather than open,
-by task 11's spike (11.3); the macOS half is still open, a task in phase 3.
+Both halves of the espeak-ng question below are resolved: the Windows half by
+task 11's spike (11.3), the macOS half by task 15's own spike (15.5).
 
 - ~~**Does the bundled `espeakng-loader` library carry the same compiled-in
   data-path defect on Windows and macOS that it carries on Linux?**~~ **Windows:
@@ -574,11 +596,22 @@ by task 11's spike (11.3); the macOS half is still open, a task in phase 3.
   has the evidence). `resolve_espeak()`'s existing call shape never leaves the
   override unset, so Windows uses the bundled wheel directly
   (`_resolve_bundled_espeak`) rather than naming an espeak-ng install with no
-  standard package-manager route. **macOS: still open.** Its wheel has not been
-  inspected, and section 15's own spike is where that happens; Homebrew remains
-  the fallback named until then. Deferrable there for the same reason it always
-  was: the spec requires only that an absent runtime is reported with what to
-  install, and either answer satisfies it.
+  standard package-manager route. **macOS: resolved.** The pinned 0.2.4 macOS
+  `arm64` wheel was unpacked and its `libespeak-ng.1.52.0.dylib` string table
+  read directly (the same evidence standard as Windows, not executed on a real
+  Mac): it carries the identical cluster of strings — `ESPEAK_DATA_PATH`,
+  `getenv`, the format string `%s/espeak-ng-data`, and a compiled-in
+  build-machine fallback path (`/Users/runner/work/espeakng-loader/...`, a
+  GitHub Actions macOS runner path, the same shape as the Windows and Linux
+  findings). Unlike Windows, this changes nothing about which library macOS
+  uses: `resolve_espeak()` never reaches `_resolve_bundled_espeak()` for macOS
+  at all — `_espeak_library_name` always asks for Homebrew's own
+  `libespeak-ng.1.dylib` directly, the same system-preference macOS already
+  shared with Linux before this spike — so the defect is confirmed present but
+  structurally unreached. What the spike did change is the remedy: the failure
+  path when Homebrew's library cannot be loaded now names `brew install
+  espeak-ng` explicitly, where it previously said only that the library could
+  not be loaded and named nothing to install.
 
 The question about `nvidia-*-cu12` wheels on Windows is resolved rather than open:
 all six publish `win_amd64`, none publishes any macOS wheel. It is recorded under

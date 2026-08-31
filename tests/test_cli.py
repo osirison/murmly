@@ -14,9 +14,11 @@ import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 from channel_helpers import command_channel_address
+from module_stubs import injected_module
 
 from murmly.cli import (
     _measurement_clip,
@@ -29,6 +31,7 @@ from murmly.cli import (
     live_transcription_diagnostics,
     main,
     measure_partial_pass_ms,
+    microphone_diagnostics,
     overlay_diagnostics,
     paste_injection_diagnostics,
     platform_diagnostics,
@@ -509,6 +512,41 @@ class CliTests(unittest.TestCase):
         self.assertEqual(str(Path(sys.executable)), command[0])
         self.assertTrue(command[1].endswith("overlay_renderer_qt.py"))
         self.assertIn("windows", command)
+
+    def test_overlay_diagnostics_reports_the_qt_renderer_on_macos(self) -> None:
+        """Task 15.1: the same Qt renderer Windows launches, launched with
+        `--backend macos` instead -- `session`/`desktop` name the platform
+        the same way they do for Windows (task 6.3's reasoning again)."""
+        config = self._config()
+        completed = self._helper_result(
+            {"available": True, "pyside6": True, "qt_version": "6.11.2"}
+        )
+        launches: list[list[str]] = []
+
+        def record(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            launches.append(command)
+            return completed
+
+        macos_profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        with (
+            patch("murmly.cli.resolve_platform", return_value=macos_profile),
+            patch("murmly.cli.detect_overlay_backend", return_value=OverlayBackend.MACOS),
+        ):
+            report = overlay_diagnostics(config, env={}, run_command=record)
+
+        self.assertTrue(report["available"])
+        self.assertEqual("macos", report["backend"])
+        self.assertEqual("macos", report["session"])
+        self.assertEqual("macos", report["desktop"])
+        self.assertTrue(report["pyside6"])
+        self.assertEqual("6.11.2", report["qt_version"])
+        self.assertFalse(report["pygobject"])
+        self.assertIsNone(report["gtk4"])
+
+        command = launches[0]
+        self.assertEqual(str(Path(sys.executable)), command[0])
+        self.assertTrue(command[1].endswith("overlay_renderer_qt.py"))
+        self.assertIn("macos", command)
 
     def _run_spike(self, *, paste: bool, focus_changed: bool, verify_target: bool = True):
         from murmly.focus import WindowIdentity
@@ -1556,6 +1594,7 @@ class DoctorCompletenessTests(unittest.TestCase):
         "delivery",
         "overlay",
         "speech_output",
+        "microphone",
         "installation",
     )
 
@@ -1722,9 +1761,13 @@ class DoctorCompletenessTests(unittest.TestCase):
         """The command channel (task 7.1), hotkey registration (task 8.3),
         service management (task 8.1), clipboard (task 9.1), paste injection
         (task 9.2), focus observation (task 9.4) and the overlay (task 10.1)
-        all have a Windows mechanism now; speech synthesis, which this change
-        did not build for Windows, still reports unavailable rather than
-        dropped (18.17)."""
+        all have a Windows mechanism now, and so does speech synthesis --
+        which this change did not build for Windows because it did not have
+        to: `KokoroSynthesizer` names no platform, and gating its registry on
+        Linux was a leftover that made this report deny Windows a capability
+        it has. Every concern is expected to resolve here, so 18.17's
+        "unavailable rather than dropped" is asserted by the shape check
+        above rather than by any concern being absent."""
         answered = {"ok": True, "state": "IDLE", "model_resident": False}
         windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1747,6 +1790,7 @@ class DoctorCompletenessTests(unittest.TestCase):
             "paste_injection": "windows",
             "focus_observation": "windows",
             "overlay": "qt",
+            "speech_synthesis": "kokoro",
         }
         for concern, section in report["platform"]["concerns"].items():
             with self.subTest(concern=concern):
@@ -2012,6 +2056,78 @@ class PlatformDiagnosticsTests(unittest.TestCase):
         self.assertNotEqual("granted", permission_report["state"])
         self.assertIn("could not read the grant", permission_report["detail"])
 
+    def test_macos_paste_injection_concern_is_anded_with_the_accessibility_grant(self) -> None:
+        """`macos` is a genuinely registered `paste_injection` candidate
+        (`BackendChoice.available` is `True` on its own), but the concern's
+        own `available` must still fold in whether the Accessibility grant
+        this mechanism needs has actually been given -- a present mechanism
+        with a denied permission is not a usable concern."""
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        denied = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.DENIED,
+        )
+
+        with patch("murmly.cli.PERMISSIONS", {MACOS_ACCESSIBILITY_PERMISSION: denied}):
+            report = platform_diagnostics(profile)
+
+        paste_injection = report["concerns"]["paste_injection"]
+        self.assertFalse(paste_injection["available"])
+        self.assertIn("Accessibility", paste_injection["reason"])
+        self.assertTrue(paste_injection["remedy"])
+
+    def test_macos_paste_injection_concern_is_available_when_granted(self) -> None:
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        granted = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.GRANTED,
+        )
+
+        with patch("murmly.cli.PERMISSIONS", {MACOS_ACCESSIBILITY_PERMISSION: granted}):
+            report = platform_diagnostics(profile)
+
+        paste_injection = report["concerns"]["paste_injection"]
+        self.assertTrue(paste_injection["available"])
+        self.assertEqual("macos", paste_injection["mechanism"])
+
+    def test_macos_paste_injection_concern_is_unavailable_when_undetermined(self) -> None:
+        """18.13's own rule, applied to a concern rather than only to a
+        `permissions` entry: an unreadable grant must never be reported as an
+        available concern either."""
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        cannot_tell = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.UNDETERMINED,
+        )
+
+        with patch("murmly.cli.PERMISSIONS", {MACOS_ACCESSIBILITY_PERMISSION: cannot_tell}):
+            report = platform_diagnostics(profile)
+
+        self.assertFalse(report["concerns"]["paste_injection"]["available"])
+
+    def test_non_macos_paste_injection_concern_is_untouched(self) -> None:
+        """The AND only ever applies on macOS -- Windows' `paste_injection`
+        concern (never permission-gated) must not gain a `reason`/`remedy`
+        key it did not already have."""
+        profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+        report = platform_diagnostics(profile)
+
+        self.assertTrue(report["concerns"]["paste_injection"]["available"])
+        self.assertNotIn("reason", report["concerns"]["paste_injection"])
+
 
 class SecondHotkeyCommandTests(unittest.TestCase):
     """The CLI surface the second hotkey needs."""
@@ -2148,6 +2264,219 @@ class SecondHotkeyCommandTests(unittest.TestCase):
                 main(["--config", str(config_path), "toggle"])
 
         self.assertEqual(["toggle"], sent)
+
+
+def _sounddevice_with_devices(devices: list[dict[str, object]]) -> ModuleType:
+    module = ModuleType("sounddevice")
+    module.query_devices = lambda: devices
+    return module
+
+
+def _sounddevice_raising(error: Exception) -> ModuleType:
+    def query_devices():
+        raise error
+
+    module = ModuleType("sounddevice")
+    module.query_devices = query_devices
+    return module
+
+
+_INPUT_DEVICE = {
+    "name": "Built-in Microphone",
+    "max_input_channels": 1,
+    "max_output_channels": 0,
+    "default_samplerate": 48_000,
+}
+_OUTPUT_ONLY_DEVICE = {
+    "name": "Built-in Speakers",
+    "max_input_channels": 0,
+    "max_output_channels": 2,
+    "default_samplerate": 48_000,
+}
+
+_LINUX_PROFILE = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+_MACOS_PROFILE = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+
+
+def _fake_microphone_permission(state: PermissionState, error: Exception | None = None) -> Permission:
+    def check(profile: PlatformProfile) -> PermissionState:
+        if error is not None:
+            raise error
+        return state
+
+    return Permission(
+        name="test-microphone-permission",
+        capability="microphone capture",
+        grant_location="System Settings > Privacy & Security > Microphone",
+        check=check,
+    )
+
+
+class MicrophoneDiagnosticsTests(unittest.TestCase):
+    """`microphone_diagnostics`, task 12.5: distinguishing a denied
+    microphone from an absent device, which are identical from inside the
+    capture path itself (design.md's "the whole difficulty")."""
+
+    def test_a_device_present_on_a_platform_with_no_gating_permission_is_available(self) -> None:
+        with injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])):
+            report = microphone_diagnostics(_LINUX_PROFILE)
+
+        self.assertEqual(
+            {"device_present": True, "permission": None, "available": True},
+            report,
+        )
+
+    def test_no_input_device_is_reported_unavailable_naming_the_absence(self) -> None:
+        with injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])):
+            report = microphone_diagnostics(_LINUX_PROFILE)
+
+        self.assertFalse(report["device_present"])
+        self.assertFalse(report["available"])
+        self.assertIn("no microphone input device", report["detail"].casefold())
+
+    def test_a_device_query_failure_is_undetermined_not_a_claim_of_absence_or_grant(self) -> None:
+        with injected_module("sounddevice", _sounddevice_raising(RuntimeError("no host api"))):
+            report = microphone_diagnostics(_LINUX_PROFILE)
+
+        self.assertIsNone(report["device_present"])
+        self.assertFalse(report["available"])
+        self.assertIn("no host api", report["device_detail"])
+
+    def test_a_denied_permission_with_a_device_present_is_reported_denied(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertTrue(report["device_present"])
+        self.assertEqual("denied", report["permission"]["state"])
+        self.assertFalse(report["available"])
+        self.assertIn(permission.grant_location, report["detail"])
+
+    def test_an_undetermined_permission_is_reported_unavailable_never_granted(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.UNDETERMINED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("undetermined", report["permission"]["state"])
+        self.assertFalse(report["available"])
+
+    def test_a_permission_check_that_raises_is_undetermined_not_granted(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.GRANTED, error=RuntimeError("boom"))
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("undetermined", report["permission"]["state"])
+        self.assertIn("boom", report["permission"]["detail"])
+        self.assertFalse(report["available"])
+
+    def test_no_device_takes_priority_over_a_denied_permission(self) -> None:
+        """The scenario a headless macOS CI runner actually is: no
+        microphone hardware and a permission this reads as denied (or
+        undetermined -- its TCC state is not a normal user's either). The
+        report MUST say "no device", never "denied": claiming a denial would
+        assert a working microphone exists but is locked away, when the
+        truer fact is there is nothing to lock."""
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertFalse(report["available"])
+        self.assertIn("no microphone input device", report["detail"].casefold())
+        self.assertNotIn("denied", report["detail"].casefold())
+        # The permission's own state is still reported, just never allowed to
+        # override the device-absence detail.
+        self.assertEqual("denied", report["permission"]["state"])
+
+    def test_granted_permission_and_a_present_device_on_macos_is_available_but_flagged_unverified(
+        self,
+    ) -> None:
+        """Task 12.6: every readable fact can be good on macOS and this must
+        still not claim end-to-end capture works -- a launchd-started daemon
+        can have both and still receive nothing (design.md's largest risk,
+        tasks 12.1-12.4, none of them provable from here)."""
+        permission = _fake_microphone_permission(PermissionState.GRANTED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertTrue(report["available"])
+        self.assertIn("not yet verified end to end", report["detail"])
+
+    def test_the_report_shape_is_the_same_key_set_across_every_outcome(self) -> None:
+        """18.17's rule applied to this section: the fields present must not
+        change with the outcome, only their values -- `device_present`,
+        `permission` and `available` are always present; `detail` and
+        `device_detail` are the only conditional keys, the same convention
+        every other diagnostics section already uses."""
+        permission = _fake_microphone_permission(PermissionState.GRANTED)
+        base_keys = {"device_present", "permission", "available"}
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=None),
+        ):
+            clean_report = microphone_diagnostics(_LINUX_PROFILE)
+        self.assertEqual(base_keys, set(clean_report))
+
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            absent_report = microphone_diagnostics(_MACOS_PROFILE)
+        self.assertEqual(base_keys | {"detail"}, set(absent_report))
+
+
+class MicrophoneDiagnosticsRuntimeIntegrationTests(unittest.TestCase):
+    """Task 12.5, against the real machine: everything in
+    `MicrophoneDiagnosticsTests` above proves the priority logic against
+    injected fakes for `sounddevice.query_devices` and the permission check.
+    This calls `microphone_diagnostics` with no injection at all, against
+    whatever `resolve_platform()` and the real `sounddevice` report on the
+    runner it executes on.
+
+    Follows the same convention as `MacosMicrophonePermissionRuntimeIntegrationTests`
+    and `WindowsMicrophonePermissionRuntimeIntegrationTests`: skip in `setUp`
+    on every platform but the one this proves something on, then assert only
+    what a real, unknown-state runner can prove, with the full report printed
+    into every failure message so a real run's actual facts land in the CI
+    log even when the test passes.
+
+    The macOS CI runner this targets is headless -- "no microphone device at
+    all" is this task's own stated ground truth for it, not a guess this
+    class makes. So this does not pin `device_present is False` specifically:
+    whether PortAudio enumerates zero input devices or `query_devices` raises
+    outright is exactly what cannot be known from a Linux machine, and both
+    outcomes reach `microphone_diagnostics`'s "not `True`" branch. What is
+    pinned, unconditionally, is the parent instruction's literal test: on a
+    runner with no device and no ordinary user's TCC state, this reports
+    unavailable, never claims the microphone works, and -- the distinction
+    task 12.5 exists for -- the detail never says "denied" for a machine that
+    has no device to have denied capture to.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("This proves what the real headless macOS CI runner reports, not a fake")
+
+    def test_a_headless_runner_reports_no_device_never_denied_never_available(self) -> None:
+        report = microphone_diagnostics(resolve_platform())
+
+        self.assertIsNot(True, report["device_present"], f"full report: {report!r}")
+        self.assertFalse(report["available"], f"full report: {report!r}")
+        self.assertNotIn("denied", report["detail"].casefold(), f"full report: {report!r}")
 
 
 class SpeechOutputDiagnosticsTests(unittest.TestCase):
@@ -2310,6 +2639,22 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
         self.assertEqual([CPU_PROVIDER], report["providers"])
         self.assertNotIn("device_detail", report, "nothing fell back")
         load_model.assert_not_called()
+
+    def test_coreml_is_named_rather_than_folded_into_cpu(self) -> None:
+        """Task 15.4: `device_in_use` must not hide macOS's own accelerator.
+
+        `CoreMLExecutionProvider` is not a value `[tts] device` accepts (only
+        `auto`'s resolution ever selects it), so this reads `_processor_name`
+        directly rather than through a doctor report compared against a
+        device setting -- `report["device"]` stays `"auto"` regardless of
+        which provider actually ran.
+        """
+        from murmly.cli import _processor_name
+        from murmly.tts import COREML_PROVIDER, CPU_PROVIDER, CUDA_PROVIDER
+
+        self.assertEqual("coreml", _processor_name(COREML_PROVIDER))
+        self.assertEqual("cuda", _processor_name(CUDA_PROVIDER))
+        self.assertEqual("cpu", _processor_name(CPU_PROVIDER))
 
     def test_an_unrecognized_processor_is_reported_alongside_the_one_in_use(self) -> None:
         """The one in use here is the default the unrecognized value fell back to.

@@ -30,6 +30,7 @@ from murmly.daemon import (
     peer_identity_mechanism_for,
     peer_identity_supported,
     read_peer_identity,
+    read_peer_identity_macos,
     send_command,
     socket_path_detail,
 )
@@ -3365,6 +3366,10 @@ def windows_profile() -> PlatformProfile:
     return PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
 
 
+def macos_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+
+
 class PeerIdentityMechanismDispatchTests(unittest.TestCase):
     """18.7: peer identity is read by the resolved platform's own mechanism,
     and the same mechanism supplies what it is compared against."""
@@ -3418,6 +3423,82 @@ class PeerIdentityMechanismDispatchTests(unittest.TestCase):
 
         self.assertIs(read_peer_identity_from_pipe, daemon._peer_identity)
         self.assertIs(current_user_sid_string, daemon._local_identity)
+
+    def test_macos_dispatches_to_getpeereid(self) -> None:
+        """Task 13.2: `getpeereid` reads a uid and nothing else, so it shares
+        the Linux branch's `os.getuid` comparison rather than needing one of
+        its own -- the same UID-only comparison `_peer_permitted` already
+        makes for every platform."""
+        mechanism = peer_identity_mechanism_for(macos_profile())
+
+        self.assertIs(read_peer_identity_macos, mechanism.read)
+        self.assertIs(os.getuid, mechanism.local)
+        self.assertTrue(mechanism.supported)
+
+    def test_macos_reports_peer_identity_supported_without_so_peercred(self) -> None:
+        """`socket.SO_PEERCRED` does not exist on macOS's `socket` module --
+        `getpeereid` is a separate libSystem call, not a `getsockopt` option,
+        so this must not fall through to `hasattr(socket, "SO_PEERCRED")`."""
+        self.assertTrue(peer_identity_supported(macos_profile()))
+
+    def test_a_daemon_constructed_for_macos_wires_getpeereid(self) -> None:
+        """The dispatch is not only reachable directly -- `MurmlyDaemon.__init__`
+        actually uses it when a resolved macOS profile is supplied."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=macos_profile())
+
+        self.assertIs(read_peer_identity_macos, daemon._peer_identity)
+        self.assertIs(os.getuid, daemon._local_identity)
+
+    def test_a_daemon_constructed_for_macos_wires_the_macos_hotkey_registrar(self) -> None:
+        """Section 13's own populator of `hotkey_mechanism_is_in_process`
+        (task 13.5): a macOS daemon must build `MacosHotkeyRegistrar`, not
+        fall through to `WindowsHotkeyRegistrar` the way an unconditional
+        dispatch would."""
+        from murmly.mac_hotkey import MacosHotkeyRegistrar
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=macos_profile())
+
+        self.assertIsInstance(daemon._hotkey_registrar, MacosHotkeyRegistrar)
+
+
+class GetpeereidRuntimeIntegrationTests(unittest.TestCase):
+    """Task 13.2, against the real `getpeereid(3)`: everything above this
+    class proves the dispatch against a resolved profile alone.
+    `getpeereid` is a BSD/Darwin libSystem function glibc does not provide
+    (confirmed on this machine: accessing the symbol through `ctypes.CDLL(None)`
+    raises `AttributeError`), so this follows
+    `WindowsPipeSecurityDescriptorIntegrationTests` (`test_platform.py`)'s
+    pattern of skipping in `setUp` on every platform but the one with the
+    mechanism, using a real `AF_UNIX` `socketpair` -- headless-provable,
+    unlike a hotkey or a paste.
+    """
+
+    def setUp(self) -> None:
+        import sys
+
+        if sys.platform != "darwin":
+            self.skipTest("A macOS kernel is required to call getpeereid")
+
+    def test_reads_this_processes_own_uid_off_a_real_socketpair(self) -> None:
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.assertEqual(os.getuid(), read_peer_identity_macos(left))
+            self.assertEqual(os.getuid(), read_peer_identity_macos(right))
+        finally:
+            left.close()
+            right.close()
 
 
 class ChannelShapeMismatchTests(unittest.TestCase):

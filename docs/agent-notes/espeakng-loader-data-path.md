@@ -80,6 +80,40 @@ that found this. What the correction does change is Windows: see
 uses the bundled wheel directly rather than hunting a system install Windows
 has no package-manager route to.
 
+## macOS spike (task 15.5, 2026-08-31)
+
+Same question, asked of the macOS wheel: does `espeakng_loader-0.2.4-py3-none-macosx_11_0_arm64.whl`
+carry the identical compiled-in data-path defect? Downloaded from PyPI and
+unpacked from this Linux machine, `strings` against
+`espeakng_loader/libespeak-ng.1.52.0.dylib`:
+
+```text
+ESPEAK_DATA_PATH
+_getenv
+%s/espeak-ng-data
+/Users/runner/work/espeakng-loader/espeakng-loader/espeak-ng/_dynamic/lib
+/Users/runner/work/espeakng-loader/espeakng-loader/espeak-ng/_dynamic/share/espeak-ng-data
+Wrong version of espeak-ng-data
+```
+
+Yes -- the identical cluster (`getenv`, `ESPEAK_DATA_PATH`, the `%s/espeak-ng-data`
+format string, and a compiled-in build-machine path, here a GitHub Actions
+macOS runner path rather than Linux's `/home/runner/...` or Windows'
+`D:/a/...`) confirms the same upstream defect, same evidence standard as the
+Windows finding above: the wheel was inspected, not executed.
+
+**Unlike Windows, this changes nothing about which library macOS uses.**
+`resolve_espeak()` never reaches `_resolve_bundled_espeak()` for macOS at all
+-- `tts.py`'s `_espeak_library_name` always asks for Homebrew's own
+`libespeak-ng.1.dylib` by name, the same system-first preference macOS already
+shared with Linux before this spike, so the bundled wheel's defect is
+confirmed present but structurally unreached on macOS the way it is on
+Windows. What this spike did change: the failure path when Homebrew's library
+cannot be loaded on macOS now says `Install it with \`brew install
+espeak-ng\`.` -- it previously said only that the library could not be
+loaded, naming nothing to install, unlike the Linux branch's "Install your
+distribution's espeak-ng package."
+
 ## Symptom
 
 Any phoneme-based TTS that goes through `phonemizer` + `espeakng-loader` fails

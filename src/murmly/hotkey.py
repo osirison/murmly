@@ -546,6 +546,171 @@ def windows_hotkey_for_portable(portable: str) -> WindowsHotkey:
     return encode_for_windows(parse_specification(portable))
 
 
+#: Carbon `Events.h`'s `EventModifiers` bits, used by `RegisterEventHotKey`
+#: (task 13.5). Kept separate from `WINDOWS_MODIFIER_BITS`: the numeric values
+#: differ and mean a different bitfield (`EventModifiers`, not `fsModifiers`).
+#: `Hyper` is absent for the same reason it is absent from the other two
+#: platform tables -- there is no fifth Carbon modifier bit to give it, so a
+#: spec naming it is refused by name rather than dropped.
+MACOS_CMD_KEY = 0x0100
+MACOS_SHIFT_KEY = 0x0200
+MACOS_OPTION_KEY = 0x0800
+MACOS_CONTROL_KEY = 0x1000
+
+MACOS_MODIFIER_BITS: dict[str, int] = {
+    "Meta": MACOS_CMD_KEY,
+    "Ctrl": MACOS_CONTROL_KEY,
+    "Alt": MACOS_OPTION_KEY,
+    "Shift": MACOS_SHIFT_KEY,
+}
+
+#: `HIToolbox/Events.h`'s `kVK_ANSI_*` virtual-key codes for the letters and
+#: digits -- physical positions on a US ANSI keyboard, not characters. See
+#: `encode_for_macos`'s docstring for why that distinction matters here and
+#: nowhere else in this module. Transcribed from Apple's published header and
+#: not confirmed on a real Mac -- the same caveat `_WINDOWS_NAMED_KEYS` and
+#: `_GNOME_NAMED_KEYS` carry for their own tables.
+_MACOS_LETTER_DIGIT_KEYS: dict[str, int] = {
+    "A": 0x00, "S": 0x01, "D": 0x02, "F": 0x03, "H": 0x04, "G": 0x05,
+    "Z": 0x06, "X": 0x07, "C": 0x08, "V": 0x09, "B": 0x0B, "Q": 0x0C,
+    "W": 0x0D, "E": 0x0E, "R": 0x0F, "Y": 0x10, "T": 0x11,
+    "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15, "6": 0x16, "5": 0x17,
+    "9": 0x19, "7": 0x1A, "8": 0x1C, "0": 0x1D,
+    "O": 0x1F, "U": 0x20, "I": 0x22, "P": 0x23,
+    "L": 0x25, "J": 0x26, "K": 0x28, "N": 0x2D, "M": 0x2E,
+}
+
+#: `kVK_*` codes for the subset of Murmly's named keys a Mac keyboard has.
+#: Every key absent here (`Insert`, `Pause`, `Print`, `SysReq`, and the four
+#: media keys) has no Carbon virtual-key code at all -- Apple keyboards do not
+#: have the first four, and the media keys are delivered as `NX_KEYTYPE`
+#: special-key events rather than ordinary `kVK_` presses -- so `_macos_key_
+#: value` refuses them by name exactly as `_windows_key_value` refuses
+#: `SysReq`/`Backtab`/`Microphone Mute`.
+_MACOS_NAMED_KEYS: dict[str, int] = {
+    "Escape": 0x35,
+    "Tab": 0x30,
+    # kVK_Delete: the key every Apple keyboard itself labels "delete" and
+    # every other platform Murmly supports calls Backspace.
+    "Backspace": 0x33,
+    # kVK_ForwardDelete: what Windows and X11 call Delete.
+    "Delete": 0x75,
+    "Return": 0x24,
+    # kVK_ANSI_KeypadEnter -- the numpad key, distinct from Return exactly as
+    # Windows' and GNOME's own encodings distinguish the two.
+    "Enter": 0x4C,
+    "Clear": 0x47,
+    "Home": 0x73,
+    "End": 0x77,
+    "Left": 0x7B,
+    "Up": 0x7E,
+    "Right": 0x7C,
+    "Down": 0x7D,
+    "PgUp": 0x74,
+    "PgDown": 0x79,
+    "Space": 0x31,
+    "Volume Down": 0x49,
+    "Volume Mute": 0x4A,
+    "Volume Up": 0x48,
+}
+
+#: `kVK_F1`..`kVK_F20`. Positional, not linear like KDE/GNOME's `base + n` or
+#: Windows' contiguous `VK_F1..VK_F24` -- Carbon assigns function-key codes in
+#: the order Apple added the physical keys, not numeric order, which is
+#: exactly the kind of table a wrong recall corrupts silently; see
+#: `SamePhysicalMacosKeyTests` for the invariants pinned against it.
+_MACOS_FUNCTION_KEYS: dict[int, int] = {
+    1: 0x7A, 2: 0x78, 3: 0x63, 4: 0x76, 5: 0x60, 6: 0x61, 7: 0x62, 8: 0x64,
+    9: 0x65, 10: 0x6D, 11: 0x67, 12: 0x6F, 13: 0x69, 14: 0x6B, 15: 0x71,
+    16: 0x6A, 17: 0x40, 18: 0x4F, 19: 0x50, 20: 0x5A,
+}
+#: `Events.h` defines Carbon function-key codes only up to `kVK_F20` -- lower
+#: than KDE's/GNOME's F35 and Windows' own F24 -- so a spec naming F21 or
+#: higher parses fine and is refused here, by this platform, rather than by
+#: the platform-neutral parse that has no way to know Carbon's own ceiling is
+#: the lowest of the three.
+_MACOS_MAX_FUNCTION_KEY = 20
+
+
+@dataclass(frozen=True, slots=True)
+class MacosHotkey:
+    """A hotkey encoded for Carbon's `RegisterEventHotKey`.
+
+    `modifiers` is the `EventModifiers` bitmask `RegisterEventHotKey`'s third
+    argument takes, built from `MACOS_MODIFIER_BITS`; `key_code` is the
+    `UInt32` virtual-key code its fourth argument takes. `portable` is the same
+    untranslated text `Hotkey.portable`/`WindowsHotkey.portable` produce, so a
+    binding this encoder produced round-trips through `HotkeyRecordStore`
+    exactly like a KDE, GNOME, or Windows one does.
+    """
+
+    modifiers: int
+    key_code: int
+    portable: str
+
+
+def _macos_key_value(key: str, label: str) -> int:
+    if key in _MACOS_LETTER_DIGIT_KEYS:
+        return _MACOS_LETTER_DIGIT_KEYS[key]
+    if key.startswith("F") and key[1:].isdigit():
+        number = int(key[1:])
+        value = _MACOS_FUNCTION_KEYS.get(number)
+        if value is not None:
+            return value
+        raise HotkeyError(
+            f"Hotkey {label!r} names {key!r}, which is outside the range macOS can "
+            f"register: F1-F{_MACOS_MAX_FUNCTION_KEY}."
+        )
+    value = _MACOS_NAMED_KEYS.get(key)
+    if value is not None:
+        return value
+    raise HotkeyError(f"Hotkey {label!r} names {key!r}, which macOS has no key for.")
+
+
+def encode_for_macos(spec: HotkeySpec, raw: str | None = None) -> MacosHotkey:
+    """Encode `spec` for Carbon's `RegisterEventHotKey`.
+
+    `_MACOS_LETTER_DIGIT_KEYS` looks a letter or digit up by its physical
+    position on a US ANSI keyboard, unlike `_kde_key_value`/`_windows_key_
+    value`, which both derive the code with `ord()` because Qt's and Win32's
+    own key constants already track whatever keyboard-layout remapping the OS
+    applied. Carbon's `kVK_*` codes predate that remapping: they name a
+    physical key regardless of layout, so a spec built from one of Murmly's
+    letter names is translated here by table lookup rather than by `ord()`,
+    and would resolve to a different physical key than the letter it names on
+    a non-QWERTY-derived ANSI layout such as Dvorak.
+
+    Refuses `Hyper` and any key macOS cannot register (`_macos_key_value`),
+    naming it rather than dropping or substituting it, matching
+    `encode_for_kde`, `encode_for_gnome` and `encode_for_windows`.
+    """
+    label = raw if raw is not None else _spec_text(spec)
+    modifiers = 0
+    for name in NEUTRAL_MODIFIER_ORDER:
+        if name not in spec.modifiers:
+            continue
+        bit = MACOS_MODIFIER_BITS.get(name)
+        if bit is None:
+            raise HotkeyError(
+                f"Hotkey {label!r} uses {name!r}, which macOS has no key for. "
+                "Supported modifiers on this platform are Meta (also Cmd or "
+                "Command), Ctrl, Alt, and Shift."
+            )
+        modifiers |= bit
+    key_code = _macos_key_value(spec.key, label)
+    return MacosHotkey(modifiers=modifiers, key_code=key_code, portable=_spec_text(spec))
+
+
+def macos_hotkey_for_portable(portable: str) -> MacosHotkey:
+    """The macOS encoding for a hotkey already stored as portable text.
+
+    `portable` is `Hotkey.portable` / `HotkeyRecordStore`'s own currency --
+    parsed back to a neutral spec and re-encoded, the same shape
+    `windows_hotkey_for_portable` already uses for its own storage.
+    """
+    return encode_for_macos(parse_specification(portable))
+
+
 def gnome_accelerator(portable: str) -> str:
     """The GTK accelerator for a hotkey already encoded as KDE portable text.
 

@@ -418,6 +418,39 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual("libespeak-ng.so.1", library_path)
         self.assertEqual("/usr/share/espeak-ng-data", data_path)
 
+    def test_macos_resolves_the_versioned_homebrew_name_not_find_library(self) -> None:
+        """`ctypes.util.find_library` guesses the unversioned `libespeak-ng`,
+        which Homebrew's build does not ship (`_espeak_library_name`'s own
+        docstring) -- so macOS must never reach `find_library` at all, unlike
+        the Linux branch just above."""
+        with (
+            patch("ctypes.util.find_library") as find_library,
+            patch("ctypes.CDLL", return_value=object()),
+            patch("murmly.tts._loaded_library_path", return_value=None),
+            patch("murmly.tts._espeak_data_path", return_value="/opt/homebrew/share/espeak-ng-data"),
+        ):
+            library_path, data_path = resolve_espeak(
+                PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+            )
+
+        find_library.assert_not_called()
+        self.assertEqual("libespeak-ng.1.dylib", library_path)
+        self.assertEqual("/opt/homebrew/share/espeak-ng-data", data_path)
+
+    def test_macos_without_homebrews_library_names_it_in_the_remedy(self) -> None:
+        """Task 15.5: the macOS twin of the Linux 'not found' remedy just
+        above, naming Homebrew rather than 'your distribution' -- macOS has
+        neither `dnf` nor `apt`. Before this task, this branch named nothing
+        to install at all.
+        """
+        with patch("ctypes.CDLL", side_effect=OSError("dlopen failed")):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+                )
+
+        self.assertIn("brew install espeak-ng", str(raised.exception))
+
     def test_windows_resolves_the_bundled_wheel_rather_than_a_system_install(self) -> None:
         """Task 11.4: Windows has no espeak-ng package-manager route, so this
         uses `espeakng_loader`'s own bundled library and data instead of
@@ -654,6 +687,34 @@ class RuntimeResolutionTests(unittest.TestCase):
         ):
             with self.assertNoLogs("murmly.tts", level="WARNING"):
                 self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
+
+    def test_auto_prefers_coreml_on_a_machine_with_no_cuda(self) -> None:
+        """Task 15.4: `[tts] device = "auto"` on macOS's own accelerator.
+
+        CTranslate2 has no macOS GPU backend, which is why `[stt] device` and
+        `[tts] device` are separate settings -- but `onnxruntime`'s stock
+        macOS wheel does carry CoreML, so `auto` here should reach for it
+        exactly as it reaches for CUDA on a machine that has one, rather than
+        falling all the way to the CPU only because there is no NVIDIA device.
+        """
+        with (
+            patch(
+                "onnxruntime.get_available_providers",
+                return_value=[CPU_PROVIDER, "CoreMLExecutionProvider"],
+            ),
+            patch("murmly.tts.cuda_device_count_available", return_value=0),
+        ):
+            providers = resolve_providers(self._config("auto"))
+
+        self.assertEqual(["CoreMLExecutionProvider", CPU_PROVIDER], providers)
+
+    def test_coreml_is_not_offered_when_cpu_is_explicitly_configured(self) -> None:
+        """The explicit `cpu` shortcut returns before any provider is inspected."""
+        with patch(
+            "onnxruntime.get_available_providers",
+            return_value=[CPU_PROVIDER, "CoreMLExecutionProvider"],
+        ):
+            self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("cpu")))
 
     def test_a_machine_with_a_gpu_is_still_told_about_the_swap(self) -> None:
         """The remedy is right when there is a device it would put to use."""
@@ -1276,6 +1337,35 @@ class SilenceMeasurementTests(unittest.TestCase):
         from murmly.tts import _median_internal_gap
 
         self.assertEqual(0.0, _median_internal_gap(np.full(1_000, 0.5, dtype=np.float32), 1_000))
+
+
+class MacosCoreMLRuntimeIntegrationTests(unittest.TestCase):
+    """Task 15.4, against the real `onnxruntime` build: `onnxruntime`'s own
+    `get_available_providers()` is not faked here, unlike every other test in
+    `RuntimeResolutionTests` above, because the entire claim under test is
+    that the stock macOS wheel carries `CoreMLExecutionProvider` -- something
+    no fake could prove either way. Follows `MacosAcceleratorRuntimeIntegrationTests`
+    (`test_stt.py`)'s pattern for the other half of the same design.md claim:
+    the two settings are independent, so `[stt] device` finding no
+    accelerator on this same machine is proven there, not here.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("Only the macOS onnxruntime wheel is what this claim is about")
+
+    def test_coreml_is_available(self) -> None:
+        import onnxruntime
+
+        self.assertIn("CoreMLExecutionProvider", onnxruntime.get_available_providers())
+
+    def test_auto_resolves_to_coreml(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir, tts_device="auto")
+
+            self.assertEqual(
+                ["CoreMLExecutionProvider", CPU_PROVIDER], resolve_providers(config)
+            )
 
 
 if __name__ == "__main__":

@@ -1,34 +1,36 @@
 """Persisted record of which hotkeys Murmly has bound and what each is for.
 
-On every platform this change claims, the desktop itself holds the binding --
-a KDE launcher file, a GNOME `custom-keybindings` entry -- and that is the one
-source of truth `doctor` and a fresh session both read. This module exists for
-a different case, not yet built: a platform that registers a hotkey inside
-Murmly's own process (Windows' `RegisterHotKey`, section 8; macOS's Carbon
-`RegisterEventHotKey`, section 13). Such a registration exists only while the
-daemon that made it is running, so nothing external records it the way a
-launcher file or a dconf value does, and the daemon has to re-create it at
-every session start from something Murmly itself wrote.
+On KDE Plasma and GNOME, the desktop itself holds the binding -- a launcher
+file, a `custom-keybindings` entry -- and that is the one source of truth
+`doctor` and a fresh session both read. This module exists for the other
+case: a platform that registers a hotkey inside Murmly's own process
+(Windows' `RegisterHotKey`, section 8; macOS's Carbon `RegisterEventHotKey`,
+section 13). Such a registration exists only while the daemon that made it is
+running, so nothing external records it the way a launcher file or a dconf
+value does, and the daemon has to re-create it at every session start from
+something Murmly itself wrote.
 
 `HotkeyRecordStore` is that something: a small file mapping purpose key
 (`"window"`, `"session"`) to Murmly's cross-platform hotkey currency -- KDE
 portable text, the same string `Hotkey.portable` already produces and every
 encoder in `hotkey.py` can parse back via `parse_specification`. It is written
 on every successful install regardless of which desktop bound the key, so it
-is ready the day an in-process backend exists to read it -- but it must never
-be *read* on a platform whose binding the desktop itself holds, since a second
+is ready for either in-process backend to read -- but it must never be
+*read* on a platform whose binding the desktop itself holds, since a second
 copy of that state can drift from the one the desktop actually has.
 `platform.hotkey_mechanism_is_in_process` is the guard that decides which
-platform that is; today it is none of them, by design (`IN_PROCESS_HOTKEY_MECHANISMS`
-is empty), so `rebind_from_record` below is a tested no-op everywhere this
-change runs.
+platform that is; `IN_PROCESS_HOTKEY_MECHANISMS` names `windows-hotkey` and
+`macos-hotkey`, so `rebind_from_record` below is a tested no-op only on
+Plasma, GNOME, and any other Linux desktop.
 
-The contract a future in-process backend satisfies to plug into this: the
-daemon creates its registrar once at startup and keeps the instance (there is
-no daemon-side registrar yet, so nothing populates it), and that instance
-exposes ``rebind(bindings: dict[str, str]) -> None`` taking exactly what
-`HotkeyRecordStore.read()` returns. `rebind_from_record` is written against
-that contract without knowing which platform will satisfy it first.
+The contract each in-process backend satisfies to plug into this: the daemon
+creates its registrar once at startup and keeps the instance
+(`MurmlyDaemon.__init__`'s own `self._hotkey_registrar` dispatch, by resolved
+operating system), and that instance exposes
+``rebind(bindings: dict[str, str]) -> None`` taking exactly what
+`HotkeyRecordStore.read()` returns -- `win_hotkey.WindowsHotkeyRegistrar` and
+`mac_hotkey.MacosHotkeyRegistrar` both satisfy it, independently, against
+their own platform's encoder.
 """
 
 from __future__ import annotations

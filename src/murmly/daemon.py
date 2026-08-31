@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+import ctypes
 import json
 import logging
 import os
@@ -324,10 +325,14 @@ def peer_identity_supported(profile: PlatformProfile | None = None) -> bool:
 
     Windows always answers True: task 7.4 reads it from the pipe's client
     process token, a mechanism every Windows version this project targets
-    carries, unlike `SO_PEERCRED`, which is a Linux-only socket option.
+    carries, unlike `SO_PEERCRED`, which is a Linux-only socket option. macOS
+    also always answers True (task 13.2): `getpeereid(3)` is a libSystem
+    function every Darwin kernel this project targets carries, not a
+    `socket`-module attribute the way `SO_PEERCRED` is, so it is named by
+    operating system here rather than by `hasattr`.
     """
     resolved = profile if profile is not None else resolve_platform()
-    if resolved.operating_system is OperatingSystem.WINDOWS:
+    if resolved.operating_system in (OperatingSystem.WINDOWS, OperatingSystem.MACOS):
         return True
     return hasattr(socket, "SO_PEERCRED")
 
@@ -352,6 +357,60 @@ def read_peer_identity(connection: socket.socket) -> int | None:
         return None
     _pid, uid, _gid = struct.unpack("3i", credentials)
     return uid
+
+
+#: `sys/ucred.h`'s `uid_t`/`gid_t` -- both `__uint32_t` on Darwin.
+_DARWIN_UID_T = ctypes.c_uint32
+_DARWIN_GID_T = ctypes.c_uint32
+
+
+def read_peer_identity_macos(connection: socket.socket) -> int | None:
+    """The user id on the other end of a UNIX socket connection, read through
+    `getpeereid(3)` (task 13.2).
+
+    macOS's `socket` module carries no `SO_PEERCRED` -- it is a Linux-only
+    `getsockopt` option (`read_peer_identity`'s own docstring) -- but BSD
+    sockets (and Darwin's, which descends from them) answer the same question
+    through a dedicated libSystem call instead: `int getpeereid(int fd, uid_t
+    *euid, gid_t *egid)`, declared here with real `ctypes` types rather than
+    left to default -- `uid_t`/`gid_t` are 4 bytes and the function's own
+    return is `c_int`, so nothing here is at risk of the pointer-truncation
+    defect class this change's other new ctypes code carries a comment about,
+    but declaring the signature explicitly is the rule regardless of whether
+    a given call happens to be safe by accident.
+
+    `getpeereid` reports no pid at all (design.md's "The command channel"),
+    unlike `SO_PEERCRED`'s three-way `(pid, uid, gid)` tuple -- which is
+    exactly enough for the one comparison `_peer_permitted` ever makes: it
+    already compares only the uid `read_peer_identity`'s Linux branch reports,
+    ignoring the pid entirely, so this platform's mechanism satisfies
+    `PeerIdentityMechanism`'s contract with nothing missing.
+
+    Loaded through `ctypes.CDLL(None)` -- the running process's own image,
+    which already links every libSystem symbol -- rather than a framework
+    path, because `getpeereid` is a plain libc function, not
+    framework-bundled Objective-C or Carbon API the way this change's other
+    macOS ctypes calls are.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError as error:
+        logger.warning("Unable to load libSystem to read a peer identity: %s", error)
+        return None
+    libc.getpeereid.restype = ctypes.c_int
+    libc.getpeereid.argtypes = [ctypes.c_int, ctypes.POINTER(_DARWIN_UID_T), ctypes.POINTER(_DARWIN_GID_T)]
+
+    uid = _DARWIN_UID_T()
+    gid = _DARWIN_GID_T()
+    status = libc.getpeereid(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid))
+    if status != 0:
+        logger.warning(
+            "Unable to read the peer identity of a connection: getpeereid failed "
+            "(errno=%s)",
+            ctypes.get_errno(),
+        )
+        return None
+    return int(uid.value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +460,13 @@ def peer_identity_mechanism_for(profile: PlatformProfile) -> PeerIdentityMechani
         from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
 
         return PeerIdentityMechanism(True, read_peer_identity_from_pipe, current_user_sid_string)
+    if profile.operating_system is OperatingSystem.MACOS:
+        # `read_peer_identity_macos` (task 13.2), compared with the same
+        # `os.getuid()` the Linux branch below uses: `getpeereid` answers a
+        # uid, exactly what the UID-only comparison `_peer_permitted` already
+        # makes needs, so macOS shares the Linux branch's `local` callable
+        # rather than needing one of its own.
+        return PeerIdentityMechanism(True, read_peer_identity_macos, os.getuid)
     return PeerIdentityMechanism(
         peer_identity_supported(profile), read_peer_identity, getattr(os, "getuid", None)
     )
@@ -1107,17 +1173,28 @@ class MurmlyDaemon:
         # hotkey registration, if this platform's mechanism is one -- `None`
         # for Plasma and GNOME, since neither registers here: a launcher file
         # and a dconf value are both desktop-held state. Windows'
-        # `WindowsHotkeyRegistrar` (section 8) is the first populator; macOS's
-        # Carbon `RegisterEventHotKey` (section 13) is the intended second.
+        # `WindowsHotkeyRegistrar` (section 8) and macOS's
+        # `MacosHotkeyRegistrar` (section 13) are the two populators, chosen by
+        # the resolved operating system -- `hotkey_mechanism_is_in_process`
+        # only says *that* this platform's mechanism registers here, not
+        # *which* platform, so the registrar class itself still has to be
+        # picked by `self._profile.operating_system` rather than assumed to be
+        # Windows' now that a second one exists.
         # `hotkey_registrar` lets a test substitute a fake without touching a
-        # real message-loop thread; every real caller leaves it `None` and
-        # gets whatever `hotkey_mechanism_is_in_process(self._profile)` says.
+        # real message-loop or event-loop thread; every real caller leaves it
+        # `None` and gets whatever `hotkey_mechanism_is_in_process(self._profile)`
+        # and `self._profile.operating_system` together say.
         if hotkey_registrar is not None:
             self._hotkey_registrar: object | None = hotkey_registrar
         elif hotkey_mechanism_is_in_process(self._profile):
-            from murmly.win_hotkey import WindowsHotkeyRegistrar
+            if self._profile.operating_system is OperatingSystem.MACOS:
+                from murmly.mac_hotkey import MacosHotkeyRegistrar
 
-            self._hotkey_registrar = WindowsHotkeyRegistrar(on_hotkey=self._handle_in_process_hotkey)
+                self._hotkey_registrar = MacosHotkeyRegistrar(on_hotkey=self._handle_in_process_hotkey)
+            else:
+                from murmly.win_hotkey import WindowsHotkeyRegistrar
+
+                self._hotkey_registrar = WindowsHotkeyRegistrar(on_hotkey=self._handle_in_process_hotkey)
         else:
             self._hotkey_registrar = None
 
