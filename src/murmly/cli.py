@@ -770,18 +770,43 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
         "command_socket": command_socket_diagnostics(config, resolved_profile),
         "platform": platform_diagnostics(resolved_profile),
         "session": session,
+        # Unconditional, `None` where there is nothing to say. A top-level
+        # key that comes and goes with what a host has installed makes the
+        # report a different shape on different machines, which is what
+        # `platform-support`'s "The diagnostics report keeps its shape"
+        # forbids. This one only ever appeared on Linux, because the branch
+        # that can raise is the Linux one.
+        "session_detail": session_detail,
         "clipboard_command": clipboard_command,
         "paste_injection": injection_report,
         "model_profile": config.model_profile,
         "model_name": config.model_name,
         "model_cache_path": model_cache_path,
+        # Always present, `None` where the cache could not be resolved -- like
+        # `limitations` below, this is a top-level field, and a top-level field
+        # gated on what this host happens to have installed (here,
+        # `huggingface_hub`) is exactly the platform-varying shape
+        # `platform-support`'s "diagnostics report keeps its shape" scenario
+        # forbids. A host without the project's extras -- any machine that
+        # never ran `uv sync`, a PR reviewer's checkout among them -- used to
+        # make this key vanish instead of reporting the gap.
+        "model_cache_detail": model_cache_detail,
         "device": config.device,
         "compute_type": config.compute_type,
         "runtime_device": runtime_device,
+        # Same rule. This one appeared on any machine where resolving the
+        # runtime raised -- which its own test scenario names as "the cuda
+        # extra is not installed", so it came and went with an optional
+        # dependency, exactly as `model_cache_detail` did.
+        "runtime_detail": runtime_detail,
         "runtime_compute_type": runtime_compute_type,
         "beam_size": config.beam_size,
         "vad_filter": config.vad_filter,
         "model_resident": model_resident,
+        # Always present, `None` where the daemon answered normally -- same
+        # reasoning as `model_cache_detail` above: a top-level field, so it
+        # cannot be gated on a state some hosts happen not to reach.
+        "model_resident_detail": model_resident_detail,
         # Reported even when it is zero. Zero is how release is switched off, and
         # a reader who cannot see the value cannot tell a model that will never
         # be released from one this report forgot to mention.
@@ -790,6 +815,14 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
         # whether a release's freed memory reaches the system is the same fact
         # for the transcription model and the synthesis session alike.
         "system_memory_returnable": system_memory_returnable(),
+        # Always present, `None` where memory is returnable --
+        # `system_memory_unreturnable_reason()` already answers `None` in that
+        # case, so this is a direct, unconditional call rather than a branch on
+        # `system_memory_returnable`'s value. That branch is what previously
+        # made this key present only on the platforms/libc builds where the
+        # allocator cannot be asked, the same top-level shape violation as
+        # `model_cache_detail` above.
+        "system_memory_returnable_detail": system_memory_unreturnable_reason(),
         "live_transcription": live_transcription_diagnostics(config),
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
@@ -797,16 +830,6 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
         "microphone": microphone,
         "installation": installation_diagnostics(),
     }
-    if session_detail is not None:
-        report["session_detail"] = session_detail
-    if runtime_detail is not None:
-        report["runtime_detail"] = runtime_detail
-    if model_resident_detail is not None:
-        report["model_resident_detail"] = model_resident_detail
-    if not report["system_memory_returnable"]:
-        report["system_memory_returnable_detail"] = system_memory_unreturnable_reason()
-    if model_cache_detail is not None:
-        report["model_cache_detail"] = model_cache_detail
     print(json.dumps(report, indent=2))
 
 

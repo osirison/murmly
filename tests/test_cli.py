@@ -189,7 +189,7 @@ class CliTests(unittest.TestCase):
 
         report = json.loads(output.getvalue())
         self.assertEqual("/tmp/hf-cache/hub", report["model_cache_path"])
-        self.assertNotIn("model_cache_detail", report)
+        self.assertIsNone(report["model_cache_detail"])
 
     def test_doctor_reports_system_memory_as_returnable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -211,7 +211,7 @@ class CliTests(unittest.TestCase):
 
         report = json.loads(output.getvalue())
         self.assertIs(True, report["system_memory_returnable"])
-        self.assertNotIn("system_memory_returnable_detail", report)
+        self.assertIsNone(report["system_memory_returnable_detail"])
 
     def test_doctor_names_the_reason_where_system_memory_is_not_returnable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1710,6 +1710,9 @@ class DoctorCompletenessTests(unittest.TestCase):
         "model_profile",
         "model_name",
         "model_cache_path",
+        "model_cache_detail",
+        "session_detail",
+        "runtime_detail",
         "device",
         "compute_type",
         "runtime_device",
@@ -1717,8 +1720,10 @@ class DoctorCompletenessTests(unittest.TestCase):
         "beam_size",
         "vad_filter",
         "model_resident",
+        "model_resident_detail",
         "unload_after_idle_s",
         "system_memory_returnable",
+        "system_memory_returnable_detail",
         "live_transcription",
         "delivery",
         "overlay",
@@ -1743,10 +1748,12 @@ class DoctorCompletenessTests(unittest.TestCase):
             # Pinned like every other host fact this helper already fixes:
             # `system_memory_returnable` reads the real C library linked into
             # this interpreter, not `profile`, so a musl or macOS host would
-            # otherwise add `system_memory_returnable_detail` to the report
-            # and fail every shape assertion below that expects `SECTIONS`
-            # exactly -- a host difference the True/False behaviour itself
-            # already has its own dedicated tests for, elsewhere in this file.
+            # otherwise flip `system_memory_returnable_detail` from `None` to a
+            # string below and fail the exact `assertIsNone` assertions the
+            # success-shape test makes on it -- the key itself is unconditional
+            # now and stays in `SECTIONS` either way; only its value depends on
+            # the host, and the True/False behaviour already has its own
+            # dedicated tests elsewhere in this file.
             patch("murmly.cli.system_memory_returnable", return_value=True),
             redirect_stdout(StringIO()) as output,
         ):
@@ -1772,10 +1779,77 @@ class DoctorCompletenessTests(unittest.TestCase):
         for section in self.SECTIONS:
             self.assertIn(section, report)
 
+    def test_the_report_keeps_its_shape_when_the_model_cache_cannot_be_resolved(self) -> None:
+        """Pins the defect a human reviewer found on PR #50: on any host where
+        `huggingface_hub` cannot be imported -- every machine without the
+        project's extras, a reviewer's checkout among them --
+        `transcription_model_cache_path` returns a detail and no path, and the
+        report used to grow `model_cache_detail` only there, failing the
+        exact-set assertions everywhere else in this class. No import blocker
+        needed here: the probe's own return value is the thing this test
+        controls, so this runs -- and fails the old way, on a report that
+        still had the conditional `if model_cache_detail is not None:` -- on
+        every host, fully-provisioned CI included, rather than only on a host
+        missing the import."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with patch(
+                "murmly.cli.transcription_model_cache_path",
+                return_value=(None, "Unable to determine the transcription model cache: no module named 'huggingface_hub'"),
+            ):
+                report = self._report(config, Mock(return_value=("cpu", "int8")))
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIsNone(report["model_cache_path"])
+        self.assertIn("huggingface_hub", report["model_cache_detail"])
+
+    def test_the_report_keeps_its_shape_when_the_runtime_cannot_be_resolved(self) -> None:
+        """The sibling of the model-cache case, and the one that would have been
+        found next: `runtime_detail`'s own scenario for appearing is "the cuda
+        extra is not installed", so it came and went with an optional dependency
+        exactly as `model_cache_detail` did -- on a host without that extra the
+        report grew a key and the exact-set assertions failed."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            report = self._report(
+                config, Mock(side_effect=RuntimeError("the cuda extra is not installed"))
+            )
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIn("cuda", report["runtime_detail"])
+
+    def test_the_report_keeps_its_shape_when_the_session_cannot_be_read(self) -> None:
+        """The third of the same family. This key only ever appeared on Linux,
+        because the branch that can raise is the Linux one -- so the report was
+        a different shape on Linux than on Windows or macOS whenever the session
+        probe failed, which is the platform-varying case the requirement names
+        rather than the host-varying one."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with patch(
+                "murmly.cli.is_wayland_session", side_effect=OSError("cannot read the session")
+            ):
+                report = self._report(config, Mock(return_value=("cpu", "int8")))
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIsNotNone(report["session_detail"])
+
     def test_the_success_shape_of_every_section_is_unchanged(self) -> None:
-        # A daemon that answers, so this is the shape when nothing failed. The
-        # `*_detail` keys are what the report adds when something did, and one
-        # appearing here would mean a probe was reported as unanswerable.
+        # A daemon that answers, so this is the shape when nothing failed.
+        # Every `*_detail` key is unconditional now: present and `None` when its
+        # probe had nothing to report.
+        # `model_cache_detail`, `model_resident_detail` and
+        # `system_memory_returnable_detail` are unconditional now (`SECTIONS`
+        # above), so they are present here too, `None`, asserted below.
         if not hasattr(os, "getuid"):
             # `command_socket.path_private` below needs a real POSIX
             # directory's real permissions to come back true, the same as
@@ -1792,10 +1866,26 @@ class DoctorCompletenessTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch("murmly.cli.send_command", return_value=answered):
+            with (
+                patch("murmly.cli.send_command", return_value=answered),
+                # Pinned for the same reason as `system_memory_returnable` in
+                # `_report` above: `transcription_model_cache_path` imports
+                # `huggingface_hub`, a real dependency this venv has, but not
+                # one every host that can run this test file is guaranteed to
+                # -- a bare checkout with no `uv sync` run at all, a reviewer's
+                # among them, cannot. That host difference is what
+                # `test_the_report_keeps_its_shape_when_the_model_cache_cannot_be_resolved`
+                # exists to cover; this test is about the *success* shape, so
+                # it fixes the probe's answer rather than depending on this
+                # interpreter's own installed packages.
+                patch("murmly.cli.transcription_model_cache_path", return_value=("/models/cache", None)),
+            ):
                 report = self._report(config, Mock(return_value=("cuda", "float16")), profile=linux_profile)
 
         self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIsNone(report["model_cache_detail"])
+        self.assertIsNone(report["model_resident_detail"])
+        self.assertIsNone(report["system_memory_returnable_detail"])
         self.assertEqual("cuda", report["runtime_device"])
         self.assertEqual("float16", report["runtime_compute_type"])
         self.assertIn(report["session"], {"wayland", "x11"})
@@ -3321,7 +3411,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
 
         self.assertIs(True, report["model_resident"])
         self.assertIs(True, report["speech_output"]["resident"])
-        self.assertNotIn("model_resident_detail", report)
+        self.assertIsNone(report["model_resident_detail"])
         self.assertNotIn("resident_detail", report["speech_output"])
         # The whole of the no-side-effect guarantee for transcription: the report
         # answered without a transcriber ever being constructed, which is the
