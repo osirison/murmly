@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,6 +30,18 @@ def run_bash(script: str, *, cwd: Path) -> subprocess.CompletedProcess[str]:
 
 class BootstrapShTests(unittest.TestCase):
     def setUp(self) -> None:
+        if sys.platform == "win32":
+            # `bootstrap.sh` is explicitly the Linux half of task 16.2 (see
+            # this module's own docstring and `bootstrap.sh`'s own header);
+            # `bootstrap.ps1` is the Windows half, covered by
+            # `test_bootstrap_ps1.py`. Not "no bash is available" -- a real
+            # interpreter runs and exits 1 with empty stdout and stderr,
+            # which is not what Git Bash does and does look like the
+            # `bash.exe` stub Windows ships for launching WSL failing
+            # silently with no distribution registered. Either way, a script
+            # that never runs on Windows by design does not need a working
+            # shell there to prove anything.
+            self.skipTest("bootstrap.sh is Linux-only; bootstrap.ps1 is the Windows entry point")
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)

@@ -359,7 +359,15 @@ install_announce_hook() {
         socket_flag=(--socket "$socket")
     fi
 
-    python3 "$installer" --script "$target" "${instruction_flag[@]}" "${socket_flag[@]}" \
+    # `${a[@]+"${a[@]}"}`, not a bare `"${a[@]}"`: see the comment above
+    # `command_install` in main() for why a bare empty-array expansion is an
+    # "unbound variable" error under `set -u` on bash before 4.4, which is
+    # what macOS ships as `/bin/bash`. Both flags are routinely empty at once
+    # (a checkout with no voice-note script and no resolvable socket path),
+    # so this is reachable, not theoretical.
+    python3 "$installer" --script "$target" \
+        ${instruction_flag[@]+"${instruction_flag[@]}"} \
+        ${socket_flag[@]+"${socket_flag[@]}"} \
         --agents "$agents" | while IFS= read -r line; do
         info "$line"
     done
@@ -705,7 +713,17 @@ main() {
     esac
 
     case "$command" in
-        install) command_install "${positional[@]}" ;;
+        # `${a[@]+"${a[@]}"}`, not a bare `"${a[@]}"`: `set -u` and an empty
+        # array are an error together on bash before 4.4 --
+        # "positional[@]: unbound variable" -- and macOS still ships 3.2 as
+        # `/bin/bash`. Nothing else here needs a newer bash, so the script
+        # should not acquire that requirement by accident.
+        #
+        # Not `"${a[@]:-}"` either, which is the tempting shorter spelling and
+        # a different thing: on an empty array that expands to one empty
+        # argument rather than to none, so `setup.sh install` would call
+        # `command_install ""` instead of `command_install`.
+        install) command_install ${positional[@]+"${positional[@]}"} ;;
         upgrade) command_upgrade ;;
         hooks) command_hooks "${positional[0]:-}" ;;
         uninstall) command_uninstall ;;

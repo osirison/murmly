@@ -17,6 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -36,9 +37,29 @@ def run_bash(script: str, *, cwd: Path) -> subprocess.CompletedProcess[str]:
 
 class SetupShTestCase(unittest.TestCase):
     def setUp(self) -> None:
+        if sys.platform == "win32":
+            # `setup.sh` is the Linux entry point (its own header: "pulling
+            # the source, naming and offering this Linux system's own
+            # packages" -- none of it is meant to run anywhere else);
+            # `bootstrap.ps1` is Windows's equivalent, covered by
+            # `test_bootstrap_ps1.py`. This is not "no bash is available" --
+            # a real interpreter runs and exits 1 with empty stdout and
+            # stderr, which does not look like Git Bash at all and does look
+            # like the `bash.exe` stub Windows ships for WSL launching
+            # silently when no distribution is registered. Either way, a
+            # script that never runs on Windows by design does not need a
+            # working shell there to prove anything.
+            self.skipTest("setup.sh is Linux-only; bootstrap.ps1 is the Windows entry point")
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.repo = Path(self._tmp.name)
+        # Resolved once here, not left as the raw tempdir path: on macOS
+        # `/var` is a symlink to `/private/var`, and bash sets `$PWD` from
+        # the physical (symlink-resolved) working directory when launched via
+        # `subprocess.run(cwd=...)`. Without this, setup.sh's own `$PWD`-based
+        # `$REPO` and this test's expectation name the same directory by two
+        # different strings. A no-op on Linux and Windows, where the tempdir
+        # is already its own canonical path.
+        self.repo = Path(self._tmp.name).resolve()
         shutil.copy(SETUP_SH, self.repo / "setup.sh")
 
     def fake_command(self, name: str, record: Path, *, bin_dir: Path | None = None) -> Path:
@@ -73,8 +94,20 @@ class RefuseUnsupportedOsTests(SetupShTestCase):
         self.assertIn("Linux and Windows", result.stderr)
 
     def test_proceeds_on_linux(self) -> None:
+        # Steered the same way `test_refuses_on_darwin...` steers the other
+        # branch: a fake `uname` on `PATH`, not the ambient host's real one.
+        # Without this, the assertion was really "the CI runner's OS is
+        # Linux", which is true on two of the three runners for a reason that
+        # has nothing to do with this guard, and false on the macOS runner --
+        # where the guard correctly refuses, and the test wrongly fails.
+        bin_dir = self.repo / "fake-bin"
+        bin_dir.mkdir()
+        uname = bin_dir / "uname"
+        uname.write_text("#!/bin/sh\necho Linux\n")
+        uname.chmod(0o755)
+
         result = run_bash(
-            'source ./setup.sh\nrefuse_unsupported_os\necho REACHED',
+            f'PATH="{bin_dir}:$PATH"\nsource ./setup.sh\nrefuse_unsupported_os\necho REACHED',
             cwd=self.repo,
         )
 

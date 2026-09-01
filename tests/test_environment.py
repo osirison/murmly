@@ -86,13 +86,34 @@ class RefuseOrWarnEnvironmentPreconditionsTests(unittest.TestCase):
         self.assertEqual([], messages)
 
     def test_windows_with_unreadable_registry_warns_and_proceeds(self) -> None:
-        # On this test runner (Linux), the real registry reader raises, which
-        # `environment_preconditions_for` already coerces to `satisfied: None`
-        # -- neither precondition can be refused on that silence (11.5/11.6's
-        # own "never claim a denial from silence either" rule).
+        # Induced directly through a constructed table, not left to the
+        # ambient host: on a Linux runner the real registry reader raises and
+        # this passed by accident, but on a real Windows runner the registry
+        # is genuinely readable, so `satisfied` comes back `True`/`True` and
+        # the warnings this test expects never fire (the same shape as the
+        # macOS microphone test whose "headless, no device" premise turned
+        # out to be host-dependent too). `check=lambda _profile: None` is
+        # `_windows_registry_flag`'s own "unreadable" answer, exercised
+        # directly the way the sibling tests above exercise `True`/`False`.
+        from murmly.platform import EnvironmentPrecondition, WINDOWS_DEVELOPER_MODE, WINDOWS_LONG_PATHS
+
+        table = {
+            WINDOWS_LONG_PATHS: EnvironmentPrecondition(
+                name=WINDOWS_LONG_PATHS,
+                description="long paths are needed",
+                remedy="enable Win32 long paths",
+                check=lambda _profile: None,
+            ),
+            WINDOWS_DEVELOPER_MODE: EnvironmentPrecondition(
+                name=WINDOWS_DEVELOPER_MODE,
+                description="doubles the model cache",
+                remedy="enable Developer Mode",
+                check=lambda _profile: None,
+            ),
+        }
         messages: list[str] = []
         result = refuse_or_warn_environment_preconditions(
-            profile(operating_system=OperatingSystem.WINDOWS, libc=None), messages.append
+            profile(operating_system=OperatingSystem.WINDOWS, libc=None), messages.append, table
         )
         self.assertIsNone(result)
         self.assertTrue(any("long" in message for message in messages))
