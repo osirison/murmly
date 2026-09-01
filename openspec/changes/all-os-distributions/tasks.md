@@ -197,4 +197,4 @@ shippable on their own. See `design.md` — Migration Plan.
 - [ ] 20.4 On Windows, confirm the pipe refuses a connection from another account, the hotkey toggles capture, a transcript reaches the focused window, and a transcript aimed at an elevated window stays on the clipboard and is reported as copied but not pasted
 - [ ] 20.5 On macOS, confirm a launchd-started daemon records — the phase 3 gate — then that the hotkey fires without any permission granted, that pasting fails silently until Accessibility is granted and is reported as ungranted until then, and that it works after
 - [ ] 20.6 On each platform, stop the daemon and confirm the hotkey is released rather than left claimed
-- [ ] 20.7 On each platform, run `doctor` and confirm every field is present, that the platform section names a mechanism or a reason for each concern, and that nothing is reported available whose permission is denied
+- [x] 20.7 On each platform, run `doctor` and confirm every field is present, that the platform section names a mechanism or a reason for each concern, and that nothing is reported available whose permission is denied
