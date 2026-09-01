@@ -4,7 +4,8 @@
     This page assumes murmly is already installed on Linux or Windows, with
     Python 3.12 or newer, from a terminal. On Linux, whether the hotkey
     registers itself at all depends on your desktop: KDE Plasma X11 is
-    verified end to end, KDE Plasma Wayland is not, GNOME's backend has never
+    verified end to end before the port to Windows and not re-verified on X11
+    since, KDE Plasma Wayland is not verified, GNOME's backend has never
     been run against a live GNOME session, and any other desktop has no
     automatic registration — `murmly install` prints the command to bind the
     key yourself instead. Windows always registers itself, with no

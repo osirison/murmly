@@ -21,8 +21,10 @@ in one page with pictures. The
   transcription runtime. macOS is not supported.
 - **Python 3.12 or newer**, and **a terminal**, on either platform.
 - **On Linux, your desktop decides the hotkey and overlay.** KDE Plasma X11 is
-  verified end to end; Plasma Wayland uses the same registration path with a
-  different key-grab mechanism and has not been verified end to end; GNOME has
+  the configuration murmly was built against and was verified end to end before
+  the port to Windows, though not re-verified on X11 since; Plasma Wayland uses
+  the same registration path with a different key-grab mechanism and has not
+  been verified end to end; GNOME has
   a hotkey backend that has never been run against a live GNOME session; any
   other desktop registers no hotkey and shows no overlay automatically, though
   everything else still installs.

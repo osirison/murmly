@@ -46,7 +46,7 @@ transcription, clipboard, and paste — works the same regardless of desktop.
 
 | Desktop | Hotkey | Overlay |
 | --- | --- | --- |
-| KDE Plasma, X11 | Registers itself. **Verified end to end.** | Appears. **Verified end to end.** |
+| KDE Plasma, X11 | Registers itself. The configuration murmly was built against, and the only one where it can confirm a transcript reached the window you were in. **Verified end to end before the port to Windows; not re-verified on X11 since.** | Appears. Same status: verified before the port, not re-verified on X11 since. |
 | KDE Plasma, Wayland | Registers itself, through the same registration path as X11 with a different key-grab mechanism underneath. **Not verified end to end** — murmly says so during installation and checks whether the hotkey actually took effect. | Appears. **Not verified end to end** on Wayland specifically. |
 | GNOME | Registers itself, through GNOME's own `custom-keybindings` mechanism. **Has never been run against a live GNOME session** — no automated environment murmly is built or tested in has one, so treat this as unproven until you have confirmed it yourself. `murmly doctor` shows what actually happened. | **Does not appear.** GNOME has no overlay backend today; murmly says so and installs everything else. |
 | Anything else (Sway, Hyprland, river, and other desktops) | **Does not register itself.** `murmly install` still installs the background service, and prints the command you'd run to bind the hotkey yourself. | **Does not appear.** No overlay backend exists for these desktops; murmly says so and installs everything else. |

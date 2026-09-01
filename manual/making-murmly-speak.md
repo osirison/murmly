@@ -22,7 +22,8 @@ ready-made connection for this — see
 ## Turning it on
 
 You need murmly installed already: Linux or Windows, Python 3.12 or newer, and
-a terminal, on either one. On Linux, KDE Plasma X11 is verified end to end;
+a terminal, on either one. On Linux, KDE Plasma X11 was verified end to end
+before the port to Windows and not re-verified on X11 since;
 Plasma Wayland and GNOME are not, and any other desktop registers no hotkey
 and shows no overlay automatically — though everything below still installs
 and works regardless of desktop. On Windows, the hotkey is always automatic

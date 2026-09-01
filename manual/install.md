@@ -9,9 +9,11 @@ supported.
 
 Whether the hotkey registers itself and whether the recording overlay appears both
 depend on your desktop on Linux, and are automatic on Windows with no session-specific
-gap. On Linux, X11 under KDE Plasma is verified end to end; Plasma Wayland uses the same
-hotkey-registration path with a different key-grab mechanism underneath and has not been
-verified end to end; GNOME has a hotkey backend that has never been run against a live
+gap. On Linux, X11 under KDE Plasma is the configuration murmly was built against, and
+was verified end to end before the port to Windows though not re-verified on X11 since;
+Plasma Wayland uses the same hotkey-registration path with a different key-grab
+mechanism underneath and has not been verified end to end; GNOME has a hotkey backend
+that has never been run against a live
 GNOME session; every other desktop has no automatic hotkey registration or overlay at
 all. Windows has run every capability below as an automated test on a real Windows
 machine, short of the deeper human-driven checks against a second account and an
@@ -220,19 +222,24 @@ card](speed-and-memory.md).
 ## The recording overlay's packages
 
 On Linux, the overlay that shows you what murmly is doing while you talk needs a few
-system packages of its own:
+system packages of its own. You do not have to work out which: installing detects
+your package manager — `dnf`, `apt`, `pacman`, `zypper` or `apk` — names the packages
+in that manager's own spelling, shows you the command, and asks before running it. It
+offers only what is actually missing, so on a machine that already has them it says so
+and asks nothing. Where it recognises no package manager, it prints the list plainly
+and leaves the installing to you.
+
+The packages are GTK 4, PyGObject, libX11 and libXext, plus `gtk4-layer-shell` on
+Plasma Wayland only. On Fedora that comes out as:
 
 ```bash
 sudo dnf install gtk4 python3-gobject libX11 libXext
 sudo dnf install gtk4-layer-shell   # Plasma Wayland only
 ```
 
-`gtk4-layer-shell` is needed on Plasma Wayland only, as the comment above says. The
-overlay runs as a separate helper under `/usr/bin/python3` — the system Python, not
-murmly's own environment — so it can use the distribution's own tested PyGObject and GTK
-packages instead of compiling duplicates inside the virtual environment. Replace `dnf`
-with your distribution's own package manager and package names if it is not
-Fedora-based; `setup.sh` names them for you.
+The overlay runs as a separate helper under `/usr/bin/python3` — the system Python,
+not murmly's own environment — so it can use the distribution's own tested PyGObject
+and GTK packages instead of compiling duplicates inside the virtual environment.
 
 On Windows, the overlay's toolkit is a pip extra rather than a system package:
 
