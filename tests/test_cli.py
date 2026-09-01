@@ -1696,6 +1696,13 @@ class TranscriptionRuntimeGapTests(unittest.TestCase):
         self.assertIn("unavailable", joined)
 
 
+#: A Linux/Plasma profile for the tests below that mean Linux specifically,
+#: rather than whatever the runner happens to be.
+_LINUX_PLASMA = PlatformProfile(
+    operating_system=OperatingSystem.LINUX, architecture="x86_64", desktop=Desktop.PLASMA
+)
+
+
 class DoctorCompletenessTests(unittest.TestCase):
     """`murmly doctor` reports every section it can and explains the ones it cannot."""
 
@@ -1835,10 +1842,21 @@ class DoctorCompletenessTests(unittest.TestCase):
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch(
-                "murmly.cli.is_wayland_session", side_effect=OSError("cannot read the session")
+            # Pinned to Linux, not read off the host: `is_wayland_session` is
+            # only consulted on the Linux branch, so patching it does nothing on
+            # a Windows or macOS runner and this test would assert a detail that
+            # was never going to be produced. That is the same "a test that names
+            # a platform must pin it" mistake this change fixed elsewhere.
+            with (
+                patch("murmly.cli.resolve_platform", return_value=_LINUX_PLASMA),
+                patch(
+                    "murmly.cli.is_wayland_session",
+                    side_effect=OSError("cannot read the session"),
+                ),
             ):
-                report = self._report(config, Mock(return_value=("cpu", "int8")))
+                report = self._report(
+                    config, Mock(return_value=("cpu", "int8")), profile=_LINUX_PLASMA
+                )
 
         self.assertEqual(set(self.SECTIONS), set(report))
         self.assertIsNotNone(report["session_detail"])

@@ -694,6 +694,7 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
         }
 
     model_cache_path, model_cache_detail = transcription_model_cache_path()
+    memory_returnable = system_memory_returnable()
 
     # Guarded like every other probe: this is the exact misconfiguration the
     # command exists to explain, and a report that stops here withholds it.
@@ -814,15 +815,17 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
         # One answer for both models: they share a process and an allocator, so
         # whether a release's freed memory reaches the system is the same fact
         # for the transcription model and the synthesis session alike.
-        "system_memory_returnable": system_memory_returnable(),
-        # Always present, `None` where memory is returnable --
-        # `system_memory_unreturnable_reason()` already answers `None` in that
-        # case, so this is a direct, unconditional call rather than a branch on
-        # `system_memory_returnable`'s value. That branch is what previously
-        # made this key present only on the platforms/libc builds where the
-        # allocator cannot be asked, the same top-level shape violation as
-        # `model_cache_detail` above.
-        "system_memory_returnable_detail": system_memory_unreturnable_reason(),
+        "system_memory_returnable": memory_returnable,
+        # Always present, `None` where memory is returnable. Derived from the
+        # value reported just above rather than by calling the reason function
+        # unconditionally: the two would otherwise be answered independently and
+        # could disagree, which is what "returnable: true" alongside a detail
+        # saying no C library could be found would be. The old conditional made
+        # this key present only where the allocator cannot be asked, the same
+        # top-level shape violation as `model_cache_detail` above.
+        "system_memory_returnable_detail": (
+            None if memory_returnable else system_memory_unreturnable_reason()
+        ),
         "live_transcription": live_transcription_diagnostics(config),
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
