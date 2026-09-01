@@ -53,7 +53,7 @@ one Murmly already takes when the visual runtime is missing.
 **Reason**: The requirement specified placement, stacking, focus and input
 behaviour only for a KDE Plasma X11 or Wayland session, and its scenarios named
 those two sessions as the only presentations to hold equal. Murmly now presents the
-overlay on Linux, Windows and macOS, so the guarantee has to be stated against
+overlay on Linux and on Windows, so the guarantee has to be stated against
 whatever platform is presenting it.
 
 **Migration**: Replaced by "Non-disruptive placement on every platform", which

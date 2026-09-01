@@ -36,13 +36,23 @@ without running on it.
 - **THEN** it answers for that environment
 - **AND** the answer does not depend on the environment Murmly is actually running in
 
-### Requirement: Murmly supports Linux, Windows, and macOS, and says exactly why it cannot run where it cannot
+### Requirement: Murmly supports Linux and Windows, and says exactly why it cannot run where it cannot
 
-Murmly SHALL run on Linux, on Windows, and on macOS. On Linux it MUST NOT require
-a particular distribution, package manager, init system, desktop environment, or
+Murmly SHALL run on Linux and on Windows. On Linux it MUST NOT require a
+particular distribution, package manager, init system, desktop environment, or
 display protocol in order to start, capture, transcribe, and put a transcript on
 the clipboard. Recognising the distribution MUST NOT be a condition of running on
 it.
+
+macOS is deliberately absent from that list rather than missing from it. Every
+macOS mechanism this capability describes is built and exercised — the command
+channel, the service, the hotkey, the clipboard, injection, focus observation and
+synthesis all have a macOS backend that runs against the real system APIs. What
+is not established is whether a daemon started by the platform's own service
+manager can capture audio at all, which macOS gates behind a permission that
+fails silently rather than refusing. Until that is proven, claiming macOS would
+be claiming the one thing Murmly is for. A later change adds it to this
+requirement; nothing here is written so as to make that harder.
 
 Murmly depends on runtimes that are not built for every combination of operating
 system, processor architecture, and C library. Where a runtime Murmly needs has no

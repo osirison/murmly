@@ -141,6 +141,18 @@ Murmly work. No mobile platform, no BSD, no ChromeOS. No new feature: the point 
 this change is that what Murmly already does works in more places, not that it does
 more.
 
+**Read this before the rest: macOS was built and is not claimed.** Everything
+below describing macOS was implemented and is exercised on a macOS runner — the
+UNIX socket with `getpeereid`, the launchd agent, Carbon hotkeys, `NSPasteboard`,
+`CGEventPost`, `NSWorkspace` focus, and CoreML synthesis. It shipped as code and
+not as a supported platform, decided partway through the work: whether a daemon
+started by launchd can capture audio at all needs a Mac with a microphone and
+somebody speaking into it, because macOS gates that behind a permission whose
+failure is silent — an open stream delivering zeroes, no dialog and no error.
+Claiming macOS on that basis would be claiming the one thing Murmly is for. The
+spec deltas say Linux and Windows; the code, the tests and the CI job stay so it
+cannot rot, and finishing it later is the microphone question plus the overlay.
+
 ## Capabilities
 
 ### New Capabilities
