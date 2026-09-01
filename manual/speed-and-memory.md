@@ -102,6 +102,20 @@ to speak.
 
 ## Running speech on your graphics card
 
+This needs murmly already installed: Linux or Windows, Python 3.12 or newer,
+and a terminal, on either one — see [what you need before you
+start](what-you-need.md) and [installing murmly](install.md) for the install
+itself. Neither the sync below nor the doctor check it feeds needs any
+permission on either platform; the hotkey and overlay disclosures on those
+two pages apply to installing murmly in the first place, not to this
+follow-on step.
+
+The command below applies on Linux and on Windows, the same command on both —
+the CUDA extra and the `onnxruntime-gpu` wheel it swaps in both publish for
+either platform. It does not apply to musl-based Linux or Windows on ARM64,
+which have no build of the transcription runtime to begin with, and murmly
+does not run on those machines at all.
+
 The GPU build of ONNX Runtime **replaces** the CPU one rather than joining
 it — both install into the same `onnxruntime` package namespace, and an
 environment holding both leaves the survivor of any later uninstall broken:

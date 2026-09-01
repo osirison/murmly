@@ -4,6 +4,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
+import ctypes
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ import threading
 import time
 
 from murmly.audio import SoundDeviceRecorder
-from murmly.config import MurmlyConfig
+from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig
 from murmly.focus import (
     FocusObserver,
     WindowIdentity,
@@ -23,14 +24,21 @@ from murmly.focus import (
     record_target,
     should_deliver,
 )
+from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path, rebind_from_record
 from murmly.idle import IdleRelease
-from murmly.integrations import ClipboardPaster
+from murmly.integrations import Paster, create_clipboard_paster
 from murmly.overlay import (
     detect_overlay_backend,
     NullOverlayController,
     OverlayController,
     OverlayLifecycle,
     OverlayState,
+)
+from murmly.platform import (
+    OperatingSystem,
+    PlatformProfile,
+    hotkey_mechanism_is_in_process,
+    resolve_platform,
 )
 from murmly.silence import SilenceDetector
 from murmly.speech import (
@@ -42,6 +50,7 @@ from murmly.speech import (
     SpeechSuspendError,
 )
 from murmly.stt import FasterWhisperTranscriber
+from murmly.win_pipe import is_pipe_name
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +75,23 @@ COMMAND_SPEECH_SESSION = "speech_session"
 COMMAND_TOGGLE = "toggle"
 COMMAND_TOGGLE_SESSION = "toggle_session"
 COMMAND_STATUS = "status"
+#: Task 5.5: what `murmly install` reaches a running daemon for, since an
+#: in-process hotkey registration cannot be changed by writing a file the
+#: desktop reads. See `hotkey_record.py` -- a no-op reply on every platform
+#: this change targets, since neither Plasma nor GNOME registers in-process.
+COMMAND_REBIND_HOTKEYS = "rebind_hotkeys"
+
+#: Which command an in-process hotkey purpose (`installer.HotkeyPurpose.key`,
+#: also `HotkeyRecordStore`'s own keys) fires when the platform's own message
+#: loop -- not a connection -- is what learned it was pressed (task 8.3).
+#: Kept as its own small table here, hardcoding the two purpose keys rather
+#: than importing them from `installer.py`, the same way `hotkey_record.py`'s
+#: docstring already names `"window"`/`"session"` without importing that
+#: module.
+IN_PROCESS_HOTKEY_COMMANDS: dict[str, str] = {
+    "window": COMMAND_TOGGLE,
+    "session": COMMAND_TOGGLE_SESSION,
+}
 # A speech session's own bound. `MAX_COMMAND_BYTES` stays 4096 for every
 # existing command: a sender streaming a reply carries paragraphs, and a state
 # query does not.
@@ -254,7 +280,26 @@ def _directory_exposure(
 
     Each detail carries its own remedy, because they differ: a directory this
     account does not own cannot be corrected with chmod.
+
+    The whole analysis below is skipped, not merely `os.getuid()`, on a host
+    that has no `os.getuid` at all. In production this function is reached
+    only through the Linux/macOS branch of `_require_private_channel`, where
+    the resolved profile and the real host agree and `os.getuid` always
+    exists. A test may deliberately resolve one of those profiles on a real
+    Windows interpreter instead, to keep this branch exercised on every host
+    (see `MurmlyDaemon.__init__`'s own docstring for the matching seam on the
+    peer-identity side). On that host every mode bit this function reads is
+    synthetic: CPython's Windows `os.stat` derives `st_mode` from the
+    FILE_ATTRIBUTE_READONLY flag alone, so an ordinary writable directory
+    reports `0o777` -- group- and other-writable, with no sticky bit -- which
+    would read as "writable by other accounts" for the first directory in
+    every walk, and there is no real uid or mode-bit information underneath
+    it to judge either way. Returning `None` immediately is the same "nothing
+    to report" a `os.getuid()`-only guard would still get wrong one line
+    later.
     """
+    if not hasattr(os, "getuid"):
+        return None
     if info.st_uid not in (0, os.getuid()):
         return (
             f"{directory} is owned by uid {info.st_uid}, which can grant itself write "
@@ -275,13 +320,32 @@ def _directory_exposure(
     )
 
 
-def peer_identity_supported() -> bool:
-    """Whether this platform can report the account behind an accepted connection."""
+def peer_identity_supported(profile: PlatformProfile | None = None) -> bool:
+    """Whether this platform can report the account behind an accepted connection.
+
+    Windows always answers True: task 7.4 reads it from the pipe's client
+    process token, a mechanism every Windows version this project targets
+    carries, unlike `SO_PEERCRED`, which is a Linux-only socket option. macOS
+    also always answers True (task 13.2): `getpeereid(3)` is a libSystem
+    function every Darwin kernel this project targets carries, not a
+    `socket`-module attribute the way `SO_PEERCRED` is, so it is named by
+    operating system here rather than by `hasattr`.
+    """
+    resolved = profile if profile is not None else resolve_platform()
+    if resolved.operating_system in (OperatingSystem.WINDOWS, OperatingSystem.MACOS):
+        return True
     return hasattr(socket, "SO_PEERCRED")
 
 
 def read_peer_identity(connection: socket.socket) -> int | None:
-    """The user id on the other end of the connection, or None where unreadable."""
+    """The user id on the other end of the connection, or None where unreadable.
+
+    The UNIX transport's own mechanism -- `SO_PEERCRED` -- kept under its
+    original name and signature because it is still exactly what a UNIX socket
+    connection is read with. `peer_identity_mechanism_for` is what a caller
+    that does not already know which transport it holds should use instead;
+    this function remains the concrete Linux answer it dispatches to.
+    """
     if not peer_identity_supported():
         return None
     try:
@@ -293,6 +357,131 @@ def read_peer_identity(connection: socket.socket) -> int | None:
         return None
     _pid, uid, _gid = struct.unpack("3i", credentials)
     return uid
+
+
+#: `sys/ucred.h`'s `uid_t`/`gid_t` -- both `__uint32_t` on Darwin.
+_DARWIN_UID_T = ctypes.c_uint32
+_DARWIN_GID_T = ctypes.c_uint32
+
+
+def read_peer_identity_macos(connection: socket.socket) -> int | None:
+    """The user id on the other end of a UNIX socket connection, read through
+    `getpeereid(3)` (task 13.2).
+
+    macOS's `socket` module carries no `SO_PEERCRED` -- it is a Linux-only
+    `getsockopt` option (`read_peer_identity`'s own docstring) -- but BSD
+    sockets (and Darwin's, which descends from them) answer the same question
+    through a dedicated libSystem call instead: `int getpeereid(int fd, uid_t
+    *euid, gid_t *egid)`, declared here with real `ctypes` types rather than
+    left to default -- `uid_t`/`gid_t` are 4 bytes and the function's own
+    return is `c_int`, so nothing here is at risk of the pointer-truncation
+    defect class this change's other new ctypes code carries a comment about,
+    but declaring the signature explicitly is the rule regardless of whether
+    a given call happens to be safe by accident.
+
+    `getpeereid` reports no pid at all (design.md's "The command channel"),
+    unlike `SO_PEERCRED`'s three-way `(pid, uid, gid)` tuple -- which is
+    exactly enough for the one comparison `_peer_permitted` ever makes: it
+    already compares only the uid `read_peer_identity`'s Linux branch reports,
+    ignoring the pid entirely, so this platform's mechanism satisfies
+    `PeerIdentityMechanism`'s contract with nothing missing.
+
+    Loaded through `ctypes.CDLL(None)` -- the running process's own image,
+    which already links every libSystem symbol -- rather than a framework
+    path, because `getpeereid` is a plain libc function, not
+    framework-bundled Objective-C or Carbon API the way this change's other
+    macOS ctypes calls are.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError as error:
+        logger.warning("Unable to load libSystem to read a peer identity: %s", error)
+        return None
+    libc.getpeereid.restype = ctypes.c_int
+    libc.getpeereid.argtypes = [ctypes.c_int, ctypes.POINTER(_DARWIN_UID_T), ctypes.POINTER(_DARWIN_GID_T)]
+
+    uid = _DARWIN_UID_T()
+    gid = _DARWIN_GID_T()
+    status = libc.getpeereid(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid))
+    if status != 0:
+        logger.warning(
+            "Unable to read the peer identity of a connection: getpeereid failed "
+            "(errno=%s)",
+            ctypes.get_errno(),
+        )
+        return None
+    return int(uid.value)
+
+
+@dataclass(frozen=True, slots=True)
+class PeerIdentityMechanism:
+    """One platform's own way of reading a peer's identity, and comparing it.
+
+    Returned as one paired value rather than two separately defaulted
+    constructor parameters, so a caller cannot accidentally pair one
+    platform's reader with another platform's comparison -- the
+    `command-interface` spec's "Peer identity read by the platform's own
+    mechanism" scenario requires the read and the comparison it feeds to both
+    be the same platform's own rule (task 18.7).
+    """
+
+    supported: bool
+    read: Callable[[object], object | None]
+    # `| None`: `peer_identity_mechanism_for`'s non-Windows branch stores
+    # `None` here on a host with no `os.getuid` at all, never called in that
+    # case -- see that function's own docstring for why.
+    local: Callable[[], object] | None
+
+
+def peer_identity_mechanism_for(profile: PlatformProfile) -> PeerIdentityMechanism:
+    """Dispatch to `profile`'s own way of reading and comparing peer identity.
+
+    Windows compares SID strings, both read by `win_pipe`'s own mechanism --
+    `os.getuid()`, the UNIX comparison, is not a concept a pipe's client-token
+    SID could ever equal. Every other resolved platform keeps the existing
+    `SO_PEERCRED`/`os.getuid()` pair unchanged, which is what keeps this
+    dispatch a zero-behaviour-change addition on Linux.
+
+    `getattr(os, "getuid", None)`, not the bare name: on a real Linux or
+    macOS host this returns the exact same function object (`PeerIdentity
+    MechanismDispatchTests.test_linux_keeps_the_existing_socket_functions`
+    asserts `is`, not merely equality), so nothing changes there. The bare
+    name is an `AttributeError` waiting to happen the moment this function
+    is *called* -- not merely referenced -- for a non-Windows profile on a
+    real Windows interpreter, which only a test deliberately does (see
+    `MurmlyDaemon.__init__`'s own comment on this same hazard). `None`
+    reaches `PeerIdentityMechanism.local` there instead, and `.supported`
+    reports `False` alongside it -- `hasattr`, the same idiom
+    `peer_identity_supported` and `_directory_exposure` both already use to
+    ask what a platform can do rather than assume it, instead of the bare
+    `AttributeError` that reaching this branch used to raise for exactly
+    that host/profile pair. `local` is never called there regardless:
+    `_peer_permitted` only calls it once `self._peer_identity` -- the
+    platform's `read` -- has already answered with a real identity, and on a
+    host missing `os.getuid` altogether that never happens: `read_peer_
+    identity` answers `None` with no `SO_PEERCRED` (every real Windows
+    host), and `read_peer_identity_macos` is never reachable on a
+    non-Darwin host in the first place.
+    """
+    if profile.operating_system is OperatingSystem.WINDOWS:
+        from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
+
+        return PeerIdentityMechanism(True, read_peer_identity_from_pipe, current_user_sid_string)
+    if profile.operating_system is OperatingSystem.MACOS:
+        # `read_peer_identity_macos` (task 13.2), compared with the same
+        # `os.getuid()` the Linux branch below uses: `getpeereid` answers a
+        # uid, exactly what the UID-only comparison `_peer_permitted` already
+        # makes needs, so macOS shares the Linux branch's `local` callable
+        # rather than needing one of its own. `getattr(os, "getuid", None)`,
+        # not the bare name -- see this function's own docstring: a real
+        # Windows interpreter has no `os.getuid` at all, and a macOS profile
+        # resolved there (only a test does this) must report the mechanism
+        # unsupported rather than raise while building it.
+        local = getattr(os, "getuid", None)
+        return PeerIdentityMechanism(local is not None, read_peer_identity_macos, local)
+    return PeerIdentityMechanism(
+        peer_identity_supported(profile), read_peer_identity, getattr(os, "getuid", None)
+    )
 
 
 def create_socket_directory(directory: Path) -> None:
@@ -336,12 +525,22 @@ class SpeechSession:
         partial_sink: Callable[[str], None] | None = None,
         on_silence: Callable[[], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        profile: PlatformProfile | None = None,
     ) -> None:
         self._config = config
+        # Resolved once, like `MurmlyDaemon.__init__` resolves it (task 1.3),
+        # and passed here rather than re-resolved -- `_ensure_paster` and the
+        # default focus observer both read it, and must agree with whatever
+        # decided the rest of this process is on Windows.
+        self._profile = profile if profile is not None else resolve_platform()
         self._recorder = SoundDeviceRecorder(config, level_sink=level_sink)
         self._transcriber = FasterWhisperTranscriber(config)
-        self._paster: ClipboardPaster | None = None
-        self._focus = focus_observer if focus_observer is not None else create_focus_observer()
+        self._paster: Paster | None = None
+        self._focus = (
+            focus_observer
+            if focus_observer is not None
+            else create_focus_observer(profile=self._profile)
+        )
         self._partial_sink = partial_sink
         self._on_silence = on_silence
         self._clock = clock
@@ -610,11 +809,12 @@ class SpeechSession:
         if text is not None and self._partial_sink is not None:
             self._partial_sink(text)
 
-    def _ensure_paster(self) -> ClipboardPaster:
+    def _ensure_paster(self) -> Paster:
         if self._paster is None:
-            self._paster = ClipboardPaster(
+            self._paster = create_clipboard_paster(
                 restore_clipboard=self._config.restore_clipboard,
                 restore_delay_ms=self._config.restore_clipboard_delay_ms,
+                profile=self._profile,
             )
         return self._paster
 
@@ -889,20 +1089,39 @@ class MurmlyDaemon:
         config: MurmlyConfig,
         session: SpeechSession | None = None,
         overlay: OverlayLifecycle | None = None,
-        peer_identity: Callable[[socket.socket], int | None] = read_peer_identity,
+        peer_identity: Callable[[object], object | None] | None = None,
         speech: SpeechEngine | None = None,
+        profile: PlatformProfile | None = None,
+        local_identity: Callable[[], object] | None = None,
+        hotkey_registrar: object | None = None,
     ) -> None:
         self._config = config
-        self._peer_identity = peer_identity
-        # Before the overlay, which spawns a renderer from its constructor: a
-        # daemon that refuses to run must not start anything first.
-        self._require_private_socket_path()
+        # Resolved once and kept, like every other platform-dependent decision
+        # in this change (task 1.3) -- `serve_forever` and `shutdown` both read
+        # it later to decide whether the channel is a UNIX socket or a named
+        # pipe, and must agree with what was decided here.
+        self._profile = profile if profile is not None else resolve_platform()
+        # Before anything else, peer-identity mechanism dispatch included: a
+        # daemon that refuses to run must not start anything first, and on a
+        # deliberately mismatched profile/host pair -- a non-Windows profile
+        # constructed on a real Windows interpreter, which only a test does,
+        # to keep asserting the shape refusal on every host -- a refusal
+        # this mismatch is here to produce must still run before anything
+        # else does. `peer_identity_mechanism_for` itself no longer raises
+        # for that pair (it answers an unsupported mechanism instead, see
+        # its own docstring), but the ordering stays: nothing else should
+        # start before a refusal that applies has had its chance to fire.
+        self._require_private_channel()
+        mechanism = peer_identity_mechanism_for(self._profile)
+        self._peer_identity = peer_identity if peer_identity is not None else mechanism.read
+        self._local_identity = local_identity if local_identity is not None else mechanism.local
         self._overlay = overlay or self._create_overlay(config)
         self._session = session or SpeechSession(
             config,
             level_sink=self._publish_level,
             partial_sink=self._publish_partial,
             on_silence=self._on_silence,
+            profile=self._profile,
         )
         self._speech = speech if speech is not None else SpeechEngine(config)
         # Two countdowns rather than one. The two models reclaim different
@@ -944,6 +1163,15 @@ class MurmlyDaemon:
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
         self._server: socket.socket | None = None
+        # Set once the channel is actually accepting, not merely assigned to
+        # `_server` -- `wait_until_served` (tests/test_daemon.py) waits on this
+        # rather than polling `getsockopt(SO_ACCEPTCONN)`, which macOS refuses
+        # for an AF_UNIX socket with `OSError: [Errno 42] Protocol not
+        # available`; a probe connection is not a substitute either, since the
+        # daemon counts every accepted connection through its peer-identity
+        # check, and a test that answers that check differently per
+        # connection would be answering one of these probes.
+        self._listening = threading.Event()
         self._worker_slots = threading.BoundedSemaphore(MAX_COMMAND_WORKERS)
         self._connections_lock = threading.Lock()
         self._connections: set[socket.socket] = set()
@@ -955,6 +1183,34 @@ class MurmlyDaemon:
         # Shutdown answers a command that outlives the drain, so the claim is what
         # keeps it and the worker from both writing to the same connection.
         self._claimed: set[socket.socket] = set()
+        # Task 5.4/5.5's design boundary: whatever object holds an in-process
+        # hotkey registration, if this platform's mechanism is one -- `None`
+        # for Plasma and GNOME, since neither registers here: a launcher file
+        # and a dconf value are both desktop-held state. Windows'
+        # `WindowsHotkeyRegistrar` (section 8) and macOS's
+        # `MacosHotkeyRegistrar` (section 13) are the two populators, chosen by
+        # the resolved operating system -- `hotkey_mechanism_is_in_process`
+        # only says *that* this platform's mechanism registers here, not
+        # *which* platform, so the registrar class itself still has to be
+        # picked by `self._profile.operating_system` rather than assumed to be
+        # Windows' now that a second one exists.
+        # `hotkey_registrar` lets a test substitute a fake without touching a
+        # real message-loop or event-loop thread; every real caller leaves it
+        # `None` and gets whatever `hotkey_mechanism_is_in_process(self._profile)`
+        # and `self._profile.operating_system` together say.
+        if hotkey_registrar is not None:
+            self._hotkey_registrar: object | None = hotkey_registrar
+        elif hotkey_mechanism_is_in_process(self._profile):
+            if self._profile.operating_system is OperatingSystem.MACOS:
+                from murmly.mac_hotkey import MacosHotkeyRegistrar
+
+                self._hotkey_registrar = MacosHotkeyRegistrar(on_hotkey=self._handle_in_process_hotkey)
+            else:
+                from murmly.win_hotkey import WindowsHotkeyRegistrar
+
+                self._hotkey_registrar = WindowsHotkeyRegistrar(on_hotkey=self._handle_in_process_hotkey)
+        else:
+            self._hotkey_registrar = None
 
     @property
     def state(self) -> str:
@@ -974,90 +1230,192 @@ class MurmlyDaemon:
     def speech(self) -> SpeechEngine:
         return self._speech
 
+    def _uses_named_pipe(self) -> bool:
+        """Whether this daemon's channel is Windows' named pipe rather than a
+        UNIX socket (task 7.1) -- decided once, from the resolved platform, the
+        same way every other platform-dependent choice in this change is."""
+        return self._profile.operating_system is OperatingSystem.WINDOWS
+
     def serve_forever(self) -> None:
         try:
-            # Re-checked here, before the unlink below deletes whatever sits at
-            # the configured path: that unlink must never run against a path
-            # Murmly would refuse.
-            self._require_private_socket_path()
-            if not peer_identity_supported():
+            # Re-checked here, before anything below acts on the configured
+            # path or name: that action must never run against one Murmly
+            # would refuse.
+            self._require_private_channel()
+            if not peer_identity_supported(self._profile):
                 logger.warning(
                     "This platform cannot report the account behind a connection. The "
-                    "command socket is protected by its file permissions alone."
+                    "command channel is protected by its own access control alone."
                 )
-            try:
-                create_socket_directory(self._config.socket_path.parent)
-            except OSError as error:
-                # Named as the startup refusal it is. Left as an OSError it would
-                # reach the caller's backstop and be reported as an unexpected
-                # failure, which is the one thing it is not.
-                raise DaemonStartupError(
-                    f"Refusing to serve at {self._config.socket_path}. Its directory "
-                    f"could not be created: {error}."
-                ) from error
+            if self._uses_named_pipe():
+                self._serve_named_pipe()
+            else:
+                self._serve_unix_socket()
+        finally:
+            # Outside the channel's own unwinding, because a refusal that
+            # happens before the channel exists still has an overlay to close,
+            # and, on Windows, a hotkey thread `_rebind_hotkeys` may already
+            # have started. `serve_forever` ending through an exception --
+            # not only through an explicit `shutdown()` call -- must not leave
+            # that thread holding `RegisterHotKey` bindings with no daemon
+            # left to answer them (task 8.5); `shutdown()` releases the same
+            # registrar too, and a second `stop()` here is a no-op on it.
+            self._release_hotkey_registrar()
+            self._close_overlay()
+
+    def _serve_unix_socket(self) -> None:
+        try:
+            create_socket_directory(self._config.socket_path.parent)
+        except OSError as error:
+            # Named as the startup refusal it is. Left as an OSError it would
+            # reach the caller's backstop and be reported as an unexpected
+            # failure, which is the one thing it is not.
+            raise DaemonStartupError(
+                f"Refusing to serve at {self._config.socket_path}. Its directory "
+                f"could not be created: {error}."
+            ) from error
+        try:
+            self._config.socket_path.unlink(missing_ok=True)
+        except OSError as error:
+            raise DaemonStartupError(
+                f"Refusing to serve at {self._config.socket_path}. What is already "
+                f"at that path could not be removed: {error}."
+            ) from error
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                self._server = server
+                try:
+                    server.bind(str(self._config.socket_path))
+                    # The window between bind and chmod is accepted. What
+                    # keeps it closed is the umask, which leaves the node
+                    # unwritable by other accounts even before the chmod; the
+                    # directory rule above does not, since it deliberately
+                    # serves a directory others can traverse.
+                    self._config.socket_path.chmod(SOCKET_MODE)
+                    server.listen()
+                except OSError as error:
+                    raise DaemonStartupError(
+                        f"Refusing to serve at {self._config.socket_path}. Its socket "
+                        f"could not be created: {error}."
+                    ) from error
+                self._listening.set()
+                logger.debug("Hotkey rebind at startup: %s", self._rebind_hotkeys())
+                server.settimeout(0.2)
+                self._accept_loop(server)
+        finally:
+            self._server = None
+            self._listening.clear()
             try:
                 self._config.socket_path.unlink(missing_ok=True)
             except OSError as error:
-                raise DaemonStartupError(
-                    f"Refusing to serve at {self._config.socket_path}. What is already "
-                    f"at that path could not be removed: {error}."
-                ) from error
-            try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
-                    self._server = server
-                    try:
-                        server.bind(str(self._config.socket_path))
-                        # The window between bind and chmod is accepted. What
-                        # keeps it closed is the umask, which leaves the node
-                        # unwritable by other accounts even before the chmod; the
-                        # directory rule above does not, since it deliberately
-                        # serves a directory others can traverse.
-                        self._config.socket_path.chmod(SOCKET_MODE)
-                        server.listen()
-                    except OSError as error:
-                        raise DaemonStartupError(
-                            f"Refusing to serve at {self._config.socket_path}. Its socket "
-                            f"could not be created: {error}."
-                        ) from error
-                    server.settimeout(0.2)
-                    while not self._shutdown.is_set():
-                        try:
-                            connection, _address = server.accept()
-                        except socket.timeout:
-                            continue
-                        except OSError:
-                            if self._shutdown.is_set():
-                                break
-                            raise
-                        # Checked before a worker slot is taken: inside a worker, a
-                        # foreign account could occupy every slot and deny service to
-                        # the owner -- the pool this change is otherwise hardening.
-                        if not self._peer_permitted(connection):
-                            self._refuse(
-                                connection,
-                                failure_response(
-                                    CommandCode.NOT_PERMITTED,
-                                    "Murmly serves only the account it runs as.",
-                                ),
-                            )
-                            connection.close()
-                            continue
-                        self._dispatch_connection(connection)
-            finally:
-                self._server = None
-                try:
-                    self._config.socket_path.unlink(missing_ok=True)
-                except OSError as error:
-                    # Reported rather than raised: a failure to clean up must not
-                    # replace the reason the daemon is unwinding.
-                    logger.warning("The command socket could not be removed: %s", error)
-        finally:
-            # Outside the socket's own unwinding, because a refusal that happens
-            # before the socket exists still has an overlay to close: the
-            # constructor started one.
-            self._close_overlay()
+                # Reported rather than raised: a failure to clean up must not
+                # replace the reason the daemon is unwinding.
+                logger.warning("The command socket could not be removed: %s", error)
 
-    def _require_private_socket_path(self) -> None:
+    def _serve_named_pipe(self) -> None:
+        """Windows' command channel: a named pipe, never a file (tasks 7.1, 7.6).
+
+        No directory to create, and nothing to unlink or chmod afterwards --
+        `_require_private_channel` already refused a configured value that is
+        not shaped like a pipe name, and the DACL `win_pipe.
+        create_named_pipe_server` builds into the pipe itself is what grants
+        only this account's SID (task 7.2), rather than a filesystem mode bit.
+        `NamedPipeServer` is imported here rather than at module load, matching
+        the deferred-import shape every other platform-specific subsystem in
+        this codebase uses (`installer._current_session`,
+        `stt._load_model_locked`, and every loader in `platform/__init__.py`) --
+        `win_pipe.py` itself imports no `pywin32` name until one of its own
+        methods runs, so this is a convention kept for consistency, not a
+        requirement for `daemon.py`'s own importability.
+        """
+        from murmly.win_pipe import NamedPipeServer
+
+        try:
+            server = NamedPipeServer(str(self._config.socket_path))
+        except OSError as error:
+            raise DaemonStartupError(
+                f"Refusing to serve at {self._config.socket_path}. Its named pipe "
+                f"could not be created: {error}."
+            ) from error
+        self._server = server
+        # Already connectable: `NamedPipeServer.__init__` builds its one
+        # waiting pipe instance before returning (see its own docstring), so
+        # there is no separate listen() call whose completion `_listening`
+        # would otherwise need to wait for.
+        self._listening.set()
+        try:
+            with server:
+                logger.debug("Hotkey rebind at startup: %s", self._rebind_hotkeys())
+                server.settimeout(0.2)
+                self._accept_loop(server)
+        finally:
+            self._server = None
+            self._listening.clear()
+
+    def _accept_loop(self, server) -> None:
+        """Accept connections until shutdown, against either transport.
+
+        Written once and shared, rather than once per transport: `server` is
+        either a UNIX `socket.socket` or a `win_pipe.NamedPipeServer`, and this
+        loop calls only the subset of methods the two share
+        (`accept`/`settimeout`, with a connection object answering to
+        `close`), which is exactly what `win_pipe.NamedPipeServer` and
+        `win_pipe.NamedPipeConnection` were built to satisfy.
+        """
+        while not self._shutdown.is_set():
+            try:
+                connection, _address = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._shutdown.is_set():
+                    break
+                raise
+            # Checked before a worker slot is taken: inside a worker, a
+            # foreign account could occupy every slot and deny service to
+            # the owner -- the pool this change is otherwise hardening.
+            if not self._peer_permitted(connection):
+                self._refuse(
+                    connection,
+                    failure_response(
+                        CommandCode.NOT_PERMITTED,
+                        "Murmly serves only the account it runs as.",
+                    ),
+                )
+                connection.close()
+                continue
+            self._dispatch_connection(connection)
+
+    def _require_private_channel(self) -> None:
+        """Refuse a channel this account cannot serve privately, before anything opens it.
+
+        Dispatches on the resolved platform's channel kind (task 7.5), not on
+        the configured value's shape alone: the shape decides which of the two
+        wrong combinations this is, and either one is refused regardless of
+        which platform is actually running, so a value copied from one
+        platform's configuration onto the other is refused with a reason
+        naming the mismatch rather than silently misread. A filesystem
+        socket's directory-privacy analysis (`socket_path_detail`) does not
+        apply to a name that is not in the filesystem, and is not run for one.
+        """
+        configured = str(self._config.socket_path)
+        if self._uses_named_pipe():
+            if is_pipe_name(configured):
+                return
+            raise DaemonStartupError(
+                f"Refusing to serve at {configured}. Windows serves its command "
+                "channel as a named pipe, not a filesystem path, so this daemon "
+                "cannot create it privately. Configure daemon.socket_path as a "
+                f"pipe name such as {WINDOWS_PIPE_NAME}."
+            )
+        if is_pipe_name(configured):
+            raise DaemonStartupError(
+                f"Refusing to serve at {configured}. This is a Windows named-pipe "
+                f"name, but {self._profile.operating_system.value} serves its "
+                "command channel as a filesystem socket, so this daemon cannot "
+                "create it privately. Configure daemon.socket_path as a "
+                "filesystem path instead."
+            )
         detail = socket_path_detail(self._config.socket_path)
         if detail is None:
             return
@@ -1066,23 +1424,54 @@ class MurmlyDaemon:
         # ownership fault is not corrected the way a mode fault is.
         raise DaemonStartupError(f"Refusing to serve at {self._config.socket_path}. {detail}")
 
-    def _peer_permitted(self, connection: socket.socket) -> bool:
+    def _peer_permitted(self, connection: object) -> bool:
         """Whether the account behind this connection is the one Murmly serves.
+
+        The comparison is `==` against `self._local_identity()`, not a
+        UID-specific comparison: on Linux and macOS both sides are `os.getuid()`
+        integers, unchanged from before this dispatch existed, and on Windows
+        both sides are the SID strings `win_pipe` reads (task 18.7's "the same
+        rule is applied to the result").
 
         An identity this platform cannot report is served rather than refused,
         which is reported at startup and in diagnostics: refusing would make the
         daemon unusable on a platform whose only fault is not offering the check.
         """
-        uid = self._peer_identity(connection)
-        if uid is None:
+        identity = self._peer_identity(connection)
+        if identity is None:
             return True
-        if uid == os.getuid():
+        if identity == self._local_identity():
             return True
-        logger.warning("Refused a command from uid %d.", uid)
+        logger.warning("Refused a command from %r.", identity)
         return False
+
+    def _release_hotkey_registrar(self) -> None:
+        """Stop the in-process hotkey registrar, if this platform holds one (task 8.5).
+
+        Released before anything else unwinds wherever it is called from: a
+        hotkey firing mid-shutdown would call `handle_command` through
+        `_handle_in_process_hotkey` and could start a new capture on a daemon
+        that is already on its way out. On a platform holding no in-process
+        hotkey, `self._hotkey_registrar` is `None` and this is a no-op.
+
+        Called from both `shutdown()` and `serve_forever()`'s own unwinding:
+        a `serve_forever` that ends through an unhandled exception, not only
+        through an explicit `shutdown()` call, must not leave the message-loop
+        thread holding `RegisterHotKey` bindings with no daemon left to answer
+        them. Safe to call twice -- `WindowsHotkeyRegistrar.stop()` is
+        idempotent on a thread that is already stopped -- so both call sites
+        keep this line rather than one deferring to the other.
+        """
+        if self._hotkey_registrar is None:
+            return
+        try:
+            self._hotkey_registrar.stop()
+        except Exception:  # noqa: BLE001 - releasing a hotkey must not raise
+            logger.warning("Could not release the in-process hotkey registration.", exc_info=True)
 
     def shutdown(self) -> None:
         self._shutdown.set()
+        self._release_hotkey_registrar()
         server = self._server
         if server is not None:
             try:
@@ -1121,7 +1510,12 @@ class MurmlyDaemon:
                 connection.close()
             except OSError:
                 pass
-        self._config.socket_path.unlink(missing_ok=True)
+        # A named pipe has no filesystem node to remove -- closing every
+        # handle above is what releases it (task 7.6: `socket_path` still
+        # names the channel, but naming it is not the same as it existing on
+        # disk).
+        if not self._uses_named_pipe():
+            self._config.socket_path.unlink(missing_ok=True)
         self._close_overlay()
 
     def _stop_capture(self) -> None:
@@ -1731,7 +2125,54 @@ class MurmlyDaemon:
             )
         return residency
 
+    def _rebind_hotkeys(self) -> str:
+        """Re-register every recorded hotkey, where this platform needs it.
+
+        Never raises: called both from a command a sender is waiting on and
+        from the daemon's own startup, and a hotkey rebind failing must not be
+        why either one stops answering.
+
+        Reads `self._profile` -- resolved once at construction (task 1.3) --
+        rather than resolving again here: `self._hotkey_registrar` was built
+        from that same resolution, and a second, independent
+        `resolve_platform()` call could in principle disagree with it (an
+        environment variable changing between the two calls), which would
+        leave `rebind_from_record` asking whether the *wrong* profile's
+        mechanism is in-process while actually driving the registrar this
+        daemon already holds.
+        """
+        try:
+            record = HotkeyRecordStore(default_hotkey_record_path())
+            return rebind_from_record(self._profile, record, self._hotkey_registrar)
+        except Exception as error:  # noqa: BLE001 - see docstring
+            logger.warning("Hotkey rebind failed: %s", error)
+            return f"Hotkey rebind failed: {error}"
+
+    def _handle_in_process_hotkey(self, purpose: str) -> None:
+        """The callback a platform's own message-loop thread fires when it
+        learns a hotkey was pressed (task 8.3) -- Windows' `WindowsHotkeyRegistrar`
+        today, a future macOS registrar tomorrow.
+
+        Runs on that thread, not a connection's worker thread, and calls
+        `handle_command` directly rather than reaching through the command
+        channel the way a keypress on Linux launches `murmly toggle` as a new
+        process: there is no channel to reach through from inside the very
+        process that would have to answer it. Never raises: the registrar
+        already treats a raising handler as one bad event rather than a reason
+        to stop pumping messages, but nothing here should ever need that.
+        """
+        command = IN_PROCESS_HOTKEY_COMMANDS.get(purpose)
+        if command is None:
+            logger.warning("A hotkey fired for an unrecognized purpose %r.", purpose)
+            return
+        try:
+            self.handle_command(command)
+        except Exception:  # noqa: BLE001 - the hotkey thread must keep running
+            logger.warning("Handling the %r hotkey failed.", purpose, exc_info=True)
+
     def handle_command(self, command: str) -> dict[str, object]:
+        if command == COMMAND_REBIND_HOTKEYS:
+            return {"ok": True, "detail": self._rebind_hotkeys()}
         if command == COMMAND_STATUS:
             # Residency travels with the state rather than under a command of
             # its own. `status` already means "what is the daemon doing right
@@ -1739,7 +2180,22 @@ class MurmlyDaemon:
             # caller talking to a daemon too old to include the fields sees them
             # absent -- which is the same case it must handle for a daemon that
             # does not answer at all.
-            return {"ok": True, "state": self.state, **self._residency()}
+            response: dict[str, object] = {"ok": True, "state": self.state, **self._residency()}
+            # Present on every platform (platform-support's "What does not
+            # depend on the platform is identical on every platform": the
+            # command protocol's responses are the same shape everywhere,
+            # and a concern the platform cannot serve is reported as such
+            # rather than the field being silently absent). Task 8.6/8.7,
+            # 18.10's registrar reports the purposes it actually holds; where
+            # there is no in-process registrar at all -- Linux and macOS,
+            # where Plasma and GNOME hold their own bindings and this daemon
+            # holds none in-process for `status` to report -- the true
+            # answer is the empty list, not an omitted key: this daemon
+            # genuinely holds no hotkeys in-process there, which is a fact
+            # about the platform, not a value this daemon failed to produce.
+            held = getattr(self._hotkey_registrar, "held_purposes", None)
+            response["hotkeys_held"] = sorted(held()) if held is not None else []
+            return response
         if command not in (COMMAND_TOGGLE, COMMAND_TOGGLE_SESSION):
             return failure_response(
                 CommandCode.UNSUPPORTED_COMMAND, f"Unsupported command: {command}"
@@ -2152,7 +2608,14 @@ def send_command(
     A response that never arrives is reported as the daemon not responding rather
     than as a timeout, which is what it is from here: the daemon took the request,
     so restarting the service would answer a question the caller did not ask.
+
+    Dispatches on `socket_path`'s own shape (task 7.6): a pipe-shaped value is
+    Windows' channel regardless of which platform this call happens to run on,
+    the same rule `MurmlyDaemon._require_private_channel` applies from the
+    server side.
     """
+    if is_pipe_name(socket_path):
+        return _send_command_over_pipe(socket_path, command, connect_timeout, response_timeout)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(connect_timeout)
         client.connect(socket_path)
@@ -2169,6 +2632,47 @@ def send_command(
             raise DaemonNotRespondingError(
                 f"Murmly daemon did not respond within {response_timeout:g} seconds."
             ) from error
+    if not payload:
+        raise DaemonNotRespondingError("Murmly daemon closed the connection before responding.")
+    return json.loads(payload.decode("utf-8"))
+
+
+def _send_command_over_pipe(
+    pipe_name: str,
+    command: str,
+    connect_timeout: float,
+    response_timeout: float,
+) -> dict[str, object]:
+    """Windows' client half of `send_command`: same protocol and response
+    shape as the UNIX branch, a named pipe underneath instead of a socket.
+
+    `connect_named_pipe_client` raises `FileNotFoundError` and
+    `ConnectionRefusedError` for the same conditions `socket.connect` does on
+    the UNIX transport -- no pipe of this name, and a pipe that exists but has
+    no instance free to accept -- which is what lets every existing caller of
+    `send_command` (`cli.send_command_with_recovery`'s "no daemon running" and
+    "daemon is not responding" branches) keep catching the same exception
+    types regardless of which transport actually ran.
+    """
+    from murmly.win_pipe import connect_named_pipe_client
+
+    client = connect_named_pipe_client(pipe_name, connect_timeout)
+    try:
+        client.sendall((json.dumps({"command": command}) + "\n").encode("utf-8"))
+        client.settimeout(response_timeout)
+        payload = b""
+        try:
+            while not payload.endswith(b"\n"):
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                payload += chunk
+        except socket.timeout as error:
+            raise DaemonNotRespondingError(
+                f"Murmly daemon did not respond within {response_timeout:g} seconds."
+            ) from error
+    finally:
+        client.close()
     if not payload:
         raise DaemonNotRespondingError("Murmly daemon closed the connection before responding.")
     return json.loads(payload.decode("utf-8"))

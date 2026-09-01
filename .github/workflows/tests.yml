@@ -14,8 +14,8 @@ permissions:
 
 jobs:
   unittest:
-    name: unittest (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: unittest (${{ matrix.name }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -23,6 +23,29 @@ jobs:
         # The floor declared in pyproject.toml, and the version development
         # happens on. A break confined to one of them is worth telling apart.
         python-version: ["3.12", "3.14"]
+        # Every platform Murmly supports. The platform-dependent backends are
+        # selected from an injected profile, so their selection is exercised
+        # everywhere -- but the Win32 and AppKit calls behind them run only on
+        # the machine that has them, and this matrix is the only place that
+        # happens. A backend that imports something absent, or a lockfile that
+        # cannot resolve for a platform, fails here rather than on the first
+        # person to try it.
+        #
+        # macos-14 rather than macos-13: onnxruntime stopped publishing an
+        # Intel wheel at 1.24.1, so Apple Silicon on macOS 14 is the floor and
+        # an Intel runner could not install the transcription stack at all.
+        os: ["ubuntu-latest", "windows-latest", "macos-14"]
+        # Each of these names an `os` the matrix already declares, so it adds
+        # the label to those combinations rather than creating new ones. An
+        # include entry sharing no key with the matrix would overwrite the
+        # earlier entries instead of expanding them.
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: windows-latest
+            name: Windows
+          - os: macos-14
+            name: macOS
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +54,12 @@ jobs:
       # exercise the real module skip themselves rather than fail -- including
       # the one pinning the private symbol Murmly unregisters at daemon exit,
       # which is the whole point of running them here.
+      #
+      # Linux only: the sounddevice wheel bundles PortAudio on Windows and
+      # macOS and ships as pure Python on Linux, which is the same asymmetry
+      # the installer has to name in its system-package list.
       - name: Install PortAudio
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libportaudio2
@@ -55,10 +83,44 @@ jobs:
       # the model files are still absent here, and the suite injects both rather
       # than reading the environment for them.
       - name: Sync the environment
+        if: "!(runner.os == 'Windows' && matrix.python-version == '3.12')"
         run: uv sync --locked
+
+      # The one job named above is deliberately the only one that installs
+      # the `overlay` extra (task 10.2): PySide6/PySide6-Addons/PySide6-Essentials
+      # together are hundreds of megabytes (`uv.lock`'s own recorded wheel
+      # sizes), and every other (os, python-version) pair in this matrix would
+      # pay that cost again for zero additional coverage -- `pyside6` ships as
+      # a `cp310-abi3` wheel, one build for every CPython this project
+      # supports, so installing it on both 3.12 and 3.14 would exercise
+      # byte-identical PySide6 code, never a version-specific difference the
+      # way faster-whisper or pywin32 might have. macOS is left out for a
+      # different reason: task 15's own Qt spike is still an open question
+      # design.md records as unconfirmed, and installing the extra there
+      # without also writing its runtime test would just be dead weight this
+      # change does not add. Windows' floor Python (3.12) is picked over 3.14
+      # arbitrarily between two otherwise-equal options, favoring the more
+      # widely-deployed release.
+      #
+      # This is what makes `overlay_renderer_qt.py` (tasks 10.1/10.3/10.5) run
+      # for the first time anywhere in this project's history, instead of only
+      # ever being import-checked on a machine with no PySide6 at all.
+      - name: Sync the environment with the overlay extra
+        if: "runner.os == 'Windows' && matrix.python-version == '3.12'"
+        run: uv sync --locked --extra overlay
 
       - name: Run the suite
         run: uv run --no-sync python -m unittest discover -s tests
+
+      # A green run on a platform says nothing about how much of the suite that
+      # platform actually ran: a test that skips itself is not a test that
+      # passed. Windows and macOS skip more than Linux does, legitimately -- no
+      # AF_UNIX, no SO_PEERCRED, no X11 -- and the only way to tell a legitimate
+      # skip from coverage quietly lost is to be able to read the list. This
+      # prints it, per platform, in the log of the run that produced it.
+      - name: List what this platform skipped
+        if: always()
+        run: uv run --no-sync python -m unittest discover -s tests -v 2>&1 | grep -E "skipped '" || echo "nothing skipped"
 
   docs:
     name: docs

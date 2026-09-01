@@ -35,8 +35,8 @@ This check is controlled by
 
 ## What each session gets
 
-Verification needs to read the focused window, which only X11 exposes to
-applications:
+These are two separate questions: whether murmly can tell that focus moved
+away before it pastes, and whether it can tell the paste itself landed.
 
 | Session | Target verification | Clipboard preservation |
 | --- | --- | --- |
@@ -44,13 +44,40 @@ applications:
 | X11 without EWMH | no | yes |
 | Wayland with `wtype` or `ydotool` | no | yes |
 | Wayland with `xdotool`, which is the KDE Plasma path | no | no |
+| Windows | yes | no |
 
 On KDE Plasma's Wayland session, murmly cannot check the window and cannot put
-your old clipboard back — that is the last row above, and it is why both of
-its columns say "no".
+your old clipboard back — that is the row above naming `xdotool`, and it is
+why both of its columns say "no". Windows can check the window: it reads the
+foreground window directly, needing no permission. It still cannot put your
+old clipboard back, but for the unrelated reason in the next section —
+`SendInput`'s own success cannot be trusted, regardless of whether the window
+it was aimed at was still the right one.
 
 `murmly doctor` reports which of these applies to your session, under
 `delivery`.
+
+## Pasting into an elevated window on Windows
+
+On Windows, murmly pastes by sending synthetic keystrokes with `SendInput`.
+Windows itself — not murmly — silently discards synthetic input aimed at a
+window belonging to a process running at a higher privilege level than
+murmly's own, such as anything opened with "Run as administrator". This is
+User Interface Privilege Isolation (UIPI), a Windows security feature, and it
+produces no error: the call that sends the keystrokes reports success whether
+or not anything actually arrived.
+
+This is the same class of failure as the KDE Plasma Wayland case above: a
+paste that reports nothing wrong while nothing happens. murmly's response is
+the same one it gives there. Because `SendInput`'s success cannot be trusted,
+murmly treats every paste on Windows as unconfirmed: the transcript is left on
+the clipboard rather than assumed delivered, and your previous clipboard
+contents are never restored over it — restoring over the only copy of what you
+said, on the chance the paste silently failed, would be worse than leaving it
+on the clipboard for you to paste yourself.
+
+If you were dictating into an elevated window, that is exactly what happened:
+paste from the clipboard by hand.
 
 ## Restoring your previous clipboard
 

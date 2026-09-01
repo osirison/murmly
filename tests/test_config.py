@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import os
 import re
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import murmly.config
 
@@ -29,14 +32,25 @@ from murmly.config import (
     MIN_OVERLAY_TEXT_SIZE_PX,
     MIN_SILENCE_MS,
     MIN_UNLOAD_AFTER_IDLE_S,
+    WINDOWS_PIPE_NAME,
+    default_config_path,
+    default_runtime_dir,
     default_socket_path,
+    default_tts_model_dir,
     load_config,
 )
 
 
 class ConfigTests(unittest.TestCase):
     def test_default_socket_path_uses_runtime_dir(self) -> None:
-        socket_path = default_socket_path({"XDG_RUNTIME_DIR": "/tmp/runtime"})
+        # `default_socket_path` takes no `profile=` of its own -- only `env`,
+        # which carries no operating system -- so the Linux/XDG answer this
+        # asserts needs `sys.platform` itself pinned, the same as `test_
+        # config.LinuxPathsAreUnmovedTests` pins it for the same reason:
+        # left to the real host, a Windows runner's own resolution answers
+        # the named pipe instead, regardless of `XDG_RUNTIME_DIR`.
+        with patch("sys.platform", "linux"):
+            socket_path = default_socket_path({"XDG_RUNTIME_DIR": "/tmp/runtime"})
         self.assertEqual(Path("/tmp/runtime/murmly.sock"), socket_path)
 
     def test_load_config_reads_overrides(self) -> None:
@@ -69,7 +83,8 @@ class ConfigTests(unittest.TestCase):
                     bottom_margin_px = 48
                     reduced_motion = true
                     """
-                ).strip()
+                ).strip(),
+                encoding="utf-8",
             )
 
             config = load_config(config_path)
@@ -105,7 +120,7 @@ class ConfigTests(unittest.TestCase):
     def test_invalid_overlay_table_uses_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('overlay = "invalid"')
+            config_path.write_text('overlay = "invalid"', encoding="utf-8")
 
             config = load_config(config_path)
 
@@ -125,7 +140,8 @@ class ConfigTests(unittest.TestCase):
                         bottom_margin_px = {margin}
                         reduced_motion = 1
                         """
-                    ).strip()
+                    ).strip(),
+                    encoding="utf-8",
                 )
 
                 config = load_config(config_path)
@@ -149,7 +165,8 @@ class ConfigTests(unittest.TestCase):
                     [clipboard]
                     verify_target = false
                     """
-                ).strip()
+                ).strip(),
+                encoding="utf-8",
             )
 
             config = load_config(config_path)
@@ -166,7 +183,8 @@ class ConfigTests(unittest.TestCase):
                         [clipboard]
                         verify_target = {value}
                         """
-                    ).strip()
+                    ).strip(),
+                    encoding="utf-8",
                 )
 
                 config = load_config(config_path)
@@ -176,7 +194,7 @@ class ConfigTests(unittest.TestCase):
     def test_invalid_clipboard_table_uses_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('clipboard = "invalid"')
+            config_path.write_text('clipboard = "invalid"', encoding="utf-8")
 
             config = load_config(config_path)
 
@@ -193,7 +211,7 @@ class ConfigTests(unittest.TestCase):
     def test_restore_delay_accepts_an_in_range_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text("[clipboard]\nrestore_delay_ms = 1200")
+            config_path.write_text("[clipboard]\nrestore_delay_ms = 1200", encoding="utf-8")
 
             config = load_config(config_path)
 
@@ -203,7 +221,7 @@ class ConfigTests(unittest.TestCase):
         for value in (-1, MAX_RESTORE_DELAY_MS + 1, 999_999_999):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
                 config_path = Path(temp_dir) / "config.toml"
-                config_path.write_text(f"[clipboard]\nrestore_delay_ms = {value}")
+                config_path.write_text(f"[clipboard]\nrestore_delay_ms = {value}", encoding="utf-8")
 
                 config = load_config(config_path)
 
@@ -214,7 +232,7 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
                 config_path = Path(temp_dir) / "config.toml"
                 rendered = f'"{value}"' if isinstance(value, str) else value
-                config_path.write_text(f"[clipboard]\nrestore_delay_ms = {rendered}")
+                config_path.write_text(f"[clipboard]\nrestore_delay_ms = {rendered}", encoding="utf-8")
 
                 config = load_config(config_path)
 
@@ -249,7 +267,8 @@ class ConfigTests(unittest.TestCase):
                         auto_transcribe_silence_ms = 1500
                         auto_transcribe_min_speech_ms = 500
                         """
-                    ).strip()
+                    ).strip(),
+                    encoding="utf-8",
                 )
 
                 config = load_config(config_path)
@@ -265,7 +284,7 @@ class ConfigTests(unittest.TestCase):
     def test_unrecognized_auto_transcribe_mode_falls_back_and_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('[stt]\nauto_transcribe = "whenever"')
+            config_path.write_text('[stt]\nauto_transcribe = "whenever"', encoding="utf-8")
 
             config = load_config(config_path)
 
@@ -288,7 +307,8 @@ class ConfigTests(unittest.TestCase):
                         auto_transcribe_silence_ms = {silence}
                         auto_transcribe_min_speech_ms = -5
                         """
-                    ).strip()
+                    ).strip(),
+                    encoding="utf-8",
                 )
 
                 config = load_config(config_path)
@@ -311,7 +331,7 @@ class ConfigTests(unittest.TestCase):
         ):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
                 config_path = Path(temp_dir) / "config.toml"
-                config_path.write_text(f"[overlay]\ntext_size_px = {value}")
+                config_path.write_text(f"[overlay]\ntext_size_px = {value}", encoding="utf-8")
 
                 config = load_config(config_path)
 
@@ -321,7 +341,7 @@ class ConfigTests(unittest.TestCase):
         for value in ('"yes"', "1", "[]"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
                 config_path = Path(temp_dir) / "config.toml"
-                config_path.write_text(f"[stt]\nlive_transcribe = {value}")
+                config_path.write_text(f"[stt]\nlive_transcribe = {value}", encoding="utf-8")
 
                 config = load_config(config_path)
 
@@ -339,7 +359,8 @@ class ConfigTests(unittest.TestCase):
                     compute_type = "unsafe"
                     beam_size = 1000000
                     """
-                ).strip()
+                ).strip(),
+                encoding="utf-8",
             )
 
             config = load_config(config_path)
@@ -363,7 +384,7 @@ class ConfigTests(unittest.TestCase):
         """The two settings are independent, which is the point of adding one."""
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('[stt]\ndevice = "cuda"')
+            config_path.write_text('[stt]\ndevice = "cuda"', encoding="utf-8")
 
             config = load_config(config_path)
 
@@ -374,7 +395,7 @@ class ConfigTests(unittest.TestCase):
         for device in ("auto", "cpu", "cuda"):
             with self.subTest(device=device), tempfile.TemporaryDirectory() as temp_dir:
                 config_path = Path(temp_dir) / "config.toml"
-                config_path.write_text(f'[tts]\ndevice = "{device}"')
+                config_path.write_text(f'[tts]\ndevice = "{device}"', encoding="utf-8")
 
                 config = load_config(config_path)
 
@@ -384,7 +405,7 @@ class ConfigTests(unittest.TestCase):
     def test_unrecognized_synthesis_device_falls_back_and_is_reported(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('[tts]\ndevice = "rocm"')
+            config_path.write_text('[tts]\ndevice = "rocm"', encoding="utf-8")
 
             config = load_config(config_path)
 
@@ -427,7 +448,8 @@ class ConfigTests(unittest.TestCase):
                     [tts]
                     unload_after_idle_s = 0
                     """
-                ).strip()
+                ).strip(),
+                encoding="utf-8",
             )
 
             config = load_config(config_path)
@@ -457,7 +479,8 @@ class ConfigTests(unittest.TestCase):
                         [tts]
                         unload_after_idle_s = {tts_value}
                         """
-                    ).strip()
+                    ).strip(),
+                    encoding="utf-8",
                 )
 
                 config = load_config(config_path)
@@ -487,7 +510,8 @@ class ConfigTests(unittest.TestCase):
                         [tts]
                         unload_after_idle_s = {value}
                         """
-                    ).strip()
+                    ).strip(),
+                    encoding="utf-8",
                 )
 
                 config = load_config(config_path)
@@ -506,7 +530,8 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as temp_dir:
                 config_path = Path(temp_dir) / "config.toml"
                 config_path.write_text(
-                    f"[stt]\nunload_after_idle_s = {value}\n\n[tts]\nunload_after_idle_s = {value}"
+                    f"[stt]\nunload_after_idle_s = {value}\n\n[tts]\nunload_after_idle_s = {value}",
+                    encoding="utf-8",
                 )
 
                 config = load_config(config_path)
@@ -527,13 +552,132 @@ class ConfigTests(unittest.TestCase):
                     [tts]
                     unload_after_idle_s = 900
                     """
-                ).strip()
+                ).strip(),
+                encoding="utf-8",
             )
 
             config = load_config(config_path)
 
         self.assertEqual(0, config.unload_after_idle_s)
         self.assertEqual(900, config.tts_unload_after_idle_s)
+
+
+class LinuxPathsAreUnmovedTests(unittest.TestCase):
+    """18.5: the platform branches must not move an existing Linux install.
+
+    Every expected path is written as a literal here, not derived by calling
+    the functions under test, so a change to those functions cannot make this
+    test agree with whatever they now say.
+    """
+
+    def test_every_xdg_combination_resolves_exactly_as_it_did_before(self) -> None:
+        if os.name != "posix":
+            # `Path.home()` and `os.getuid()` are both POSIX facts a Windows
+            # host cannot supply at all -- unlike the operating system
+            # decision itself, which the `patch("sys.platform", "linux")`
+            # below can inject on any POSIX host, this one has no fake to
+            # inject: pathlib picks `WindowsPath` from `os.name`, not from
+            # `sys.platform`, so there is no way to make it hand back a
+            # POSIX-shaped path here to compare a Linux install's literal
+            # answer against. Runs unchanged, still asserting the same
+            # literals, on Linux and on macOS -- both real POSIX hosts.
+            self.skipTest("needs a POSIX host: Path.home() and os.getuid() have no Windows equivalent")
+        with patch("sys.platform", "linux"):
+            home = Path.home()
+            uid_runtime_dir = Path(f"/run/user/{os.getuid()}")
+
+            # Each of the three overrides is independently set or unset, for every
+            # one of the eight combinations. `env` always carries an unrelated key
+            # so an "unset" combination is never the empty dict: `default_*`'s
+            # `env or os.environ` treats `{}` as falsy and would silently read the
+            # real process environment instead of the combination under test.
+            for config_home, data_home, runtime_dir in itertools.product(
+                ("/tmp/murmly-test-config", None),
+                ("/tmp/murmly-test-data", None),
+                ("/tmp/murmly-test-runtime", None),
+            ):
+                env = {"MURMLY_TEST_UNRELATED": "1"}
+                if config_home is not None:
+                    env["XDG_CONFIG_HOME"] = config_home
+                if data_home is not None:
+                    env["XDG_DATA_HOME"] = data_home
+                if runtime_dir is not None:
+                    env["XDG_RUNTIME_DIR"] = runtime_dir
+
+                expected_config_path = (
+                    Path(config_home) / "murmly" / "config.toml"
+                    if config_home is not None
+                    else home / ".config" / "murmly" / "config.toml"
+                )
+                expected_data_dir = (
+                    Path(data_home) / "murmly"
+                    if data_home is not None
+                    else home / ".local" / "share" / "murmly"
+                )
+                expected_runtime_dir = Path(runtime_dir) if runtime_dir is not None else uid_runtime_dir
+                expected_socket_path = expected_runtime_dir / "murmly.sock"
+
+                with self.subTest(config_home=config_home, data_home=data_home, runtime_dir=runtime_dir):
+                    self.assertEqual(expected_config_path, default_config_path(env))
+                    self.assertEqual(expected_data_dir, default_tts_model_dir(env))
+                    self.assertEqual(expected_runtime_dir, default_runtime_dir(env))
+                    self.assertEqual(expected_socket_path, default_socket_path(env))
+
+
+class WindowsAndMacOSPathTests(unittest.TestCase):
+    """2.1, 2.2: the other two branches, and that Windows never reaches getuid."""
+
+    def test_windows_paths_use_appdata_and_never_call_getuid(self) -> None:
+        env = {
+            "APPDATA": r"C:\Users\a\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\a\AppData\Local",
+        }
+        with (
+            patch("sys.platform", "win32"),
+            # `create=True`: a Windows host has no `os.getuid` to patch over in
+            # the first place, and that absence is exactly the fact this test
+            # exists to pin -- `patch` would otherwise refuse to patch an
+            # attribute that is not there to begin with.
+            patch(
+                "murmly.config.os.getuid",
+                create=True,
+                side_effect=AssertionError("os.getuid() must not run on Windows"),
+            ),
+        ):
+            self.assertEqual(
+                Path(r"C:\Users\a\AppData\Roaming") / "murmly" / "config.toml",
+                default_config_path(env),
+            )
+            self.assertEqual(
+                Path(r"C:\Users\a\AppData\Local") / "murmly",
+                default_tts_model_dir(env),
+            )
+            self.assertIsNone(default_runtime_dir(env))
+            self.assertEqual(Path(WINDOWS_PIPE_NAME), default_socket_path(env))
+
+            # The whole read path, not only the functions in isolation: this is
+            # the failure task 2.2 exists to prevent, reached through the entry
+            # point a Windows invocation actually uses.
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config = load_config(Path(temp_dir) / "missing.toml", env)
+            self.assertEqual(Path(WINDOWS_PIPE_NAME), config.socket_path)
+
+    def test_macos_paths_use_the_library_directories(self) -> None:
+        with patch("sys.platform", "darwin"):
+            home = Path.home()
+            self.assertEqual(
+                home / "Library" / "Application Support" / "murmly" / "config.toml",
+                default_config_path({}),
+            )
+            self.assertEqual(
+                home / "Library" / "Application Support" / "murmly",
+                default_tts_model_dir({}),
+            )
+            self.assertEqual(home / "Library" / "Caches" / "murmly", default_runtime_dir({}))
+            self.assertEqual(
+                home / "Library" / "Caches" / "murmly" / "murmly.sock",
+                default_socket_path({}),
+            )
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -575,7 +719,7 @@ class ExampleConfigTests(unittest.TestCase):
 
     def test_example_config_names_every_option_the_loader_reads(self) -> None:
         """A misspelled key is silently ignored, so equality alone proves nothing."""
-        source = Path(murmly.config.__file__).read_text()
+        source = Path(murmly.config.__file__).read_text(encoding="utf-8")
         read_keys = set(
             re.findall(
                 r"\b(daemon|audio|stt|clipboard|overlay|tts)\.get\(\s*\"(\w+)\"",
@@ -584,12 +728,12 @@ class ExampleConfigTests(unittest.TestCase):
         )
 
         self.assertTrue(read_keys, "no option lookups found in config.py")
-        self.assertEqual(read_keys, option_keys(EXAMPLE_CONFIG_PATH.read_text()))
+        self.assertEqual(read_keys, option_keys(EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8")))
 
     def test_the_manual_sample_covers_the_same_options(self) -> None:
         block = re.search(
             r"## The whole file, at its defaults\b.*?```toml\n(.*?)```",
-            MANUAL_SETTINGS_PATH.read_text(),
+            MANUAL_SETTINGS_PATH.read_text(encoding="utf-8"),
             re.DOTALL,
         )
 
@@ -597,7 +741,7 @@ class ExampleConfigTests(unittest.TestCase):
             block, "no TOML sample under the settings page's whole-file heading"
         )
         self.assertEqual(
-            option_keys(EXAMPLE_CONFIG_PATH.read_text()),
+            option_keys(EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8")),
             option_keys(block.group(1)),
         )
 
@@ -622,15 +766,15 @@ class ExampleConfigTests(unittest.TestCase):
         project_root = Path(murmly.config.__file__).parent.parent.parent
         sections = {
             "manual/making-murmly-speak.md": re.search(
-                r"(^# Making murmly speak\b.*)", MANUAL_SPEECH_PATH.read_text(),
+                r"(^# Making murmly speak\b.*)", MANUAL_SPEECH_PATH.read_text(encoding="utf-8"),
                 re.DOTALL | re.MULTILINE,
             ),
             "config.example.toml": re.search(
-                r"^\[tts\]\n(.*)", EXAMPLE_CONFIG_PATH.read_text(), re.DOTALL | re.MULTILINE
+                r"^\[tts\]\n(.*)", EXAMPLE_CONFIG_PATH.read_text(encoding="utf-8"), re.DOTALL | re.MULTILINE
             ),
             "pyproject.toml": re.search(
                 r"^# Installed by default(.*?)^default-groups",
-                (project_root / "pyproject.toml").read_text(),
+                (project_root / "pyproject.toml").read_text(encoding="utf-8"),
                 re.DOTALL | re.MULTILINE,
             ),
         }

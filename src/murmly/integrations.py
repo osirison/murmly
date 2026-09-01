@@ -8,6 +8,9 @@ from pathlib import Path
 from shutil import which as shutil_which
 import subprocess
 import time
+from typing import Protocol
+
+from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
 
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,23 @@ class DeliveryOutcome:
     reason: str | None = None
 
 
+class Paster(Protocol):
+    """What `daemon.SpeechSession` and `cli._run_spike` need from a paster,
+    satisfied structurally by `ClipboardPaster` (Linux) and
+    `win_clipboard.WindowsClipboardPaster` (Windows) without either
+    subclassing this -- the same shape `focus.FocusObserver` gives the two
+    focus-observer implementations. `create_clipboard_paster` is what chooses
+    between them.
+    """
+
+    @property
+    def injection(self) -> PasteInjection: ...
+
+    def copy(self, text: str) -> None: ...
+
+    def copy_and_paste(self, text: str) -> DeliveryOutcome: ...
+
+
 WAYLAND_INJECTORS = (
     # wtype first: on a compositor that offers the virtual keyboard protocol it is
     # the native route and needs nothing else. Then xdotool, which reaches Wayland
@@ -92,8 +112,8 @@ X11_INJECTORS = (InjectorCandidate("xdotool", ("xdotool", "key", "--clearmodifie
 
 def is_wayland_session(env: dict[str, str] | None = None) -> bool:
     environment = env or os.environ
-    session_type = environment.get("XDG_SESSION_TYPE", "").lower()
-    return bool(environment.get("WAYLAND_DISPLAY")) or session_type == "wayland"
+    profile = resolve_platform(environment)
+    return profile.wayland_display or profile.session_type == "wayland"
 
 
 def choose_clipboard_copy_command(
@@ -169,7 +189,7 @@ def input_consent_advisory(method: str, env: dict[str, str] | None = None) -> st
     config_home = environment.get("XDG_CONFIG_HOME") or f"{environment.get('HOME', '')}/.config"
     kwinrc = Path(config_home) / "kwinrc"
     try:
-        settings = kwinrc.read_text()
+        settings = kwinrc.read_text(encoding="utf-8")
     except OSError:
         # No kwinrc: not a KWin session, so this dialog is not in the way.
         return None
@@ -200,6 +220,8 @@ def probe_injector(
             list(candidate.probe),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             env=env or os.environ,
             timeout=PROBE_TIMEOUT_SECONDS,
@@ -217,13 +239,90 @@ def select_paste_injection(
     which: Which = shutil_which,
     run: Run = subprocess.run,
     excluded: Iterable[str] = (),
+    profile: PlatformProfile | None = None,
+    macos_accessibility_trusted: Callable[[], bool] | None = None,
 ) -> PasteInjection:
     """Pick an injection method this session can actually execute.
 
     A tool that is installed but cannot run here is never selected: preferring it
     on presence alone is what leaves a transcript undelivered with nothing said.
+
+    `profile` defaults to resolving from `env` (real `sys.platform`, exactly as
+    `is_wayland_session` does), and takes an explicit value only so a test can
+    supply a `PlatformProfile` naming an operating system this machine is not
+    running on -- `env` alone cannot do that, since it carries session and
+    desktop variables, never the operating system itself.
+
+    Windows has exactly one method, `SendInput`, which `win_clipboard.py`
+    documents as always present and never confirming delivery (task 9.2, 9.3):
+    there is nothing to detect, so this returns immediately rather than
+    running the Wayland/X11 candidate lists' installed-and-probed machinery
+    against a platform those tools do not exist on.
+
+    macOS also has exactly one method, `CGEventPost`, but unlike Windows'
+    `SendInput` it is gated behind a real, checkable permission -- the
+    Accessibility grant `AXIsProcessTrusted()` reports (task 14.4). Task 18.12
+    and the `transcript-delivery` spec's "a method the platform gates behind a
+    permission MUST NOT be reported as available while that permission is
+    ungranted" is what `macos_accessibility_trusted` exists to make testable
+    from Linux: it defaults to the real `AXIsProcessTrusted()` call, and a
+    test supplies a fake instead, exactly as `_windows_microphone_permission_
+    check`'s own `read_registry_value` parameter does for a different
+    platform's permission.
     """
     environment = env or os.environ
+    resolved = profile if profile is not None else resolve_platform(environment)
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        from murmly.win_clipboard import SEND_INPUT_METHOD
+
+        if SEND_INPUT_METHOD in set(excluded):
+            return PasteInjection(
+                None,
+                None,
+                reason=f"{SEND_INPUT_METHOD} failed to inject a paste earlier in this session",
+            )
+        return PasteInjection(SEND_INPUT_METHOD, (), confirms_delivery=False)
+    if resolved.operating_system is OperatingSystem.MACOS:
+        from murmly.mac_clipboard import CGEVENT_POST_METHOD, _real_is_process_trusted
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, PERMISSIONS
+
+        if CGEVENT_POST_METHOD in set(excluded):
+            return PasteInjection(
+                None,
+                None,
+                reason=f"{CGEVENT_POST_METHOD} failed to inject a paste earlier in this session",
+            )
+        is_trusted = macos_accessibility_trusted if macos_accessibility_trusted is not None else _real_is_process_trusted
+        try:
+            trusted = is_trusted()
+        except (OSError, ValueError, AttributeError):
+            # `_real_is_process_trusted` raises when `ApplicationServices`
+            # cannot even be loaded -- every real macOS host has it, so this
+            # is only reachable when a caller (a test, this function's own
+            # exhaustive cross-platform sweep) resolves a macOS profile on a
+            # host that is not one, the same hazard `platform.py`'s own
+            # `_real_macos_accessibility_trusted` already guards its one
+            # documented caller against. Collapsed to "not trusted", not
+            # "available": a check that cannot tell is never treated as a
+            # grant, the same rule every other permission check in this
+            # codebase applies to its own silence.
+            trusted = False
+        if not trusted:
+            permission = PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]
+            # Named as the permission this genuinely is (distinct from "no
+            # injector is installed", the absent case the branches below
+            # report, and from "installed but cannot inject in this session",
+            # the X11/Wayland probe-failure case) -- 18.12 and the
+            # `transcript-delivery` spec's own scenario both require this
+            # case to be told apart from the other two, not folded into
+            # `reason`'s free text alone.
+            return PasteInjection(
+                None,
+                None,
+                reason="The Accessibility permission has not been granted to Murmly.",
+                remedy=(f"Grant it in {permission.grant_location}.",),
+            )
+        return PasteInjection(CGEVENT_POST_METHOD, (), confirms_delivery=False)
     wayland = is_wayland_session(environment)
     candidates = WAYLAND_INJECTORS if wayland else X11_INJECTORS
     remedy = injector_remedy(environment)
@@ -268,14 +367,25 @@ class ClipboardPaster:
         which: Which = shutil_which,
         restore_clipboard: bool = True,
         restore_delay_ms: int = 200,
+        profile: PlatformProfile | None = None,
     ) -> None:
         self._env = env or os.environ
         self._which = which
+        # Threaded through to `select_paste_injection` below, not re-resolved
+        # independently: this class is `create_clipboard_paster`'s Linux
+        # branch (its own docstring: "must not change what it returns"), so
+        # its own injector choice must agree with whichever profile decided
+        # to construct it here, rather than asking `resolve_platform` a
+        # second time and risking a different, real-host answer -- the one
+        # case that can disagree is a caller exercising this branch from a
+        # non-Linux machine via `profile=`, exactly as `create_clipboard_
+        # paster`'s own docstring says that parameter is for.
+        self._profile = profile
         self._copy_command = choose_clipboard_copy_command(self._env, which)
         self._read_command = choose_clipboard_read_command(self._env, which)
         # Resolved but not required: a session that cannot inject a paste can still
         # copy, and a transcript on the clipboard is one the user still has.
-        self._injection = select_paste_injection(self._env, which)
+        self._injection = select_paste_injection(self._env, which, profile=self._profile)
         self._failed_methods: set[str] = set()
         self._restore_clipboard = restore_clipboard
         self._restore_delay_ms = restore_delay_ms
@@ -316,6 +426,7 @@ class ClipboardPaster:
             self._env,
             self._which,
             excluded=self._failed_methods,
+            profile=self._profile,
         )
 
     def copy(self, text: str) -> None:
@@ -329,6 +440,8 @@ class ClipboardPaster:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=self._env,
         )
         return result.stdout
@@ -338,6 +451,52 @@ class ClipboardPaster:
             command,
             input=stdin_text,
             text=True,
+            encoding="utf-8",
             check=True,
             env=self._env,
         )
+
+
+def create_clipboard_paster(
+    env: dict[str, str] | None = None,
+    which: Which = shutil_which,
+    restore_clipboard: bool = True,
+    restore_delay_ms: int = 200,
+    profile: PlatformProfile | None = None,
+) -> Paster:
+    """Choose the platform's own clipboard-and-paste implementation.
+
+    Linux keeps `ClipboardPaster`'s subprocess-based `xclip`/`wl-copy` and
+    injector stack, constructed exactly as every existing caller already
+    constructs it -- this is the one branch that must not change what it
+    returns. Windows goes to `win_clipboard.WindowsClipboardPaster`, imported
+    from inside this function so the module stays importable without
+    `pywin32` on every other platform, the same deferred-import shape
+    `BackendRegistry`'s loaders use.
+
+    `profile` takes the place `env` cannot fill: `resolve_platform` reads the
+    operating system from `sys.platform`, not from `env`, so a caller
+    exercising the Windows branch from a non-Windows machine supplies a
+    `PlatformProfile` directly rather than an environment mapping.
+    """
+    environment = env or os.environ
+    resolved = profile if profile is not None else resolve_platform(environment)
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        from murmly.win_clipboard import WindowsClipboardPaster
+
+        return WindowsClipboardPaster(
+            restore_clipboard=restore_clipboard, restore_delay_ms=restore_delay_ms
+        )
+    if resolved.operating_system is OperatingSystem.MACOS:
+        from murmly.mac_clipboard import MacosClipboardPaster
+
+        return MacosClipboardPaster(
+            restore_clipboard=restore_clipboard, restore_delay_ms=restore_delay_ms
+        )
+    return ClipboardPaster(
+        env=environment,
+        which=which,
+        restore_clipboard=restore_clipboard,
+        restore_delay_ms=restore_delay_ms,
+        profile=resolved,
+    )

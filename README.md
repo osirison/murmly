@@ -1,13 +1,13 @@
 ---
 title: murmly
-description: Fedora-first local voice-to-text daemon for Linux desktops
+description: Local voice-to-text daemon for Linux and Windows desktops
 ---
 
 # murmly
 
-`murmly` is a Fedora-first, local voice-to-text tool for Linux desktops. Press a
+`murmly` is a local voice-to-text tool for Linux and Windows desktops. Press a
 hotkey, speak, press it again: the transcript is typed into whatever you were
-working in. Everything runs locally.
+working in. Everything runs locally. macOS is not supported.
 
 **[osirison.github.io/murmly](https://osirison.github.io/murmly/)** — what it is,
 in one page with pictures. The
@@ -15,35 +15,63 @@ in one page with pictures. The
 
 ## What you need
 
-- Fedora
-- KDE Plasma, for the hotkey and the recording overlay
-- Python 3.12 or newer
-- A terminal, to run the installer
-- An X11 session. Plasma Wayland uses the same registration path with a
-  different key-grab mechanism and has not been verified end to end
+- **Linux** (any distribution, glibc-based) or **Windows** (x86_64).
+  Two machines within those two platforms cannot run murmly at all: musl-based
+  Linux and Windows on ARM64, neither of which has a build of the
+  transcription runtime. macOS is not supported.
+- **Python 3.12 or newer**, and **a terminal**, on either platform.
+- **On Linux, your desktop decides the hotkey and overlay.** KDE Plasma X11 is
+  the configuration murmly was built against and was verified end to end before
+  the port to Windows, though not re-verified on X11 since; Plasma Wayland uses
+  the same registration path with a different key-grab mechanism and has not
+  been verified end to end; GNOME has
+  a hotkey backend that has never been run against a live GNOME session; any
+  other desktop registers no hotkey and shows no overlay automatically, though
+  everything else still installs.
+- **On Windows, the hotkey and clipboard always work with no permission
+  needed**; the overlay needs a separate `uv sync --extra overlay`, and
+  microphone capture depends on Windows' own privacy setting, which
+  `murmly doctor` reports. Every Windows capability listed here has run as an
+  automated test on a real Windows machine; a second account and an elevated
+  window are the one deeper check still open.
+
+See [what you need before you start](https://osirison.github.io/murmly/manual/what-you-need/)
+for the full detail behind this, including every permission each platform asks
+for.
 
 ## Install
 
 ```bash
-./setup.sh install Meta+X
+./bootstrap.sh install Meta+X      # Linux
 ```
 
-One script installs, upgrades, and removes. It installs the system packages for
-your session after showing you the `dnf` command and asking, syncs the Python
-environment, binds the hotkey, and starts the service.
+```powershell
+.\bootstrap.ps1 install Meta+X     # Windows
+```
+
+Both `bootstrap.sh` and `bootstrap.ps1` do the same two things first: install
+`uv` if it is not already on `PATH`, then hand every argument off. On Linux,
+that hand-off goes to `setup.sh`, which installs the system packages for your
+session after showing you the command and asking, syncs the Python
+environment, binds the hotkey, and starts the service — and which the
+commands below call directly, since by then `uv` is already there. On
+Windows, the hand-off goes straight to `murmly` — there are no system
+packages to install first.
 
 ```bash
-./setup.sh upgrade     # pull, re-sync, rebind, restart
-./setup.sh uninstall   # remove the service, hotkeys, and announcements
-uv run murmly doctor   # report what murmly found on this machine
+./setup.sh upgrade      # Linux: pull, re-sync, rebind, restart
+./setup.sh uninstall    # Linux: remove the service, hotkeys, and announcements
+.\bootstrap.ps1 uninstall   # Windows: the same, via Task Scheduler
+uv run murmly doctor    # either platform: report what murmly found here
 ```
 
-`--yes` answers every prompt for an unattended run, which includes the one
-confirming what `--purge` is about to delete, so those two together remove the
-environment, the models, and your configuration without asking.
+`--yes` answers every Linux `setup.sh` prompt for an unattended run, which
+includes the one confirming what `--purge` is about to delete, so those two
+together remove the environment, the models, and your configuration without
+asking.
 
-Installing by hand, the GPU runtime, and what to do if murmly cannot paste on
-your desktop are on the
+Installing by hand, the GPU runtime, the overlay's separate install on
+Windows, and what to do if murmly cannot paste are on the
 [install page](https://osirison.github.io/murmly/manual/install/).
 
 ## Use it

@@ -50,10 +50,23 @@ def _fake_x11(display: int = 1, atom: int = 0) -> object:
 
 
 class SessionClassificationTests(unittest.TestCase):
+    """Every case here is the X11/Wayland classification specifically, which
+    `create_focus_observer` only reaches for a non-Windows profile -- pinned
+    to Linux explicitly (matching `WindowsClassificationTests` below), rather
+    than left to resolve the real host, so it keeps running on a Windows
+    runner instead of that host's own resolution sending every case here into
+    the Windows branch none of them set up a `windows_focus_observer` for."""
+
+    def _linux_profile(self):
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        return PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+
     def test_wayland_session_is_unverified_without_touching_x11(self) -> None:
         observer = create_focus_observer(
             env={"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"},
             x11_loader=lambda: self.fail("X11 must not be loaded on a Wayland session"),
+            profile=self._linux_profile(),
         )
 
         self.assertFalse(observer.supported)
@@ -64,7 +77,9 @@ class SessionClassificationTests(unittest.TestCase):
         def missing() -> object:
             raise OSError("libX11 is required to verify the transcript delivery target.")
 
-        observer = create_focus_observer(env={"XDG_SESSION_TYPE": "x11"}, x11_loader=missing)
+        observer = create_focus_observer(
+            env={"XDG_SESSION_TYPE": "x11"}, x11_loader=missing, profile=self._linux_profile()
+        )
 
         self.assertFalse(observer.supported)
         self.assertIn("libX11", observer.detail)
@@ -73,6 +88,7 @@ class SessionClassificationTests(unittest.TestCase):
         observer = create_focus_observer(
             env={"XDG_SESSION_TYPE": "x11"},
             x11_loader=lambda: _fake_x11(display=0),
+            profile=self._linux_profile(),
         )
 
         self.assertFalse(observer.supported)
@@ -82,10 +98,54 @@ class SessionClassificationTests(unittest.TestCase):
         observer = create_focus_observer(
             env={"XDG_SESSION_TYPE": "x11"},
             x11_loader=lambda: _fake_x11(display=1, atom=0),
+            profile=self._linux_profile(),
         )
 
         self.assertFalse(observer.supported)
         self.assertIn("_NET_ACTIVE_WINDOW", observer.detail)
+
+
+class WindowsClassificationTests(unittest.TestCase):
+    """Task 9.4: `profile`, not `env`, selects the Windows branch -- `env`
+    carries session/desktop variables, never the operating system itself, so
+    a test exercising Windows from this Linux machine supplies a
+    `PlatformProfile` directly."""
+
+    def _windows_profile(self):
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        return PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+    def test_a_windows_profile_gets_the_windows_observer_without_touching_x11(self) -> None:
+        sentinel = object()
+
+        observer = create_focus_observer(
+            profile=self._windows_profile(),
+            x11_loader=lambda: self.fail("X11 must not be loaded on Windows"),
+            windows_focus_observer=lambda: sentinel,
+        )
+
+        self.assertIs(sentinel, observer)
+
+    def test_a_windows_profile_wins_over_a_wayland_shaped_env(self) -> None:
+        """A stale or forwarded `WAYLAND_DISPLAY` must not steer a Windows
+        profile into the Wayland branch -- `profile` decides first."""
+        sentinel = object()
+
+        observer = create_focus_observer(
+            env={"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"},
+            profile=self._windows_profile(),
+            windows_focus_observer=lambda: sentinel,
+        )
+
+        self.assertIs(sentinel, observer)
+
+    def test_the_default_loader_returns_a_real_windows_focus_observer(self) -> None:
+        from murmly.win_focus import WindowsFocusObserver
+
+        observer = create_focus_observer(profile=self._windows_profile())
+
+        self.assertIsInstance(observer, WindowsFocusObserver)
 
 
 class DeliveryDecisionTests(unittest.TestCase):

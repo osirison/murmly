@@ -11,10 +11,14 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import Mock, patch
+
+from channel_helpers import command_channel_address
+from module_stubs import injected_module
 
 from murmly.cli import (
     _measurement_clip,
@@ -27,18 +31,77 @@ from murmly.cli import (
     live_transcription_diagnostics,
     main,
     measure_partial_pass_ms,
+    microphone_diagnostics,
     overlay_diagnostics,
     paste_injection_diagnostics,
+    platform_diagnostics,
+    transcription_model_cache_path,
 )
 from murmly.config import MurmlyConfig
-from murmly.daemon import DaemonNotRespondingError, DaemonStartupError, MurmlyDaemon
+from murmly.daemon import DaemonNotRespondingError, DaemonStartupError, MurmlyDaemon, send_command
 from murmly.integrations import PasteInjection
-from murmly.overlay import OverlayBackend, OverlayHealth, renderer_environment
+from murmly.overlay import (
+    SYSTEM_PYTHON,
+    OverlayBackend,
+    OverlayHealth,
+    renderer_environment,
+    renderer_python,
+)
+from murmly.platform import (
+    BACKEND_REGISTRIES,
+    Desktop,
+    OperatingSystem,
+    Permission,
+    PermissionState,
+    PlatformProfile,
+    RuntimeGap,
+    resolve_platform,
+)
 from murmly.stt import FasterWhisperTranscriber
+
+
+@contextmanager
+def _pinned_overlay_platform(operating_system: OperatingSystem, backend: OverlayBackend | None):
+    """Pins what `overlay_diagnostics` sees for the platform and the overlay
+    backend, independent of the real host `sys.platform` genuinely resolves
+    to -- the same two-name patch `test_overlay_diagnostics_reports_the_qt_
+    renderer_on_windows` already uses for its Windows case, generalized so
+    every other scenario in this file can assert its own platform's
+    behaviour on any CI host, real Windows included.
+
+    Both names need patching, not just one: `overlay_diagnostics` calls
+    `resolve_platform` directly for its own `desktop`/`session` fields, but
+    `detect_overlay_backend` resolves the operating system through
+    `murmly.overlay`'s own module-level `resolve_platform` binding, which
+    patching `murmly.cli.resolve_platform` never touches.
+    """
+    profile = PlatformProfile(operating_system=operating_system, architecture="x86_64")
+    with (
+        patch("murmly.cli.resolve_platform", return_value=profile),
+        patch("murmly.cli.detect_overlay_backend", return_value=backend),
+    ):
+        yield
 
 
 class CliTests(unittest.TestCase):
     def test_daemon_exits_cleanly_on_sigterm(self) -> None:
+        if not hasattr(os, "getuid") or not resolve_platform().supported:
+            # A real subprocess running the real `python -m murmly`, so there
+            # is no profile to inject the way every other test in this file
+            # injects one into `main()` in-process: it runs under whatever
+            # `resolve_platform()` genuinely resolves for this host, checked
+            # directly rather than hardcoding a platform name. Windows joined
+            # `SUPPORTED_OPERATING_SYSTEMS` (see `test_platform.py`'s
+            # `test_supported_reports_only_the_operating_systems_murmly_
+            # claims_today`), but still has no `os.getuid`, so this still
+            # skips there -- for a different, and still valid, reason:
+            # `SIGTERM` is not the same signal there either, since
+            # `Popen.send_signal` maps it to `TerminateProcess`, not a
+            # catchable signal a clean-exit handler could run for. macOS has
+            # both `os.getuid` and a real `SIGTERM`, but is not in
+            # `SUPPORTED_OPERATING_SYSTEMS` at all, per this change's binding
+            # scope decision, so it skips on the `not .supported` half instead.
+            self.skipTest("needs a real subprocess on a Murmly-supported operating system")
         with tempfile.TemporaryDirectory() as temp_dir:
             socket_path = Path(temp_dir) / "murmly.sock"
             config_path = Path(temp_dir) / "config.toml"
@@ -54,6 +117,7 @@ class CliTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
             )
             try:
                 deadline = time.monotonic() + 5
@@ -101,6 +165,121 @@ class CliTests(unittest.TestCase):
         self.assertEqual("auto", report["compute_type"])
         self.assertEqual("cuda", report["runtime_device"])
         self.assertEqual("float16", report["runtime_compute_type"])
+
+    def test_doctor_reports_the_transcription_model_cache_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "auto")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
+                patch(
+                    "murmly.cli.transcription_model_cache_path",
+                    return_value=("/tmp/hf-cache/hub", None),
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertEqual("/tmp/hf-cache/hub", report["model_cache_path"])
+        self.assertIsNone(report["model_cache_detail"])
+
+    def test_doctor_reports_system_memory_as_returnable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "auto")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
+                patch("murmly.cli.system_memory_returnable", return_value=True),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIs(True, report["system_memory_returnable"])
+        self.assertIsNone(report["system_memory_returnable_detail"])
+
+    def test_doctor_names_the_reason_where_system_memory_is_not_returnable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "auto")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
+                patch("murmly.cli.system_memory_returnable", return_value=False),
+                patch(
+                    "murmly.cli.system_memory_unreturnable_reason",
+                    return_value="this platform's C library has no malloc_trim",
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIs(False, report["system_memory_returnable"])
+        self.assertEqual(
+            "this platform's C library has no malloc_trim",
+            report["system_memory_returnable_detail"],
+        )
+
+    def test_an_unresolvable_model_cache_is_named_rather_than_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "auto")),
+                patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+                patch(
+                    "murmly.cli.select_paste_injection",
+                    return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+                ),
+                patch(
+                    "murmly.cli.transcription_model_cache_path",
+                    return_value=(None, "Unable to determine the transcription model cache: boom"),
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                _run_doctor(config)
+
+        report = json.loads(output.getvalue())
+        self.assertIsNone(report["model_cache_path"])
+        self.assertIn("boom", report["model_cache_detail"])
+
+    def test_the_transcription_model_cache_path_asks_huggingface_hub(self) -> None:
+        """2.5: the cache stays wherever `huggingface_hub` itself resolves it,
+
+        not somewhere `murmly` derives on its own -- moving it would strand
+        the 1.6 GB an existing install already has cached under the Hub's own
+        answer.
+        """
+        import huggingface_hub.constants as hf_constants
+
+        path, detail = transcription_model_cache_path()
+
+        self.assertIsNone(detail)
+        self.assertEqual(hf_constants.HF_HUB_CACHE, path)
 
     def test_paste_injection_diagnostics_names_the_method_when_it_can_inject(self) -> None:
         report = paste_injection_diagnostics(
@@ -150,15 +329,16 @@ class CliTests(unittest.TestCase):
             }
         )
 
-        report = overlay_diagnostics(
-            config,
-            env={
-                "XDG_SESSION_TYPE": "x11",
-                "DISPLAY": ":0",
-                "XDG_CURRENT_DESKTOP": "KDE",
-            },
-            run_command=lambda *_args, **_kwargs: completed,
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, OverlayBackend.X11):
+            report = overlay_diagnostics(
+                config,
+                env={
+                    "XDG_SESSION_TYPE": "x11",
+                    "DISPLAY": ":0",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                },
+                run_command=lambda *_args, **_kwargs: completed,
+            )
 
         self.assertTrue(report["available"])
         self.assertTrue(report["supported_session"])
@@ -166,6 +346,26 @@ class CliTests(unittest.TestCase):
         self.assertTrue(report["gdk_x11"])
         self.assertTrue(report["native_x11"])
         self.assertEqual("4.22.4", report["gtk4"])
+        # PyGObject and GTK4 are distribution packages the system interpreter
+        # has them installed into, so the report and the subprocess it ran the
+        # check with must agree on that interpreter rather than each picking
+        # their own notion of "the" Python.
+        self.assertEqual(str(renderer_python(OverlayBackend.X11)), report["system_python"])
+
+    def test_overlay_diagnostics_rejecting_the_session_still_names_an_interpreter(self) -> None:
+        """No backend is selected here, so this is `renderer_python`'s only caller
+        that cannot hand it a backend -- and the answer must stay what it always
+        was rather than silently becoming `None`."""
+        config = self._config()
+        with _pinned_overlay_platform(OperatingSystem.LINUX, None):
+            report = overlay_diagnostics(
+                config,
+                env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+                run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+            )
+
+        self.assertIsNone(report["backend"])
+        self.assertEqual(str(SYSTEM_PYTHON), report["system_python"])
 
     def test_overlay_diagnostics_checks_under_the_renderer_environment(self) -> None:
         config = self._config()
@@ -176,16 +376,17 @@ class CliTests(unittest.TestCase):
             recorded.update(keywords)
             return completed
 
-        report = overlay_diagnostics(
-            config,
-            env={
-                "XDG_SESSION_TYPE": "wayland",
-                "WAYLAND_DISPLAY": "wayland-0",
-                "XDG_CURRENT_DESKTOP": "KDE",
-                "LD_PRELOAD": "/tmp/injected.so",
-            },
-            run_command=record,
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, OverlayBackend.WAYLAND):
+            report = overlay_diagnostics(
+                config,
+                env={
+                    "XDG_SESSION_TYPE": "wayland",
+                    "WAYLAND_DISPLAY": "wayland-0",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                    "LD_PRELOAD": "/tmp/injected.so",
+                },
+                run_command=record,
+            )
 
         self.assertTrue(report["available"])
         # Whatever the renderer will be launched with, down to the preload that
@@ -213,15 +414,16 @@ class CliTests(unittest.TestCase):
             returncode=1,
         )
 
-        report = overlay_diagnostics(
-            config,
-            env={
-                "XDG_SESSION_TYPE": "wayland",
-                "WAYLAND_DISPLAY": "wayland-0",
-                "XDG_CURRENT_DESKTOP": "KDE",
-            },
-            run_command=lambda *_args, **_kwargs: completed,
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, OverlayBackend.WAYLAND):
+            report = overlay_diagnostics(
+                config,
+                env={
+                    "XDG_SESSION_TYPE": "wayland",
+                    "WAYLAND_DISPLAY": "wayland-0",
+                    "XDG_CURRENT_DESKTOP": "KDE",
+                },
+                run_command=lambda *_args, **_kwargs: completed,
+            )
 
         self.assertFalse(report["available"])
         self.assertEqual("wayland", report["backend"])
@@ -231,11 +433,12 @@ class CliTests(unittest.TestCase):
 
     def test_overlay_diagnostics_rejects_unsupported_session(self) -> None:
         config = self._config()
-        report = overlay_diagnostics(
-            config,
-            env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
-            run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, None):
+            report = overlay_diagnostics(
+                config,
+                env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+                run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+            )
 
         self.assertFalse(report["available"])
         self.assertFalse(report["supported_session"])
@@ -244,11 +447,12 @@ class CliTests(unittest.TestCase):
 
     def test_overlay_diagnostics_reports_disabled_overlay_on_unsupported_session(self) -> None:
         config = self._config(overlay_enabled=False)
-        report = overlay_diagnostics(
-            config,
-            env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
-            run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
-        )
+        with _pinned_overlay_platform(OperatingSystem.LINUX, None):
+            report = overlay_diagnostics(
+                config,
+                env={"XDG_SESSION_TYPE": "wayland", "XDG_CURRENT_DESKTOP": "GNOME"},
+                run_command=lambda *_args, **_kwargs: self.fail("helper should not run"),
+            )
 
         self.assertFalse(report["enabled"])
         self.assertFalse(report["available"])
@@ -269,6 +473,79 @@ class CliTests(unittest.TestCase):
 
         self.assertFalse(report["available"])
         self.assertIn("system interpreter missing", report["detail"])
+
+    def test_overlay_diagnostics_reports_the_qt_renderer_on_windows(self) -> None:
+        """Task 10.1/10.5: on Windows the Qt renderer's own `--check` is
+        launched (`renderer_script`, not the hardcoded GTK4 file name), and
+        `session`/`desktop` name the platform instead of misreporting a
+        non-Linux machine as `x11` (task 6.3's same reasoning, applied here)."""
+        config = self._config()
+        completed = self._helper_result(
+            {"available": True, "pyside6": True, "qt_version": "6.11.2"}
+        )
+        launches: list[list[str]] = []
+
+        def record(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            launches.append(command)
+            return completed
+
+        windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        with (
+            patch("murmly.cli.resolve_platform", return_value=windows_profile),
+            patch("murmly.cli.detect_overlay_backend", return_value=OverlayBackend.WINDOWS),
+        ):
+            report = overlay_diagnostics(config, env={}, run_command=record)
+
+        self.assertTrue(report["available"])
+        self.assertEqual("windows", report["backend"])
+        self.assertEqual("windows", report["session"])
+        self.assertEqual("windows", report["desktop"])
+        self.assertTrue(report["pyside6"])
+        self.assertEqual("6.11.2", report["qt_version"])
+        # Every GTK4-only key still present, as its does-not-apply default --
+        # the field set does not depend on which renderer answered.
+        self.assertFalse(report["pygobject"])
+        self.assertIsNone(report["gtk4"])
+
+        command = launches[0]
+        self.assertEqual(str(Path(sys.executable)), command[0])
+        self.assertTrue(command[1].endswith("overlay_renderer_qt.py"))
+        self.assertIn("windows", command)
+
+    def test_overlay_diagnostics_reports_the_qt_renderer_on_macos(self) -> None:
+        """Task 15.1: the same Qt renderer Windows launches, launched with
+        `--backend macos` instead -- `session`/`desktop` name the platform
+        the same way they do for Windows (task 6.3's reasoning again)."""
+        config = self._config()
+        completed = self._helper_result(
+            {"available": True, "pyside6": True, "qt_version": "6.11.2"}
+        )
+        launches: list[list[str]] = []
+
+        def record(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            launches.append(command)
+            return completed
+
+        macos_profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        with (
+            patch("murmly.cli.resolve_platform", return_value=macos_profile),
+            patch("murmly.cli.detect_overlay_backend", return_value=OverlayBackend.MACOS),
+        ):
+            report = overlay_diagnostics(config, env={}, run_command=record)
+
+        self.assertTrue(report["available"])
+        self.assertEqual("macos", report["backend"])
+        self.assertEqual("macos", report["session"])
+        self.assertEqual("macos", report["desktop"])
+        self.assertTrue(report["pyside6"])
+        self.assertEqual("6.11.2", report["qt_version"])
+        self.assertFalse(report["pygobject"])
+        self.assertIsNone(report["gtk4"])
+
+        command = launches[0]
+        self.assertEqual(str(Path(sys.executable)), command[0])
+        self.assertTrue(command[1].endswith("overlay_renderer_qt.py"))
+        self.assertIn("macos", command)
 
     def _run_spike(self, *, paste: bool, focus_changed: bool, verify_target: bool = True):
         from murmly.focus import WindowIdentity
@@ -292,7 +569,7 @@ class CliTests(unittest.TestCase):
         with (
             patch("murmly.cli.SoundDeviceRecorder") as recorder,
             patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
-            patch("murmly.cli.ClipboardPaster") as paster,
+            patch("murmly.cli.create_clipboard_paster") as paster,
             patch("murmly.cli.create_focus_observer", return_value=Observer()),
             redirect_stdout(StringIO()),
         ):
@@ -663,6 +940,96 @@ class InstallCommandTests(unittest.TestCase):
         self.assertNotIn("Meta+X is not active", report)
         self.assertNotIn("Meta+X, Meta+A", report)
 
+    def _successful_outcome(self, hotkey_registered: bool = True):
+        from murmly.installer import InstallOutcome
+
+        return InstallOutcome(
+            entrypoint=Path("/bin/murmly"),
+            hotkey=None,
+            service_installed=True,
+            hotkey_registered=hotkey_registered,
+            already_bound=False,
+            session_supported=True,
+            session_verified=True,
+            user_override=None,
+            messages=("Registered Meta+X.",),
+        )
+
+    def test_a_desktop_held_mechanism_never_sends_a_rebind(self) -> None:
+        """Task 5.5: a no-op on every platform this change targets -- Plasma
+        and GNOME both hold the binding declaratively, not in this process."""
+        from murmly.cli import _run_install
+        from murmly.platform import OperatingSystem, PlatformProfile, Desktop
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", desktop=Desktop.PLASMA)
+        with (
+            patch("murmly.cli.Installer") as installer,
+            patch("murmly.cli.send_command") as sent,
+            redirect_stdout(StringIO()),
+        ):
+            installer.return_value.install.return_value = self._successful_outcome()
+            exit_code = _run_install("Meta+X", profile=profile)
+
+        self.assertEqual(0, exit_code)
+        sent.assert_not_called()
+
+    def test_a_declined_hotkey_never_sends_a_rebind_either(self) -> None:
+        from murmly.cli import _run_install
+        from murmly.platform import OperatingSystem, PlatformProfile, Desktop
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", desktop=Desktop.PLASMA)
+        with (
+            patch("murmly.cli.Installer") as installer,
+            patch("murmly.cli.send_command") as sent,
+            redirect_stdout(StringIO()),
+        ):
+            installer.return_value.install.return_value = self._successful_outcome(hotkey_registered=False)
+            exit_code = _run_install("Meta+X", profile=profile)
+
+        self.assertEqual(0, exit_code)
+        sent.assert_not_called()
+
+    def test_an_in_process_mechanism_reaches_the_running_daemon(self) -> None:
+        """The branch a future Windows or macOS backend exercises, proven by
+        patching the marker function rather than by a real in-process backend
+        existing (none does yet)."""
+        from murmly.cli import _run_install
+        from murmly.config import MurmlyConfig
+
+        config = MurmlyConfig(socket_path=Path("/tmp/murmly-test.sock"), config_path=Path("/tmp/config.toml"))
+        with (
+            patch("murmly.cli.Installer") as installer,
+            patch("murmly.cli.hotkey_mechanism_is_in_process", return_value=True),
+            patch("murmly.cli.send_command") as sent,
+            redirect_stdout(StringIO()),
+        ):
+            installer.return_value.install.return_value = self._successful_outcome()
+            exit_code = _run_install("Meta+X", config=config)
+
+        self.assertEqual(0, exit_code)
+        sent.assert_called_once_with(str(config.socket_path), "rebind_hotkeys")
+
+    def test_an_in_process_mechanism_with_no_running_daemon_still_reports_success(self) -> None:
+        """A daemon that is not running picks the new keys up from the record
+        at its next start -- failing to reach one now is not an install
+        failure."""
+        from murmly.cli import _run_install
+        from murmly.config import MurmlyConfig
+        from murmly.daemon import DaemonNotRespondingError
+
+        config = MurmlyConfig(socket_path=Path("/tmp/murmly-test.sock"), config_path=Path("/tmp/config.toml"))
+        with (
+            patch("murmly.cli.Installer") as installer,
+            patch("murmly.cli.hotkey_mechanism_is_in_process", return_value=True),
+            patch("murmly.cli.send_command", side_effect=DaemonNotRespondingError("no reply")),
+            redirect_stdout(StringIO()) as output,
+        ):
+            installer.return_value.install.return_value = self._successful_outcome()
+            exit_code = _run_install("Meta+X", config=config)
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("Registered Meta+X.", output.getvalue())
+
 
 class UninstallCommandTests(unittest.TestCase):
     def test_prints_what_was_removed(self) -> None:
@@ -703,6 +1070,136 @@ class UninstallCommandTests(unittest.TestCase):
 
         self.assertEqual(1, exit_code)
         self.assertIn("systemctl unavailable", errors.getvalue())
+
+
+class SyncCommandTests(unittest.TestCase):
+    """Task 16.1's caller in `cli.py`: `murmly sync` reaches
+    `environment.py`'s pre-sync gates and its extras/GPU-swap logic, refusing
+    or delegating rather than reimplementing either."""
+
+    @staticmethod
+    def _parse(*argv: str):
+        from murmly.cli import build_parser
+
+        return build_parser().parse_args(["sync", *argv])
+
+    def test_refuses_before_syncing_on_a_machine_with_no_transcription_runtime(self) -> None:
+        from murmly.cli import _run_sync
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="musl")
+        with (
+            patch("murmly.environment.sync_environment") as sync_environment,
+            patch("murmly.environment.install_system_packages") as install_system_packages,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("ctranslate2", errors.getvalue())
+        sync_environment.assert_not_called()
+        install_system_packages.assert_not_called()
+
+    def test_refuses_before_syncing_when_a_windows_precondition_fails(self) -> None:
+        from murmly.cli import _run_sync
+
+        # `refuse_before_sync` is patched out wholesale -- rather than relied
+        # on to pass a Windows profile through its own unsupported-platform
+        # check for free -- so this test does not depend on whether Windows
+        # is in `SUPPORTED_OPERATING_SYSTEMS`: it isolates the
+        # environment-precondition refusal this test is actually about,
+        # regardless of that flag's current value.
+        profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        with (
+            patch("murmly.environment.refuse_before_sync", return_value=None),
+            patch(
+                "murmly.environment.refuse_or_warn_environment_preconditions",
+                return_value="murmly: refusing to sync. long paths are off.",
+            ),
+            patch("murmly.environment.sync_environment") as sync_environment,
+            redirect_stderr(StringIO()) as errors,
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("long paths are off", errors.getvalue())
+        sync_environment.assert_not_called()
+
+    def test_installs_system_packages_only_on_linux(self) -> None:
+        from murmly.cli import _run_sync
+
+        windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        with (
+            patch("murmly.environment.refuse_before_sync", return_value=None),
+            patch("murmly.environment.install_system_packages") as install_system_packages,
+            patch("murmly.environment.sync_environment"),
+        ):
+            _run_sync(self._parse(), windows_profile)
+
+        install_system_packages.assert_not_called()
+
+        linux_profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        with (
+            patch("murmly.environment.install_system_packages") as install_system_packages,
+            patch("murmly.environment.sync_environment"),
+        ):
+            _run_sync(self._parse(), linux_profile)
+
+        install_system_packages.assert_called_once()
+
+    def test_forwards_flags_to_sync_environment(self) -> None:
+        from murmly.cli import _run_sync
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        with (
+            patch("murmly.environment.install_system_packages"),
+            patch("murmly.environment.sync_environment") as sync_environment,
+        ):
+            exit_code = _run_sync(
+                self._parse("--cuda", "--no-tts", "--yes", "--project", "/tmp/some-project"), profile
+            )
+
+        self.assertEqual(0, exit_code)
+        sync_environment.assert_called_once()
+        _args, kwargs = sync_environment.call_args
+        self.assertEqual(Path("/tmp/some-project"), _args[0])
+        self.assertEqual("yes", kwargs["want_cuda"])
+        self.assertEqual("no", kwargs["want_tts"])
+
+    def test_a_failing_sync_reports_and_exits_non_zero(self) -> None:
+        from murmly.cli import _run_sync
+        from murmly.environment import EnvironmentSyncError
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        with (
+            patch("murmly.environment.install_system_packages"),
+            patch("murmly.environment.sync_environment", side_effect=EnvironmentSyncError("uv sync failed")),
+            redirect_stderr(StringIO()) as errors,
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("uv sync failed", errors.getvalue())
+
+    def test_declines_prompts_with_nothing_attached_and_no_yes(self) -> None:
+        """Task 16.6, exercised through the real `make_confirm` this command
+        builds -- not a fake -- with stdin faked as non-interactive."""
+        from murmly.cli import _run_sync
+
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc")
+        confirms: list = []
+
+        def fake_sync_environment(_project_dir, *, confirm, **_kwargs):
+            confirms.append(confirm("Install the GPU runtime?"))
+
+        with (
+            patch("murmly.environment.install_system_packages"),
+            patch("murmly.environment.sync_environment", side_effect=fake_sync_environment),
+            patch("sys.stdin.isatty", return_value=False),
+        ):
+            exit_code = _run_sync(self._parse(), profile)
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([False], confirms)
 
 
 class InstallationDiagnosticsTests(unittest.TestCase):
@@ -871,6 +1368,14 @@ class UnhandledFailureTests(unittest.TestCase):
     """No Murmly command terminates with an unhandled error."""
 
     def test_a_daemon_that_answers_nothing_is_reported_and_exits_non_zero(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            # Builds its own bare UNIX-socket server by hand to simulate a
+            # daemon that accepts and then closes without responding -- the
+            # same pattern `test_daemon.py`'s equivalent tests skip on
+            # Windows for, and for the same reason: no comparably bare way to
+            # fake this against a real named-pipe server without
+            # reimplementing `win_pipe.NamedPipeServer` here a second time.
+            self.skipTest("needs a real UNIX socket to build a bare server for")
         with tempfile.TemporaryDirectory() as temp_dir:
             socket_path = Path(temp_dir) / "murmly.sock"
             config_path = Path(temp_dir) / "config.toml"
@@ -900,7 +1405,16 @@ class UnhandledFailureTests(unittest.TestCase):
             thread = threading.Thread(target=accept_and_close, daemon=True)
             thread.start()
             try:
-                with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+                with (
+                    patch(
+                        "murmly.cli.resolve_platform",
+                        return_value=PlatformProfile(
+                            operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                        ),
+                    ),
+                    redirect_stdout(StringIO()),
+                    redirect_stderr(StringIO()) as errors,
+                ):
                     exit_code = main(["--config", str(config_path), "status"])
             finally:
                 stop.set()
@@ -914,7 +1428,14 @@ class UnhandledFailureTests(unittest.TestCase):
             config_path = Path(temp_dir) / "config.toml"
             config_path.write_text("[daemon\nsocket_path = \n", encoding="utf-8")
 
-            with redirect_stdout(StringIO()), redirect_stderr(StringIO()) as errors:
+            with (
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()) as errors,
+            ):
                 exit_code = main(["--config", str(config_path), "doctor"])
 
         self.assertEqual(1, exit_code)
@@ -922,6 +1443,8 @@ class UnhandledFailureTests(unittest.TestCase):
         self.assertIn("Unable to read the configuration", errors.getvalue())
 
     def test_a_daemon_that_refuses_to_start_is_reported_and_exits_non_zero(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir) / "shared"
             directory.mkdir()
@@ -943,6 +1466,10 @@ class UnhandledFailureTests(unittest.TestCase):
                 # The daemon branch ends in os._exit; performing that here would
                 # take the test runner with it.
                 patch("murmly.cli.leave_without_finalizing"),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -959,6 +1486,10 @@ class UnhandledFailureTests(unittest.TestCase):
 
             with (
                 patch("murmly.cli._run_doctor", side_effect=RuntimeError("probe exploded")),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -981,6 +1512,10 @@ class UnhandledFailureTests(unittest.TestCase):
             with (
                 patch("murmly.cli._run_daemon", side_effect=RuntimeError("worker exploded")),
                 patch("murmly.cli.leave_without_finalizing"),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
                 redirect_stderr(StringIO()) as errors,
             ):
@@ -996,6 +1531,178 @@ class UnhandledFailureTests(unittest.TestCase):
             main(["not-a-command"])
 
 
+class UnsupportedPlatformTests(unittest.TestCase):
+    """An operating system Murmly does not support is refused before anything runs (1.7, 18.3)."""
+
+    def _unsupported_profile(self) -> PlatformProfile:
+        return PlatformProfile(operating_system=OperatingSystem.OTHER, architecture="x86_64")
+
+    def test_install_is_refused_naming_the_platform_and_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Never created: a refusal that ran must not have to create the
+            # directory a config file would live in before it can be missing.
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                patch("murmly.cli.Installer") as installer,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "install", "Meta+X"])
+
+            self.assertEqual(1, exit_code)
+            reported = errors.getvalue()
+            self.assertIn("other", reported)
+            self.assertIn("linux", reported)
+            installer.assert_not_called()
+            self.assertEqual([], os.listdir(temp_dir), "a refused platform must write nothing")
+
+    def test_daemon_is_refused_before_the_config_is_even_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                patch("murmly.cli.MurmlyDaemon") as daemon,
+                patch("murmly.cli.leave_without_finalizing") as leave,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "daemon"])
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("other", errors.getvalue())
+            daemon.assert_not_called()
+            leave.assert_called_once_with(1)
+            self.assertEqual([], os.listdir(temp_dir))
+
+    def test_doctor_is_refused_too(self) -> None:
+        """Every command is refused, not only the ones that write files.
+
+        Pins spec.md's "An unsupported operating system" scenario literally:
+        it says every command, doctor included. If a later diagnostics change
+        wants doctor to run anyway and explain the refusal itself, that is a
+        spec change, not a fix to this test.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "doctor"])
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("other", errors.getvalue())
+            self.assertEqual([], os.listdir(temp_dir))
+
+    def test_toggle_is_refused_without_starting_the_service(self) -> None:
+        """The command most likely to run unattended: a hotkey press.
+
+        `toggle` reaches `send_command_with_recovery`, which can start the
+        installed systemd service when nothing answers on the socket. An
+        unsupported platform must be refused before that recovery path ever
+        runs, not merely before the commands that obviously write files.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            with (
+                patch("murmly.cli.resolve_platform", return_value=self._unsupported_profile()),
+                patch("murmly.cli.send_command_with_recovery") as send,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = main(["--config", str(config_path), "toggle"])
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("other", errors.getvalue())
+            send.assert_not_called()
+            self.assertEqual([], os.listdir(temp_dir))
+
+    def test_a_supported_platform_is_not_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            supported = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+            with (
+                patch("murmly.cli.resolve_platform", return_value=supported),
+                patch.object(FasterWhisperTranscriber, "resolve_runtime", return_value=("cpu", "int8")),
+                redirect_stdout(StringIO()),
+            ):
+                exit_code = main(["--config", str(config_path), "doctor"])
+
+            self.assertEqual(0, exit_code)
+
+
+class TranscriptionRuntimeGapTests(unittest.TestCase):
+    """The machine-capability check refuses the daemon before it is constructed (1.8, 18.4)."""
+
+    def _config(self, temp_dir: str) -> MurmlyConfig:
+        return MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+        )
+
+    def test_a_missing_transcription_runtime_refuses_before_the_daemon_is_built(self) -> None:
+        from murmly.cli import _serve_daemon
+
+        gap = RuntimeGap(
+            runtime="ctranslate2",
+            characteristic="a musl C library",
+            capability="transcription",
+            matches=lambda profile: True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch("murmly.cli.transcription_runtime_gap", return_value=gap),
+                patch("murmly.cli.MurmlyDaemon") as daemon,
+                redirect_stderr(StringIO()) as errors,
+            ):
+                exit_code = _serve_daemon(
+                    self._config(temp_dir),
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                )
+
+        self.assertEqual(1, exit_code)
+        daemon.assert_not_called()
+        reported = errors.getvalue()
+        self.assertIn("ctranslate2", reported)
+        self.assertIn("musl", reported)
+
+    def test_a_gap_outside_transcription_starts_and_reports_the_capability_unavailable(self) -> None:
+        from murmly.cli import _serve_daemon
+
+        other_gap = RuntimeGap(
+            runtime="onnxruntime",
+            characteristic="a fictional architecture",
+            capability="speech synthesis",
+            matches=lambda profile: True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_daemon = Mock()
+            fake_daemon.serve_forever.return_value = None
+            with (
+                patch("murmly.cli.transcription_runtime_gap", return_value=None),
+                patch("murmly.cli.runtime_gaps_for", return_value=(other_gap,)),
+                patch("murmly.cli.MurmlyDaemon", return_value=fake_daemon) as daemon,
+                self.assertLogs("murmly.cli", level="WARNING") as logs,
+            ):
+                exit_code = _serve_daemon(
+                    self._config(temp_dir),
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                )
+
+        self.assertEqual(0, exit_code)
+        daemon.assert_called_once()
+        fake_daemon.serve_forever.assert_called_once()
+        joined = " ".join(logs.output)
+        self.assertIn("speech synthesis", joined)
+        self.assertIn("onnxruntime", joined)
+        self.assertIn("unavailable", joined)
+
+
+#: A Linux/Plasma profile for the tests below that mean Linux specifically,
+#: rather than whatever the runner happens to be.
+_LINUX_PLASMA = PlatformProfile(
+    operating_system=OperatingSystem.LINUX, architecture="x86_64", desktop=Desktop.PLASMA
+)
+
+
 class DoctorCompletenessTests(unittest.TestCase):
     """`murmly doctor` reports every section it can and explains the ones it cannot."""
 
@@ -1003,11 +1710,16 @@ class DoctorCompletenessTests(unittest.TestCase):
         "config_path",
         "socket_path",
         "command_socket",
+        "platform",
         "session",
         "clipboard_command",
         "paste_injection",
         "model_profile",
         "model_name",
+        "model_cache_path",
+        "model_cache_detail",
+        "session_detail",
+        "runtime_detail",
         "device",
         "compute_type",
         "runtime_device",
@@ -1015,15 +1727,24 @@ class DoctorCompletenessTests(unittest.TestCase):
         "beam_size",
         "vad_filter",
         "model_resident",
+        "model_resident_detail",
         "unload_after_idle_s",
+        "system_memory_returnable",
+        "system_memory_returnable_detail",
         "live_transcription",
         "delivery",
         "overlay",
         "speech_output",
+        "microphone",
         "installation",
     )
 
-    def _report(self, config: MurmlyConfig, resolve_runtime: object) -> dict[str, object]:
+    def _report(
+        self,
+        config: MurmlyConfig,
+        resolve_runtime: object,
+        profile: PlatformProfile | None = None,
+    ) -> dict[str, object]:
         with (
             patch.object(FasterWhisperTranscriber, "resolve_runtime", resolve_runtime),
             patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
@@ -1031,9 +1752,19 @@ class DoctorCompletenessTests(unittest.TestCase):
                 "murmly.cli.select_paste_injection",
                 return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
             ),
+            # Pinned like every other host fact this helper already fixes:
+            # `system_memory_returnable` reads the real C library linked into
+            # this interpreter, not `profile`, so a musl or macOS host would
+            # otherwise flip `system_memory_returnable_detail` from `None` to a
+            # string below and fail the exact `assertIsNone` assertions the
+            # success-shape test makes on it -- the key itself is unconditional
+            # now and stays in `SECTIONS` either way; only its value depends on
+            # the host, and the True/False behaviour already has its own
+            # dedicated tests elsewhere in this file.
+            patch("murmly.cli.system_memory_returnable", return_value=True),
             redirect_stdout(StringIO()) as output,
         ):
-            _run_doctor(config)
+            _run_doctor(config, profile)
         return json.loads(output.getvalue())
 
     def test_the_report_is_complete_when_the_configured_runtime_is_unavailable(self) -> None:
@@ -1055,20 +1786,124 @@ class DoctorCompletenessTests(unittest.TestCase):
         for section in self.SECTIONS:
             self.assertIn(section, report)
 
+    def test_the_report_keeps_its_shape_when_the_model_cache_cannot_be_resolved(self) -> None:
+        """Pins the defect a human reviewer found on PR #50: on any host where
+        `huggingface_hub` cannot be imported -- every machine without the
+        project's extras, a reviewer's checkout among them --
+        `transcription_model_cache_path` returns a detail and no path, and the
+        report used to grow `model_cache_detail` only there, failing the
+        exact-set assertions everywhere else in this class. No import blocker
+        needed here: the probe's own return value is the thing this test
+        controls, so this runs -- and fails the old way, on a report that
+        still had the conditional `if model_cache_detail is not None:` -- on
+        every host, fully-provisioned CI included, rather than only on a host
+        missing the import."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with patch(
+                "murmly.cli.transcription_model_cache_path",
+                return_value=(None, "Unable to determine the transcription model cache: no module named 'huggingface_hub'"),
+            ):
+                report = self._report(config, Mock(return_value=("cpu", "int8")))
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIsNone(report["model_cache_path"])
+        self.assertIn("huggingface_hub", report["model_cache_detail"])
+
+    def test_the_report_keeps_its_shape_when_the_runtime_cannot_be_resolved(self) -> None:
+        """The sibling of the model-cache case, and the one that would have been
+        found next: `runtime_detail`'s own scenario for appearing is "the cuda
+        extra is not installed", so it came and went with an optional dependency
+        exactly as `model_cache_detail` did -- on a host without that extra the
+        report grew a key and the exact-set assertions failed."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            report = self._report(
+                config, Mock(side_effect=RuntimeError("the cuda extra is not installed"))
+            )
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIn("cuda", report["runtime_detail"])
+
+    def test_the_report_keeps_its_shape_when_the_session_cannot_be_read(self) -> None:
+        """The third of the same family. This key only ever appeared on Linux,
+        because the branch that can raise is the Linux one -- so the report was
+        a different shape on Linux than on Windows or macOS whenever the session
+        probe failed, which is the platform-varying case the requirement names
+        rather than the host-varying one."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            # Pinned to Linux, not read off the host: `is_wayland_session` is
+            # only consulted on the Linux branch, so patching it does nothing on
+            # a Windows or macOS runner and this test would assert a detail that
+            # was never going to be produced. That is the same "a test that names
+            # a platform must pin it" mistake this change fixed elsewhere.
+            with (
+                patch("murmly.cli.resolve_platform", return_value=_LINUX_PLASMA),
+                patch(
+                    "murmly.cli.is_wayland_session",
+                    side_effect=OSError("cannot read the session"),
+                ),
+            ):
+                report = self._report(
+                    config, Mock(return_value=("cpu", "int8")), profile=_LINUX_PLASMA
+                )
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIsNotNone(report["session_detail"])
+
     def test_the_success_shape_of_every_section_is_unchanged(self) -> None:
-        # A daemon that answers, so this is the shape when nothing failed. The
-        # `*_detail` keys are what the report adds when something did, and one
-        # appearing here would mean a probe was reported as unanswerable.
+        # A daemon that answers, so this is the shape when nothing failed.
+        # Every `*_detail` key is unconditional now: present and `None` when its
+        # probe had nothing to report.
+        # `model_cache_detail`, `model_resident_detail` and
+        # `system_memory_returnable_detail` are unconditional now (`SECTIONS`
+        # above), so they are present here too, `None`, asserted below.
+        if not hasattr(os, "getuid"):
+            # `command_socket.path_private` below needs a real POSIX
+            # directory's real permissions to come back true, the same as
+            # `test_a_private_socket_path_is_reported_as_private`; the
+            # `linux_profile` injection keeps the rest of this Linux-shaped
+            # report (session, platform.operating_system) exercised on macOS
+            # too, but cannot substitute for the POSIX host this one field
+            # still needs.
+            self.skipTest("needs a POSIX host: command_socket.path_private reads real POSIX permissions")
+        linux_profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
         answered = {"ok": True, "state": "IDLE", "model_resident": False}
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
                 socket_path=Path(temp_dir) / "murmly.sock",
                 config_path=Path(temp_dir) / "config.toml",
             )
-            with patch("murmly.cli.send_command", return_value=answered):
-                report = self._report(config, Mock(return_value=("cuda", "float16")))
+            with (
+                patch("murmly.cli.send_command", return_value=answered),
+                # Pinned for the same reason as `system_memory_returnable` in
+                # `_report` above: `transcription_model_cache_path` imports
+                # `huggingface_hub`, a real dependency this venv has, but not
+                # one every host that can run this test file is guaranteed to
+                # -- a bare checkout with no `uv sync` run at all, a reviewer's
+                # among them, cannot. That host difference is what
+                # `test_the_report_keeps_its_shape_when_the_model_cache_cannot_be_resolved`
+                # exists to cover; this test is about the *success* shape, so
+                # it fixes the probe's answer rather than depending on this
+                # interpreter's own installed packages.
+                patch("murmly.cli.transcription_model_cache_path", return_value=("/models/cache", None)),
+            ):
+                report = self._report(config, Mock(return_value=("cuda", "float16")), profile=linux_profile)
 
         self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertIsNone(report["model_cache_detail"])
+        self.assertIsNone(report["model_resident_detail"])
+        self.assertIsNone(report["system_memory_returnable_detail"])
         self.assertEqual("cuda", report["runtime_device"])
         self.assertEqual("float16", report["runtime_compute_type"])
         self.assertIn(report["session"], {"wayland", "x11"})
@@ -1086,11 +1921,247 @@ class DoctorCompletenessTests(unittest.TestCase):
             },
             set(report["delivery"]),
         )
+        # `peer_identity_supported` is what keeps the shape identical across
+        # platforms -- it is always present, and reports the concern
+        # unavailable (False) rather than being absent, exactly as the spec's
+        # "diagnostics report keeps its shape" scenario requires.
+        # `peer_identity_detail` is the accompanying explanation, added only
+        # when there is something to explain, the same convention `delivery`
+        # and `platform.concerns` already use elsewhere in this same report
+        # (compare `test_a_private_socket_path_is_reported_as_private`'s
+        # `assertNotIn("detail", report)`). `linux_profile` cannot make this
+        # one field answer as Linux would on a real macOS interpreter:
+        # `peer_identity_supported` reads `hasattr(socket, "SO_PEERCRED")` on
+        # the real host, not the injected profile -- `getpeereid` for macOS
+        # is tasks.md 13.2, not yet built -- exactly as
+        # `test_a_private_socket_path_reports_peer_identity_support`'s
+        # docstring already documents for this same field.
+        expected_command_socket_fields = {"path", "path_private", "peer_identity_supported"}
+        if not hasattr(socket, "SO_PEERCRED"):
+            expected_command_socket_fields.add("peer_identity_detail")
         self.assertEqual(
-            {"path", "path_private", "peer_identity_supported"},
+            expected_command_socket_fields,
             set(report["command_socket"]),
         )
         self.assertTrue(report["command_socket"]["path_private"])
+        self.assertEqual(
+            {
+                "operating_system",
+                "supported",
+                "architecture",
+                "libc",
+                "desktop",
+                "concerns",
+                "permissions",
+                "environment",
+            },
+            set(report["platform"]),
+        )
+        self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
+        self.assertEqual("linux", report["platform"]["operating_system"])
+        # 9.5: the Windows microphone permission's `applies` keeps a Linux
+        # report from growing an entry for a grant Linux does not gate
+        # anything behind -- the field stays exactly as empty as it was
+        # before that permission existed.
+        self.assertEqual({}, report["platform"]["permissions"])
+        # 11.5, 11.6: same rule, for the two Windows environment preconditions.
+        self.assertEqual({}, report["platform"]["environment"])
+
+    def test_the_report_carries_the_same_field_names_on_a_platform_with_no_mechanisms(self) -> None:
+        """18.17: an unserviceable concern is reported unavailable, not absent
+        -- proved by a platform this change gives no backend at all (an
+        unrecognized operating system, `OperatingSystem.OTHER`), so every
+        concern reports unavailable rather than one being dropped."""
+        answered = {"ok": True, "state": "IDLE", "model_resident": False}
+        other_profile = PlatformProfile(operating_system=OperatingSystem.OTHER, architecture="x86_64")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with patch("murmly.cli.send_command", return_value=answered):
+                report = self._report(
+                    config, Mock(return_value=("cpu", "int8")), profile=other_profile
+                )
+
+        # Same top-level keys as the Linux report above (6.5), and the same
+        # eight concern keys inside `platform` (6.1) -- present and reporting
+        # unavailable, never dropped.
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
+        for concern, section in report["platform"]["concerns"].items():
+            with self.subTest(concern=concern):
+                self.assertFalse(section["available"])
+                self.assertIsNone(section["mechanism"])
+
+    def test_windows_reports_the_backends_this_change_built_for_it(self) -> None:
+        """The command channel (task 7.1), hotkey registration (task 8.3),
+        service management (task 8.1), clipboard (task 9.1), paste injection
+        (task 9.2), focus observation (task 9.4) and the overlay (task 10.1)
+        all have a Windows mechanism now, and so does speech synthesis --
+        which this change did not build for Windows because it did not have
+        to: `KokoroSynthesizer` names no platform, and gating its registry on
+        Linux was a leftover that made this report deny Windows a capability
+        it has. Every concern is expected to resolve here, so 18.17's
+        "unavailable rather than dropped" is asserted by the shape check
+        above rather than by any concern being absent."""
+        answered = {"ok": True, "state": "IDLE", "model_resident": False}
+        windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with patch("murmly.cli.send_command", return_value=answered):
+                report = self._report(
+                    config, Mock(return_value=("cpu", "int8")), profile=windows_profile
+                )
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
+        built = {
+            "command_channel": "named-pipe",
+            "hotkey_registration": "windows-hotkey",
+            "service_management": "task-scheduler",
+            "clipboard": "windows",
+            "paste_injection": "windows",
+            "focus_observation": "windows",
+            "overlay": "qt",
+            "speech_synthesis": "kokoro",
+        }
+        for concern, section in report["platform"]["concerns"].items():
+            with self.subTest(concern=concern):
+                if concern in built:
+                    self.assertTrue(section["available"])
+                    self.assertEqual(built[concern], section["mechanism"])
+                else:
+                    self.assertFalse(section["available"])
+                    self.assertIsNone(section["mechanism"])
+                    self.assertTrue(section["reason"])
+
+        # 6.3: a non-Linux session is not misreported as `wayland` or `x11`.
+        self.assertNotIn(report["session"], {"wayland", "x11"})
+        self.assertEqual("windows", report["session"])
+
+        # 9.5: the first `permissions` entry, present on a Windows profile.
+        self.assertIn("windows-microphone", report["platform"]["permissions"])
+        self.assertEqual(
+            "microphone capture",
+            report["platform"]["permissions"]["windows-microphone"]["capability"],
+        )
+
+        # 11.5, 11.6: both environment preconditions, present on a Windows
+        # profile. Not asserted here: what `satisfied` actually is -- this
+        # test also runs on a real Windows CI runner, where
+        # `_real_read_registry_value` reads that runner's own registry rather
+        # than failing to import `winreg` the way the Linux host running this
+        # assertion locally does, so `satisfied` is a real `True`/`False`
+        # there, not `None`. Asserted instead is the one thing true on every
+        # host: both names are reported, each with a description, and a
+        # remedy is present exactly when the precondition is not satisfied --
+        # the same restraint this test already shows the microphone entry
+        # above, asserting `capability` and never `state`.
+        self.assertEqual(
+            {"windows-long-paths", "windows-developer-mode"},
+            set(report["platform"]["environment"]),
+        )
+        for name, section in report["platform"]["environment"].items():
+            with self.subTest(precondition=name):
+                self.assertIn(section["satisfied"], (None, True, False))
+                self.assertTrue(section["description"])
+                self.assertEqual("remedy" in section, section["satisfied"] is not True)
+
+        # `choose_clipboard_copy_command` has no Windows branch (task 9.1 is a
+        # Win32 API call, not a command); `_run_doctor` must not call it and
+        # report the wrong platform's remedy instead.
+        self.assertEqual("Win32 clipboard API (CF_UNICODETEXT)", report["clipboard_command"])
+
+    def test_macos_reports_the_backends_this_change_built_for_it(self) -> None:
+        """The macOS sibling of the Windows test just above: every one of the
+        eight concerns has a macOS mechanism (tasks 12-15), so 18.17's
+        "unavailable rather than dropped" is asserted by the shape check
+        below the same way, with no concern absent.
+
+        `paste_injection` is ANDed with the Accessibility grant
+        (`platform_diagnostics`'s own docstring), which reads the real,
+        undetermined state of a Linux test runner that has no `Application
+        Services` framework at all -- forced to `GRANTED` here so this test
+        proves the report's *shape* on every host, the same way
+        `test_macos_paste_injection_concern_is_available_when_granted`
+        already isolates that concern's own AND-ing from the host's real
+        grant state.
+        """
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        answered = {"ok": True, "state": "IDLE", "model_resident": False}
+        macos_profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        granted_accessibility = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.GRANTED,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+            with (
+                patch("murmly.cli.send_command", return_value=answered),
+                patch.dict(
+                    "murmly.cli.PERMISSIONS",
+                    {MACOS_ACCESSIBILITY_PERMISSION: granted_accessibility},
+                ),
+            ):
+                report = self._report(
+                    config, Mock(return_value=("cpu", "int8")), profile=macos_profile
+                )
+
+        self.assertEqual(set(self.SECTIONS), set(report))
+        self.assertEqual(set(BACKEND_REGISTRIES), set(report["platform"]["concerns"]))
+        built = {
+            "command_channel": "unix-socket",
+            "hotkey_registration": "macos-hotkey",
+            "service_management": "launchd",
+            "clipboard": "macos",
+            "paste_injection": "macos",
+            "focus_observation": "macos",
+            "overlay": "qt",
+            "speech_synthesis": "kokoro",
+        }
+        self.assertEqual(set(built), set(BACKEND_REGISTRIES))
+        for concern, section in report["platform"]["concerns"].items():
+            with self.subTest(concern=concern):
+                self.assertTrue(section["available"])
+                self.assertEqual(built[concern], section["mechanism"])
+
+        # 6.3: a non-Linux session is not misreported as `wayland` or `x11`.
+        self.assertNotIn(report["session"], {"wayland", "x11"})
+        self.assertEqual("macos", report["session"])
+
+        # 12.5, 14.4: both macOS permissions are present, each naming what it
+        # gates -- not their `state`, which this Linux runner cannot read for
+        # real (the same restraint the Windows test above shows its own
+        # registry-backed permissions and preconditions).
+        self.assertEqual(
+            {"macos-microphone", "macos-accessibility"}, set(report["platform"]["permissions"])
+        )
+        self.assertEqual(
+            "microphone capture", report["platform"]["permissions"]["macos-microphone"]["capability"]
+        )
+        self.assertEqual(
+            "paste injection", report["platform"]["permissions"]["macos-accessibility"]["capability"]
+        )
+
+        # 11.5, 11.6: macOS gates neither Windows environment precondition.
+        self.assertEqual({}, report["platform"]["environment"])
+
+        # `choose_clipboard_copy_command` has no macOS branch (task 14.1 is an
+        # `NSPasteboard` call, not a command); `_run_doctor` must not call it
+        # and report a misleading "install xclip" instead (the defect this
+        # pins: left unguarded, this field asked the Linux-only chooser about
+        # a macOS profile and got exactly that).
+        self.assertEqual("NSPasteboard", report["clipboard_command"])
 
     def test_diagnostics_report_a_socket_path_the_daemon_would_refuse(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1127,9 +2198,16 @@ class DoctorCompletenessTests(unittest.TestCase):
                 report = command_socket_diagnostics(config)
 
         self.assertFalse(report["peer_identity_supported"])
-        self.assertIn("file permissions alone", report["peer_identity_detail"])
+        self.assertIn("access control alone", report["peer_identity_detail"])
 
     def test_a_private_socket_path_is_reported_as_private(self) -> None:
+        if not hasattr(os, "getuid"):
+            # A filesystem path resolves to Windows' own named-pipe mismatch
+            # branch there instead (correctly, and differently) -- this test
+            # is about the POSIX directory-privacy analysis specifically,
+            # which needs a real POSIX host's own permissions to mean
+            # anything, the same as `test_daemon.py`'s `SocketAccessTests`.
+            self.skipTest("needs a POSIX host: private-directory reporting reads real POSIX permissions")
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
                 socket_path=Path(temp_dir) / "murmly.sock",
@@ -1140,7 +2218,68 @@ class DoctorCompletenessTests(unittest.TestCase):
 
         self.assertTrue(report["path_private"])
         self.assertNotIn("detail", report)
+
+    def test_a_private_socket_path_reports_peer_identity_support(self) -> None:
+        """Split out of `test_a_private_socket_path_is_reported_as_private`:
+        `peer_identity_supported` ignores the `profile` it is handed and
+        answers from `hasattr(socket, "SO_PEERCRED")` on the real interpreter
+        (task 13 -- macOS's own `getpeereid` mechanism is not built yet), so
+        there is no profile this test could inject to make the real answer
+        True on a host where it genuinely is not, unlike every other
+        Linux-shaped field `command_socket_diagnostics` reports. Kept as its
+        own test, rather than folded back with a conditional assertion, so
+        Linux keeps proving `SO_PEERCRED` is actually detected rather than
+        merely echoed back."""
+        if not hasattr(socket, "SO_PEERCRED"):
+            self.skipTest("needs a real SO_PEERCRED socket option")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+            report = command_socket_diagnostics(config)
+
         self.assertTrue(report["peer_identity_supported"])
+
+    def test_a_pipe_shaped_path_is_reported_private_on_windows(self) -> None:
+        """Task 7.5: the filesystem path-privacy analysis is skipped entirely
+        for a pipe-shaped configured value -- the DACL `win_pipe.
+        create_named_pipe_server` builds is unconditionally owner-only, so
+        there is nothing else to check."""
+        from murmly.config import WINDOWS_PIPE_NAME
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        config = MurmlyConfig(
+            socket_path=Path(WINDOWS_PIPE_NAME),
+            config_path=Path("/nonexistent/config.toml"),
+        )
+        windows_profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+        report = command_socket_diagnostics(config, windows_profile)
+
+        self.assertTrue(report["path_private"])
+        self.assertNotIn("detail", report)
+
+    def test_a_pipe_shaped_path_is_reported_not_private_off_windows(self) -> None:
+        from murmly.config import WINDOWS_PIPE_NAME
+
+        config = MurmlyConfig(
+            socket_path=Path(WINDOWS_PIPE_NAME),
+            config_path=Path("/nonexistent/config.toml"),
+        )
+
+        # "Off Windows" is the scenario under test, not merely whichever
+        # platform happens to run the suite -- an explicit non-Windows
+        # profile is what keeps this exercised even on a real Windows
+        # runner, where the unresolved default would agree with a
+        # pipe-shaped path instead of calling it out as the mismatch it is.
+        report = command_socket_diagnostics(
+            config, PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+        )
+
+        self.assertFalse(report["path_private"])
+        self.assertIn("filesystem socket", report["detail"])
 
     def test_an_unreadable_focus_probe_does_not_abandon_the_delivery_section(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1157,6 +2296,161 @@ class DoctorCompletenessTests(unittest.TestCase):
 
         self.assertFalse(report["verification_supported"])
         self.assertIn("the display went away", report["detail"])
+
+
+class PlatformDiagnosticsTests(unittest.TestCase):
+    """`platform_diagnostics`, the `platform` section's own renderer (6.1, 6.2, 6.4)."""
+
+    def test_a_mechanism_that_does_not_exist_names_nothing_to_install(self) -> None:
+        # No overlay backend exists for GNOME at all -- the "does not exist"
+        # scenario, distinct from Plasma-without-a-display below.
+        profile = PlatformProfile(
+            operating_system=OperatingSystem.LINUX,
+            architecture="x86_64",
+            session_type="wayland",
+            wayland_display=True,
+            desktop=Desktop.GNOME,
+        )
+        report = platform_diagnostics(profile)
+        overlay = report["concerns"]["overlay"]
+
+        self.assertFalse(overlay["available"])
+        self.assertTrue(overlay["reason"])
+        self.assertEqual([], overlay["remedy"])
+
+    def test_a_mechanism_that_exists_but_could_not_be_used_names_what_to_fix(self) -> None:
+        # Plasma is present; only the display is missing -- the "exists but
+        # could not be used" scenario, and the one thing this report must not
+        # do here is send someone after KDE Plasma they already have.
+        headless_plasma = PlatformProfile(
+            operating_system=OperatingSystem.LINUX, architecture="x86_64", desktop=Desktop.PLASMA
+        )
+        report = platform_diagnostics(headless_plasma)
+        overlay = report["concerns"]["overlay"]
+
+        self.assertFalse(overlay["available"])
+        self.assertTrue(overlay["remedy"])
+
+    def test_every_concern_is_present_on_every_platform(self) -> None:
+        for profile in (
+            PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64", desktop=Desktop.PLASMA),
+            PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64"),
+            PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64"),
+        ):
+            with self.subTest(operating_system=profile.operating_system):
+                report = platform_diagnostics(profile)
+                self.assertEqual(set(BACKEND_REGISTRIES), set(report["concerns"]))
+
+    def test_a_permission_that_cannot_be_read_is_undetermined_not_granted(self) -> None:
+        cannot_tell = Permission(
+            name="test_permission",
+            capability="test capability",
+            grant_location="Settings > Test",
+            check=lambda profile: PermissionState.UNDETERMINED,
+        )
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+
+        with patch("murmly.cli.PERMISSIONS", {"test_permission": cannot_tell}):
+            report = platform_diagnostics(profile)
+
+        self.assertEqual("undetermined", report["permissions"]["test_permission"]["state"])
+        self.assertNotEqual("granted", report["permissions"]["test_permission"]["state"])
+
+    def test_a_permission_check_that_raises_is_undetermined_not_granted(self) -> None:
+        """18.13: a check that fails to run is exactly as uninformative about
+        the grant as a platform offering no way to read it -- neither may be
+        reported as granted."""
+
+        def _raises(profile: PlatformProfile) -> PermissionState:
+            raise RuntimeError("could not read the grant")
+
+        broken = Permission(
+            name="test_permission",
+            capability="test capability",
+            grant_location="Settings > Test",
+            check=_raises,
+        )
+        profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+
+        with patch("murmly.cli.PERMISSIONS", {"test_permission": broken}):
+            report = platform_diagnostics(profile)
+
+        permission_report = report["permissions"]["test_permission"]
+        self.assertEqual("undetermined", permission_report["state"])
+        self.assertNotEqual("granted", permission_report["state"])
+        self.assertIn("could not read the grant", permission_report["detail"])
+
+    def test_macos_paste_injection_concern_is_anded_with_the_accessibility_grant(self) -> None:
+        """`macos` is a genuinely registered `paste_injection` candidate
+        (`BackendChoice.available` is `True` on its own), but the concern's
+        own `available` must still fold in whether the Accessibility grant
+        this mechanism needs has actually been given -- a present mechanism
+        with a denied permission is not a usable concern."""
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        denied = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.DENIED,
+        )
+
+        with patch("murmly.cli.PERMISSIONS", {MACOS_ACCESSIBILITY_PERMISSION: denied}):
+            report = platform_diagnostics(profile)
+
+        paste_injection = report["concerns"]["paste_injection"]
+        self.assertFalse(paste_injection["available"])
+        self.assertIn("Accessibility", paste_injection["reason"])
+        self.assertTrue(paste_injection["remedy"])
+
+    def test_macos_paste_injection_concern_is_available_when_granted(self) -> None:
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        granted = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.GRANTED,
+        )
+
+        with patch("murmly.cli.PERMISSIONS", {MACOS_ACCESSIBILITY_PERMISSION: granted}):
+            report = platform_diagnostics(profile)
+
+        paste_injection = report["concerns"]["paste_injection"]
+        self.assertTrue(paste_injection["available"])
+        self.assertEqual("macos", paste_injection["mechanism"])
+
+    def test_macos_paste_injection_concern_is_unavailable_when_undetermined(self) -> None:
+        """18.13's own rule, applied to a concern rather than only to a
+        `permissions` entry: an unreadable grant must never be reported as an
+        available concern either."""
+        from murmly.platform import MACOS_ACCESSIBILITY_PERMISSION, Permission
+
+        profile = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+        cannot_tell = Permission(
+            name=MACOS_ACCESSIBILITY_PERMISSION,
+            capability="paste injection",
+            grant_location="System Settings > Privacy & Security > Accessibility",
+            check=lambda profile: PermissionState.UNDETERMINED,
+        )
+
+        with patch("murmly.cli.PERMISSIONS", {MACOS_ACCESSIBILITY_PERMISSION: cannot_tell}):
+            report = platform_diagnostics(profile)
+
+        self.assertFalse(report["concerns"]["paste_injection"]["available"])
+
+    def test_non_macos_paste_injection_concern_is_untouched(self) -> None:
+        """The AND only ever applies on macOS -- Windows' `paste_injection`
+        concern (never permission-gated) must not gain a `reason`/`remedy`
+        key it did not already have."""
+        profile = PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+        report = platform_diagnostics(profile)
+
+        self.assertTrue(report["concerns"]["paste_injection"]["available"])
+        self.assertNotIn("reason", report["concerns"]["paste_injection"])
 
 
 class SecondHotkeyCommandTests(unittest.TestCase):
@@ -1257,9 +2551,13 @@ class SecondHotkeyCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text("")
+            config_path.write_text("", encoding="utf-8")
             with (
                 patch("murmly.cli.send_command_with_recovery", fake_send),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
             ):
                 main(["--config", str(config_path), "toggle-session"])
@@ -1278,14 +2576,374 @@ class SecondHotkeyCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text("")
+            config_path.write_text("", encoding="utf-8")
             with (
                 patch("murmly.cli.send_command_with_recovery", fake_send),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+                ),
                 redirect_stdout(StringIO()),
             ):
                 main(["--config", str(config_path), "toggle"])
 
         self.assertEqual(["toggle"], sent)
+
+
+def _sounddevice_with_devices(devices: list[dict[str, object]]) -> ModuleType:
+    module = ModuleType("sounddevice")
+    module.query_devices = lambda: devices
+    return module
+
+
+def _sounddevice_raising(error: Exception) -> ModuleType:
+    def query_devices():
+        raise error
+
+    module = ModuleType("sounddevice")
+    module.query_devices = query_devices
+    return module
+
+
+_INPUT_DEVICE = {
+    "name": "Built-in Microphone",
+    "max_input_channels": 1,
+    "max_output_channels": 0,
+    "default_samplerate": 48_000,
+}
+_OUTPUT_ONLY_DEVICE = {
+    "name": "Built-in Speakers",
+    "max_input_channels": 0,
+    "max_output_channels": 2,
+    "default_samplerate": 48_000,
+}
+
+_LINUX_PROFILE = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+_MACOS_PROFILE = PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+
+
+def _fake_microphone_permission(state: PermissionState, error: Exception | None = None) -> Permission:
+    def check(profile: PlatformProfile) -> PermissionState:
+        if error is not None:
+            raise error
+        return state
+
+    return Permission(
+        name="test-microphone-permission",
+        capability="microphone capture",
+        grant_location="System Settings > Privacy & Security > Microphone",
+        check=check,
+    )
+
+
+class MicrophoneDiagnosticsTests(unittest.TestCase):
+    """`microphone_diagnostics`, task 12.5: distinguishing a denied
+    microphone from an absent device, which are identical from inside the
+    capture path itself (design.md's "the whole difficulty")."""
+
+    def test_a_device_present_on_a_platform_with_no_gating_permission_is_available(self) -> None:
+        with injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])):
+            report = microphone_diagnostics(_LINUX_PROFILE)
+
+        self.assertEqual(
+            {"device_present": True, "permission": None, "available": True},
+            report,
+        )
+
+    def test_no_input_device_is_reported_unavailable_naming_the_absence(self) -> None:
+        with injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])):
+            report = microphone_diagnostics(_LINUX_PROFILE)
+
+        self.assertFalse(report["device_present"])
+        self.assertFalse(report["available"])
+        self.assertIn("no microphone input device", report["detail"].casefold())
+
+    def test_a_device_query_failure_is_undetermined_not_a_claim_of_absence_or_grant(self) -> None:
+        with injected_module("sounddevice", _sounddevice_raising(RuntimeError("no host api"))):
+            report = microphone_diagnostics(_LINUX_PROFILE)
+
+        self.assertIsNone(report["device_present"])
+        self.assertFalse(report["available"])
+        self.assertIn("no host api", report["device_detail"])
+
+    def test_a_denied_permission_with_a_device_present_is_reported_denied(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertTrue(report["device_present"])
+        self.assertEqual("denied", report["permission"]["state"])
+        self.assertFalse(report["available"])
+        self.assertIn(permission.grant_location, report["detail"])
+
+    def test_an_undetermined_permission_is_reported_unavailable_never_granted(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.UNDETERMINED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("undetermined", report["permission"]["state"])
+        self.assertFalse(report["available"])
+
+    def test_a_permission_check_that_raises_is_undetermined_not_granted(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.GRANTED, error=RuntimeError("boom"))
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("undetermined", report["permission"]["state"])
+        self.assertIn("boom", report["permission"]["detail"])
+        self.assertFalse(report["available"])
+
+    def test_no_device_takes_priority_over_a_denied_permission(self) -> None:
+        """The scenario a headless macOS CI runner actually is: no
+        microphone hardware and a permission this reads as denied (or
+        undetermined -- its TCC state is not a normal user's either). The
+        report MUST say "no device", never "denied": claiming a denial would
+        assert a working microphone exists but is locked away, when the
+        truer fact is there is nothing to lock."""
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertFalse(report["available"])
+        self.assertIn("no microphone input device", report["detail"].casefold())
+        self.assertNotIn("denied", report["detail"].casefold())
+        # The permission's own state is still reported, just never allowed to
+        # override the device-absence detail.
+        self.assertEqual("denied", report["permission"]["state"])
+
+    def test_granted_permission_and_a_present_device_on_macos_is_available_but_flagged_unverified(
+        self,
+    ) -> None:
+        """Task 12.6: every readable fact can be good on macOS and this must
+        still not claim end-to-end capture works -- a launchd-started daemon
+        can have both and still receive nothing (design.md's largest risk,
+        tasks 12.1-12.4, none of them provable from here)."""
+        permission = _fake_microphone_permission(PermissionState.GRANTED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertTrue(report["available"])
+        self.assertIn("not yet verified end to end", report["detail"])
+
+    def test_the_report_shape_is_the_same_key_set_across_every_outcome(self) -> None:
+        """18.17's rule applied to this section: the fields present must not
+        change with the outcome, only their values -- `device_present`,
+        `permission` and `available` are always present; `detail` and
+        `device_detail` are the only conditional keys, the same convention
+        every other diagnostics section already uses."""
+        permission = _fake_microphone_permission(PermissionState.GRANTED)
+        base_keys = {"device_present", "permission", "available"}
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=None),
+        ):
+            clean_report = microphone_diagnostics(_LINUX_PROFILE)
+        self.assertEqual(base_keys, set(clean_report))
+
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            absent_report = microphone_diagnostics(_MACOS_PROFILE)
+        self.assertEqual(base_keys | {"detail"}, set(absent_report))
+
+
+def _assert_never_conflates_absence_with_denial(
+    case: unittest.TestCase, report: dict[str, object]
+) -> None:
+    """Task 12.5's own difficulty: an absent device and a denied permission
+    are indistinguishable from inside the capture path, so the report must
+    resolve that ambiguity itself rather than passing it through. Whenever a
+    device was not confirmed present, the detail must never say "denied" --
+    that would claim a working microphone exists but is locked away, when
+    the truer fact may be there is nothing to lock.
+
+    A module-level helper, not a `TestCase` method, shared between
+    `MicrophoneDiagnosticsInvariantTests`'s injected cases and
+    `MicrophoneDiagnosticsRuntimeIntegrationTests`'s real one: the two
+    classes assert the same guarantee against different inputs and neither
+    is a specialisation of the other, so subclassing one from the other
+    would double-run the injected cases as skipped copies under the runtime
+    class for no benefit."""
+    if report["device_present"] is not True:
+        case.assertNotIn("denied", report.get("detail", "").casefold(), f"full report: {report!r}")
+
+
+def _assert_never_claims_launchd_capture_is_verified(
+    case: unittest.TestCase, report: dict[str, object]
+) -> None:
+    """Task 12.6: whatever the permission says, a granted TCC state and an
+    enumerable device are still not proof a launchd-started daemon receives
+    audio (design.md's largest risk, tasks 12.1-12.4, none of them provable
+    from a diagnostics report). So whenever the report claims the microphone
+    is available on macOS, the "not yet verified end to end" disclaimer must
+    be the reason given -- the claim that must never leak on its own is
+    `available: true` standing for confirmed end-to-end capture."""
+    if report["available"] and report.get("permission") is not None:
+        case.assertIn(
+            "not yet verified end to end", report.get("detail", ""), f"full report: {report!r}"
+        )
+
+
+class MicrophoneDiagnosticsInvariantTests(unittest.TestCase):
+    """Task 12.5's two guarantees, checked against `microphone_diagnostics`'s
+    actual output rather than against one assumed device/permission state.
+
+    These used to be pinned only by `MicrophoneDiagnosticsRuntimeIntegrationTests`,
+    against the real machine's `sounddevice` and TCC state, on the assumption
+    that a GitHub macOS runner is headless: no microphone device and no
+    ordinary user's grant. The first real run of this code on an actual Mac
+    (2026-08-31 CI) showed that assumption wrong -- the runner has an audio
+    device and TCC already reports the microphone granted. A test that
+    asserts "no device, never granted" against a machine that has both a
+    device and a grant is not proving the guarantee failed; it is proving the
+    test's premise about the runner was never true. `microphone_diagnostics`
+    reported correctly, in both directions of that mistaken premise --
+    `device_present: True`, `permission.state: "granted"`, `available: True`
+    -- so the fault was the test's assumed inputs, not the function's output.
+
+    So the guarantees are asserted here as invariants over the report's
+    actual fields, true regardless of what a given Mac's device and grant
+    state turn out to be, and checked against every reachable combination
+    through injected `sounddevice`/permission fakes -- deviceless, denied,
+    undetermined and granted -- rather than against whichever one combination
+    a given CI runner happens to have on a given day.
+    """
+
+    def test_a_deviceless_runner_never_reports_denied(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_OUTPUT_ONLY_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_a_device_query_failure_never_reports_denied(self) -> None:
+        with (
+            injected_module("sounddevice", _sounddevice_raising(RuntimeError("no host api"))),
+            patch("murmly.cli.microphone_permission_for", return_value=None),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_a_denied_permission_with_a_device_present_renders_as_denied(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.DENIED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("denied", report["permission"]["state"])
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_an_undetermined_permission_with_a_device_present_renders_as_undetermined(self) -> None:
+        permission = _fake_microphone_permission(PermissionState.UNDETERMINED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("undetermined", report["permission"]["state"])
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertFalse(report["available"])
+
+    def test_a_granted_permission_with_a_device_present_renders_as_granted_but_unverified(
+        self,
+    ) -> None:
+        permission = _fake_microphone_permission(PermissionState.GRANTED)
+        with (
+            injected_module("sounddevice", _sounddevice_with_devices([_INPUT_DEVICE])),
+            patch("murmly.cli.microphone_permission_for", return_value=permission),
+        ):
+            report = microphone_diagnostics(_MACOS_PROFILE)
+
+        self.assertEqual("granted", report["permission"]["state"])
+        _assert_never_conflates_absence_with_denial(self, report)
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+        self.assertTrue(report["available"])
+
+
+class MicrophoneDiagnosticsRuntimeIntegrationTests(unittest.TestCase):
+    """Task 12.5, against the real machine: `MicrophoneDiagnosticsTests` and
+    `MicrophoneDiagnosticsInvariantTests` above prove the priority logic and
+    its two invariants against injected fakes for `sounddevice.query_devices`
+    and the permission check, covering every reachable combination
+    deliberately. This calls `microphone_diagnostics` with no injection at
+    all, against whatever `resolve_platform()` and the real `sounddevice`
+    report on the runner it executes on, and checks the same two invariants
+    against whatever combination that runner actually has.
+
+    Follows the same convention as `MacosMicrophonePermissionRuntimeIntegrationTests`
+    and `WindowsMicrophonePermissionRuntimeIntegrationTests`: skip in `setUp`
+    on every platform but the one this proves something on, then assert only
+    what a real, unknown-state runner can prove, with the full report printed
+    into every failure message so a real run's actual facts land in the CI
+    log even when the test passes.
+
+    What this class does NOT do any more: assume the runner is headless. The
+    first real run of this code on an actual GitHub macOS runner (2026-08-31)
+    showed it has a microphone device and TCC already reports it granted --
+    not the deviceless, ungranted machine this test was originally written
+    for. That runner state is itself informative: it means this class can
+    prove the granted/present branch end to end on real hardware, but it
+    cannot exercise the deviceless or denied branches -- those stay covered
+    only by `MicrophoneDiagnosticsInvariantTests`'s injected cases above, and
+    task 12.6's actual question -- whether a launchd-started daemon receives
+    audio at all -- remains unanswered by any of tasks 12.1-12.5's
+    diagnostics, on this runner or any other; that is what tasks 12.1-12.4
+    exist to establish separately.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("This proves what the real macOS CI runner reports, not a fake")
+
+    def test_the_runner_never_conflates_device_absence_with_denial(self) -> None:
+        report = microphone_diagnostics(resolve_platform())
+
+        _assert_never_conflates_absence_with_denial(self, report)
+
+    def test_the_runner_never_claims_launchd_capture_is_verified(self) -> None:
+        report = microphone_diagnostics(resolve_platform())
+
+        _assert_never_claims_launchd_capture_is_verified(self, report)
+
+    def test_the_runner_reports_a_recognised_permission_state_or_none(self) -> None:
+        report = microphone_diagnostics(resolve_platform())
+        permission = report["permission"]
+
+        if permission is not None:
+            self.assertIn(
+                permission["state"],
+                {state.value for state in PermissionState},
+                f"full report: {report!r}",
+            )
 
 
 class SpeechOutputDiagnosticsTests(unittest.TestCase):
@@ -1351,7 +3009,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('[tts]\nvoice = "morgan_freeman"\nrate = 900\n')
+            config_path.write_text('[tts]\nvoice = "morgan_freeman"\nrate = 900\n', encoding="utf-8")
             report = speech_output_diagnostics(load_config(config_path))
 
         self.assertEqual("af_heart", report["voice"])
@@ -1373,7 +3031,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text("[tts]\nrate = 1979-05-27\n")
+            config_path.write_text("[tts]\nrate = 1979-05-27\n", encoding="utf-8")
             report = speech_output_diagnostics(load_config(config_path))
 
         self.assertEqual(100, report["rate_percent"])
@@ -1449,6 +3107,22 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("device_detail", report, "nothing fell back")
         load_model.assert_not_called()
 
+    def test_coreml_is_named_rather_than_folded_into_cpu(self) -> None:
+        """Task 15.4: `device_in_use` must not hide macOS's own accelerator.
+
+        `CoreMLExecutionProvider` is not a value `[tts] device` accepts (only
+        `auto`'s resolution ever selects it), so this reads `_processor_name`
+        directly rather than through a doctor report compared against a
+        device setting -- `report["device"]` stays `"auto"` regardless of
+        which provider actually ran.
+        """
+        from murmly.cli import _processor_name
+        from murmly.tts import COREML_PROVIDER, CPU_PROVIDER, CUDA_PROVIDER
+
+        self.assertEqual("coreml", _processor_name(COREML_PROVIDER))
+        self.assertEqual("cuda", _processor_name(CUDA_PROVIDER))
+        self.assertEqual("cpu", _processor_name(CPU_PROVIDER))
+
     def test_an_unrecognized_processor_is_reported_alongside_the_one_in_use(self) -> None:
         """The one in use here is the default the unrecognized value fell back to.
 
@@ -1461,7 +3135,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text('[tts]\ndevice = "rocm"\n')
+            config_path.write_text('[tts]\ndevice = "rocm"\n', encoding="utf-8")
             report = speech_output_diagnostics(load_config(config_path))
 
         self.assertEqual("cpu", report["device"])
@@ -1706,7 +3380,12 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
         temp_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
         return MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            # Host-appropriate: most callers below patch `send_command`
+            # outright and never touch this address at all, but the two that
+            # don't -- the real "no daemon answers" and "a daemon really is
+            # there" cases -- need the transport this host actually has, not
+            # a filesystem path Windows would refuse before ever reaching it.
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             tts_model_dir=Path(temp_dir) / "models",
             **overrides,
@@ -1750,7 +3429,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
 
         self.assertIs(True, report["model_resident"])
         self.assertIs(True, report["speech_output"]["resident"])
-        self.assertNotIn("model_resident_detail", report)
+        self.assertIsNone(report["model_resident_detail"])
         self.assertNotIn("resident_detail", report["speech_output"])
         # The whole of the no-side-effect guarantee for transcription: the report
         # answered without a transcriber ever being constructed, which is the
@@ -1935,9 +3614,19 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
         thread.start()
         self.addCleanup(thread.join, 3)
         self.addCleanup(daemon.shutdown)
+        # `.exists()` alone only ever proves the UNIX transport is ready: a
+        # named pipe is never a filesystem node to begin with, so it would
+        # never become true and this would just spin out the deadline. A
+        # whole exchange is what both transports can prove readiness with.
         deadline = time.time() + 3
-        while not config.socket_path.exists() and time.time() < deadline:
-            time.sleep(0.01)
+        while True:
+            try:
+                send_command(str(config.socket_path), "status")
+                break
+            except Exception:  # noqa: BLE001 - not up yet is the ordinary case here
+                if time.time() >= deadline:
+                    self.fail("daemon socket was not accepting connections")
+                time.sleep(0.01)
 
         transcription, synthesis = daemon_residency(config)
 
@@ -2158,8 +3847,15 @@ class DaemonExitTeardownTests(unittest.TestCase):
         """A short-lived command keeps sounddevice's own exit behavior."""
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
+            # A TOML literal string (single quotes), not a basic one: a
+            # Windows temp path is full of backslashes, and a basic string
+            # feeds each one to TOML's own escape processing -- most letters
+            # following it are not a recognised escape at all, which is a
+            # parse error ("Invalid hex value") `load_config` inside `main()`
+            # then reports as this command's own failure before `doctor` is
+            # ever reached.
             config_path.write_text(
-                f'[daemon]\nsocket_path = "{Path(temp_dir) / "murmly.sock"}"\n',
+                f"[daemon]\nsocket_path = '{Path(temp_dir) / 'murmly.sock'}'\n",
                 encoding="utf-8",
             )
             with (
@@ -2168,6 +3864,10 @@ class DaemonExitTeardownTests(unittest.TestCase):
                     FasterWhisperTranscriber,
                     "resolve_runtime",
                     return_value=("cpu", "int8"),
+                ),
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
                 ),
                 redirect_stdout(StringIO()),
             ):
@@ -2183,10 +3883,27 @@ class DaemonExitWithoutFinalizeTests(unittest.TestCase):
     The daemon dumped core exactly that way on 2026-08-22. See issue #27.
     """
 
+    def setUp(self) -> None:
+        # Every test below but the two exercising `leave_without_finalizing`
+        # directly goes through `main()`, which resolves the real platform
+        # before any of the mocked-out daemon behaviour below ever runs.
+        # Pinned to Linux so that gate keeps agreeing to run this suite's own
+        # daemon-exit tests on every host, exactly as it already does when
+        # this suite happens to run on Linux for real.
+        patcher = patch(
+            "murmly.cli.resolve_platform",
+            return_value=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _config_file(self, temp_dir: str) -> Path:
         config_path = Path(temp_dir) / "config.toml"
+        # A TOML literal string -- see
+        # `DaemonExitTeardownTests.test_a_command_other_than_the_daemon_leaves_the_teardown_alone`
+        # for why a basic (double-quoted) string cannot hold a Windows path.
         config_path.write_text(
-            f'[daemon]\nsocket_path = "{Path(temp_dir) / "murmly.sock"}"\n',
+            f"[daemon]\nsocket_path = '{Path(temp_dir) / 'murmly.sock'}'\n",
             encoding="utf-8",
         )
         return config_path

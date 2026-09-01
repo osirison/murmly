@@ -11,20 +11,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from murmly.config import MurmlyConfig, default_socket_path
+from channel_helpers import command_channel_address, connect_command_channel
+from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, default_socket_path
 from murmly.daemon import (
     ADOPT_SESSION,
+    DESTINATION_SESSION,
     MAX_COMMAND_BYTES,
     MAX_COMMAND_WORKERS,
     CommandCode,
     DaemonNotRespondingError,
     DaemonStartupError,
     MurmlyDaemon,
+    PeerIdentityMechanism,
     ProcessingResult,
     RequestError,
     SpeechSession,
     SpeechSessionConnection,
+    peer_identity_mechanism_for,
+    peer_identity_supported,
     read_peer_identity,
+    read_peer_identity_macos,
     send_command,
     socket_path_detail,
 )
@@ -32,6 +38,7 @@ from murmly.focus import NullFocusObserver, WindowIdentity
 from murmly.idle import IdleRelease
 from murmly.integrations import DeliveryOutcome
 from murmly.overlay import OverlayHealth, OverlayState
+from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
 
 
 class DummySession:
@@ -150,9 +157,12 @@ class FakeOverlay:
 
 
 # What `status` answers from a daemon that has done nothing yet: idle, holding no
-# transcription model, and with no synthesis residency at all, because a daemon
-# with speech output off never builds a synthesizer to hold a session.
-IDLE_STATUS = {"ok": True, "state": "IDLE", "model_resident": False}
+# transcription model, with no synthesis residency at all (a daemon with speech
+# output off never builds a synthesizer to hold a session), and holding no
+# hotkeys in-process -- present on every platform (platform-support's
+# "identical on every platform"), empty here because these tests build a
+# daemon with no in-process hotkey registrar at all.
+IDLE_STATUS = {"ok": True, "state": "IDLE", "model_resident": False, "hotkeys_held": []}
 
 
 def wait_until_served(
@@ -168,18 +178,20 @@ def wait_until_served(
     wrong in the daemon: rarely on an idle machine, and on the first CI run that
     ever exercised them.
 
-    `SO_ACCEPTCONN` is read off the daemon's own socket rather than a connection
-    being made to it, because a probe connection is not free. The daemon counts
-    every accepted connection through its peer-identity check, and a test that
-    answers that check differently per connection would be answering one of these
-    probes.
+    Waits on `daemon._listening` -- an event `MurmlyDaemon` sets itself once
+    `listen()` (or, on Windows, `NamedPipeServer.__init__`) has actually
+    succeeded -- rather than reading `SO_ACCEPTCONN` off the daemon's own
+    socket, which was this function's first fix for the same race: macOS
+    refuses that read against an AF_UNIX socket outright, with `OSError:
+    [Errno 42] Protocol not available` (CI-verified; Linux answers it fine, so
+    this was invisible until macOS joined the matrix). A probe connection is
+    not a substitute either, and was never considered for the reason `_listening`'s
+    own docstring in `daemon.py` repeats: the daemon counts every accepted
+    connection through its peer-identity check, and a test that answers that
+    check differently per connection would be answering one of these probes.
     """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        server = daemon._server
-        if server is not None and server.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
-            return
-        time.sleep(0.01)
+    if daemon._listening.wait(timeout):
+        return
     test.fail("daemon socket was not listening")
 
 
@@ -187,7 +199,7 @@ class DaemonTests(unittest.TestCase):
     def test_daemon_initializes_without_clipboard_tools(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
                 overlay_enabled=False,
             )
@@ -197,7 +209,7 @@ class DaemonTests(unittest.TestCase):
 
     def test_socket_protocol_toggles_between_idle_and_done(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(
                 socket_path=socket_path,
                 config_path=Path(temp_dir) / "config.toml",
@@ -227,7 +239,7 @@ class DaemonTests(unittest.TestCase):
     def test_speech_session_injects_level_sink_into_recorder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
                 overlay_enabled=False,
             )
@@ -240,7 +252,7 @@ class DaemonTests(unittest.TestCase):
     def test_daemon_publishes_successful_overlay_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
             )
             overlay = FakeOverlay()
@@ -276,7 +288,7 @@ class DaemonTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
             )
             daemon = MurmlyDaemon(config, session=OrderedSession(), overlay=OrderedOverlay())
@@ -294,7 +306,7 @@ class DaemonTests(unittest.TestCase):
         for session, toggle_count in cases:
             with self.subTest(toggle_count=toggle_count), tempfile.TemporaryDirectory() as temp_dir:
                 config = MurmlyConfig(
-                    socket_path=Path(temp_dir) / "murmly.sock",
+                    socket_path=command_channel_address(temp_dir),
                     config_path=Path(temp_dir) / "config.toml",
                 )
                 overlay = FakeOverlay()
@@ -310,7 +322,7 @@ class DaemonTests(unittest.TestCase):
     def test_overlay_failure_does_not_change_voice_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
             )
             daemon = MurmlyDaemon(config, session=DummySession(), overlay=FakeOverlay(fail=True))
@@ -324,7 +336,7 @@ class DaemonTests(unittest.TestCase):
     def test_disabled_overlay_does_not_create_renderer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
                 overlay_enabled=False,
             )
@@ -335,7 +347,7 @@ class DaemonTests(unittest.TestCase):
 
     def test_server_shutdown_closes_overlay_after_socket_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(socket_path=socket_path, config_path=Path(temp_dir) / "config.toml")
             overlay = FakeOverlay()
             daemon = MurmlyDaemon(config, session=DummySession(), overlay=overlay)
@@ -353,7 +365,7 @@ class DaemonTests(unittest.TestCase):
     def test_shutdown_stops_capture(self) -> None:
         """Nothing else closes the microphone once PortAudio's own teardown is gone."""
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(socket_path=socket_path, config_path=Path(temp_dir) / "config.toml")
             session = DummySession()
             daemon = MurmlyDaemon(config, session=session, overlay=FakeOverlay())
@@ -364,7 +376,7 @@ class DaemonTests(unittest.TestCase):
 
     def test_shutdown_continues_when_capture_will_not_stop(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(socket_path=socket_path, config_path=Path(temp_dir) / "config.toml")
             session = DummySession(stop_error=RuntimeError("the device is wedged"))
             overlay = FakeOverlay()
@@ -384,7 +396,7 @@ class DaemonTests(unittest.TestCase):
 
     def test_shutdown_unwinds_server_while_processing_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(socket_path=socket_path, config_path=Path(temp_dir) / "config.toml")
             session = BlockingSession()
             overlay = FakeOverlay()
@@ -424,9 +436,30 @@ class DaemonTests(unittest.TestCase):
             self.assertEqual(CommandCode.SHUTTING_DOWN, responses[0]["code"])
 
     def test_incomplete_clients_are_bounded_and_closed_on_shutdown(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            # Relies on a UNIX listen backlog holding every one of these
+            # connects pending at once before the daemon's accept loop ever
+            # runs. `win_pipe.NamedPipeServer` keeps exactly one pipe instance
+            # waiting at a time (task 7.1) and a client beyond that blocks
+            # inside its own `connect` on `WaitNamedPipe` instead of queueing,
+            # which is a different, not a lesser, guarantee -- this specific
+            # scenario has no pipe equivalent to assert.
+            self.skipTest("needs a UNIX socket's listen backlog, which the named-pipe transport has no equivalent of")
         clients: list[socket.socket] = []
-        with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+        # A client that never sends anything leaves its worker blocked in
+        # `recv()`; the shutdown loop only calls `connection.shutdown(SHUT_RDWR)`
+        # on it, and whether that alone wakes a *different* thread's blocking
+        # `recv()` on the same fd promptly is a kernel-specific guarantee, not
+        # a portable one -- observed to hold on Linux and not within 1s on
+        # macOS. `COMMAND_TIMEOUT_SECONDS` is what actually bounds a silent
+        # peer regardless of that (`test_a_request_that_never_arrives_is_
+        # answered` patches it the same way for the same reason), so patching
+        # it down is what makes "closed on shutdown" true, and quick to
+        # observe, on every platform rather than only the one where the
+        # kernel's shutdown()-interrupts-recv() fast path happens to win the
+        # race within the poll window below.
+        with patch("murmly.daemon.COMMAND_TIMEOUT_SECONDS", 0.2), tempfile.TemporaryDirectory() as temp_dir:
+            socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(
                 socket_path=socket_path,
                 config_path=Path(temp_dir) / "config.toml",
@@ -451,7 +484,11 @@ class DaemonTests(unittest.TestCase):
 
             daemon.shutdown()
             server_thread.join(timeout=0.5)
-            deadline = time.time() + 1
+            # 2s, not 1s: with the patched 0.2s read timeout this converges in
+            # well under that on every platform, but the margin is kept
+            # generous rather than tight against a loaded runner, since the
+            # loop below already returns the moment it hits 0.
+            deadline = time.time() + 2
             while True:
                 with daemon._connections_lock:
                     remaining_connections = len(daemon._connections)
@@ -468,7 +505,7 @@ class DaemonTests(unittest.TestCase):
 
     def test_oversized_command_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             config = MurmlyConfig(
                 socket_path=socket_path,
                 config_path=Path(temp_dir) / "config.toml",
@@ -478,10 +515,12 @@ class DaemonTests(unittest.TestCase):
             server_thread = threading.Thread(target=daemon.serve_forever, daemon=True)
             server_thread.start()
             wait_until_served(self, daemon)
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-                client.connect(str(socket_path))
+            client = connect_command_channel(socket_path, 5.0)
+            try:
                 client.sendall(b"x" * 4_097)
                 response = json.loads(client.recv(4_096))
+            finally:
+                client.close()
             daemon.shutdown()
             server_thread.join(timeout=1)
 
@@ -491,7 +530,7 @@ class DaemonTests(unittest.TestCase):
     def test_shutdown_during_slot_acquisition_rejects_connection_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
                 overlay_enabled=False,
             )
@@ -532,7 +571,7 @@ class DaemonTests(unittest.TestCase):
 class DeliveryTargetTests(unittest.TestCase):
     def _config(self, temp_dir: str, **overrides: object) -> MurmlyConfig:
         return MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             **overrides,
@@ -619,7 +658,7 @@ class DeliveryTargetTests(unittest.TestCase):
 class TranscriptDeliveryTests(unittest.TestCase):
     def _session(self, temp_dir: str, observer, verify_target: bool = True) -> SpeechSession:
         config = MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             verify_target=verify_target,
@@ -793,13 +832,26 @@ class SegmentSession(DummySession):
 
 class AutoTranscribeTests(unittest.TestCase):
     def _daemon(self, temp_dir: str, session, **overrides: object) -> MurmlyDaemon:
+        # A plain filesystem path, not `command_channel_address`, paired with
+        # a profile pinned to Linux regardless of the real host -- the same
+        # seam `RebindHotkeysCommandTests._daemon` documents. Every test in
+        # this class drives the daemon through `handle_command` in-process,
+        # never over a real socket, so the channel address is never opened;
+        # left to the real host's own resolution, a Windows runner would
+        # build a real in-process `WindowsHotkeyRegistrar` here and `status`
+        # would answer with a `hotkeys_held` key none of these auto-transcribe
+        # tests are about.
         config = MurmlyConfig(
             socket_path=Path(temp_dir) / "murmly.sock",
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             **overrides,
         )
-        return MurmlyDaemon(config, session=session)
+        return MurmlyDaemon(
+            config,
+            session=session,
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
 
     def _settle(self, daemon: MurmlyDaemon) -> None:
         """Wait for an off-thread segment delivery to finish.
@@ -985,7 +1037,7 @@ class AutoTranscribeTests(unittest.TestCase):
 class LiveTranscriptionSessionTests(unittest.TestCase):
     def _session(self, temp_dir: str, **overrides: object) -> SpeechSession:
         config = MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             **overrides,
@@ -1074,7 +1126,7 @@ class LiveWorkerCadenceTests(unittest.TestCase):
 
     def _session(self, temp_dir: str, **overrides: object) -> SpeechSession:
         config = MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             **overrides,
@@ -1147,7 +1199,7 @@ class LiveWorkerCadenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             session = BlockingSegmentSession()
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
                 overlay_enabled=False,
                 auto_transcribe="continuous",
@@ -1194,7 +1246,7 @@ class LiveWorkerCadenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             session = SegmentSession(texts=["one"])
             config = MurmlyConfig(
-                socket_path=Path(temp_dir) / "murmly.sock",
+                socket_path=command_channel_address(temp_dir),
                 config_path=Path(temp_dir) / "config.toml",
                 overlay_enabled=False,
                 auto_transcribe="continuous",
@@ -1253,7 +1305,7 @@ class SegmentToggleConcurrencyTests(unittest.TestCase):
 
     def _daemon(self, temp_dir: str, session, **overrides: object) -> MurmlyDaemon:
         config = MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             **overrides,
@@ -1566,7 +1618,7 @@ class IdleModelReleaseTests(unittest.TestCase):
         **overrides: object,
     ) -> MurmlyDaemon:
         config = MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             **overrides,
@@ -1853,7 +1905,7 @@ class SpeechLostSinceStartupTests(unittest.TestCase):
 
     def _daemon(self, temp_dir: str, speech) -> MurmlyDaemon:
         config = MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
             tts_enabled=True,
@@ -1966,15 +2018,21 @@ def send_payload(socket_path: Path, payload: bytes, timeout: float = 5.0) -> byt
     the send can lose the race and raise. That is the refusal arriving, not a
     failure: the frame is already on the wire and is what the caller wants.
     """
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(timeout)
-        client.connect(str(socket_path))
+    client = connect_command_channel(socket_path, timeout)
+    try:
         if payload:
             try:
                 client.sendall(payload)
-            except BrokenPipeError:
+            except OSError:
+                # `BrokenPipeError` on the UNIX transport; `win_pipe.
+                # NamedPipeConnection.sendall` raises the plain `OSError`
+                # `_run_overlapped` wraps every Win32 failure in, including
+                # this same "wrote into a connection the peer already closed"
+                # one -- both are the refusal racing this send, not a failure.
                 pass
         return read_frame(client)
+    finally:
+        client.close()
 
 
 def send_and_read_to_close(socket_path: Path, payload: bytes, timeout: float = 10.0) -> bytes:
@@ -1983,19 +2041,25 @@ def send_and_read_to_close(socket_path: Path, payload: bytes, timeout: float = 1
     Reading past the first newline is the point: it is what can observe a second
     response on a connection that should carry exactly one.
     """
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(timeout)
-        client.connect(str(socket_path))
+    client = connect_command_channel(socket_path, timeout)
+    try:
         client.sendall(payload)
         received = b""
         while True:
             try:
                 chunk = client.recv(4_096)
-            except (ConnectionResetError, socket.timeout):
+            except OSError:
+                # `ConnectionResetError`/`socket.timeout` on the UNIX
+                # transport; the pipe transport raises the plain `OSError`
+                # `_run_overlapped` wraps every Win32 read failure in,
+                # including the broken-pipe one a closed connection produces
+                # here. Both mean the same thing: nothing more is coming.
                 break
             if not chunk:
                 break
             received += chunk
+    finally:
+        client.close()
     return received
 
 
@@ -2005,7 +2069,7 @@ class ServedDaemonTests(unittest.TestCase):
     def serve(self, session: object | None = None, **overrides: object) -> tuple[MurmlyDaemon, Path]:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
-        socket_path = Path(temp_dir.name) / "murmly.sock"
+        socket_path = command_channel_address(temp_dir.name)
         config = MurmlyConfig(
             socket_path=socket_path,
             config_path=Path(temp_dir.name) / "config.toml",
@@ -2040,7 +2104,7 @@ class ServedDaemonTests(unittest.TestCase):
 class FailureCodeTests(unittest.TestCase):
     def _daemon(self, temp_dir: str, session: object | None = None) -> MurmlyDaemon:
         config = MurmlyConfig(
-            socket_path=Path(temp_dir) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir),
             config_path=Path(temp_dir) / "config.toml",
             overlay_enabled=False,
         )
@@ -2152,6 +2216,278 @@ class FailureCodeTests(unittest.TestCase):
             self.assertNotIn("code", response)
 
 
+class RebindHotkeysCommandTests(unittest.TestCase):
+    """Task 5.5: `rebind_hotkeys` is what `murmly install` reaches a running
+    daemon for. On every platform this change targets it is a reported no-op,
+    since neither Plasma nor GNOME registers a hotkey in this process."""
+
+    def _daemon(self, temp_dir: str) -> MurmlyDaemon:
+        # A plain filesystem path, not `command_channel_address` -- the
+        # profile below is pinned to Linux regardless of the real host, so
+        # the channel it is paired with has to be the Linux-shaped one too,
+        # or `_require_private_channel` refuses the mismatch itself before
+        # any of these tests reach what they are actually about.
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+        )
+        # This class's own docstring: "on every platform this change targets
+        # it is a reported no-op, since neither Plasma nor GNOME registers a
+        # hotkey in this process" -- a Linux/desktop scenario specifically,
+        # left unpinned here would otherwise resolve the real host, and a
+        # Windows runner's own resolution answers with a real, in-process
+        # `WindowsHotkeyRegistrar` instead of the no-op these tests are about.
+        return MurmlyDaemon(
+            config,
+            session=DummySession(),
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
+
+    def test_reports_the_desktop_holds_the_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            response = self._daemon(temp_dir).handle_command("rebind_hotkeys")
+
+        self.assertTrue(response["ok"])
+        self.assertIn("held by the desktop", response["detail"])
+
+    def test_never_raises_even_if_the_rebind_itself_explodes(self) -> None:
+        """A hotkey rebind failing must never be why a command -- or, at
+        startup, the whole daemon -- stops answering."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir)
+
+            with patch("murmly.daemon.rebind_from_record", side_effect=RuntimeError("boom")):
+                response = daemon.handle_command("rebind_hotkeys")
+
+        self.assertTrue(response["ok"])
+        self.assertIn("Hotkey rebind failed", response["detail"])
+
+    def test_uses_the_profile_resolved_at_construction_not_a_fresh_one(self) -> None:
+        """`_rebind_hotkeys` must read `self._profile` -- resolved once at
+        construction (task 1.3) -- rather than calling `resolve_platform()`
+        again: the registrar it drives (`self._hotkey_registrar`) was built
+        from that same resolution, and a second, independent call could in
+        principle disagree with it."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(
+                config, session=DummySession(), profile=windows_profile(), hotkey_registrar=object()
+            )
+
+            with patch("murmly.platform.resolve_platform") as resolve:
+                daemon.handle_command("rebind_hotkeys")
+
+        resolve.assert_not_called()
+
+    def test_a_default_daemon_holds_no_in_process_registrar(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir)
+
+        self.assertIsNone(daemon._hotkey_registrar)
+
+
+class FakeHotkeyRegistrar:
+    """The `hotkey_record.py` `rebind` contract, plus `stop`/`held_purposes`
+    -- exactly `win_hotkey.WindowsHotkeyRegistrar`'s public surface, without
+    touching a real thread or any Win32 call."""
+
+    def __init__(self) -> None:
+        self.rebind_calls: list[dict[str, str]] = []
+        self.stopped = False
+        self._held: frozenset[str] = frozenset()
+
+    def rebind(self, bindings: dict[str, str]) -> None:
+        self.rebind_calls.append(dict(bindings))
+        self._held = frozenset(bindings)
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._held = frozenset()
+
+    def held_purposes(self) -> frozenset[str]:
+        return self._held
+
+
+class InProcessHotkeyRegistrarWiringTests(unittest.TestCase):
+    """Task 8.3/8.5, 18.10: a fired hotkey dispatches through `handle_command`
+    like any other command, the registrar is released on shutdown, and
+    `status` reports what it holds -- present only where a registrar exists
+    at all, so a Linux daemon's `status` response is unchanged."""
+
+    def _daemon(self, temp_dir: str, registrar: object) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(WINDOWS_PIPE_NAME),
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+        )
+        return MurmlyDaemon(
+            config, session=DummySession(), profile=windows_profile(), hotkey_registrar=registrar
+        )
+
+    def test_shutdown_releases_the_registrar(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon.shutdown()
+
+        self.assertTrue(registrar.stopped)
+
+    def test_serve_forever_releases_the_registrar_even_when_it_never_reaches_shutdown(
+        self,
+    ) -> None:
+        """8.5's release must hold on `serve_forever`'s own error paths, not
+        only when something external calls `shutdown()`: a daemon that fails
+        to start its channel must not leave a hotkey thread holding
+        `RegisterHotKey` bindings with nothing left to release them.
+
+        `NamedPipeServer` is patched to raise, rather than relied on to raise
+        on its own: on this machine, with no `pywin32` installed, the
+        deferred `from murmly.win_pipe import NamedPipeServer` import inside
+        `_serve_named_pipe` fails on its own -- but that is an accident of
+        this machine's dependencies, not something the test means to prove,
+        and on a real Windows host, where `pywin32` is installed, it does not
+        happen at all: `NamedPipeServer(...)` succeeds, `_accept_loop` starts
+        polling its 0.2s accept timeout, and `daemon.serve_forever()` never
+        returns -- exactly the hang `ci4-Windows.log` recorded at this line.
+        Patching the constructor is what makes the startup failure this test
+        is actually about happen deterministically, on every platform,
+        without depending on whether the real dependency is importable here.
+        """
+        registrar = FakeHotkeyRegistrar()
+        registrar.rebind({"window": "Meta+X"})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            with patch(
+                "murmly.win_pipe.NamedPipeServer",
+                side_effect=OSError("simulated named-pipe creation failure"),
+            ):
+                with self.assertRaises(DaemonStartupError):
+                    daemon.serve_forever()
+
+        self.assertTrue(registrar.stopped)
+
+    def test_status_reports_the_registrars_held_purposes(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        registrar.rebind({"window": "Meta+X"})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            response = daemon.handle_command("status")
+
+        self.assertEqual(["window"], response["hotkeys_held"])
+
+    def test_status_reports_nothing_held_once_stopped(self) -> None:
+        """18.10: not held once the registrar (and so the daemon) stops."""
+        registrar = FakeHotkeyRegistrar()
+        registrar.rebind({"window": "Meta+X"})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon.shutdown()
+            response = daemon.handle_command("status")
+
+        self.assertEqual([], response["hotkeys_held"])
+
+    def test_status_reports_hotkeys_held_empty_with_no_registrar(self) -> None:
+        """platform-support's "identical on every platform": the key is
+        present on Linux too, since a client written against one platform's
+        response shape must work unchanged against another's -- but empty,
+        since this daemon genuinely holds no hotkeys in-process here (Plasma
+        and GNOME hold their own bindings)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # A plain filesystem path: the profile below is pinned to Linux
+            # regardless of the real host, so the channel has to match it --
+            # see `RebindHotkeysCommandTests._daemon` for the same seam.
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            # Pinned to Linux (see this class's `_daemon` a few tests up for
+            # the same seam): unpinned, a Windows runner's own resolution
+            # gives this daemon a real in-process registrar instead of "no
+            # registrar", which is the one case this test names.
+            daemon = MurmlyDaemon(
+                config,
+                session=DummySession(),
+                profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+            )
+
+            response = daemon.handle_command("status")
+
+        self.assertEqual([], response["hotkeys_held"])
+
+    def test_a_fired_hotkey_toggles_capture_through_handle_command(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon._handle_in_process_hotkey("window")
+
+        self.assertEqual(1, daemon._session.started)
+
+    def test_a_fired_hotkey_for_the_session_purpose_toggles_the_session_destination(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            daemon._handle_in_process_hotkey("session")
+
+        self.assertEqual(1, daemon._session.started)
+        self.assertEqual(DESTINATION_SESSION, daemon._capture_destination)
+
+    def test_an_unrecognized_purpose_is_logged_not_raised(self) -> None:
+        registrar = FakeHotkeyRegistrar()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, registrar)
+
+            with self.assertLogs("murmly.daemon", level="WARNING") as logs:
+                daemon._handle_in_process_hotkey("unknown")
+
+        self.assertTrue(any("unrecognized purpose" in line for line in logs.output))
+
+
+class RebindAtStartupTests(unittest.TestCase):
+    def test_startup_calls_rebind_once_before_the_daemon_serves_a_command(self) -> None:
+        """Exercises the actual `serve_forever` startup path, not just the
+        command handler -- a daemon that never receives `rebind_hotkeys` still
+        rebinds once, on its own, right after its command channel comes up.
+
+        Patched before the thread starts, so there is no race with
+        `serve_forever`'s own call to it: whichever runs first, the count
+        settles at exactly one once the socket answers a real command.
+        """
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        config = MurmlyConfig(
+            socket_path=command_channel_address(temp_dir.name),
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+        daemon = MurmlyDaemon(config, session=DummySession())
+        calls: list[bool] = []
+        original = daemon._rebind_hotkeys
+        daemon._rebind_hotkeys = lambda: (calls.append(True), original())[1]
+
+        thread = threading.Thread(target=daemon.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(daemon.shutdown)
+
+        deadline = time.time() + 3
+        while not calls and time.time() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(1, len(calls))
+
+
 class RequestShapeTests(ServedDaemonTests):
     def test_a_payload_that_is_not_an_object_is_answered(self) -> None:
         _daemon, socket_path = self.serve()
@@ -2235,9 +2571,8 @@ class AnsweredConnectionTests(ServedDaemonTests):
     def test_a_connection_over_capacity_is_answered(self) -> None:
         daemon, socket_path = self.serve()
         for _index in range(MAX_COMMAND_WORKERS):
-            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client = connect_command_channel(socket_path, 5.0)
             self.addCleanup(client.close)
-            client.connect(str(socket_path))
         self.assertEqual(MAX_COMMAND_WORKERS, self.wait_for_connections(daemon, MAX_COMMAND_WORKERS))
 
         response = json.loads(send_payload(socket_path, b'{"command": "status"}\n'))
@@ -2366,16 +2701,22 @@ class AnsweredConnectionTests(ServedDaemonTests):
 
     def test_a_peer_that_never_reads_does_not_stop_the_daemon(self) -> None:
         _daemon, socket_path = self.serve()
-        silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        silent = connect_command_channel(socket_path, 5.0)
         self.addCleanup(silent.close)
-        silent.connect(str(socket_path))
         silent.sendall(b'{"command": "status"}\n')
 
         self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_a_client_that_receives_nothing_raises_a_named_type(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            # Builds its own bare UNIX-socket server by hand to simulate a
+            # daemon that accepts and then closes without responding --
+            # `send_command`'s named-pipe branch has no comparably bare way to
+            # fake that against a real pipe server without reimplementing
+            # `win_pipe.NamedPipeServer` here a second time.
+            self.skipTest("needs a real UNIX socket to build a bare server for")
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.addCleanup(server.close)
             server.bind(str(socket_path))
@@ -2496,8 +2837,7 @@ class AnsweredConnectionTests(ServedDaemonTests):
         # One of the two connections that cannot be answered. Murmly discards the
         # response it produced and goes on serving.
         _daemon, socket_path = self.serve()
-        early = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        early.connect(str(socket_path))
+        early = connect_command_channel(socket_path, 5.0)
         early.sendall(b'{"command": "status"}\n')
         early.close()
 
@@ -2516,9 +2856,8 @@ class AnsweredConnectionTests(ServedDaemonTests):
                 return {"ok": True, "state": "IDLE", "text": "x" * (2 << 20), "delivered": True}
 
             daemon.handle_command = oversized
-            silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            silent = connect_command_channel(socket_path, 5.0)
             self.addCleanup(silent.close)
-            silent.connect(str(socket_path))
             silent.sendall(b'{"command": "toggle"}\n')
             started = time.monotonic()
 
@@ -2534,8 +2873,12 @@ class AnsweredConnectionTests(ServedDaemonTests):
         # The other half of "no command terminates with an unhandled error": a
         # daemon that answers nothing at all is as unhelpful as one that closes,
         # and a hotkey press has nowhere to show a caller that never returns.
+        if not hasattr(socket, "AF_UNIX"):
+            # Builds its own bare UNIX-socket server by hand, the same as
+            # `test_a_client_that_receives_nothing_raises_a_named_type` above.
+            self.skipTest("needs a real UNIX socket to build a bare server for")
         with tempfile.TemporaryDirectory() as temp_dir:
-            socket_path = Path(temp_dir) / "murmly.sock"
+            socket_path = command_channel_address(temp_dir)
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.addCleanup(server.close)
             server.bind(str(socket_path))
@@ -2580,6 +2923,8 @@ class AnsweredConnectionTests(ServedDaemonTests):
 
 class SocketAccessTests(ServedDaemonTests):
     def test_the_socket_and_every_directory_murmly_creates_are_owner_only(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX mode bits, which Windows does not enforce this way")
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         directory = Path(temp_dir.name) / "created" / "nested"
@@ -2596,6 +2941,13 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertEqual(0o700, stat.S_IMODE(directory.parent.stat().st_mode))
 
     def test_peer_identity_reports_the_connecting_account(self) -> None:
+        if not hasattr(socket, "SO_PEERCRED"):
+            # `read_peer_identity` is the concrete Linux/`SO_PEERCRED` answer
+            # `peer_identity_mechanism_for` dispatches to -- calling it
+            # directly, as this test does, bypasses that dispatch and so
+            # bypasses Windows' own working mechanism too. See
+            # `PeerIdentityMechanismDispatchTests` for the dispatch itself.
+            self.skipTest("needs a real SO_PEERCRED socket option")
         left, right = socket.socketpair()
         self.addCleanup(left.close)
         self.addCleanup(right.close)
@@ -2610,16 +2962,22 @@ class SocketAccessTests(ServedDaemonTests):
     def test_a_peer_from_another_account_is_refused_and_takes_no_capacity(self) -> None:
         # A genuine cross-account connection needs a second account and root,
         # which the suite does not have and must not need, so the comparison is
-        # substituted. More refusals than there are worker slots are sent: if one
-        # consumed a slot, the permitted command that follows could not be served.
+        # substituted -- with a fixed sentinel rather than the real `os.getuid()`
+        # (which Windows has none of), since the comparison itself, not the
+        # real local account, is the point. More refusals than there are
+        # worker slots are sent: if one consumed a slot, the permitted command
+        # that follows could not be served.
+        local_account = 1000
         refusals = MAX_COMMAND_WORKERS + 4
         seen: list[socket.socket] = []
 
         def foreign_until_permitted(connection: socket.socket) -> int:
             seen.append(connection)
-            return os.getuid() + 1 if len(seen) <= refusals else os.getuid()
+            return local_account + 1 if len(seen) <= refusals else local_account
 
-        _daemon, socket_path = self.serve(peer_identity=foreign_until_permitted)
+        _daemon, socket_path = self.serve(
+            peer_identity=foreign_until_permitted, local_identity=lambda: local_account
+        )
 
         for _index in range(refusals):
             response = json.loads(send_payload(socket_path, b'{"command": "toggle"}\n'))
@@ -2630,13 +2988,41 @@ class SocketAccessTests(ServedDaemonTests):
 
     def test_a_refused_peer_runs_no_command(self) -> None:
         session = DummySession()
-        _daemon, socket_path = self.serve(session, peer_identity=lambda connection: os.getuid() + 1)
+        # A sentinel unequal to whatever this host's own default local
+        # identity resolves to, rather than `os.getuid() + 1`, which Windows
+        # has no `os.getuid()` to add to in the first place.
+        _daemon, socket_path = self.serve(session, peer_identity=lambda connection: "a-different-account")
 
         json.loads(send_payload(socket_path, b'{"command": "toggle"}\n'))
 
         self.assertEqual(0, session.started)
 
+    def test_a_peer_identity_of_any_comparable_type_is_permitted_when_equal(self) -> None:
+        """18.7: `_peer_permitted` compares with `==` against whatever
+        `local_identity` returns, not an int-specific comparison -- the same
+        code path that lets Linux compare `os.getuid()` integers is what lets
+        Windows compare the SID strings `win_pipe` reads."""
+        _daemon, socket_path = self.serve(
+            peer_identity=lambda _connection: "S-1-5-21-000-111-222-1000",
+            local_identity=lambda: "S-1-5-21-000-111-222-1000",
+        )
+
+        self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
+
+    def test_a_peer_identity_of_any_comparable_type_is_refused_when_it_differs(self) -> None:
+        _daemon, socket_path = self.serve(
+            peer_identity=lambda _connection: "S-1-5-21-000-111-222-9999",
+            local_identity=lambda: "S-1-5-21-000-111-222-1000",
+        )
+
+        response = json.loads(send_payload(socket_path, b'{"command": "toggle"}\n'))
+
+        self.assertFalse(response["ok"])
+        self.assertEqual(CommandCode.NOT_PERMITTED, response["code"])
+
     def test_the_daemon_refuses_a_socket_path_other_accounts_can_write(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         for mode in (0o777, 0o770):
             with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as temp_dir:
                 directory = Path(temp_dir) / "shared"
@@ -2659,6 +3045,8 @@ class SocketAccessTests(ServedDaemonTests):
                 self.assertFalse(socket_path.exists())
 
     def test_a_refused_socket_path_is_not_unlinked(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir) / "shared"
             directory.mkdir()
@@ -2677,6 +3065,8 @@ class SocketAccessTests(ServedDaemonTests):
             self.assertEqual("not ours", occupant.read_text(encoding="utf-8"))
 
     def test_the_daemon_serves_a_directory_others_can_read_but_not_write(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         directory = Path(temp_dir.name) / "readable"
@@ -2693,21 +3083,45 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertEqual(IDLE_STATUS, send_command(str(socket_path), "status"))
 
     def test_the_default_socket_path_is_served(self) -> None:
+        if not hasattr(os, "getuid"):
+            # Windows's default channel is a named pipe with no comparable
+            # per-user runtime directory (`config.default_runtime_dir`
+            # returns `None` there).
+            self.skipTest("needs the Linux XDG_RUNTIME_DIR filesystem-socket default")
         runtime_dir = tempfile.TemporaryDirectory()
         self.addCleanup(runtime_dir.cleanup)
-        socket_path = default_socket_path({"XDG_RUNTIME_DIR": runtime_dir.name})
-        config = MurmlyConfig(
-            socket_path=socket_path,
-            config_path=Path(runtime_dir.name) / "config.toml",
-            overlay_enabled=False,
-        )
+        # `default_runtime_dir` reads `Path.home()` for macOS's own
+        # `~/Library/Caches` default and ignores `XDG_RUNTIME_DIR` there
+        # entirely -- `resolve_platform`, which decides which branch runs,
+        # reads the real `sys.platform`, not the `env` this test hands
+        # `default_socket_path`, so there is no `env` override that could
+        # make a real macOS host answer the Linux way. `Path.home` is
+        # patched, not left real, so this exercises macOS's own answer
+        # without writing into the runner's actual home directory.
+        home_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(home_dir.cleanup)
+        profile = resolve_platform()
+        if profile.operating_system is OperatingSystem.MACOS:
+            expected_path = Path(home_dir.name) / "Library" / "Caches" / "murmly" / "murmly.sock"
+        else:
+            expected_path = Path(runtime_dir.name) / "murmly.sock"
 
-        _daemon, served_path = self.serve_config(config)
+        with patch.object(Path, "home", return_value=Path(home_dir.name)):
+            socket_path = default_socket_path({"XDG_RUNTIME_DIR": runtime_dir.name})
+            config = MurmlyConfig(
+                socket_path=socket_path,
+                config_path=Path(runtime_dir.name) / "config.toml",
+                overlay_enabled=False,
+            )
 
-        self.assertEqual(Path(runtime_dir.name) / "murmly.sock", served_path)
-        self.assertEqual(IDLE_STATUS, send_command(str(served_path), "status"))
+            _daemon, served_path = self.serve_config(config)
+
+            self.assertEqual(expected_path, served_path)
+            self.assertEqual(IDLE_STATUS, send_command(str(served_path), "status"))
 
     def test_the_daemon_refuses_a_private_directory_under_one_others_can_write(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         # The exposure is above the directory that holds the socket. Renaming
         # `wide/private` away and putting another one in its place substitutes
         # every path under it, so checking the holder alone misses this.
@@ -2735,6 +3149,8 @@ class SocketAccessTests(ServedDaemonTests):
             self.assertFalse(socket_path.exists())
 
     def test_a_directory_missing_under_one_others_can_write_is_refused(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         # Nothing exists below `wide` yet, so `wide` is where another account
         # would create the directory first and own everything under it.
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2747,18 +3163,29 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIsNotNone(detail)
         self.assertIn(str(wide), detail)
 
-    @unittest.skipUnless(
-        Path(tempfile.gettempdir()).stat().st_mode & stat.S_ISVTX,
-        "the shared temporary directory is not sticky here",
-    )
     def test_a_sticky_shared_ancestor_leaves_the_path_private(self) -> None:
-        # /tmp is world-writable and sticky, and every temporary directory in
-        # this suite sits under it. The sticky bit is exactly what stops another
-        # account renaming ours away, so it is accepted above the holder.
+        # A shared, world-writable ancestor above the directory holding the
+        # socket is accepted when it is sticky -- the sticky bit is exactly
+        # what stops another account renaming that holder away. Built by
+        # hand, the same as `test_the_sticky_bit_does_not_excuse_the_
+        # directory_holding_the_socket` below, rather than relying on
+        # `tempfile.gettempdir()` itself being sticky and world-writable:
+        # true of the traditional `/tmp` a Linux run sits under, but not of
+        # macOS's own per-user `$TMPDIR`, which is neither -- this exercised
+        # the property on Linux only, and skipped everywhere else.
         with tempfile.TemporaryDirectory() as temp_dir:
-            self.assertIsNone(socket_path_detail(Path(temp_dir) / "murmly.sock"))
+            shared = Path(temp_dir) / "shared"
+            shared.mkdir()
+            shared.chmod(0o1777)
+            holder = shared / "holder"
+            holder.mkdir()
+            holder.chmod(0o700)
+
+            self.assertIsNone(socket_path_detail(holder / "murmly.sock"))
 
     def test_the_sticky_bit_does_not_excuse_the_directory_holding_the_socket(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         # Sticky stops another account removing our entry; it does not stop one
         # creating the entry first, which is all it takes when the node is the
         # thing being created.
@@ -2773,6 +3200,8 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIn(str(shared), detail)
 
     def test_a_directory_owned_by_another_account_is_not_private(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs a real os.getuid() to patch a foreign value over")
         # A directory this account does not own can be opened up by its owner at
         # any time, so its mode right now says nothing. The comparison is
         # substituted because the suite has one account.
@@ -2784,10 +3213,18 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIn(str(temp_dir), detail)
         self.assertIn("owned by uid", detail)
 
-    @unittest.skipIf(os.getuid() == 0, "root is not bound by directory permissions")
     def test_a_startup_failure_closes_the_overlay_the_constructor_started(self) -> None:
         # The refusal happens before the socket exists, so the unwinding that
         # closes the overlay has to sit outside the socket's own.
+        if not hasattr(os, "getuid"):
+            # `chmod(0o500)` below is what makes the directory uncreatable, and
+            # Windows does not enforce POSIX mode bits that way at all -- nor
+            # does it reach this refusal by that route: a filesystem
+            # `socket_path` there is refused at construction, for an entirely
+            # different reason, before `chmod` would ever matter.
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
+        if os.getuid() == 0:
+            self.skipTest("root is not bound by directory permissions")
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         parent = Path(temp_dir.name) / "murmly"
@@ -2808,7 +3245,42 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIn(str(socket_path), str(refusal.exception))
         self.assertTrue(overlay.closed)
 
+    def test_an_uncreatable_runtime_directory_names_the_location_and_the_cause(self) -> None:
+        """2.4: a location Murmly needs and cannot create names itself and why.
+
+        `create_socket_directory` raises a bare `OSError` naming the directory
+        it tried and failed to make; `serve_forever` is what turns that into a
+        `DaemonStartupError` that also names the socket path Murmly was asked
+        to serve at, so the refusal is legible without reading `daemon.py`.
+        """
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
+        if os.getuid() == 0:
+            self.skipTest("root is not bound by directory permissions")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        parent = Path(temp_dir.name) / "murmly"
+        parent.mkdir()
+        parent.chmod(0o500)
+        self.addCleanup(parent.chmod, 0o700)
+        socket_path = parent / "nested" / "murmly.sock"
+        config = MurmlyConfig(
+            socket_path=socket_path,
+            config_path=Path(temp_dir.name) / "config.toml",
+            overlay_enabled=False,
+        )
+        daemon = MurmlyDaemon(config, session=DummySession())
+
+        with self.assertRaises(DaemonStartupError) as refusal:
+            daemon.serve_forever()
+
+        message = str(refusal.exception)
+        self.assertIn(str(socket_path), message)
+        self.assertIn("could not be created", message)
+
     def test_a_symlink_does_not_hide_the_directory_it_is_reached_through(self) -> None:
+        if not hasattr(os, "getuid"):
+            self.skipTest("needs POSIX directory permissions, which Windows does not enforce this way")
         # A caller opens the configured path, so the link is what it reaches
         # through. Judging only what the path resolves to leaves the directory
         # holding the link unexamined, and an account that can write there
@@ -2835,6 +3307,20 @@ class SocketAccessTests(ServedDaemonTests):
         self.assertIn(str(wide), chained)
 
     def test_a_socket_path_that_cannot_be_created_is_reported_as_a_refusal(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            # This test pins the profile to Linux specifically to reach
+            # `_serve_unix_socket`'s own directory-creation refusal (see the
+            # comment below), which on a real Windows interpreter means
+            # constructing a bare `socket.socket(socket.AF_UNIX, ...)`
+            # directly, bypassing the platform dispatch that would otherwise
+            # route a real Windows run to the named-pipe transport instead.
+            # CPython does not expose `socket.AF_UNIX` on Windows at all
+            # (design.md's "The command channel": Winsock has supported it
+            # since build 17063, but `python/cpython#77589` is still open),
+            # so there is no way to reach this specific refusal path on this
+            # host, only a bare `AttributeError` `_serve_unix_socket` does
+            # not, and should not, treat as a `DaemonStartupError`.
+            self.skipTest("needs socket.AF_UNIX, which this Windows Python does not expose")
         # The daemon detected this itself, so it is a refusal rather than the
         # unexpected failure the caller's backstop would otherwise report.
         temp_dir = tempfile.TemporaryDirectory()
@@ -2846,7 +3332,15 @@ class SocketAccessTests(ServedDaemonTests):
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
         )
-        daemon = MurmlyDaemon(config, session=DummySession())
+        # A filesystem path, and this test means the directory-creation
+        # refusal `serve_forever` raises for one, specifically -- not the
+        # shape-mismatch refusal an unpinned Windows resolution would raise
+        # instead, at construction, before `serve_forever` is ever reached.
+        daemon = MurmlyDaemon(
+            config,
+            session=DummySession(),
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
 
         with self.assertRaises(DaemonStartupError) as refusal:
             daemon.serve_forever()
@@ -2866,6 +3360,220 @@ class SocketAccessTests(ServedDaemonTests):
             any("cannot report the account" in line for line in logs.output),
             f"expected the startup warning, got {logs.output!r}",
         )
+
+
+def windows_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+
+def macos_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+
+
+class PeerIdentityMechanismDispatchTests(unittest.TestCase):
+    """18.7: peer identity is read by the resolved platform's own mechanism,
+    and the same mechanism supplies what it is compared against."""
+
+    def test_linux_keeps_the_existing_socket_functions(self) -> None:
+        # `peer_identity_mechanism_for`'s else branch already reads
+        # `getattr(os, "getuid", None)`, not the bare name, so calling the
+        # dispatcher itself never raises here on a real Windows interpreter
+        # (unlike the macOS branch before this change -- see
+        # `peer_identity_mechanism_for`'s own docstring). What still needs
+        # guarding is this test's own expectation: `getattr(os, "getuid",
+        # None)`, not the bare name, is what a real Windows host resolves
+        # to (`None`), while every real Linux or macOS host resolves it to
+        # the exact function `os.getuid` -- so this keeps proving the
+        # identical thing on every host instead of skipping on the one host
+        # it would otherwise fail on.
+        linux_profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+        mechanism = peer_identity_mechanism_for(linux_profile)
+
+        self.assertIs(read_peer_identity, mechanism.read)
+        self.assertIs(getattr(os, "getuid", None), mechanism.local)
+        # `peer_identity_supported(linux_profile)`, not the bare
+        # `peer_identity_supported()`: the bare call resolves the *host's*
+        # platform, which on a real macOS runner is macOS, and
+        # `peer_identity_supported` always answers True for macOS (task
+        # 13.2's `getpeereid`) regardless of what this test is asserting
+        # about. That made this assertion compare the host's answer against
+        # the explicitly-constructed Linux profile's `mechanism.supported`
+        # -- True against a real Mac's False (no `SO_PEERCRED`) -- rather
+        # than proving anything about the Linux profile this test names.
+        self.assertEqual(peer_identity_supported(linux_profile), mechanism.supported)
+
+    def test_windows_dispatches_to_the_pipes_own_mechanism(self) -> None:
+        # Proves the dispatch, and that `murmly.win_pipe` imports cleanly on
+        # this Linux machine -- calling either function is what would need
+        # `pywin32`, not naming them.
+        from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
+
+        mechanism = peer_identity_mechanism_for(windows_profile())
+
+        self.assertIs(read_peer_identity_from_pipe, mechanism.read)
+        self.assertIs(current_user_sid_string, mechanism.local)
+        self.assertTrue(mechanism.supported)
+
+    def test_windows_reports_peer_identity_supported_without_so_peercred(self) -> None:
+        self.assertTrue(peer_identity_supported(windows_profile()))
+
+    def test_a_daemon_constructed_for_windows_wires_the_pipes_mechanism(self) -> None:
+        """The dispatch is not only reachable directly -- `MurmlyDaemon.__init__`
+        actually uses it when a resolved Windows profile is supplied."""
+        from murmly.win_pipe import current_user_sid_string, read_peer_identity_from_pipe
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=windows_profile())
+
+        self.assertIs(read_peer_identity_from_pipe, daemon._peer_identity)
+        self.assertIs(current_user_sid_string, daemon._local_identity)
+
+    def test_macos_dispatches_to_getpeereid(self) -> None:
+        """Task 13.2: `getpeereid` reads a uid and nothing else, so it shares
+        the Linux branch's `os.getuid` comparison rather than needing one of
+        its own -- the same UID-only comparison `_peer_permitted` already
+        makes for every platform.
+
+        Asserted through `getattr(os, "getuid", None)`/`hasattr`, not the
+        bare name or a bare `True`: on every real macOS or Linux host
+        `os.getuid` exists, so this keeps proving the same pair
+        (`read_peer_identity_macos`, `os.getuid`) with `supported` True. On a
+        real Windows interpreter -- which only a test resolves a macOS
+        profile on, to keep this dispatch exercised on every host -- neither
+        exists, and the mechanism must report itself unsupported rather than
+        the dispatcher raising while building it (the product defect this
+        pins)."""
+        mechanism = peer_identity_mechanism_for(macos_profile())
+
+        self.assertIs(read_peer_identity_macos, mechanism.read)
+        self.assertIs(getattr(os, "getuid", None), mechanism.local)
+        self.assertEqual(hasattr(os, "getuid"), mechanism.supported)
+
+    def test_macos_reports_peer_identity_supported_without_so_peercred(self) -> None:
+        """`socket.SO_PEERCRED` does not exist on macOS's `socket` module --
+        `getpeereid` is a separate libSystem call, not a `getsockopt` option,
+        so this must not fall through to `hasattr(socket, "SO_PEERCRED")`."""
+        self.assertTrue(peer_identity_supported(macos_profile()))
+
+    def test_a_daemon_constructed_for_macos_wires_getpeereid(self) -> None:
+        """The dispatch is not only reachable directly -- `MurmlyDaemon.__init__`
+        actually uses it when a resolved macOS profile is supplied."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=macos_profile())
+
+        self.assertIs(read_peer_identity_macos, daemon._peer_identity)
+        # `getattr(os, "getuid", None)`, not the bare name -- see
+        # `test_macos_dispatches_to_getpeereid`'s own docstring: a real
+        # Windows interpreter, which only a test constructs a macOS-profiled
+        # daemon on, has no `os.getuid` at all.
+        self.assertIs(getattr(os, "getuid", None), daemon._local_identity)
+
+    def test_a_daemon_constructed_for_macos_wires_the_macos_hotkey_registrar(self) -> None:
+        """Section 13's own populator of `hotkey_mechanism_is_in_process`
+        (task 13.5): a macOS daemon must build `MacosHotkeyRegistrar`, not
+        fall through to `WindowsHotkeyRegistrar` the way an unconditional
+        dispatch would."""
+        from murmly.mac_hotkey import MacosHotkeyRegistrar
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=macos_profile())
+
+        self.assertIsInstance(daemon._hotkey_registrar, MacosHotkeyRegistrar)
+
+
+class GetpeereidRuntimeIntegrationTests(unittest.TestCase):
+    """Task 13.2, against the real `getpeereid(3)`: everything above this
+    class proves the dispatch against a resolved profile alone.
+    `getpeereid` is a BSD/Darwin libSystem function glibc does not provide
+    (confirmed on this machine: accessing the symbol through `ctypes.CDLL(None)`
+    raises `AttributeError`), so this follows
+    `WindowsPipeSecurityDescriptorIntegrationTests` (`test_platform.py`)'s
+    pattern of skipping in `setUp` on every platform but the one with the
+    mechanism, using a real `AF_UNIX` `socketpair` -- headless-provable,
+    unlike a hotkey or a paste.
+    """
+
+    def setUp(self) -> None:
+        import sys
+
+        if sys.platform != "darwin":
+            self.skipTest("A macOS kernel is required to call getpeereid")
+
+    def test_reads_this_processes_own_uid_off_a_real_socketpair(self) -> None:
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.assertEqual(os.getuid(), read_peer_identity_macos(left))
+            self.assertEqual(os.getuid(), read_peer_identity_macos(right))
+        finally:
+            left.close()
+            right.close()
+
+
+class ChannelShapeMismatchTests(unittest.TestCase):
+    """Task 7.5: a configured channel value shaped for the other platform's
+    transport is refused at startup, naming the mismatch -- never guessed at
+    or silently reinterpreted, and never run through the filesystem
+    path-privacy analysis, which does not apply to a name that is not one."""
+
+    def test_a_pipe_shaped_socket_path_is_refused_on_a_filesystem_platform(self) -> None:
+        # "A filesystem platform" is the scenario under test, not merely
+        # whichever platform the suite happens to run on: an explicit
+        # non-Windows profile is what keeps this refusal exercised even on a
+        # real Windows runner, where the unresolved default would agree with
+        # a pipe-shaped path instead of refusing it.
+        filesystem_profile = PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            with self.assertRaises(DaemonStartupError) as raised:
+                MurmlyDaemon(config, session=DummySession(), profile=filesystem_profile)
+
+        self.assertIn("named-pipe name", str(raised.exception))
+        self.assertIn("filesystem socket", str(raised.exception))
+
+    def test_a_filesystem_shaped_socket_path_is_refused_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            with self.assertRaises(DaemonStartupError) as raised:
+                MurmlyDaemon(config, session=DummySession(), profile=windows_profile())
+
+        self.assertIn("named pipe, not a filesystem path", str(raised.exception))
+
+    def test_a_pipe_shaped_socket_path_on_windows_passes_the_shape_check(self) -> None:
+        """Construction reaches past `_require_private_channel` -- the pipe
+        itself is never created here, which is what `NamedPipeServer` needs
+        `pywin32` for and this machine does not have."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(WINDOWS_PIPE_NAME),
+                config_path=Path(temp_dir) / "config.toml",
+                overlay_enabled=False,
+            )
+            daemon = MurmlyDaemon(config, session=DummySession(), profile=windows_profile())
+
+        self.assertTrue(daemon._uses_named_pipe())
 
 
 class UnaskableTranscriber:
@@ -2915,7 +3623,7 @@ class StatusResidencyTests(ServedDaemonTests):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
             **overrides,
@@ -2929,7 +3637,7 @@ class StatusResidencyTests(ServedDaemonTests):
         speech.synthesizer.resident = True
         _daemon, socket_path = self.serve_config(
             MurmlyConfig(
-                socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+                socket_path=command_channel_address(tempfile.mkdtemp()),
                 config_path=Path(tempfile.mkdtemp()) / "config.toml",
                 overlay_enabled=False,
                 tts_enabled=True,
@@ -2941,7 +3649,13 @@ class StatusResidencyTests(ServedDaemonTests):
         response = send_command(str(socket_path), "status")
 
         self.assertEqual(
-            {"ok": True, "state": "IDLE", "model_resident": True, "synthesis_resident": True},
+            {
+                "ok": True,
+                "state": "IDLE",
+                "model_resident": True,
+                "synthesis_resident": True,
+                "hotkeys_held": [],
+            },
             response,
         )
 
@@ -2954,7 +3668,7 @@ class StatusResidencyTests(ServedDaemonTests):
         speech = StubSpeechEngine()
         daemon = MurmlyDaemon(
             MurmlyConfig(
-                socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+                socket_path=command_channel_address(tempfile.mkdtemp()),
                 config_path=Path(tempfile.mkdtemp()) / "config.toml",
                 overlay_enabled=False,
                 tts_enabled=True,
@@ -2998,7 +3712,7 @@ class StatusResidencyTests(ServedDaemonTests):
         speech.synthesizer.resident = False
         _daemon, socket_path = self.serve_config(
             MurmlyConfig(
-                socket_path=Path(tempfile.mkdtemp()) / "murmly.sock",
+                socket_path=command_channel_address(tempfile.mkdtemp()),
                 config_path=Path(tempfile.mkdtemp()) / "config.toml",
                 overlay_enabled=False,
                 tts_enabled=True,

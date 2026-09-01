@@ -235,7 +235,7 @@ class OverlayRendererTests(unittest.TestCase):
         `load_layer_shell` ever runs, and layer-shell placement would then fail
         silently - the exact bug this replaced.
         """
-        source = Path(sys.modules["murmly.overlay_renderer"].__file__).read_text()
+        source = Path(sys.modules["murmly.overlay_renderer"].__file__).read_text(encoding="utf-8")
         tree = ast.parse(source)
         module_scope = [
             node
@@ -281,6 +281,7 @@ class OverlayRendererTests(unittest.TestCase):
                 ["/usr/bin/python3", str(renderer_path), "--check", "--backend", backend],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 check=False,
                 env=environment,
             )

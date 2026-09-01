@@ -55,9 +55,46 @@ import sys
 import tempfile
 import wave
 
-SOCKET_PATH = os.environ.get(
-    "MURMLY_SOCKET", f"{os.environ.get('XDG_RUNTIME_DIR', f'/run/user/{os.getuid()}')}/murmly.sock"
-)
+#: `MURMLY_SOCKET` is set on every registration `setup.sh` makes: it resolves
+#: the path once, through `murmly doctor` running under the venv (the same
+#: `murmly.config.default_socket_path` authority everything else on Linux
+#: uses), and `install_hooks.py --socket` bakes the answer into the command it
+#: registers. That is the one resolution; this script never repeats it.
+#:
+#: The literal fallback below is what answers when no such registration was
+#: made -- this script run directly, or `install_hooks.py` invoked without
+#: `--socket` because no virtual environment existed yet to ask `murmly
+#: doctor` (`./setup.sh hooks` before `./setup.sh install`). This script has
+#: no import path to `murmly` to resolve it properly at that point: it runs
+#: under the system Python with no virtual environment (see `setup.sh`'s
+#: `install_announce_hook`), copied out of a checkout that is not required to
+#: still exist by the time this runs. `openspec/changes/all-os-distributions/
+#: tasks.md` task 2.6 is about this: closed by moving the resolution to
+#: install time rather than by ever reaching it from here, which stays
+#: impossible for the reason above.
+def _default_socket_path() -> str:
+    """The fallback answer when nothing set `MURMLY_SOCKET` -- see above for
+    why its actual value should never matter on an install this hook shipped
+    behind. `os.getuid()` does not exist on Windows, which has no comparable
+    per-user runtime directory to fall back to anyway (the command channel
+    there is a named pipe, not a filesystem path -- `config.WINDOWS_PIPE_NAME`,
+    not repeated here since this script has no import path to `murmly`).
+    """
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return f"{runtime_dir}/murmly.sock"
+    if hasattr(os, "getuid"):
+        return f"/run/user/{os.getuid()}/murmly.sock"
+    return r"\\.\pipe\murmly"
+
+
+# `or`, not a default argument: `os.environ.get(key, _default_socket_path())`
+# would call `_default_socket_path()` regardless of whether `MURMLY_SOCKET` is
+# set, because Python evaluates a call's arguments before making the call --
+# which is exactly how task 2.6 stayed broken while marked done. `MURMLY_SOCKET`
+# empty is treated the same as unset; nothing sets it to the empty string on
+# purpose.
+SOCKET_PATH = os.environ.get("MURMLY_SOCKET") or _default_socket_path()
 LOG_PATH = os.environ.get("MURMLY_ANNOUNCE_LOG")
 
 # Long enough to be an account of what happened, short enough that nobody waits
@@ -95,7 +132,28 @@ CHIME_NOTES_HZ = (880.00, 1174.66, 1760.00)
 CHIME_NOTE_SECONDS = 0.13
 CHIME_ATTACK_SECONDS = 0.006
 CHIME_PEAK = 0.28
-CHIME_PLAYERS = (("pw-play",), ("paplay",), ("aplay", "-q"))
+#: Linux has three common userspace audio stacks and no way to know which one
+#: a given desktop runs without asking, so all three are tried in order and
+#: the first that exists wins. macOS ships exactly one command that always
+#: exists, so there is nothing to choose between; Windows has none at all --
+#: `play_chime` below reaches for the standard-library `winsound` module
+#: instead of a subprocess for that platform.
+LINUX_CHIME_PLAYERS: tuple[tuple[str, ...], ...] = (("pw-play",), ("paplay",), ("aplay", "-q"))
+MACOS_CHIME_PLAYERS: tuple[tuple[str, ...], ...] = (("afplay",),)
+
+
+def chime_player_candidates(platform: str = sys.platform) -> tuple[tuple[str, ...], ...]:
+    """The commands to try, in order, for a given `sys.platform` value.
+
+    Takes `platform` as a parameter rather than reading `sys.platform`
+    directly so a test can pin `"darwin"` or `"win32"` and get that
+    platform's answer on whatever machine the suite actually runs on --
+    the same reason `session_sentence` above is handed a directory instead
+    of asking `os.getcwd()`.
+    """
+    if platform == "darwin":
+        return MACOS_CHIME_PLAYERS
+    return LINUX_CHIME_PLAYERS
 
 
 def note(message: str) -> None:
@@ -359,6 +417,8 @@ def git_branch(directory: str) -> str:
             ["git", "-C", directory, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=GIT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
@@ -430,27 +490,33 @@ def play_chime() -> str:
     if os.environ.get("MURMLY_ANNOUNCE_CHIME", "1") == "0":
         return "chime disabled"
 
-    player = next((p for p in CHIME_PLAYERS if shutil.which(p[0])), None)
-    if player is None:
-        return "no audio player for the chime"
+    if sys.platform != "win32":
+        player = next((p for p in chime_player_candidates(sys.platform) if shutil.which(p[0])), None)
+        if player is None:
+            return "no audio player for the chime"
 
     override = chime_override_path()
     if os.path.isfile(override):
-        return _run_player(player, override, "chime (from " + override + ")")
+        path, label, cleanup = override, "chime (from " + override + ")", None
+    else:
+        try:
+            handle = tempfile.NamedTemporaryFile(prefix="murmly-chime-", suffix=".wav", delete=False)
+            with handle:
+                handle.write(chime_wav())
+        except OSError as error:
+            return f"chime not written: {error}"
+        path, label, cleanup = handle.name, "chime", handle.name
 
     try:
-        handle = tempfile.NamedTemporaryFile(prefix="murmly-chime-", suffix=".wav", delete=False)
-        with handle:
-            handle.write(chime_wav())
-    except OSError as error:
-        return f"chime not written: {error}"
-    try:
-        return _run_player(player, handle.name, "chime")
+        if sys.platform == "win32":
+            return _play_chime_windows(path, label)
+        return _run_player(player, path, label)
     finally:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
 
 
 def _run_player(player: tuple[str, ...], path: str, label: str) -> str:
@@ -467,20 +533,53 @@ def _run_player(player: tuple[str, ...], path: str, label: str) -> str:
     return label
 
 
+def _play_chime_windows(path: str, label: str) -> str:
+    """Play through the standard library rather than a subprocess.
+
+    Windows has no `pw-play`/`paplay`/`aplay` equivalent on every machine the
+    way Linux and macOS do, but it does ship `winsound` in the standard
+    library, which this script can use without an import path to `murmly` or
+    a third-party package. `SND_NODEFAULT` is what keeps a file `winsound`
+    cannot play from silently falling back to the system's default sound --
+    without it this would report success while playing the wrong thing.
+    """
+    try:
+        import winsound
+    except ImportError as error:
+        return f"{label} failed: {error}"
+    try:
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+    except (RuntimeError, OSError) as error:
+        return f"{label} failed: {error}"
+    return label
+
+
 # ------------------------------------------------------------- the speaking --
 
 
 class Session:
-    """One speech session on the command socket."""
+    """One speech session on the command socket.
+
+    The UNIX socket is created lazily, in `declare()`, not here: this script
+    has no import path to `murmly.win_pipe` (see `SOCKET_PATH` above for why),
+    so it has no Windows named-pipe client of its own to fall back to either.
+    Deferring construction is what lets a caller that never actually opens a
+    session -- every existing test in this file patches `declare()` itself
+    out -- go on doing that without needing `socket.AF_UNIX`, an attribute
+    Windows' `socket` module does not have at all, to exist just to be
+    constructed and immediately discarded.
+    """
 
     def __init__(self) -> None:
-        self._connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._connection: socket.socket | None = None
         self._payload = b""
 
     def __enter__(self) -> "Session":
         return self
 
     def __exit__(self, *_exception: object) -> None:
+        if self._connection is None:
+            return
         try:
             self._connection.close()
         except OSError:
@@ -488,6 +587,15 @@ class Session:
 
     def declare(self) -> str:
         """Open the session, or say why not. Empty means it is open."""
+        if not hasattr(socket, "AF_UNIX"):
+            # Honest rather than a crash: `SOCKET_PATH` already resolves to a
+            # named-pipe name on Windows (`_default_socket_path` above), but
+            # nothing here can dial it without `pywin32`, which this script,
+            # running under the system Python with no virtual environment,
+            # has no path to import from `murmly.win_pipe` even if it were
+            # installed.
+            return "no daemon: this hook has no Windows named-pipe client yet"
+        self._connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._connection.settimeout(CONNECT_TIMEOUT_SECONDS)
         try:
             self._connection.connect(SOCKET_PATH)
@@ -582,39 +690,104 @@ def announce(context: str, spoken: str, source: str) -> str:
 # ------------------------------------------------------------------- main ---
 
 
-def detach() -> bool:
-    """Put the work in a process of its own. True in the child.
+#: The argument that tells a re-invocation of this same script "you are the
+#: detached child; read a finished announcement off stdin and speak it"
+#: rather than "read a Stop payload off stdin and decide whether to
+#: announce". One script, two entry points, chosen by argv rather than a
+#: second file, because the detached process has to be this same
+#: `hooks/murmly-announce.py` -- there is nothing else on disk for
+#: `install_hooks.py` to have registered a path to.
+SPEAK_ARGV = "--speak"
 
-    Claude Code runs this hook asynchronously; Copilot's documentation does not
-    promise that, and a turn that waits out an announcement is worse than one
-    that is never announced. `setsid` is what keeps the child alive when the
-    agent exits immediately after the turn, as a non-interactive run does.
+
+def _speak_in_background(context: str, spoken: str, source: str) -> None:
+    """Hand a finished announcement to a process of its own, and return at once.
+
+    Claude Code runs this hook asynchronously; Copilot's documentation does
+    not promise that, and either way `announce()` itself can hold a
+    connection open for up to `HEARD_ALL_TIMEOUT_SECONDS` waiting to be
+    heard, which is not a turn's to wait out. `os.fork` only ever answered
+    this on POSIX. `subprocess.Popen` answers it everywhere: a new session
+    (`start_new_session=True`, POSIX's `setsid`) keeps the child alive once
+    this process's session ends, and a detached process with no console of
+    its own (`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`) is Windows'
+    equivalent, where there is no `fork` to call at all. Either way, this
+    function returns as soon as the child exists; the chiming, the speaking,
+    and the wait to be heard all happen on the child's clock, never this
+    one's.
+
+    The child is this same script, re-invoked with `SPEAK_ARGV`, reading
+    `context`/`spoken`/`source` as JSON on its own stdin -- passed that way
+    rather than as arguments so there is no command-line length limit to mind
+    for a passage up to `MAX_VOICE_NOTE_CHARACTERS` long, and encoded as
+    UTF-8 bytes explicitly because a re-invoked script's stdin is otherwise
+    decoded in the platform's locale encoding, which is not UTF-8 on Windows.
     """
-    if os.environ.get("MURMLY_ANNOUNCE_FOREGROUND") == "1":
-        return True
+    argv = [sys.executable, os.path.abspath(__file__), SPEAK_ARGV]
+    keywords: dict = {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform == "win32":
+        keywords["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        keywords["start_new_session"] = True
+
     try:
-        if os.fork() > 0:
-            return False
-    except OSError:
-        return True
+        process = subprocess.Popen(argv, **keywords)
+    except OSError as error:
+        note(f"could not start the announcement: {error}")
+        return
+
+    request = json.dumps({"context": context, "spoken": spoken, "source": source}).encode("utf-8")
     try:
-        os.setsid()
-    except OSError:
+        process.stdin.write(request)
+        process.stdin.close()
+    except (OSError, ValueError):
         pass
-    devnull = os.open(os.devnull, os.O_RDWR)
-    for descriptor in (0, 1, 2):
-        try:
-            os.dup2(devnull, descriptor)
-        except OSError:
-            pass
-    if devnull > 2:
-        os.close(devnull)
-    return True
+
+
+def _run_detached() -> int:
+    """The detached child's own entry point: speak what the parent decided.
+
+    Everything that decides *whether* to announce -- the payload, the
+    transcript, the empty-voice-note suppression -- already ran in the
+    parent, which is why this reads a finished `context`/`spoken`/`source`
+    rather than a Stop payload. `sys.stdin.buffer` is read rather than
+    `sys.stdin`, matching how `_speak_in_background` wrote it: text-mode
+    stdin decodes in the platform's locale encoding, which mangles anything
+    outside ASCII on Windows.
+    """
+    try:
+        request = json.loads(sys.stdin.buffer.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 - a broken handoff is not worth a failure
+        request = {}
+    if not isinstance(request, dict):
+        request = {}
+
+    spoken = request.get("spoken") or ""
+    if not spoken:
+        note("detached with nothing to say")
+        return 0
+
+    context = request.get("context") or ""
+    source = request.get("source") or SOURCE_SUMMARY
+
+    note(f"saying {SOURCE_LABELS.get(source, source)}: {context} | {spoken}")
+    note(f"  -> {announce(context, spoken, source)}")
+    return 0
 
 
 def main() -> int:
     try:
-        payload = json.load(sys.stdin)
+        # `sys.stdin.buffer` rather than `sys.stdin`: text-mode stdin decodes
+        # in the platform's locale encoding, which is not UTF-8 on Windows
+        # (Python 3.12/3.14 predate PEP 686's UTF-8 default) and would mangle
+        # any non-ASCII character in the agent's own message before this
+        # script ever sees it. `json.loads` accepts UTF-8 bytes directly.
+        payload = json.loads(sys.stdin.buffer.read())
     except Exception:  # noqa: BLE001 - a malformed payload is not worth a failure
         payload = {}
     if not isinstance(payload, dict):
@@ -642,16 +815,19 @@ def main() -> int:
     agent = agent_name(rows)
     context = session_sentence(agent, payload_field(payload, "cwd"))
 
-    if not detach():
+    if os.environ.get("MURMLY_ANNOUNCE_FOREGROUND") == "1":
+        note(f"saying {SOURCE_LABELS[source]}: {context} | {spoken}")
+        note(f"  -> {announce(context, spoken, source)}")
         return 0
 
-    note(f"saying {SOURCE_LABELS[source]}: {context} | {spoken}")
-    note(f"  -> {announce(context, spoken, source)}")
+    _speak_in_background(context, spoken, source)
     return 0
 
 
 if __name__ == "__main__":
     try:
+        if len(sys.argv) > 1 and sys.argv[1] == SPEAK_ARGV:
+            sys.exit(_run_detached())
         sys.exit(main())
     except Exception as error:  # noqa: BLE001 - never fail the turn
         note(f"unexpected: {error}")

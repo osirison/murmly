@@ -21,8 +21,9 @@ from murmly.audio import (
     SoundDevicePlayer,
     disable_portaudio_exit_teardown,
 )
-from murmly.config import MurmlyConfig, default_config_path, load_config
+from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, default_config_path, load_config
 from murmly.daemon import (
+    COMMAND_REBIND_HOTKEYS,
     COMMAND_STATUS,
     DaemonNotRespondingError,
     DaemonStartupError,
@@ -39,19 +40,46 @@ from murmly.installer import (
     UserService,
 )
 from murmly.integrations import (
-    ClipboardPaster,
     MissingToolError,
     PasteInjection,
     choose_clipboard_copy_command,
+    create_clipboard_paster,
     is_wayland_session,
     select_paste_injection,
 )
 from murmly.focus import FocusObserver, create_focus_observer, record_target, should_deliver
-from murmly.overlay import SYSTEM_PYTHON, detect_overlay_backend, renderer_environment
+from murmly.idle import system_memory_returnable, system_memory_unreturnable_reason
+from murmly.overlay import (
+    SYSTEM_PYTHON,
+    OverlayBackend,
+    detect_overlay_backend,
+    renderer_environment,
+    renderer_python,
+    renderer_script,
+)
+from murmly.platform import (
+    BACKEND_REGISTRIES,
+    MACOS_ACCESSIBILITY_PERMISSION,
+    PERMISSIONS,
+    PermissionState,
+    PlatformProfile,
+    SUPPORTED_OPERATING_SYSTEMS,
+    OperatingSystem,
+    environment_preconditions_for,
+    hotkey_mechanism_is_in_process,
+    microphone_permission_for,
+    resolve_platform,
+    transcription_runtime_gap,
+    runtime_gaps_for,
+    TRANSCRIPTION_CAPABILITY,
+)
 from murmly.silence import SilenceDetector
 from murmly.stt import FasterWhisperTranscriber
-from murmly.tts import CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
+from murmly.tts import COREML_PROVIDER, CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
+from murmly.win_pipe import is_pipe_name
 
+
+logger = logging.getLogger(__name__)
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -71,7 +99,7 @@ class DaemonUnavailableError(RuntimeError):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local voice-to-text for Fedora-first Linux desktops.")
+    parser = argparse.ArgumentParser(description="Local voice-to-text for Linux and Windows desktops.")
     parser.add_argument("--config", help="Path to config.toml", default=None)
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -103,6 +131,46 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     subparsers.add_parser("uninstall", help="Remove the session service and release the hotkeys.")
+
+    # Task 16.1: what `setup.sh`'s own `sync_environment` (`setup.sh:275-336`)
+    # got right, moved here so it is testable -- carrying the extras already
+    # installed across `uv sync` and reapplying the ONNX Runtime GPU swap
+    # every sync undoes. `setup.sh` becomes this subcommand's caller rather
+    # than reimplementing it: see `environment.py`'s module docstring for
+    # what stays in `setup.sh` instead. Flags mirror `setup.sh`'s own
+    # (`-y`/`--yes`, `--cuda`/`--no-cuda`, `--tts`/`--no-tts`) so `setup.sh`
+    # forwards them verbatim (task 16.5).
+    sync = subparsers.add_parser(
+        "sync",
+        help="Sync the Python environment, carrying forward the extras already installed.",
+    )
+    sync.add_argument(
+        "-y", "--yes", action="store_true", help="Answer every prompt with yes."
+    )
+    cuda_group = sync.add_mutually_exclusive_group()
+    cuda_group.add_argument(
+        "--cuda", dest="want_cuda", action="store_const", const="yes",
+        help="Install the GPU runtime extra.",
+    )
+    cuda_group.add_argument(
+        "--no-cuda", dest="want_cuda", action="store_const", const="no",
+        help="Leave the GPU runtime extra out.",
+    )
+    tts_group = sync.add_mutually_exclusive_group()
+    tts_group.add_argument(
+        "--tts", dest="want_tts", action="store_const", const="yes",
+        help="Carry speech output even on a machine that opted out of it before.",
+    )
+    tts_group.add_argument(
+        "--no-tts", dest="want_tts", action="store_const", const="no",
+        help="Leave speech output out entirely.",
+    )
+    sync.set_defaults(want_cuda="auto", want_tts="auto")
+    sync.add_argument(
+        "--project",
+        default=None,
+        help="Project directory to sync (default: the current directory).",
+    )
 
     spike = subparsers.add_parser("spike", help="Record a short clip, transcribe it, print it, and copy it.")
     spike.add_argument("--seconds", type=float, default=5.0, help="How long to record before transcribing.")
@@ -203,7 +271,36 @@ def main(argv: list[str] | None = None) -> int:
     return exit_code
 
 
+def _unsupported_platform_message(profile: PlatformProfile) -> str | None:
+    """None when `profile` is one Murmly supports; otherwise the refusal text.
+
+    Checked before any command touches a config path, a socket, or a file: a
+    partial install on a platform Murmly cannot run on is worse than none,
+    because the uninstaller for that platform does not exist to remove it.
+    """
+    if profile.supported:
+        return None
+    supported = ", ".join(supported_os.value for supported_os in SUPPORTED_OPERATING_SYSTEMS)
+    return (
+        f"murmly: unsupported platform: {profile.operating_system.value}. "
+        f"Murmly supports: {supported}."
+    )
+
+
 def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    # Resolved once and passed on from here, rather than re-resolved at each
+    # command below: this is the one call site in `cli.py` written for the
+    # platform layer, and it is what lets the refusal below run before
+    # `load_config()` touches a config path, a socket, or a file on a platform
+    # Murmly does not support. `default_runtime_dir`'s `os.getuid()` no longer
+    # raises there -- it sits behind a Linux branch now -- but a partial run on
+    # an unsupported platform is still worth refusing before it starts.
+    profile = resolve_platform()
+    unsupported = _unsupported_platform_message(profile)
+    if unsupported is not None:
+        print(unsupported, file=sys.stderr)
+        return 1
+
     config_path = Path(args.config) if args.config else default_config_path()
     try:
         config = load_config(args.config)
@@ -212,19 +309,21 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return 1
 
     if args.command == "daemon":
-        return _run_daemon(config)
+        return _run_daemon(config, profile)
     if args.command in {"toggle", "status", "toggle-session"}:
         # The daemon's command vocabulary is not the CLI's: argparse spells a
         # subcommand with a hyphen and the wire protocol does not.
         return _run_client_command(config, DAEMON_COMMANDS.get(args.command, args.command))
     if args.command == "install":
-        return _run_install(args.hotkey, args.session_hotkey)
+        return _run_install(args.hotkey, args.session_hotkey, profile=profile, config=config)
     if args.command == "uninstall":
         return _run_uninstall()
+    if args.command == "sync":
+        return _run_sync(args, profile)
     if args.command == "spike":
         return _run_spike(config, args.seconds, args.paste)
     if args.command == "doctor":
-        _run_doctor(config)
+        _run_doctor(config, profile)
         return 0
     parser.error(f"Unsupported command: {args.command}")
     return 2
@@ -316,7 +415,12 @@ def _wait_for_socket(
         sleep(DAEMON_POLL_INTERVAL_SECONDS)
 
 
-def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> int:
+def _run_install(
+    hotkey_text: str,
+    session_hotkey_text: str | None = None,
+    profile: PlatformProfile | None = None,
+    config: MurmlyConfig | None = None,
+) -> int:
     try:
         hotkey = parse_hotkey(hotkey_text)
         session_hotkey = parse_hotkey(session_hotkey_text) if session_hotkey_text else None
@@ -345,7 +449,34 @@ def _run_install(hotkey_text: str, session_hotkey_text: str | None = None) -> in
 
     for message in outcome.messages:
         print(message)
+
+    if outcome.hotkey_registered:
+        _request_hotkey_rebind(profile, config)
     return 0
+
+
+def _request_hotkey_rebind(
+    profile: PlatformProfile | None = None,
+    config: MurmlyConfig | None = None,
+) -> None:
+    """Task 5.5: reach a running daemon to rebind, since an in-process
+    registration cannot be changed by writing a file the desktop reads.
+
+    A no-op on every platform this change targets: `Installer.install` already
+    wrote the record `hotkey_record.py` reads, and `hotkey_mechanism_is_in_process`
+    is false for both `plasma` and `gnome`, so nothing is sent. Best-effort
+    where it is not a no-op: a daemon that is not running picks the new keys up
+    from the record when it next starts, so a failure to reach one now is not
+    reported as an install failure.
+    """
+    resolved_profile = profile if profile is not None else resolve_platform()
+    if not hotkey_mechanism_is_in_process(resolved_profile):
+        return
+    resolved_config = config if config is not None else load_config(default_config_path())
+    try:
+        send_command(str(resolved_config.socket_path), COMMAND_REBIND_HOTKEYS)
+    except (OSError, DaemonNotRespondingError) as error:
+        logger.debug("Could not reach the running daemon to rebind hotkeys: %s", error)
 
 
 def _run_uninstall() -> int:
@@ -360,20 +491,111 @@ def _run_uninstall() -> int:
     return 0
 
 
-def _run_daemon(config: MurmlyConfig) -> int:
+def _run_sync(args: argparse.Namespace, profile: PlatformProfile) -> int:
+    """Task 16.1's caller: `setup.sh`'s own `sync_environment` and
+    `install_system_packages`, moved into `environment.py` and reached here.
+
+    `_dispatch` has already refused an unsupported operating system before
+    this is ever reached (`_unsupported_platform_message`); `refuse_before_sync`
+    is checked again regardless, because a machine with no build of the
+    transcription runtime is a second, narrower refusal `_dispatch`'s own
+    check does not make, and because `environment.refuse_before_sync` is what
+    a fresh checkout's bootstrap needs to be able to call before `murmly` is
+    even the command doing the asking (task 16.3).
+    """
+    from murmly.environment import (
+        EnvironmentSyncError,
+        install_system_packages,
+        make_confirm,
+        refuse_before_sync,
+        refuse_or_warn_environment_preconditions,
+        sync_environment,
+    )
+
+    refusal = refuse_before_sync(profile)
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
+    # Task 16.6: declines every prompt, never assumes, when nothing is
+    # attached to the terminal and `--yes` was not given.
+    confirm = make_confirm(args.yes)
+
+    refusal = refuse_or_warn_environment_preconditions(profile, announce=print)
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
+    project_dir = Path(args.project) if args.project else Path.cwd()
+
+    if profile.operating_system is OperatingSystem.LINUX:
+        install_system_packages(
+            profile,
+            speech_output=args.want_tts != "no",
+            confirm=confirm,
+            announce=print,
+        )
+
+    try:
+        sync_environment(
+            project_dir,
+            want_cuda=args.want_cuda,
+            want_tts=args.want_tts,
+            confirm=confirm,
+            announce=print,
+        )
+    except EnvironmentSyncError as error:
+        print(f"murmly: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _run_daemon(config: MurmlyConfig, profile: PlatformProfile | None = None) -> int:
     # Wrapped rather than placed in the inner unwinding below, because every
     # return from here is the daemon process on its way out: a clean stop, a
     # startup refusal, and an exception climbing to the top all reach the exit
     # where PortAudio's teardown would otherwise run.
     try:
-        return _serve_daemon(config)
+        return _serve_daemon(config, profile)
     finally:
         disable_portaudio_exit_teardown()
 
 
-def _serve_daemon(config: MurmlyConfig) -> int:
+def _serve_daemon(config: MurmlyConfig, profile: PlatformProfile | None = None) -> int:
+    # Resolved here rather than only in `_dispatch`, so a caller that reaches
+    # `_run_daemon` directly -- every existing test does -- still gets the
+    # check without having to supply a profile of its own.
+    resolved = profile if profile is not None else resolve_platform()
+
+    gap = transcription_runtime_gap(resolved)
+    if gap is not None:
+        # The runtime's own load error is never what is shown here: it would
+        # name a missing package rather than the machine characteristic that
+        # has no build of it, and a person reading it cannot act on a loader
+        # error the way they can act on "no build exists for a musl C
+        # library".
+        print(
+            f"murmly: refusing to start. No {gap.runtime} build exists for "
+            f"{gap.characteristic}, and transcription is what Murmly is.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Everything else missing a runtime build degrades rather than refusing:
+    # the daemon still starts and serves capture, transcription and delivery,
+    # and each such capability is only logged here. `murmly doctor` is where
+    # this becomes a report a person reads (section 6), not built yet.
+    for other_gap in runtime_gaps_for(resolved):
+        if other_gap.capability != TRANSCRIPTION_CAPABILITY:
+            logger.warning(
+                "%s is unavailable: no %s build exists for %s.",
+                other_gap.capability,
+                other_gap.runtime,
+                other_gap.characteristic,
+            )
+
     try:
-        daemon = MurmlyDaemon(config)
+        daemon = MurmlyDaemon(config, profile=resolved)
     except DaemonStartupError as error:
         print(str(error), file=sys.stderr)
         return 1
@@ -407,7 +629,7 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
         return 0
     print(text)
     allowed, reason = should_deliver(observer, target, config.verify_target) if paste else (False, None)
-    paster = ClipboardPaster(
+    paster = create_clipboard_paster(
         restore_clipboard=config.restore_clipboard and allowed,
         restore_delay_ms=config.restore_clipboard_delay_ms,
     )
@@ -423,7 +645,15 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
     return 0
 
 
-def _run_doctor(config: MurmlyConfig) -> None:
+def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) -> None:
+    # Resolved once, like `_dispatch` resolves it once for every other command
+    # (task 1.3): a second `resolve_platform()` call here could in principle
+    # read a different environment than the one that decided everything else
+    # this process did. `profile` still defaults so the existing call sites --
+    # this module's own tests among them -- do not have to supply one just to
+    # exercise the machine they already run on.
+    resolved_profile = profile if profile is not None else resolve_platform()
+
     # Asked first, before any section runs and long before the report is
     # assembled. `live_transcription_diagnostics` below loads the model when live
     # transcription is enabled, and the speech probe opens the output device;
@@ -431,13 +661,30 @@ def _run_doctor(config: MurmlyConfig) -> None:
     # not what this report caused on its way past.
     (model_resident, model_resident_detail), synthesis_residency = daemon_residency(config)
 
-    try:
-        clipboard_command: list[str] | str = choose_clipboard_copy_command()
-    except MissingToolError as error:
-        clipboard_command = f"unavailable: {error}"
+    # `choose_clipboard_copy_command` has no Windows or macOS branch of its
+    # own (task 9.1's clipboard is a Win32 API call, task 14.1's an
+    # `NSPasteboard` call, neither a command to name), so this reports each
+    # platform's mechanism directly rather than asking a Linux-only chooser
+    # about a platform it was never taught. Left to fall through to the
+    # `else` branch below, a macOS profile would reach `choose_clipboard_
+    # copy_command()` with no argument -- reading this process's own
+    # environment and `PATH`, never `resolved_profile` -- find no Wayland
+    # session and no `xclip` on a real Mac, and report "unavailable: No X11
+    # clipboard command found; install xclip.", which is false: `CLIPBOARD`
+    # (`platform.py`) already resolves macOS to a working `NSPasteboard`
+    # mechanism that this field would otherwise never name.
+    if resolved_profile.operating_system is OperatingSystem.WINDOWS:
+        clipboard_command = "Win32 clipboard API (CF_UNICODETEXT)"
+    elif resolved_profile.operating_system is OperatingSystem.MACOS:
+        clipboard_command = "NSPasteboard"
+    else:
+        try:
+            clipboard_command = choose_clipboard_copy_command()
+        except MissingToolError as error:
+            clipboard_command = f"unavailable: {error}"
 
     try:
-        injection_report = paste_injection_diagnostics(select_paste_injection())
+        injection_report = paste_injection_diagnostics(select_paste_injection(profile=resolved_profile))
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         injection_report = {
             "available": False,
@@ -445,6 +692,9 @@ def _run_doctor(config: MurmlyConfig) -> None:
             "reason": f"Unable to choose a paste method: {error}",
             "remedy": [],
         }
+
+    model_cache_path, model_cache_detail = transcription_model_cache_path()
+    memory_returnable = system_memory_returnable()
 
     # Guarded like every other probe: this is the exact misconfiguration the
     # command exists to explain, and a report that stops here withholds it.
@@ -460,7 +710,17 @@ def _run_doctor(config: MurmlyConfig) -> None:
 
     session_detail: str | None = None
     try:
-        session: str | None = "wayland" if is_wayland_session() else "x11"
+        # Unchanged on Linux: `is_wayland_session()`'s own precedence still
+        # decides between the two values this field has always reported.
+        # Off Linux there is no wayland/x11 distinction to make -- Windows and
+        # macOS sessions are not display protocols in that sense -- so the
+        # field names the operating system itself rather than misreporting a
+        # non-Linux session as one of the two Linux values (task 6.3; this is
+        # the field the proposal's BREAKING note names).
+        if resolved_profile.operating_system is OperatingSystem.LINUX:
+            session: str | None = "wayland" if is_wayland_session() else "x11"
+        else:
+            session = resolved_profile.operating_system.value
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         session = None
         session_detail = f"Unable to determine the session type: {error}"
@@ -469,6 +729,20 @@ def _run_doctor(config: MurmlyConfig) -> None:
         overlay = overlay_diagnostics(config)
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         overlay = {"available": False, "detail": f"Unable to check the overlay: {error}"}
+
+    # Task 12.5: guarded like every other probe. `device_present: None` is
+    # `microphone_diagnostics`'s own answer for "could not be determined" --
+    # a probe that cannot even run must not collapse into that same value,
+    # which is why this still names the distinct top-level failure instead.
+    try:
+        microphone = microphone_diagnostics(resolved_profile)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        microphone = {
+            "device_present": None,
+            "permission": None,
+            "available": False,
+            "detail": f"Unable to check the microphone: {error}",
+        }
 
     # Guarded on its own, like every other probe: a speech stack that cannot be
     # inspected must not take the rest of the report with it.
@@ -494,57 +768,398 @@ def _run_doctor(config: MurmlyConfig) -> None:
     report: dict[str, object] = {
         "config_path": str(config.config_path),
         "socket_path": str(config.socket_path),
-        "command_socket": command_socket_diagnostics(config),
+        "command_socket": command_socket_diagnostics(config, resolved_profile),
+        "platform": platform_diagnostics(resolved_profile),
         "session": session,
+        # Unconditional, `None` where there is nothing to say. A top-level
+        # key that comes and goes with what a host has installed makes the
+        # report a different shape on different machines, which is what
+        # `platform-support`'s "The diagnostics report keeps its shape"
+        # forbids. This one only ever appeared on Linux, because the branch
+        # that can raise is the Linux one.
+        "session_detail": session_detail,
         "clipboard_command": clipboard_command,
         "paste_injection": injection_report,
         "model_profile": config.model_profile,
         "model_name": config.model_name,
+        "model_cache_path": model_cache_path,
+        # Always present, `None` where the cache could not be resolved -- like
+        # `limitations` below, this is a top-level field, and a top-level field
+        # gated on what this host happens to have installed (here,
+        # `huggingface_hub`) is exactly the platform-varying shape
+        # `platform-support`'s "diagnostics report keeps its shape" scenario
+        # forbids. A host without the project's extras -- any machine that
+        # never ran `uv sync`, a PR reviewer's checkout among them -- used to
+        # make this key vanish instead of reporting the gap.
+        "model_cache_detail": model_cache_detail,
         "device": config.device,
         "compute_type": config.compute_type,
         "runtime_device": runtime_device,
+        # Same rule. This one appeared on any machine where resolving the
+        # runtime raised -- which its own test scenario names as "the cuda
+        # extra is not installed", so it came and went with an optional
+        # dependency, exactly as `model_cache_detail` did.
+        "runtime_detail": runtime_detail,
         "runtime_compute_type": runtime_compute_type,
         "beam_size": config.beam_size,
         "vad_filter": config.vad_filter,
         "model_resident": model_resident,
+        # Always present, `None` where the daemon answered normally -- same
+        # reasoning as `model_cache_detail` above: a top-level field, so it
+        # cannot be gated on a state some hosts happen not to reach.
+        "model_resident_detail": model_resident_detail,
         # Reported even when it is zero. Zero is how release is switched off, and
         # a reader who cannot see the value cannot tell a model that will never
         # be released from one this report forgot to mention.
         "unload_after_idle_s": config.unload_after_idle_s,
+        # One answer for both models: they share a process and an allocator, so
+        # whether a release's freed memory reaches the system is the same fact
+        # for the transcription model and the synthesis session alike.
+        "system_memory_returnable": memory_returnable,
+        # Always present, `None` where memory is returnable. Derived from the
+        # value reported just above rather than by calling the reason function
+        # unconditionally: the two would otherwise be answered independently and
+        # could disagree, which is what "returnable: true" alongside a detail
+        # saying no C library could be found would be. The old conditional made
+        # this key present only where the allocator cannot be asked, the same
+        # top-level shape violation as `model_cache_detail` above.
+        "system_memory_returnable_detail": (
+            None if memory_returnable else system_memory_unreturnable_reason()
+        ),
         "live_transcription": live_transcription_diagnostics(config),
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
         "speech_output": speech,
+        "microphone": microphone,
         "installation": installation_diagnostics(),
     }
-    if session_detail is not None:
-        report["session_detail"] = session_detail
-    if runtime_detail is not None:
-        report["runtime_detail"] = runtime_detail
-    if model_resident_detail is not None:
-        report["model_resident_detail"] = model_resident_detail
     print(json.dumps(report, indent=2))
 
 
-def command_socket_diagnostics(config: MurmlyConfig) -> dict[str, object]:
+def transcription_model_cache_path() -> tuple[str | None, str | None]:
+    """Where `huggingface_hub` resolves its cache, and nothing this reports could
+    have moved.
+
+    Deliberately not one of Murmly's own locations: `faster-whisper` downloads
+    the transcription model through `huggingface_hub`, whose own default --
+    `~/.cache/huggingface/hub` on every operating system, not
+    `~/Library/Caches` and not `%LOCALAPPDATA%` -- would be re-derived wrongly by
+    guessing at it here, and moving it with `WhisperModel(download_root=)` would
+    strand the 1.6 GB an existing install already has cached under the Hub's own
+    answer. So this asks `huggingface_hub` for the path it actually resolved to,
+    through a deferred import: `murmly doctor` should not pay to import it on a
+    machine where transcription never runs.
+    """
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return None, f"Unable to determine the transcription model cache: {error}"
+    return HF_HUB_CACHE, None
+
+
+def platform_diagnostics(profile: PlatformProfile) -> dict[str, object]:
+    """The `platform` section of `murmly doctor` (task 6.1).
+
+    Names the resolved platform, and for each of the eight platform-dependent
+    concerns in `BACKEND_REGISTRIES`, the mechanism it selected or the reason
+    none was. `BackendChoice.remedy` is what decides whether an unavailable
+    concern's report may say what to install: empty renders as "the platform
+    offers none", non-empty as what to install, enable, or grant -- the
+    distinction is read off that field, never re-derived by inspecting
+    `reason`'s wording (see `BackendChoice`'s docstring).
+
+    Every concern is a key in the returned `concerns` mapping on every
+    platform, present whether or not this platform can serve it, which is what
+    keeps this section's shape identical everywhere (task 6.5, 18.17): a
+    concern this platform cannot serve is `available: False` with a reason,
+    never a key the report omits.
+
+    A concern whose mechanism is gated behind a permission must AND that
+    permission's state into its own `available`: a present mechanism whose
+    permission is denied is not an available concern, and deriving
+    `available` from `BackendChoice.available` alone would report it as one.
+    `paste_injection` on macOS is the first, and so far only, case: `macos`
+    is genuinely a registered candidate there (`BackendChoice.available` is
+    correctly `True` -- the mechanism, `CGEventPost`, exists on this
+    platform), but whether it can be *used* also depends on the Accessibility
+    grant `MACOS_ACCESSIBILITY_PERMISSION` names, which is not something
+    `BackendCandidate.supports` can express: that predicate answers "does
+    this platform have this mechanism at all", a fact about the platform, not
+    "has this person granted it", a fact about this installation that can
+    change without the platform changing. `permissions` below still renders
+    every applicable entry as its own section regardless -- this AND is
+    additional, not a replacement for it, since a person reading `doctor`
+    should see *which* permission is the reason `paste_injection` reads
+    unavailable, not just that it does.
+    """
+    concerns: dict[str, object] = {}
+    for concern, registry in BACKEND_REGISTRIES.items():
+        choice = registry.select(profile)
+        concern_report: dict[str, object] = {
+            "mechanism": choice.mechanism,
+            "available": choice.available,
+        }
+        if not choice.available:
+            concern_report["reason"] = choice.reason
+            concern_report["remedy"] = list(choice.remedy)
+        # Task 13.7. Reported for a mechanism that *is* available, unlike
+        # `reason` and `remedy`, which describe an absence and its fix. These
+        # are permanent properties of a working mechanism, and the only place
+        # a person can learn them: a macOS hotkey that is silent in one
+        # application and fine in every other looks exactly like a defect in
+        # Murmly from outside.
+        #
+        # Always present, empty where the mechanism has none. `reason` and
+        # `remedy` may be gated on `available` because that is a state every
+        # platform can be in; a key gated on *which* mechanism was selected
+        # would be present on macOS and absent on Linux, which is the
+        # platform-varying report shape `platform-support` forbids.
+        concern_report["limitations"] = list(choice.limitations)
+        concerns[concern] = concern_report
+
+    if profile.operating_system is OperatingSystem.MACOS and concerns["paste_injection"]["available"]:
+        accessibility = PERMISSIONS[MACOS_ACCESSIBILITY_PERMISSION]
+        try:
+            accessibility_state = accessibility.check(profile)
+        except Exception:  # noqa: BLE001 - a permission check must not raise
+            accessibility_state = PermissionState.UNDETERMINED
+        # Never reported available on an ungranted *or* an undetermined
+        # grant -- the same "silence is never claimed as a grant" rule this
+        # function already applies to `permissions` below, applied here to
+        # the concern the grant gates rather than only to the grant itself.
+        if accessibility_state is not PermissionState.GRANTED:
+            paste_injection = concerns["paste_injection"]
+            paste_injection["available"] = False
+            paste_injection["reason"] = "The Accessibility permission has not been granted to Murmly."
+            paste_injection["remedy"] = [f"Grant it in {accessibility.grant_location}."]
+
+    permissions: dict[str, object] = {}
+    for name, permission in PERMISSIONS.items():
+        # Filtered before the check runs, not only before rendering: a
+        # platform this permission does not apply to must not pay for -- or
+        # be reported on the strength of -- a check written for a different
+        # operating system (task 9.5's Windows registry read has no meaning
+        # to run against a Linux profile, and no `winreg` module to run it
+        # with).
+        if not permission.applies(profile):
+            continue
+        try:
+            state = permission.check(profile)
+        except Exception as error:  # noqa: BLE001 - a permission check must not raise
+            # Coerced to undetermined rather than propagated: a check that
+            # fails to run is exactly as uninformative about the grant as a
+            # platform that offers no way to read it, and the spec forbids
+            # reporting either as granted.
+            state = PermissionState.UNDETERMINED
+            permissions[name] = {
+                "capability": permission.capability,
+                "state": state.value,
+                "grant_location": permission.grant_location,
+                "detail": f"Unable to determine whether {name} is granted: {error}",
+            }
+            continue
+        permissions[name] = {
+            "capability": permission.capability,
+            "state": state.value,
+            "grant_location": permission.grant_location,
+        }
+
+    return {
+        "operating_system": profile.operating_system.value,
+        "supported": profile.supported,
+        "architecture": profile.architecture,
+        "libc": profile.libc,
+        "desktop": profile.desktop.value,
+        "concerns": concerns,
+        "permissions": permissions,
+        # Tasks 11.5, 11.6: machine settings that change what installing or
+        # running Murmly costs without blocking any capability outright, so
+        # they are their own section rather than folded into `permissions`
+        # (`EnvironmentPrecondition`'s docstring has the distinction) or
+        # `concerns` (neither gates a registry entry). `windows-long-paths`
+        # is chiefly an install-time fact; `murmly install`'s bootstrap
+        # (section 16) checks it before `uv sync` runs, where it can still
+        # change anything -- this is the ongoing report for a machine already
+        # running Murmly, same relationship `concerns` has to the registries
+        # it also reports.
+        "environment": environment_preconditions_for(profile),
+    }
+
+
+def microphone_diagnostics(profile: PlatformProfile) -> dict[str, object]:
+    """Task 12.5: distinguish a denied microphone from an absent device.
+
+    The two are identical from inside a stream: both are an open device that
+    delivers nothing, or on macOS under TCC, a device that never opens and
+    raises nothing either. Neither fact is legible from inside the capture
+    path itself (`audio.py`'s `SoundDeviceRecorder`), so this reads both from
+    outside it, the same way design.md's "the whole difficulty" is framed:
+
+    * `device_present` -- whether PortAudio enumerates any input-capable
+      device at all, through `sounddevice.query_devices()`. This is pure
+      hardware enumeration and needs no permission on any of the three
+      platforms; it answers even where the permission check below cannot.
+    * `permission` -- the platform's own microphone grant, via
+      `microphone_permission_for`, `None` on a platform (Linux, today) that
+      gates nothing behind one.
+
+    `available` is the two combined, and the priority order between them
+    matters: a runner with no device at all and an unreadable or denied
+    permission -- a headless macOS CI runner is exactly this machine -- MUST
+    report "no device", never "denied". Reporting "denied" there would claim
+    a false thing: that a working microphone exists but is locked away,
+    when the truer and more useful fact is that there is no microphone to
+    lock. Device absence is therefore checked first and, when true, is the
+    whole reason -- the permission's state is still included in the report
+    for completeness, but never overrides the device-absence detail.
+
+    Task 12.6: even where every readable fact is good -- a device is present
+    and the permission reads granted -- this does not say the capture path
+    works. That is exactly the case design.md's largest risk hides in: a
+    launchd-started daemon can have both a granted permission and a real
+    device enumerable and still receive nothing, because TCC's grant was
+    never attributed to the process launchd started in the first place
+    (tasks 12.1-12.4, none of them provable from a headless CI runner or a
+    Linux machine). So the good case still carries a `detail` naming that,
+    on macOS specifically, rather than reporting `available: true` as if
+    end-to-end capture were confirmed.
+    """
+    device_present: bool | None
+    device_detail: str | None = None
+    try:
+        import sounddevice
+
+        devices = sounddevice.query_devices()
+        device_present = any(int(device["max_input_channels"]) > 0 for device in devices)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        device_present = None
+        device_detail = f"Unable to enumerate audio devices: {error}"
+
+    permission_entry: dict[str, object] | None = None
+    permission = microphone_permission_for(profile)
+    if permission is not None:
+        try:
+            state = permission.check(profile)
+        except Exception as error:  # noqa: BLE001 - a permission check must not raise
+            state = PermissionState.UNDETERMINED
+            permission_entry = {
+                "capability": permission.capability,
+                "state": state.value,
+                "grant_location": permission.grant_location,
+                "detail": f"Unable to determine whether the microphone permission is granted: {error}",
+            }
+        else:
+            permission_entry = {
+                "capability": permission.capability,
+                "state": state.value,
+                "grant_location": permission.grant_location,
+            }
+
+    report: dict[str, object] = {
+        "device_present": device_present,
+        "permission": permission_entry,
+    }
+    if device_detail is not None:
+        report["device_detail"] = device_detail
+
+    if device_present is False:
+        report["available"] = False
+        report["detail"] = "No microphone input device was found."
+    elif device_present is None:
+        report["available"] = False
+        report["detail"] = "Unable to determine whether a microphone input device is present."
+    elif permission_entry is not None and permission_entry["state"] == PermissionState.DENIED.value:
+        report["available"] = False
+        report["detail"] = (
+            f"Microphone access is denied. Grant it at {permission_entry['grant_location']}."
+        )
+    elif permission_entry is not None and permission_entry["state"] == PermissionState.UNDETERMINED.value:
+        report["available"] = False
+        report["detail"] = "Whether microphone access is granted could not be determined."
+    elif profile.operating_system is OperatingSystem.MACOS:
+        # A device is present and the permission reads granted (or macOS
+        # gates nothing this check found undetermined) -- but that is not
+        # proof a launchd-started daemon actually receives audio (task
+        # 12.6). Reported available, since every readable fact is good, but
+        # named as unverified rather than confirmed end to end.
+        report["available"] = True
+        report["detail"] = (
+            "A microphone device is present and its permission is not denied, but capture under "
+            "a launchd-started daemon is not yet verified end to end (tasks 12.1-12.4)."
+        )
+    else:
+        report["available"] = True
+    return report
+
+
+def command_socket_diagnostics(
+    config: MurmlyConfig, profile: PlatformProfile | None = None
+) -> dict[str, object]:
     """Who can reach the command socket, for `murmly doctor`.
 
     Reported, never refused. Only the daemon refuses to start on a path another
     account can write, because every command loads this configuration and the
-    command that exists to explain the condition must keep running.
+    command that exists to explain the condition must keep running -- the
+    `command-interface` spec's "Other commands still run when the daemon would
+    refuse" scenario.
+
+    Task 7.5: `socket_path_detail`'s directory-privacy analysis presumes a
+    filesystem object, which a pipe name is not, so a pipe-shaped configured
+    value skips it entirely rather than being walked as a filesystem path. The
+    same presumption runs the other way on Windows: `socket_path_detail` reads
+    `os.stat().st_uid` through `os.getuid()`, an attribute Windows' `os` module
+    does not have at all, so a filesystem-shaped value configured on a Windows
+    resolution -- the mismatch `MurmlyDaemon._require_private_channel` refuses
+    at startup -- is reported here rather than walked, the same way the
+    reverse mismatch already is. This function reports and never refuses, so
+    it cannot let that mismatch reach `socket_path_detail` and crash instead.
     """
-    detail = socket_path_detail(config.socket_path)
+    resolved = profile if profile is not None else resolve_platform()
+    path = str(config.socket_path)
     report: dict[str, object] = {
-        "path": str(config.socket_path),
-        "path_private": detail is None,
-        "peer_identity_supported": peer_identity_supported(),
+        "path": path,
+        "peer_identity_supported": peer_identity_supported(resolved),
     }
-    if detail is not None:
-        report["detail"] = detail
+    if is_pipe_name(path):
+        # A named pipe's DACL is built owner-only unconditionally (task 7.2),
+        # so any pipe-shaped value is private wherever Windows is the platform
+        # actually serving it; a pipe-shaped value configured anywhere else is
+        # the mismatch `MurmlyDaemon._require_private_channel` also refuses.
+        report["path_private"] = resolved.operating_system is OperatingSystem.WINDOWS
+        if resolved.operating_system is not OperatingSystem.WINDOWS:
+            report["detail"] = (
+                f"{path} is a Windows named-pipe name, but "
+                f"{resolved.operating_system.value} serves its command channel as "
+                "a filesystem socket."
+            )
+    elif resolved.operating_system is OperatingSystem.WINDOWS:
+        report["path_private"] = False
+        report["detail"] = (
+            f"{path} is a filesystem path, but Windows serves its command "
+            "channel as a named pipe, so this daemon cannot create it "
+            f"privately. Configure daemon.socket_path as a pipe name such as "
+            f"{WINDOWS_PIPE_NAME}."
+        )
+    else:
+        try:
+            detail = socket_path_detail(config.socket_path)
+        except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+            # `socket_path_detail` reads `os.stat().st_uid` through
+            # `os.getuid()` for a resolved profile the caller says is Linux or
+            # macOS -- true of every real machine that profile could name,
+            # but a test may deliberately resolve one of those profiles on a
+            # real Windows interpreter, to keep this section's Linux/macOS
+            # behaviour exercised on every host, which has no `os.getuid` for
+            # it to find at all. This function reports and never refuses, so
+            # that mismatch is named rather than left to crash the report.
+            detail = f"Unable to determine whether {path} is private: {error}"
+        report["path_private"] = detail is None
+        if detail is not None:
+            report["detail"] = detail
     if not report["peer_identity_supported"]:
         report["peer_identity_detail"] = (
             "This platform cannot report the account behind a connection. The "
-            "command socket is protected by its file permissions alone."
+            "command channel is protected by its own access control alone."
         )
     return report
 
@@ -779,12 +1394,21 @@ def synthesis_providers(config: MurmlyConfig) -> tuple[list[str], str | None]:
 
 
 def _processor_name(provider: str) -> str:
-    """An execution provider in the vocabulary `[tts] device` is written in.
+    """The processor an execution provider actually ran on, for `device_in_use`.
 
-    So the two can be read as a pair -- what was asked for, and what is in use.
-    A provider name does not compare against a device setting.
+    `cuda` and `cpu` are also `[tts] device`'s own vocabulary, so those two
+    read as a pair against what was asked for. `coreml` is not: nobody sets
+    `[tts] device = "coreml"` (`config.VALID_DEVICES` never grew that value,
+    task 15.4), only `auto`'s own resolution reaches for it on macOS -- so
+    this name exists to report faithfully what ran, not to echo a setting
+    back. Reporting a CoreML session as `cpu` would hide the one accelerator
+    macOS synthesis has.
     """
-    return "cuda" if provider == CUDA_PROVIDER else "cpu"
+    if provider == CUDA_PROVIDER:
+        return "cuda"
+    if provider == COREML_PROVIDER:
+        return "coreml"
+    return "cpu"
 
 
 def negotiated_output(
@@ -1037,6 +1661,19 @@ def delivery_diagnostics(
     return report
 
 
+#: Every key a renderer's own `--check` report can contribute, regardless of
+#: which renderer answered. Keeping both renderers' keys in one place, copied
+#: unconditionally into every report's defaults below, is what keeps the
+#: `platform-support` spec's "the diagnostics report keeps its shape"
+#: requirement true here too: a GTK4-only report on Linux still carries
+#: `pyside6`/`qt_version` (as their does-not-apply defaults), and a Qt-only
+#: report on Windows still carries `pygobject`/`gtk4`/etc, rather than the
+#: field set depending on which platform answered.
+_GTK4_CHECK_KEYS: tuple[str, ...] = ("pygobject", "gtk4", "gdk_x11", "native_x11", "gtk4_layer_shell")
+_QT_CHECK_KEYS: tuple[str, ...] = ("pyside6", "qt_version")
+_RENDERER_CHECK_KEYS: tuple[str, ...] = ("system_python", *_GTK4_CHECK_KEYS, *_QT_CHECK_KEYS)
+
+
 def overlay_diagnostics(
     config: MurmlyConfig,
     env: dict[str, str] | None = None,
@@ -1044,23 +1681,38 @@ def overlay_diagnostics(
     helper_path: Path | None = None,
 ) -> dict[str, object]:
     environment = env if env is not None else os.environ
-    desktop = environment.get("XDG_CURRENT_DESKTOP") or environment.get("XDG_SESSION_DESKTOP", "")
-    session = "wayland" if is_wayland_session(environment) else "x11"
+    profile = resolve_platform(environment)
     backend = detect_overlay_backend(environment)
+    if profile.operating_system is OperatingSystem.LINUX:
+        desktop = environment.get("XDG_CURRENT_DESKTOP") or environment.get("XDG_SESSION_DESKTOP", "")
+        session = "wayland" if is_wayland_session(environment) else "x11"
+    else:
+        # No wayland/x11 distinction to misreport off Linux (task 6.3's same
+        # reasoning, applied to this report's own `session`/`desktop` fields
+        # rather than only the top-level one): the platform itself is what
+        # both name instead.
+        desktop = profile.operating_system.value
+        session = profile.operating_system.value
     supported_session = backend is not None
-    renderer_path = (helper_path or Path(__file__).with_name("overlay_renderer.py")).resolve()
+    renderer_path = (helper_path or renderer_script(backend if backend is not None else OverlayBackend.X11)).resolve()
     report: dict[str, object] = {
         "enabled": config.overlay_enabled,
         "desktop": desktop or "unknown",
         "session": session,
         "backend": backend.value if backend is not None else None,
         "supported_session": supported_session,
-        "system_python": str(SYSTEM_PYTHON),
+        # Backend-specific once there is a second renderer to disagree with
+        # this: no backend has been selected yet where `backend` is None, so
+        # this reports the interpreter Linux's own renderer needs, same as it
+        # always has.
+        "system_python": str(renderer_python(backend) if backend is not None else SYSTEM_PYTHON),
         "pygobject": False,
         "gtk4": None,
         "gdk_x11": False,
         "native_x11": False,
         "gtk4_layer_shell": False,
+        "pyside6": False,
+        "qt_version": None,
         "available": False,
     }
     if backend is None:
@@ -1071,9 +1723,11 @@ def overlay_diagnostics(
         return report
     try:
         result = run_command(
-            [str(SYSTEM_PYTHON), str(renderer_path), "--check", "--backend", backend.value],
+            [str(renderer_python(backend)), str(renderer_path), "--check", "--backend", backend.value],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=5,
             # The environment the renderer is launched with, not this process's:
@@ -1083,14 +1737,7 @@ def overlay_diagnostics(
         helper_report = json.loads(result.stdout)
         if not isinstance(helper_report, dict):
             raise ValueError("Overlay helper returned a non-object report.")
-        for key in (
-            "system_python",
-            "pygobject",
-            "gtk4",
-            "gdk_x11",
-            "native_x11",
-            "gtk4_layer_shell",
-        ):
+        for key in _RENDERER_CHECK_KEYS:
             if key in helper_report:
                 report[key] = helper_report[key]
         runtime_available = bool(helper_report.get("available")) and result.returncode == 0

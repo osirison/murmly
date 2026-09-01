@@ -12,6 +12,7 @@ from murmly.desktop import (
     detect_desktop_session,
 )
 from murmly.overlay import OverlayBackend
+from murmly.platform import Desktop
 
 
 def recorded(stdout: str = "", returncode: int = 0, stderr: str = ""):
@@ -208,14 +209,43 @@ class SessionDetectionTests(unittest.TestCase):
         self.assertFalse(session.verified)
         self.assertIn("unverified", session.detail)
 
-    def test_non_plasma_is_unsupported(self) -> None:
+    def test_gnome_wayland_is_supported_but_unverified(self) -> None:
+        # Task 4: GNOME is now a desktop Murmly registers hotkeys on, not one
+        # of the reasons registration is refused. Superseded (was
+        # `test_non_plasma_is_unsupported`, asserting the opposite): unverified
+        # end-to-end, matching Plasma-on-Wayland's own honesty rather than
+        # claiming a mechanism Murmly has never run against a live session.
         session = detect_desktop_session(
             {"XDG_CURRENT_DESKTOP": "GNOME", "XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"}
         )
 
         self.assertFalse(session.is_plasma)
+        self.assertEqual(Desktop.GNOME, session.desktop)
+        self.assertTrue(session.supported)
+        self.assertFalse(session.verified)
+        self.assertIn("unverified", session.detail)
+        self.assertEqual(OverlayBackend.WAYLAND, session.backend)
+
+    def test_gnome_without_a_display_is_unsupported(self) -> None:
+        session = detect_desktop_session({"XDG_CURRENT_DESKTOP": "GNOME", "XDG_SESSION_TYPE": "wayland"})
+
+        self.assertFalse(session.supported)
+        self.assertIn("GNOME", session.detail)
+        self.assertIn("no graphical display", session.detail)
+
+    def test_a_desktop_with_no_hotkey_backend_is_unsupported(self) -> None:
+        # Distinct from the platform lacking a backend at all: this is a
+        # desktop's own limitation, so the message names the desktops Murmly
+        # does support rather than claiming Linux itself has none.
+        session = detect_desktop_session(
+            {"XDG_CURRENT_DESKTOP": "XFCE", "XDG_SESSION_TYPE": "x11", "DISPLAY": ":0"}
+        )
+
+        self.assertFalse(session.is_plasma)
+        self.assertEqual(Desktop.OTHER, session.desktop)
         self.assertFalse(session.supported)
         self.assertIn("KDE Plasma", session.detail)
+        self.assertIn("GNOME", session.detail)
 
     def test_plasma_without_a_display_is_unsupported(self) -> None:
         session = detect_desktop_session({"XDG_CURRENT_DESKTOP": "KDE", "XDG_SESSION_TYPE": "x11"})
@@ -274,6 +304,7 @@ class LiveSessionTests(unittest.TestCase):
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             check=False,
             timeout=5,
         )

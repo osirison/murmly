@@ -8,6 +8,7 @@ import logging
 from typing import Protocol
 
 from murmly.integrations import is_wayland_session
+from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
 
 
 logger = logging.getLogger(__name__)
@@ -208,11 +209,45 @@ def _decode_window_class(value: object) -> str | None:
     return parts[-1].decode("utf-8", "replace")
 
 
+def _load_windows_focus_observer() -> FocusObserver:
+    from murmly.win_focus import WindowsFocusObserver
+
+    return WindowsFocusObserver()
+
+
+def _load_macos_focus_observer() -> FocusObserver:
+    from murmly.mac_focus import MacosFocusObserver
+
+    return MacosFocusObserver()
+
+
 def create_focus_observer(
     env: dict[str, str] | None = None,
     x11_loader: Callable[[], ctypes.CDLL] = _load_x11,
+    profile: PlatformProfile | None = None,
+    windows_focus_observer: Callable[[], FocusObserver] = _load_windows_focus_observer,
+    macos_focus_observer: Callable[[], FocusObserver] = _load_macos_focus_observer,
 ) -> FocusObserver:
-    """Classify the session once: verifying, or unverified and delivering as before."""
+    """Classify the session once: verifying, or unverified and delivering as before.
+
+    `profile` takes the place `env` cannot fill (task 9.4): `resolve_platform`
+    reads the operating system from `sys.platform`, not from `env`, so a test
+    exercising the Windows branch from this Linux machine supplies a
+    `PlatformProfile` directly rather than an environment mapping -- the same
+    reason `select_paste_injection` and `create_clipboard_paster` take one.
+
+    The macOS branch (task 14.6) is checked before `is_wayland_session`:
+    `wayland_display`/`session_type` are Linux concepts that hold their
+    uninformative defaults (`False`/`""`) on every other platform, so without
+    this branch a macOS profile would fall straight through to the X11
+    loader below and fail there with "libX11 is required", a Linux-shaped
+    error that names nothing a person on macOS could act on.
+    """
+    resolved = profile if profile is not None else resolve_platform(env)
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        return windows_focus_observer()
+    if resolved.operating_system is OperatingSystem.MACOS:
+        return macos_focus_observer()
     if is_wayland_session(env):
         return NullFocusObserver("Delivery target verification requires an X11 session.")
     try:

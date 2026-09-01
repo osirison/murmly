@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tempfile
 import threading
 import time
 import unittest
 import wave
 from importlib.metadata import PackageNotFoundError
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import Mock
 from unittest.mock import patch
 
+from module_stubs import injected_module
+
 from murmly.config import MurmlyConfig
-from murmly.stt import FasterWhisperTranscriber
+from murmly.platform import OperatingSystem, PlatformProfile
+from murmly.stt import (
+    CTRANSLATE2_CUDA_DLL_DIRECTORIES,
+    FasterWhisperTranscriber,
+    add_cuda_dll_directories,
+)
 
 
 # A gate a test forgot to open fails that test rather than hanging the suite.
@@ -220,6 +228,19 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 FasterWhisperTranscriber.resolve_runtime(config)
 
     def test_cuda_runtime_loads_libraries_from_installed_distributions(self) -> None:
+        # `ctypes.RTLD_GLOBAL` turns out to be defined on every host this
+        # suite has actually run on, Windows included -- confirmed by this
+        # test running rather than skipping on Windows CI and failing
+        # downstream instead, on the two things below that really do differ
+        # by host. There is no platform left to skip this for.
+        #
+        # An explicit Linux profile, not the host's own: since task 11.1,
+        # `load_cuda_libraries` dispatches Windows to `add_cuda_dll_directories`
+        # instead (`test_windows_dispatches_to_add_cuda_dll_directories`
+        # below), so a real Windows CI runner would otherwise take that branch
+        # here and never reach the `ctypes.CDLL`/`RTLD_GLOBAL` path this test
+        # exists to exercise. This is a provenance-check test, not a claim
+        # about what any one host actually runs in production.
         relative_paths = [
             "nvidia/cublas/lib/libcublasLt.so.12",
             "nvidia/cublas/lib/libcublas.so.12",
@@ -230,10 +251,26 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             for relative_path in relative_paths:
                 library_path = environment_path / relative_path
                 library_path.parent.mkdir(parents=True, exist_ok=True)
-                library_path.touch(mode=0o644)
+                # Read-only, not 0o644: `trusted_library_path` refuses a
+                # writable library (`st_mode & 0o022`), and Windows' CRT
+                # derives `st_mode` from the FILE_ATTRIBUTE_READONLY flag
+                # alone -- any owner-write bit in `mode` clears it, which
+                # synthesizes `0o666` there regardless of the group/other
+                # bits this call actually asks for. 0o444 is the one mode
+                # both platforms agree reports as non-writable.
+                library_path.touch(mode=0o444)
 
             package = SimpleNamespace(
-                files=[Path(path) for path in relative_paths],
+                # `importlib.metadata.Distribution.files` returns
+                # `PackagePath` entries -- a `PurePosixPath` subclass,
+                # unconditionally, because a wheel's RECORD always spells its
+                # paths with forward slashes -- so `trusted_library_path`'s
+                # `str(file) == relative_path` compares two forward-slash
+                # strings on every host. Standing this fixture up with a bare
+                # `Path` instead renders backslashes on Windows, so it never
+                # matches `relative_path` there and the runtime is reported
+                # unavailable rather than loaded.
+                files=[PurePosixPath(path) for path in relative_paths],
                 locate_file=lambda path: environment_path / path,
             )
             with (
@@ -241,12 +278,179 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 patch("murmly.stt.sys.prefix", temp_dir),
                 patch("murmly.stt.ctypes.CDLL") as load_library,
             ):
-                loaded = FasterWhisperTranscriber._load_cuda_runtime()
+                loaded = FasterWhisperTranscriber._load_cuda_runtime(
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+                )
+
+        self.assertTrue(loaded)
+        # `trusted_library_path` loads `unresolved_path.resolve(strict=True)`,
+        # not the literal joined path: on macOS, `tempfile.TemporaryDirectory`
+        # lands under `/var/folders/...`, itself a symlink to
+        # `/private/var/folders/...`, so the path actually handed to
+        # `ctypes.CDLL` is the resolved one. Resolving the expected paths the
+        # same way is a no-op on Linux, where no such symlink sits in the way.
+        self.assertEqual(
+            [str((environment_path / path).resolve()) for path in relative_paths],
+            [call.args[0] for call in load_library.call_args_list],
+        )
+
+    def test_windows_dispatches_to_add_cuda_dll_directories(self) -> None:
+        """Task 11.1: Windows never reaches the `RTLD_GLOBAL` loop above.
+
+        `RTLD_GLOBAL` has no Windows counterpart; `ctypes.CDLL` is never
+        called on this branch at all.
+        """
+        with (
+            patch("murmly.stt.add_cuda_dll_directories", return_value=True) as add_directories,
+            patch("murmly.stt.ctypes.CDLL") as load_library,
+        ):
+            loaded = FasterWhisperTranscriber._load_cuda_runtime(
+                PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+            )
+
+        self.assertTrue(loaded)
+        add_directories.assert_called_once_with(CTRANSLATE2_CUDA_DLL_DIRECTORIES)
+        load_library.assert_not_called()
+
+    def test_add_cuda_dll_directories_registers_each_trusted_directory(self) -> None:
+        """The mechanism `test_windows_dispatches_to_add_cuda_dll_directories`
+        mocks out: real provenance checks, against fixture directories laid
+        out the way task 11.1's report found the real `win_amd64` wheels to
+        be -- a `bin` directory per package, not a single named file.
+
+        `add_dll_directory` is injected because the real `os.add_dll_directory`
+        does not exist on this host at all (it is defined only under
+        `sys.platform == "win32"`), which is exactly why
+        `add_cuda_dll_directories` takes it as a parameter rather than
+        reading `os.add_dll_directory` directly.
+        """
+        relative_dirs = ["nvidia/cublas/bin", "nvidia/cudnn/bin"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment_path = Path(temp_dir)
+            file_records = []
+            for relative_dir in relative_dirs:
+                directory = environment_path / relative_dir
+                directory.mkdir(parents=True, exist_ok=True)
+                dll_name = "cublas64_12.dll" if "cublas" in relative_dir else "cudnn64_9.dll"
+                (directory / dll_name).touch()
+                file_records.append(PurePosixPath(f"{relative_dir}/{dll_name}"))
+
+            package = SimpleNamespace(
+                files=file_records,
+                locate_file=lambda path: environment_path / path,
+            )
+            registered: list[str] = []
+            with (
+                patch("murmly.stt.distribution", return_value=package),
+                patch("murmly.stt.sys.prefix", temp_dir),
+            ):
+                loaded = add_cuda_dll_directories(
+                    tuple(
+                        ("nvidia-cublas-cu12" if "cublas" in path else "nvidia-cudnn-cu12", path)
+                        for path in relative_dirs
+                    ),
+                    add_dll_directory=registered.append,
+                )
 
         self.assertTrue(loaded)
         self.assertEqual(
-            [str(environment_path / path) for path in relative_paths],
-            [call.args[0] for call in load_library.call_args_list],
+            [str((environment_path / path).resolve()) for path in relative_dirs],
+            registered,
+        )
+
+    def test_add_cuda_dll_directories_handles_missing_nvidia_distribution(self) -> None:
+        with patch("murmly.stt.distribution", side_effect=PackageNotFoundError):
+            self.assertFalse(
+                add_cuda_dll_directories(
+                    (("nvidia-cublas-cu12", "nvidia/cublas/bin"),),
+                    add_dll_directory=lambda _path: None,
+                )
+            )
+
+    def test_add_cuda_dll_directories_rejects_directory_outside_environment(self) -> None:
+        relative_dir = "nvidia/cublas/bin"
+        with (
+            tempfile.TemporaryDirectory() as environment_dir,
+            tempfile.TemporaryDirectory() as external_dir,
+        ):
+            directory = Path(external_dir) / relative_dir
+            directory.mkdir(parents=True)
+            (directory / "cublas64_12.dll").touch()
+            package = SimpleNamespace(
+                files=[PurePosixPath(f"{relative_dir}/cublas64_12.dll")],
+                locate_file=lambda path: Path(external_dir) / path,
+            )
+
+            with (
+                patch("murmly.stt.distribution", return_value=package),
+                patch("murmly.stt.sys.prefix", environment_dir),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "outside the active environment"):
+                    add_cuda_dll_directories(
+                        (("nvidia-cublas-cu12", relative_dir),),
+                        add_dll_directory=lambda _path: None,
+                    )
+
+    def test_cuda_dll_directories_finish_registering_before_the_model_is_constructed(self) -> None:
+        """Task 11.1's ordering claim, as far as a GPU-less CI runner can take
+        it: `os.add_dll_directory` over every `nvidia/*/bin` directory must
+        run before whichever call actually resolves CTranslate2's CUDA
+        dependency, which -- per `add_cuda_dll_directories`'s own docstring --
+        is deferred to `WhisperModel(...)`'s own construction, not to
+        `from faster_whisper import WhisperModel`'s bare Python-level import
+        a few lines above it in `_load_model_locked`. design.md's own
+        wording ("before the runtime is imported") is compressed: the two
+        wheels this project actually ships (the CPU-only default and the
+        `cuda` extra) both install the very same `ctranslate2`/`faster_whisper`
+        package names, so import alone cannot be what needs the CUDA
+        libraries already resolvable -- if it were, a plain `uv sync` with no
+        `cuda` extra at all would fail to import `faster_whisper` outright,
+        which it does not (this whole test module does exactly that import,
+        every run, on every platform in this project's CI matrix). What
+        `_load_model_locked` actually guarantees, and what this test proves
+        without a real GPU: `_load_cuda_runtime` -- and so
+        `add_cuda_dll_directories`, task 11.1's own mechanism -- completes in
+        full before `WhisperModel(...)` is ever called.
+
+        `test_add_cuda_dll_directories_registers_each_trusted_directory`
+        above is the other half of task 11.1's claim: that every directory
+        the wheel table names is registered, not merely the first. Composed,
+        the two tests cover "each directory is added" and "all of them are
+        added before the runtime is imported" -- the real `os.add_dll_directory`
+        call, and the real CUDA dependency resolution it is meant to satisfy,
+        both remain unconfirmed: no CI runner here has an NVIDIA device.
+        """
+        events: list[str] = []
+
+        def fake_load_cuda_libraries(libraries, windows_directories, profile=None) -> bool:
+            del libraries, profile
+            events.append(("cuda-dll-directories-added", windows_directories))
+            return True
+
+        class FakeWhisperModel:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                del args, kwargs
+                events.append(("model-constructed",))
+
+        fake_faster_whisper = SimpleNamespace(WhisperModel=FakeWhisperModel)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+                device="cuda",
+            )
+            transcriber = FasterWhisperTranscriber(config)
+
+        with (
+            injected_module("faster_whisper", fake_faster_whisper),
+            patch("murmly.stt.load_cuda_libraries", side_effect=fake_load_cuda_libraries),
+        ):
+            transcriber._load_model()
+
+        self.assertEqual(
+            [("cuda-dll-directories-added", CTRANSLATE2_CUDA_DLL_DIRECTORIES), ("model-constructed",)],
+            events,
         )
 
     def test_cuda_runtime_handles_missing_nvidia_distribution(self) -> None:
@@ -808,3 +1012,28 @@ class TranscriberResidencyTests(unittest.TestCase):
         self.assertEqual(
             "an older runtime", transcriber.transcribe_pcm16(b"\x01\x00" * 16_000)
         )
+
+
+class MacosAcceleratorRuntimeIntegrationTests(unittest.TestCase):
+    """Task 15.4, against the real CTranslate2 build: design.md's claim is
+    that CTranslate2 has no macOS GPU backend at all, so `[stt] device =
+    "auto"` must resolve to the CPU there even though `[tts] device`'s own
+    `auto` finds an accelerator on the same machine (`test_tts.py`'s
+    `MacosCoreMLRuntimeIntegrationTests`) -- the reason the two settings are
+    independent in the first place. `ctranslate2.get_cuda_device_count()` is
+    the real call, not a fake, so this only proves anything run on the
+    machine it claims to be about.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("Only macOS's own CTranslate2 build is what this claim is about")
+
+    def test_auto_finds_no_accelerator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+
+        self.assertEqual(("cpu", "int8"), FasterWhisperTranscriber.resolve_runtime(config))

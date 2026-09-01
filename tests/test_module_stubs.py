@@ -108,7 +108,7 @@ class TheSuiteDoesNotPatchSysModulesDirectly(unittest.TestCase):
         for path in sorted(Path(__file__).parent.glob("*.py")):
             if path.name in explaining:
                 continue
-            for number, line in enumerate(path.read_text().splitlines(), start=1):
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
                 if "patch.dict(sys.modules" in line:
                     offenders.append(f"{path.name}:{number}")
 

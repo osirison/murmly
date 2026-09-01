@@ -12,15 +12,22 @@ from __future__ import annotations
 from collections.abc import Iterator
 import ctypes.util
 import logging
-import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import threading
 
 from murmly.config import MurmlyConfig
 from murmly.idle import return_free_heap
+from murmly.platform import (
+    OperatingSystem,
+    PlatformProfile,
+    operating_system_for,
+    resolve_platform,
+)
 from murmly.stt import (
+    CTRANSLATE2_CUDA_DLL_DIRECTORIES,
     CTRANSLATE2_CUDA_LIBRARIES,
     cuda_device_count_available,
     load_cuda_libraries,
@@ -28,6 +35,29 @@ from murmly.stt import (
 
 
 logger = logging.getLogger(__name__)
+
+# `dlinfo` (see `_loaded_library_path` below) executes real loader code the
+# moment it is imported, using the *real* `ctypes.util.find_library` -- and a
+# module is only ever executed once; every import after the first is a
+# `sys.modules` lookup. Triggered here, at `murmly.tts` import time, that first
+# real execution happens before any test's `with patch("ctypes.util.find_library",
+# ...)` is active, because a test module imports `murmly.tts` at collection
+# time, ahead of every test body. Left lazy (inside `_loaded_library_path`),
+# the same first import instead happens lazily, at whatever moment a test
+# first reaches it -- which was inside another test's own patched context,
+# so `dlinfo._glibc`'s `find_library('dl')` call returned that patch's answer
+# instead of libdl's real name, and failed to load it. Gated to the two
+# platforms `dlinfo` has a real backend for (see `_loaded_library_path`), and
+# using the pure `operating_system_for(sys.platform)` rather than
+# `resolve_platform()`, so this reads no environment at import time. Any
+# failure here is silent and permanent for this process: `_loaded_library_path`
+# below re-imports the name every call regardless, which is what lets a test
+# still substitute `dlinfo.DLInfo` after this ran.
+if operating_system_for(sys.platform) in (OperatingSystem.LINUX, OperatingSystem.MACOS):
+    try:
+        import dlinfo  # noqa: F401 - imported for its module-level side effect, not used by name
+    except Exception:  # noqa: BLE001 - exactly as forgiving as the lazy import this pre-warms
+        pass
 
 MODEL_FILE_NAME = "kokoro-v1.0.onnx"
 VOICES_FILE_NAME = "voices-v1.0.bin"
@@ -46,8 +76,28 @@ ONNX_CUDA_LIBRARIES = CTRANSLATE2_CUDA_LIBRARIES + (
     ("nvidia-curand-cu12", "nvidia/curand/lib/libcurand.so.10"),
     ("nvidia-nvjitlink-cu12", "nvidia/nvjitlink/lib/libnvJitLink.so.12"),
 )
+# Windows' counterpart, read from each package's real `win_amd64` wheel
+# contents (task 11.1's report has the full listing) rather than translated
+# from the tuple above -- the directory name and the DLL names inside it are
+# both different from the `.so` world, not only the extension.
+ONNX_CUDA_DLL_DIRECTORIES = CTRANSLATE2_CUDA_DLL_DIRECTORIES + (
+    ("nvidia-cuda-runtime-cu12", "nvidia/cuda_runtime/bin"),
+    ("nvidia-cufft-cu12", "nvidia/cufft/bin"),
+    ("nvidia-curand-cu12", "nvidia/curand/bin"),
+    ("nvidia-nvjitlink-cu12", "nvidia/nvjitlink/bin"),
+)
 CUDA_PROVIDER = "CUDAExecutionProvider"
 CPU_PROVIDER = "CPUExecutionProvider"
+#: Task 15.4: the accelerator the stock macOS `onnxruntime` wheel carries.
+#: CTranslate2 has no macOS GPU backend at all (`stt.py`'s own `[stt] device`
+#: resolution correctly finds none there), which is exactly why `[tts]
+#: device` and `[stt] device` are separate settings -- "the accelerator" is
+#: whatever this platform's is, and on macOS that is this provider rather
+#: than `CUDA_PROVIDER`. It is never a value `[tts] device` itself accepts
+#: (`config.VALID_DEVICES` stays `{"auto", "cpu", "cuda"}`; nobody configures
+#: "coreml" by name) -- only `auto`'s own resolution reaches for it, the same
+#: way `auto` already reaches for `CUDA_PROVIDER` on a machine that has one.
+COREML_PROVIDER = "CoreMLExecutionProvider"
 
 # A swap rather than an addition: onnxruntime-gpu installs into the same package
 # namespace as the CPU build faster-whisper and kokoro-onnx depend on, and an
@@ -98,15 +148,95 @@ def split_sentences(text: str) -> list[str]:
     return [part.strip() for part in _SENTENCE_BOUNDARY.split(text.strip()) if part.strip()]
 
 
-def resolve_espeak() -> tuple[str, str]:
+def _espeak_library_name(profile: PlatformProfile) -> str | None:
+    """The name to ask the loader for, resolved for `profile`.
+
+    Windows has no branch here: `resolve_espeak` never reaches this function
+    for it, see that docstring for why.
+
+    `ctypes.util.find_library` turns a bare package name into a platform's own
+    naming convention -- but only on the platforms where its guess matches
+    what espeak-ng actually ships. On Linux that guess is `libespeak-ng.so.1`,
+    which is exactly right. It is not right on macOS: Homebrew's build ships
+    only the versioned `libespeak-ng.1.dylib`, which `find_library` would miss
+    since it guesses the unversioned name. So only Linux (and anything
+    `resolve_platform` could not name) asks `find_library`; macOS names the
+    file `ctypes.CDLL` should try directly. A name that does not exist on this
+    machine is not a bug in this function -- `resolve_espeak` turns the
+    resulting `OSError` into the same "not found" report a `None` soname
+    already produces.
+    """
+    if profile.operating_system is OperatingSystem.MACOS:
+        return "libespeak-ng.1.dylib"
+    return ctypes.util.find_library(ESPEAK_LIBRARY_NAME)
+
+
+def _resolve_bundled_espeak() -> tuple[str, str]:
+    """Windows: `espeakng_loader`'s own bundled library, not a system install.
+
+    Reversed from every other platform on purpose. Task 11.3's spike found
+    that the bundled wheel's compiled-in data directory -- the machine that
+    built it, confirmed here by unpacking the `win_amd64` wheel and reading
+    the string table of its `espeak-ng.dll` directly, and executing the
+    identical upstream code through the Linux wheel already installed in this
+    environment -- is a *fallback*, reached only when nothing else tells the
+    library where its data lives. `EspeakAPI.__init__`
+    (`phonemizer/backend/espeak/api.py`) passes `data_path` straight into
+    `espeak_Initialize`'s `path` argument; the compiled-in directory is what
+    the C library falls back to only when that argument is NULL, which is the
+    case exactly when a caller never calls `EspeakWrapper.set_data_path()`
+    before the first `EspeakWrapper` is constructed. `resolve_espeak` always
+    builds an explicit `EspeakConfig(lib_path=, data_path=)` (see
+    `KokoroSynthesizer._construct_model`), which is precisely the call shape
+    that keeps the argument non-NULL -- so the defect this function exists to
+    route around does not fire here. See
+    `docs/agent-notes/espeakng-loader-data-path.md` for the corrected account
+    and the evidence, and design.md's Open Questions, which this answers for
+    Windows: there is no espeak-ng package-manager route on Windows the way
+    there is `dnf`/`apt`/Homebrew, so nothing is lost by using the wheel that
+    already ships in every default `speech-output` install. Not run on a real
+    Windows machine -- the DLL was inspected, not executed.
+    """
+    try:
+        import espeakng_loader
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            f"{SYNTHESIS_PACKAGE} is required for speech output, and it carries "
+            "the espeak-ng library Windows uses. Run `uv sync`; speech output "
+            "is installed by default and only `--no-group tts` leaves it out."
+        ) from error
+
+    try:
+        library_path = espeakng_loader.get_library_path()
+        data_path = espeakng_loader.get_data_path()
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"the bundled espeak-ng data is missing or corrupt: {error}. "
+            "Reinstall speech output with `uv sync --reinstall`."
+        ) from error
+
+    try:
+        handle = ctypes.CDLL(library_path)
+    except OSError as error:
+        raise RuntimeError(f"espeak-ng ({library_path}) could not be loaded: {error}") from error
+    del handle
+    return library_path, data_path
+
+
+def resolve_espeak(profile: PlatformProfile | None = None) -> tuple[str, str]:
     """The phoneme library and its data directory, or why they cannot be found.
 
-    Neither path is written down here. The wheel that bundles espeak-ng compiles
-    its data directory in as the machine that built it and ignores every attempt
-    to override it, so the system install is the one that works -- but naming
-    `/usr/lib64` would only move the problem to the next distribution.
+    Every platform but Windows leaves the path unwritten here and finds the
+    system install instead: the wheel that bundles espeak-ng compiles its
+    data directory in as the machine that built it, and a caller that never
+    tells it otherwise gets that machine's path back. Windows is the
+    exception -- `_resolve_bundled_espeak`'s docstring has the reasoning and
+    the evidence for why the bundled wheel is safe to use there specifically.
     """
-    soname = ctypes.util.find_library(ESPEAK_LIBRARY_NAME)
+    resolved = profile if profile is not None else resolve_platform()
+    if resolved.operating_system is OperatingSystem.WINDOWS:
+        return _resolve_bundled_espeak()
+    soname = _espeak_library_name(resolved)
     if soname is None:
         raise RuntimeError(
             "espeak-ng is required for speech output and was not found. Install "
@@ -115,9 +245,17 @@ def resolve_espeak() -> tuple[str, str]:
     try:
         handle = ctypes.CDLL(soname)
     except OSError as error:
+        if resolved.operating_system is OperatingSystem.MACOS:
+            # macOS has no `dnf`/`apt` equivalent Murmly can name generically
+            # (task 15.5): Homebrew is the remedy, the same as the Linux
+            # branch above names a distribution package for the same absence.
+            raise RuntimeError(
+                f"espeak-ng ({soname}) could not be loaded: {error}. Install it "
+                "with `brew install espeak-ng`."
+            ) from error
         raise RuntimeError(f"espeak-ng ({soname}) could not be loaded: {error}") from error
 
-    library_path = _loaded_library_path(soname) or soname
+    library_path = _loaded_library_path(handle, resolved) or soname
     data_path = _espeak_data_path()
     if data_path is None:
         raise RuntimeError(
@@ -128,18 +266,42 @@ def resolve_espeak() -> tuple[str, str]:
     return library_path, data_path
 
 
-def _loaded_library_path(soname: str) -> str | None:
-    """Where the loader actually found a library it has already opened."""
-    stem = soname.split(".so")[0]
-    try:
-        maps = Path("/proc/self/maps").read_text()
-    except OSError:
+def _loaded_library_path(handle: ctypes.CDLL, profile: PlatformProfile) -> str | None:
+    """Where the loader actually found a library it has already opened.
+
+    Asked through `dlinfo` (a `phonemizer` dependency already in the lock, not
+    a stdlib module of the same name) rather than by parsing `/proc/self/maps`
+    for a line whose path ends in the library's name: that file is Linux-only,
+    and matching on a name fragment can pick up an unrelated library that
+    happens to share it. `dlinfo` asks the dynamic linker that resolved
+    `handle` directly, which is exact where it answers at all.
+
+    It does not answer everywhere. `dlinfo` ships exactly two backends --
+    `dlinfo._macosx` on `sys.platform == "darwin"`, `dlinfo._glibc` for every
+    other platform, unconditionally -- so importing it on Windows runs glibc's
+    `link.h` field offsets against a loader they do not describe. That import
+    also has a cost that is not this call's to pay even where it is aimed
+    correctly: `dlinfo._glibc` loads `libdl` at module import time, as a
+    process-wide side effect the first caller to reach here pays for every
+    caller after it. So this is attempted only on the two platforms `dlinfo`
+    actually has a backend for; every other resolved platform returns `None`
+    without ever importing it, the same answer a failed attempt would have
+    produced, honestly rather than by getting lucky that the failure was
+    harmless.
+
+    None on any failure even where it is attempted -- a handle patched out in
+    a test, a loader that refuses the question -- because the only use of this
+    is cosmetic: the caller already has a name to fall back to.
+    """
+    if profile.operating_system not in (OperatingSystem.LINUX, OperatingSystem.MACOS):
         return None
-    for line in maps.splitlines():
-        path = line.rsplit(" ", 1)[-1]
-        if path.startswith("/") and os.path.basename(path).startswith(stem):
-            return path
-    return None
+    try:
+        from dlinfo import DLInfo
+
+        return DLInfo(handle).path
+    except Exception as error:  # noqa: BLE001 - a best-effort diagnostic, not a requirement
+        logger.debug("Could not determine the loaded path of the phoneme library: %s", error)
+        return None
 
 
 def _espeak_data_path() -> str | None:
@@ -149,6 +311,8 @@ def _espeak_data_path() -> str | None:
             [ESPEAK_COMMAND, "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=PROBE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
@@ -215,10 +379,17 @@ def resolve_providers(config: MurmlyConfig) -> list[str]:
         # someone to replace a working runtime to fix nothing.
         if config.tts_device == "cuda" or (cuda_device_count_available() or 0) > 0:
             logger.warning("Speech output falling back to the CPU: %s", GPU_RUNTIME_REMEDY)
+            return [CPU_PROVIDER]
+        # `cuda` was never asked for and no NVIDIA device is present -- the
+        # `auto` path task 15.4 is about. CoreML is the accelerator this
+        # runtime build carries on macOS specifically; on every other
+        # platform `available` never contains it, so this is a no-op there.
+        if COREML_PROVIDER in available:
+            return [COREML_PROVIDER, CPU_PROVIDER]
         return [CPU_PROVIDER]
 
     try:
-        cuda_ready = load_cuda_libraries(ONNX_CUDA_LIBRARIES)
+        cuda_ready = load_cuda_libraries(ONNX_CUDA_LIBRARIES, ONNX_CUDA_DLL_DIRECTORIES)
     except RuntimeError as error:
         logger.warning("Speech output falling back to the CPU: %s", error)
         return [CPU_PROVIDER]

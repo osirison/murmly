@@ -6,7 +6,7 @@
 # without either generating the other.
 
 site_name: murmly
-site_description: How to install and use murmly, the local voice-to-text tool for Linux desktops.
+site_description: How to install and use murmly, the local voice-to-text tool for Linux and Windows desktops.
 site_url: https://osirison.github.io/murmly/manual/
 
 # Not docs/. That directory already holds docs/agent-notes/, which is internal
@@ -98,7 +98,7 @@ theme:
 # engine, and must be able to tell from that page alone what Murmly is. The
 # site name says "murmly" and nothing else on a reference page says what that
 # means; the description exists only in a meta tag, which nobody reads.
-copyright: murmly — press a key, speak, press again. Local voice-to-text for Linux desktops, running entirely on your own machine.
+copyright: murmly — press a key, speak, press again. Local voice-to-text for Linux and Windows, running entirely on your own machine.
 
 extra:
   # Makes the header logo link to the landing page rather than to the manual's

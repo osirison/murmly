@@ -121,7 +121,27 @@ def strip_murmly(groups: list) -> tuple[list, int]:
     return kept, removed
 
 
-def claude_entries(script: Path, instruction_script: Path | None) -> dict[str, dict]:
+def announce_command(script: Path, socket: str | None) -> str:
+    """The shell command that runs the announcement script.
+
+    `socket` is the resolved command-socket path, computed once by `murmly
+    doctor` under the venv this installer itself is invoked from (see
+    `setup.sh`'s `install_announce_hook`) -- the same authority
+    `murmly.config.default_socket_path` is everywhere else. Baked in as an
+    environment prefix rather than a placeholder substituted into the copied
+    script: the script is installed verbatim so a diff against the checkout
+    stays meaningful, and every registration this installer writes (Claude and
+    Copilot alike) needs the same value. `None` -- a caller with no import
+    path to `murmly` at install time, such as `./setup.sh hooks` run before
+    the virtual environment exists -- leaves the command bare, and the
+    script's own copy of the `XDG_RUNTIME_DIR` fallback (see
+    `hooks/murmly-announce.py`) is what answers for it at run time.
+    """
+    prefix = f"MURMLY_SOCKET='{socket}' " if socket else ""
+    return f"{prefix}python3 '{script}'"
+
+
+def claude_entries(script: Path, instruction_script: Path | None, socket: str | None = None) -> dict[str, dict]:
     """The hook entry Murmly registers for each Claude Code event.
 
     `Stop` is async. It detaches before it speaks and nobody waits on it, so
@@ -138,13 +158,15 @@ def claude_entries(script: Path, instruction_script: Path | None) -> dict[str, d
     entries = {
         STOP_EVENT: {
             "type": "command",
-            "command": f"python3 '{script}'",
+            "command": announce_command(script, socket),
             "timeout": TIMEOUT_SECONDS,
             "async": True,
             "statusMessage": "Announcing through Murmly",
         }
     }
     if instruction_script is not None:
+        # The instruction hook only ever prints text for the model to read; it
+        # never talks to the command socket, so it takes no `socket` prefix.
         entries[SESSION_START_EVENT] = {
             "type": "command",
             "command": f"python3 '{instruction_script}'",
@@ -153,13 +175,15 @@ def claude_entries(script: Path, instruction_script: Path | None) -> dict[str, d
     return entries
 
 
-def install_claude(settings_path: Path, script: Path, instruction_script: Path | None = None) -> str:
+def install_claude(
+    settings_path: Path, script: Path, instruction_script: Path | None = None, socket: str | None = None
+) -> str:
     document = read_json(settings_path)
     hooks = document.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise SystemExit(f"Refusing to touch {settings_path}: its `hooks` is not an object.")
 
-    entries = claude_entries(script, instruction_script)
+    entries = claude_entries(script, instruction_script, socket)
     replaced = 0
     for event in CLAUDE_EVENTS:
         groups = hooks.get(event)
@@ -215,7 +239,7 @@ def remove_claude(settings_path: Path) -> str:
     return f"Claude Code: removed {removed} hook(s) from {settings_path}"
 
 
-def install_copilot(hooks_dir: Path, script: Path) -> str:
+def install_copilot(hooks_dir: Path, script: Path, socket: str | None = None) -> str:
     """Register the `Stop` event, and only that one.
 
     Copilot fires `Stop` and its `agentStop` alias for the same turn, so a file
@@ -235,7 +259,7 @@ def install_copilot(hooks_dir: Path, script: Path) -> str:
             "Stop": [
                 {
                     "type": "command",
-                    "bash": f"python3 '{script}'",
+                    "bash": announce_command(script, socket),
                     "timeoutSec": TIMEOUT_SECONDS,
                 }
             ]
@@ -269,6 +293,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remove", action="store_true", help="Unregister rather than register.")
     parser.add_argument("--claude-settings", default=None, help="Override the settings.json path.")
     parser.add_argument("--copilot-hooks-dir", default=None, help="Override the hooks directory.")
+    parser.add_argument(
+        "--socket",
+        default=None,
+        help=(
+            "The resolved command-socket path, baked into the registered command as "
+            "MURMLY_SOCKET so the hook does not have to guess it at run time. Omit when "
+            "the caller has no way to resolve it (no virtual environment yet); the "
+            "hook's own fallback then applies."
+        ),
+    )
     arguments = parser.parse_args(argv)
 
     names = {name.strip() for name in arguments.agents.split(",") if name.strip()}
@@ -296,10 +330,14 @@ def main(argv: list[str] | None = None) -> int:
         messages.append(
             remove_claude(settings)
             if arguments.remove
-            else install_claude(settings, script, instruction)
+            else install_claude(settings, script, instruction, arguments.socket)
         )
     if "copilot" in names:
-        messages.append(remove_copilot(hooks_dir) if arguments.remove else install_copilot(hooks_dir, script))
+        messages.append(
+            remove_copilot(hooks_dir)
+            if arguments.remove
+            else install_copilot(hooks_dir, script, arguments.socket)
+        )
 
     for message in messages:
         print(message)

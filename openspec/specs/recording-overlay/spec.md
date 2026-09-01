@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Provide unobtrusive visual confirmation of Murmly's microphone capture and transcription lifecycle on KDE Plasma X11 and Wayland while preserving focused application input and core voice-to-text operation.
+Provide unobtrusive visual confirmation of Murmly's microphone capture and transcription lifecycle on every platform Murmly presents it on, while preserving focused application input and core voice-to-text operation. Where a platform cannot provide a surface that stays above ordinary windows, takes no focus, and intercepts no pointer input, Murmly presents no overlay rather than compromise those properties.
 
 ## Requirements
 
@@ -58,29 +58,6 @@ When capture or processing fails after an overlay transition begins, Murmly SHAL
 #### Scenario: Failure while a partial transcript is displayed
 - **WHEN** capture or processing fails while a partial transcript is displayed
 - **THEN** the overlay clears that text before showing the error presentation
-
-### Requirement: Non-disruptive Plasma placement
-On a supported KDE Plasma X11 or Wayland session, Murmly SHALL center the overlay along the bottom edge of one display with a configurable bottom margin. The overlay MUST remain above ordinary application windows, MUST NOT request keyboard focus, MUST NOT intercept pointer input, and MUST NOT move or resize in response to animation. Display-protocol differences MUST NOT change the visible recording lifecycle.
-
-#### Scenario: Overlay appears over the focused application
-- **WHEN** the overlay becomes visible while another application has focus
-- **THEN** it appears at the configured bottom-center position without changing the focused application
-
-#### Scenario: Pointer crosses the overlay
-- **WHEN** the user points or clicks through the overlay area
-- **THEN** the underlying application receives the pointer interaction
-
-#### Scenario: Multiple displays are connected
-- **WHEN** the overlay becomes visible in a multi-display Plasma session
-- **THEN** Murmly selects one display deterministically and keeps the overlay on that display for the current recording session
-
-#### Scenario: Plasma uses X11
-- **WHEN** the overlay becomes visible in a KDE Plasma X11 session
-- **THEN** Murmly provides the same position, stacking, focus, input, dimensions, and visual states as the Wayland presentation
-
-#### Scenario: Plasma uses Wayland
-- **WHEN** the overlay becomes visible in a KDE Plasma Wayland session
-- **THEN** Murmly provides the same position, stacking, focus, input, dimensions, and visual states as the X11 presentation
 
 ### Requirement: Configurable and accessible motion
 Murmly SHALL allow users to disable the recording overlay and configure its bottom margin. Murmly MUST provide a reduced-motion presentation that communicates listening, processing, and error states without continuous waveform or processing animation.
@@ -192,3 +169,49 @@ Murmly's diagnostics SHALL evaluate the overlay runtime under the same condition
 
 - **WHEN** the session does not offer a capability the overlay requires
 - **THEN** the reported cause names the missing session capability
+
+### Requirement: Non-disruptive placement on every platform
+
+Wherever the overlay is presented, Murmly SHALL center it along the bottom edge of
+one display with a configurable bottom margin. The overlay MUST remain above
+ordinary application windows, MUST NOT request keyboard focus, MUST NOT intercept
+pointer input, and MUST NOT move or resize in response to animation. Neither the
+platform nor the display protocol MUST change the visible recording lifecycle.
+
+Where a platform cannot provide one of those properties, Murmly SHALL NOT present
+the overlay at all, and MUST report that property as the reason. An overlay that
+takes focus from what the person is dictating into, or that swallows their clicks,
+defeats the thing Murmly exists to do; not drawing it is the lesser failure and the
+one Murmly already takes when the visual runtime is missing.
+
+#### Scenario: Overlay appears over the focused application
+
+- **WHEN** the overlay becomes visible while another application has focus
+- **THEN** it appears at the configured bottom-center position without changing the
+  focused application
+
+#### Scenario: Pointer crosses the overlay
+
+- **WHEN** the user points or clicks through the overlay area
+- **THEN** the underlying application receives the pointer interaction
+
+#### Scenario: Multiple displays are connected
+
+- **WHEN** the overlay becomes visible with more than one display connected
+- **THEN** Murmly selects one display deterministically and keeps the overlay on
+  that display for the current recording session
+
+#### Scenario: The same presentation on every platform
+
+- **WHEN** the overlay becomes visible on any platform and display protocol Murmly
+  supports
+- **THEN** it provides the same position, stacking, focus, input, dimensions, and
+  visual states as it does on every other
+
+#### Scenario: A platform that cannot present it without taking input
+
+- **WHEN** the platform cannot present a surface that is above ordinary windows,
+  takes no focus, and intercepts no pointer input
+- **THEN** Murmly presents no overlay
+- **AND** the reported cause names the property the platform could not provide
+- **AND** capture, transcription, and delivery continue unchanged

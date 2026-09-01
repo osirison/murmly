@@ -2,18 +2,22 @@ from __future__ import annotations
 
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import murmly.integrations
 from murmly.integrations import (
     ClipboardPaster,
     MissingToolError,
     PasteInjection,
+    create_clipboard_paster,
     input_consent_advisory,
     choose_clipboard_copy_command,
     select_paste_injection,
 )
+from murmly.platform import OperatingSystem, PlatformProfile
 
 
 def fake_which_factory(*available: str):
@@ -41,6 +45,32 @@ def probe_factory(*usable: str):
 class IntegrationSelectionTests(unittest.TestCase):
     WAYLAND = {"WAYLAND_DISPLAY": "wayland-0", "XDG_SESSION_TYPE": "wayland"}
     X11 = {"DISPLAY": ":0", "XDG_SESSION_TYPE": "x11"}
+
+    def setUp(self) -> None:
+        # None of these calls pass `profile=`, so every one of them would
+        # otherwise resolve the real host's own platform (`resolve_platform`
+        # reads `sys.platform`, not `env`, for the operating system):
+        # `select_paste_injection` only reaches the Wayland/X11 candidate
+        # lists these tests are about when the resolved platform is not
+        # Windows, which a Windows runner's own resolution would not be.
+        # Pinned to Linux here rather than at each call site, since every
+        # test in this class needs the same one -- but only the operating
+        # system: the real `resolve_platform(env)` is still what has to
+        # decide `session_type`/`wayland_display`/`x11_display` from each
+        # test's own `env`, which every candidate list in this class also
+        # dispatches on, so a bare `return_value=` replacing the whole
+        # profile would answer every one of those from an unrelated default
+        # instead of from the environment each test actually built.
+        import dataclasses
+
+        real_resolve_platform = murmly.integrations.resolve_platform
+
+        def resolve_as_linux(env=None):
+            return dataclasses.replace(real_resolve_platform(env), operating_system=OperatingSystem.LINUX)
+
+        patcher = patch("murmly.integrations.resolve_platform", side_effect=resolve_as_linux)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_wayland_prefers_wl_copy_and_a_usable_wtype(self) -> None:
         which = fake_which_factory("wl-copy", "wtype", "xdotool")
@@ -134,7 +164,17 @@ class ClipboardRestoreTests(unittest.TestCase):
     ENV = {"XDG_SESSION_TYPE": "x11"}
 
     def _paster(self, **kwargs) -> ClipboardPaster:
-        return ClipboardPaster(env=dict(self.ENV), which=lambda name: f"/usr/bin/{name}", **kwargs)
+        return ClipboardPaster(
+            env=dict(self.ENV),
+            which=lambda name: f"/usr/bin/{name}",
+            # `ClipboardPaster` is the Linux implementation specifically
+            # (`ClipboardPasterFactoryTests`'s own docstring); constructed
+            # directly here rather than through `create_clipboard_paster`,
+            # so nothing else pins its own injector selection to Linux the
+            # way that factory's dispatch otherwise would.
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+            **kwargs,
+        )
 
     def _capture(self):
         calls: list[tuple[tuple, str | None]] = []
@@ -327,7 +367,7 @@ class InputConsentAdvisoryTests(unittest.TestCase):
 
     def _env(self, temp_dir: str, kwinrc: str | None) -> dict[str, str]:
         if kwinrc is not None:
-            (Path(temp_dir) / "kwinrc").write_text(kwinrc)
+            (Path(temp_dir) / "kwinrc").write_text(kwinrc, encoding="utf-8")
         return dict(self.WAYLAND, XDG_CONFIG_HOME=temp_dir)
 
     def test_advises_while_the_grant_is_missing(self) -> None:
@@ -355,3 +395,122 @@ class InputConsentAdvisoryTests(unittest.TestCase):
             granted = self._env(temp_dir, "XwaylandEisNoPromptApps=\n")
             self.assertIsNone(input_consent_advisory("wtype", granted))
             self.assertIsNone(input_consent_advisory("xdotool", {"XDG_SESSION_TYPE": "x11", "XDG_CONFIG_HOME": temp_dir}))
+
+
+def windows_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+
+
+class WindowsPasteInjectionSelectionTests(unittest.TestCase):
+    """Task 9.2/9.3: `select_paste_injection`'s Windows branch, exercised with
+    an explicit `profile` since `env` cannot fake being on Windows (it carries
+    session variables, never `sys.platform`)."""
+
+    def test_send_input_is_always_available_and_never_confirms(self) -> None:
+        injection = select_paste_injection(profile=windows_profile())
+
+        self.assertTrue(injection.available)
+        self.assertEqual("send-input", injection.method)
+        self.assertFalse(injection.confirms_delivery)
+        # Nothing to run -- the method is an in-process API call, not a
+        # subprocess command -- but `available` still reads true from it.
+        self.assertEqual((), injection.command)
+
+    def test_a_send_input_failure_leaves_nothing_to_fall_back_to(self) -> None:
+        """Unlike Wayland/X11, Windows has exactly one candidate: once it is
+        excluded there is no second method, distinctly from "not installed"."""
+        injection = select_paste_injection(profile=windows_profile(), excluded={"send-input"})
+
+        self.assertFalse(injection.available)
+        self.assertIn("send-input", injection.reason)
+        self.assertIn("earlier in this session", injection.reason)
+
+    def test_a_supplied_profile_overrides_env_based_resolution(self) -> None:
+        """`profile` -- not `env` -- is what selects the Windows branch: a
+        Wayland-shaped `env` must not leak Linux candidates through when a
+        Windows profile is supplied explicitly."""
+        injection = select_paste_injection(
+            env={"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0"},
+            profile=windows_profile(),
+        )
+
+        self.assertEqual("send-input", injection.method)
+
+
+def macos_profile() -> PlatformProfile:
+    return PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+
+
+class MacosPasteInjectionDefaultTrustCheckTests(unittest.TestCase):
+    """Every other test of `select_paste_injection`'s macOS branch
+    (`test_mac_clipboard.py`) supplies `macos_accessibility_trusted` as a
+    fake, which is exactly why none of them exercise this function's actual
+    default: `mac_clipboard._real_is_process_trusted`, called with no
+    `try`/`except` around it at all. On a real Mac that call always
+    succeeds -- `ApplicationServices.framework` is a system framework, never
+    absent -- so this is only reachable when a macOS profile is resolved on
+    a host that is not one, exactly the shape `peer_identity_mechanism_for`
+    was already fixed for. Left unguarded, it used to raise a bare `OSError`
+    the instant this branch was reached from anywhere but a real Mac.
+    """
+
+    def test_the_default_trust_check_collapses_to_untrusted_when_it_cannot_ask(self) -> None:
+        # No `macos_accessibility_trusted=` here -- the one thing every other
+        # macOS test of this function supplies, and the one thing that was
+        # masking this default from ever running.
+        #
+        # The framework failure is induced rather than assumed. This test
+        # first asserted it by relying on the host being unable to load
+        # `ApplicationServices`, which is true on Linux and false on the macOS
+        # runner -- where the framework loads, the runner is already trusted,
+        # and the assertion inverted. A test that names a platform has to pin
+        # the condition it means rather than read the host's.
+        with patch(
+            "murmly.mac_clipboard._applicationservices",
+            side_effect=OSError("ApplicationServices is not loadable here"),
+        ):
+            injection = select_paste_injection(profile=macos_profile())
+
+        # The real check cannot tell, so it collapses to "not trusted", never
+        # to a grant -- the same "silence is never claimed as a grant" rule
+        # every other permission check in this codebase applies to its own.
+        self.assertFalse(injection.available)
+        self.assertIn("Accessibility", injection.reason)
+
+    def test_the_default_trust_check_answers_on_a_real_mac_without_raising(self) -> None:
+        """What only a Mac can show: the default reaches a real
+        `AXIsProcessTrusted` and comes back with an answer.
+
+        Which answer belongs to the runner, not to this test -- the macOS CI
+        runner turns out to have Accessibility already granted, the same way
+        it has a microphone and a granted microphone permission. So this
+        asserts that the call resolves rather than what it resolves to.
+        """
+        if sys.platform != "darwin":
+            self.skipTest("A macOS kernel is required to reach ApplicationServices")
+
+        injection = select_paste_injection(profile=macos_profile())
+
+        self.assertIsInstance(injection.available, bool)
+
+
+class ClipboardPasterFactoryTests(unittest.TestCase):
+    """`create_clipboard_paster` dispatches by profile; Linux must get back
+    exactly the same `ClipboardPaster` construction as before this factory
+    existed (zero behaviour change), and Windows must get the Win32 one."""
+
+    def test_linux_gets_an_ordinary_clipboard_paster(self) -> None:
+        paster = create_clipboard_paster(
+            env={"XDG_SESSION_TYPE": "x11"},
+            which=lambda name: f"/usr/bin/{name}",
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
+
+        self.assertIsInstance(paster, ClipboardPaster)
+
+    def test_windows_gets_the_win32_paster(self) -> None:
+        from murmly.win_clipboard import WindowsClipboardPaster
+
+        paster = create_clipboard_paster(profile=windows_profile())
+
+        self.assertIsInstance(paster, WindowsClipboardPaster)

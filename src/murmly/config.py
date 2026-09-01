@@ -5,6 +5,8 @@ from pathlib import Path
 import os
 import tomllib
 
+from murmly.platform import OperatingSystem, resolve_platform
+
 
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
@@ -136,7 +138,31 @@ DEFAULT_STT_UNLOAD_AFTER_IDLE_S = 300
 DEFAULT_TTS_UNLOAD_AFTER_IDLE_S = 0
 
 
-def default_runtime_dir(env: dict[str, str] | None = None) -> Path:
+#: Windows has no `AF_UNIX`, so the command channel there is a named pipe
+#: rather than a file (see design.md's "The command channel"). A module
+#: constant rather than a literal inline, so the daemon's actual pipe creation
+#: in a later phase revises this one name rather than a string that also
+#: appears here.
+WINDOWS_PIPE_NAME = r"\\.\pipe\murmly"
+
+
+def default_runtime_dir(env: dict[str, str] | None = None) -> Path | None:
+    """Where Murmly's own runtime files -- today, just the command socket -- go.
+
+    None on Windows rather than a fabricated path: there is no per-user runtime
+    directory there, because the command channel is a named pipe living in the
+    kernel's pipe namespace, not a file anywhere on disk. Section 7 implements
+    the pipe itself; this stays honest about there being no filesystem answer
+    until then, rather than inventing one nothing will ever create.
+    """
+    profile = resolve_platform(env)
+    if profile.operating_system is OperatingSystem.WINDOWS:
+        return None
+    if profile.operating_system is OperatingSystem.MACOS:
+        return Path.home() / "Library" / "Caches" / "murmly"
+    # Linux, and anything `resolve_platform` could not name (OperatingSystem.OTHER)
+    # keep the answer this always gave, unchanged down to the `env or os.environ`
+    # choice below: an existing install must not see its runtime directory move.
     environment = env or os.environ
     runtime_dir = environment.get("XDG_RUNTIME_DIR")
     if runtime_dir:
@@ -145,11 +171,30 @@ def default_runtime_dir(env: dict[str, str] | None = None) -> Path:
 
 
 def default_socket_path(env: dict[str, str] | None = None) -> Path:
-    return default_runtime_dir(env) / "murmly.sock"
+    """Where the command channel listens by default.
+
+    `default_runtime_dir` returning None is Windows' way of saying there is no
+    directory to build a path under, so that is answered with the pipe name
+    directly rather than joining a filename onto nothing.
+    """
+    runtime_dir = default_runtime_dir(env)
+    if runtime_dir is None:
+        return Path(WINDOWS_PIPE_NAME)
+    return runtime_dir / "murmly.sock"
 
 
 def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
     """Where the synthesis model and its voices are looked for by default."""
+    profile = resolve_platform(env)
+    if profile.operating_system is OperatingSystem.WINDOWS:
+        environment = env or os.environ
+        local_app_data = environment.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "murmly"
+        return Path.home() / "AppData" / "Local" / "murmly"
+    if profile.operating_system is OperatingSystem.MACOS:
+        return Path.home() / "Library" / "Application Support" / "murmly"
+    # Linux, and OperatingSystem.OTHER, unchanged.
     environment = env or os.environ
     xdg_data_home = environment.get("XDG_DATA_HOME")
     if xdg_data_home:
@@ -158,6 +203,16 @@ def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
 
 
 def default_config_path(env: dict[str, str] | None = None) -> Path:
+    profile = resolve_platform(env)
+    if profile.operating_system is OperatingSystem.WINDOWS:
+        environment = env or os.environ
+        app_data = environment.get("APPDATA")
+        if app_data:
+            return Path(app_data) / "murmly" / "config.toml"
+        return Path.home() / "AppData" / "Roaming" / "murmly" / "config.toml"
+    if profile.operating_system is OperatingSystem.MACOS:
+        return Path.home() / "Library" / "Application Support" / "murmly" / "config.toml"
+    # Linux, and OperatingSystem.OTHER, unchanged.
     environment = env or os.environ
     xdg_config_home = environment.get("XDG_CONFIG_HOME")
     if xdg_config_home:

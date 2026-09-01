@@ -21,15 +21,26 @@ ready-made connection for this — see
 
 ## Turning it on
 
-You need murmly installed already, which means Fedora, KDE Plasma, Python 3.12
-or newer, and a terminal — and an X11 session, since Plasma Wayland has not
-been verified end to end. [What you need before you start](what-you-need.md)
-has the detail, and [installing murmly](install.md) has the install itself.
+You need murmly installed already: Linux or Windows, Python 3.12 or newer, and
+a terminal, on either one. On Linux, KDE Plasma X11 was verified end to end
+before the port to Windows and not re-verified on X11 since;
+Plasma Wayland and GNOME are not, and any other desktop registers no hotkey
+and shows no overlay automatically — though everything below still installs
+and works regardless of desktop. On Windows, the hotkey is always automatic
+and the overlay needs its own `uv sync --extra overlay`. Speech output itself
+needs no permission on either platform, granted or otherwise: it is separate
+from the microphone and paste permissions capture already needs. See [What
+you need before you start](what-you-need.md) and [installing
+murmly](install.md) for the full detail behind capture's own requirements.
 
 ```bash
 uv sync
-sudo dnf install espeak-ng
+sudo dnf install espeak-ng   # Linux; adjust the package manager for your distribution
 ```
+
+On Windows, no separate espeak-ng install is needed: the phonemizer's own
+bundled library works there directly, unlike on Linux, where the system
+package above is what murmly actually loads.
 
 The synthesizer is installed by default. It is a dependency group named in
 `[tool.uv] default-groups`, so no sync drops it by not mentioning it, and on
@@ -39,7 +50,8 @@ a CUDA install `uv sync --extra cuda` keeps it too. To leave it out, ask:
 What is **not** installed by default is the 340 MB of model files, which is
 the part worth deciding about.
 
-Place the model files in `~/.local/share/murmly`:
+Place the model files in `~/.local/share/murmly` on Linux, or
+`%LOCALAPPDATA%\murmly` on Windows:
 
 | File | From |
 | --- | --- |

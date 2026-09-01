@@ -11,9 +11,12 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import threading
 import time
 from typing import Protocol
+
+from murmly.platform import Desktop, OperatingSystem, PlatformProfile, resolve_platform
 
 
 logger = logging.getLogger(__name__)
@@ -24,7 +27,21 @@ MIN_ERROR_DURATION_MS = 100
 MAX_ERROR_DURATION_MS = 10_000
 MAX_PARTIAL_CHARS = 200
 PARTIAL_MESSAGE_PREFIX = b'{"type":"partial"'
-SYSTEM_PYTHON = Path("/usr/bin/python3")
+#: PyGObject and GTK4 are distribution packages, not wheels -- there is no
+#: `pip install pygobject` that works the way `pip install PySide6` does -- so
+#: the renderer that imports them has to run under the interpreter those
+#: packages were actually installed into, which is the system one, not
+#: whatever interpreter Murmly's own daemon happens to be running under (a
+#: `uv`-managed virtualenv on every machine this ships to today). A renderer
+#: added later for a platform whose toolkit *is* a wheel (see
+#: `renderer_python` below) is not bound by this and should run under the
+#: project's own interpreter instead.
+GTK4_RENDERER_PYTHON = Path("/usr/bin/python3")
+#: Kept as an alias -- not a second name for a second thing -- because nothing
+#: today has more than one renderer, and every caller that predates
+#: `renderer_python` still reads plainly as "the interpreter the overlay
+#: renderer needs".
+SYSTEM_PYTHON = GTK4_RENDERER_PYTHON
 COMMON_RENDERER_ENVIRONMENT_KEYS = {
     "DBUS_SESSION_BUS_ADDRESS",
     "DESKTOP_SESSION",
@@ -38,6 +55,42 @@ COMMON_RENDERER_ENVIRONMENT_KEYS = {
     "XDG_SESSION_DESKTOP",
     "XDG_SESSION_TYPE",
 }
+#: What the Windows Qt renderer's environment is built from instead of
+#: `COMMON_RENDERER_ENVIRONMENT_KEYS`, which is entirely Linux/XDG/D-Bus
+#: vocabulary. `SYSTEMROOT` is not optional: Winsock, and much of Win32
+#: through it, refuses to initialize without it, so a Windows child launched
+#: with an env dict that omits it fails before it ever reaches the renderer's
+#: own code -- a different failure than "the visual runtime is unavailable"
+#: and one `renderer_environment` must not cause.
+WINDOWS_RENDERER_ENVIRONMENT_KEYS = {
+    "APPDATA",
+    "COMSPEC",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "PATH",
+    "PROCESSOR_ARCHITECTURE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "WINDIR",
+}
+#: The macOS Qt renderer's own environment, built the same way
+#: `WINDOWS_RENDERER_ENVIRONMENT_KEYS` is: no XDG/D-Bus/GDK vocabulary (none
+#: of that exists on macOS), and no Win32 vocabulary either. `HOME` and `PATH`
+#: are what a Cocoa process needs present at all; `LANG`/`LC_ALL`/`LC_CTYPE`
+#: are carried the same way the POSIX renderers already carry them (see
+#: `COMMON_RENDERER_ENVIRONMENT_KEYS`) because Qt's text layout consults them
+#: regardless of platform; `TMPDIR` is where macOS actually points temporary
+#: files, unlike Linux's `/tmp`, which needs no environment variable to reach.
+MACOS_RENDERER_ENVIRONMENT_KEYS = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "TMPDIR",
+}
 
 
 class OverlayState(StrEnum):
@@ -49,6 +102,83 @@ class OverlayState(StrEnum):
 class OverlayBackend(StrEnum):
     X11 = "x11"
     WAYLAND = "wayland"
+    #: Windows' overlay renderer (task 10): a Qt process presenting the same
+    #: newline-delimited JSON protocol and the same `overlay_shared` states as
+    #: the GTK4 one. Named for the platform, not the toolkit, because a member
+    #: spelled `qt` would misdescribe `MACOS` below, which shares this same
+    #: script and interpreter today but is not guaranteed to keep doing so
+    #: (see `MACOS`'s own docstring).
+    WINDOWS = "windows"
+    #: macOS's overlay renderer (task 15.1/15.2). Reuses the Qt renderer and
+    #: `WINDOWS`'s launch shape -- POSIX `socketpair`/`pass_fds` work on macOS
+    #: exactly as they do on Linux, so nothing here needs `WINDOWS`'s own
+    #: `share()`/`fromshare()` workaround -- because design.md's own spike
+    #: order is "against Qt's own flags first": `Qt.WindowTransparentForInput`
+    #: and `Qt.WindowDoesNotAcceptFocus` are requested identically to every
+    #: other backend already (`overlay_renderer_qt.py`'s window-flags code is
+    #: shared, not backend-specific), and `overlay_renderer_qt._verify_and_show`
+    #: reads back the real `NSWindow` state through `ctypes`/`objc_msgSend`
+    #: rather than assuming those flags took -- the same read-back-don't-assume
+    #: discipline `apply_and_verify_exstyle` already holds for Windows'
+    #: `SetWindowLongPtr`. It never *mutates* the Qt-created `NSWindow`:
+    #: design.md's Risks section calls reflecting AppKit calls onto Qt's own
+    #: `NSWindow` "a community technique with no citable confirmation", and
+    #: that caution applies to writing through the handle, not to reading it
+    #: back for verification. If that read-back ever reports a window missing
+    #: one of the spec's required properties on a real Mac -- unconfirmed from
+    #: here; a headless CI runner cannot show whether a click genuinely passes
+    #: through a live window, see `scripts/macos_overlay_spike.py` -- task
+    #: 15.2's fallback is a renderer built directly on `NSPanel`, through the
+    #: same raw-`ctypes`-`objc_msgSend` convention `mac_clipboard.py` and
+    #: `mac_focus.py` already established for this codebase and never PyObjC,
+    #: which design.md's own task text names but which nothing else in this
+    #: change uses -- see that convention's docstring for why arm64-only scope
+    #: makes plain `objc_msgSend` enough. At that point `MACOS` would very
+    #: likely want its own script and interpreter answers below, the same way
+    #: `WINDOWS` differs from the GTK4 backends'.
+    MACOS = "macos"
+
+
+#: The Qt renderer script `renderer_script` returns for `OverlayBackend.WINDOWS`
+#: and `OverlayBackend.MACOS`.
+QT_RENDERER_SCRIPT_NAME = "overlay_renderer_qt.py"
+#: The GTK4 renderer script every other backend returns.
+GTK4_RENDERER_SCRIPT_NAME = "overlay_renderer.py"
+
+#: Backends whose renderer is the Qt one, sharing `renderer_python`'s and
+#: `renderer_script`'s answers today -- see `OverlayBackend.MACOS`'s
+#: docstring for why that sharing is not assumed to last.
+QT_BACKENDS = (OverlayBackend.WINDOWS, OverlayBackend.MACOS)
+
+
+def renderer_python(backend: OverlayBackend) -> Path:
+    """The interpreter the renderer chosen for `backend` needs to run under.
+
+    Asked per backend rather than read off one constant, because the two
+    Linux backends share one answer for the reason recorded on
+    `GTK4_RENDERER_PYTHON` -- both launch the GTK4 renderer, only the display
+    protocol underneath it differs -- while the two `QT_BACKENDS` answer
+    differently: PySide6 is a wheel, so its renderer runs under the
+    interpreter Murmly's own daemon is already running under
+    (`sys.executable`), never the system one.
+    """
+    if backend in QT_BACKENDS:
+        return Path(sys.executable)
+    return GTK4_RENDERER_PYTHON
+
+
+def renderer_script(backend: OverlayBackend) -> Path:
+    """The renderer script `OverlayController` launches for `backend`.
+
+    Alongside `renderer_python`: before task 10 every backend launched the
+    same file (`overlay_renderer.py`), so `OverlayController` hardcoded it.
+    Now the file also depends on the backend, so this is the second half of
+    the same seam, read from the same place `renderer_python` is (this
+    module and `cli.overlay_diagnostics`), rather than the file name being
+    guessed again wherever a renderer gets launched.
+    """
+    name = QT_RENDERER_SCRIPT_NAME if backend in QT_BACKENDS else GTK4_RENDERER_SCRIPT_NAME
+    return Path(__file__).with_name(name)
 
 
 class LevelSink(Protocol):
@@ -151,24 +281,52 @@ def encode_overlay_message(message: dict[str, object]) -> bytes:
 
 def is_plasma_desktop(environment: dict[str, str] | None = None) -> bool:
     source = environment if environment is not None else os.environ
-    desktop = f"{source.get('XDG_CURRENT_DESKTOP', '')}:{source.get('XDG_SESSION_DESKTOP', '')}"
-    return any(name in desktop.casefold() for name in ("kde", "plasma"))
+    return resolve_platform(source).desktop is Desktop.PLASMA
+
+
+def overlay_backend_for_profile(profile: PlatformProfile) -> OverlayBackend | None:
+    """The pure `profile -> backend` mapping `detect_overlay_backend` delegates to.
+
+    Split out because `PlatformProfile.operating_system` comes from
+    `sys.platform` inside `resolve_platform`, which is not one of the keys a
+    caller can steer through `detect_overlay_backend`'s `environment`
+    parameter -- so a test running on Linux can never make
+    `detect_overlay_backend(...)` answer `OverlayBackend.WINDOWS` by supplying
+    an environment dict alone. Exercising the Windows branch means
+    constructing a `PlatformProfile` directly and calling this function, the
+    same shape `operating_system_for` already gives the OS mapping itself
+    (`platform/__init__.py`).
+    """
+    if profile.operating_system is OperatingSystem.WINDOWS:
+        # Every interactive Windows session has a desktop to draw on; whether
+        # it can host a layered, click-through, non-activating surface is
+        # what the Qt renderer's own `--check` answers (task 10.5), the same
+        # split kept below between "Plasma is here" and "this session's
+        # display is usable".
+        return OverlayBackend.WINDOWS
+    if profile.operating_system is OperatingSystem.MACOS:
+        # Same split as Windows immediately above: every interactive macOS
+        # session has a desktop to draw on, and whether it can actually host
+        # a layered, click-through, non-activating surface is what
+        # `overlay_renderer_qt.py`'s own `--check` and native-window read-back
+        # answer (task 15.1/15.3), not this pure mapping.
+        return OverlayBackend.MACOS
+    if profile.desktop is not Desktop.PLASMA:
+        return None
+    if profile.session_type == "wayland":
+        return OverlayBackend.WAYLAND if profile.wayland_display else None
+    if profile.session_type == "x11":
+        return OverlayBackend.X11 if profile.x11_display else None
+    if not profile.session_type and profile.wayland_display:
+        return OverlayBackend.WAYLAND
+    if not profile.session_type and profile.x11_display:
+        return OverlayBackend.X11
+    return None
 
 
 def detect_overlay_backend(environment: dict[str, str] | None = None) -> OverlayBackend | None:
     source = environment if environment is not None else os.environ
-    if not is_plasma_desktop(source):
-        return None
-    session_type = source.get("XDG_SESSION_TYPE", "").casefold()
-    if session_type == "wayland":
-        return OverlayBackend.WAYLAND if source.get("WAYLAND_DISPLAY") else None
-    if session_type == "x11":
-        return OverlayBackend.X11 if source.get("DISPLAY") else None
-    if not session_type and source.get("WAYLAND_DISPLAY"):
-        return OverlayBackend.WAYLAND
-    if not session_type and source.get("DISPLAY"):
-        return OverlayBackend.X11
-    return None
+    return overlay_backend_for_profile(resolve_platform(source))
 
 
 def renderer_environment(
@@ -176,6 +334,15 @@ def renderer_environment(
     environment: dict[str, str] | None = None,
 ) -> dict[str, str]:
     source = environment if environment is not None else os.environ
+    if backend is OverlayBackend.WINDOWS:
+        # None of the GTK4/X11/Wayland vocabulary above applies here, and
+        # `GDK_BACKEND`/`PYTHONNOUSERSITE` are GTK-renderer concerns the Qt
+        # renderer has no use for. `SYSTEMROOT` and the rest are what Winsock
+        # and Win32 need present to initialize at all -- see
+        # `WINDOWS_RENDERER_ENVIRONMENT_KEYS`.
+        return {key: source[key] for key in WINDOWS_RENDERER_ENVIRONMENT_KEYS if key in source}
+    if backend is OverlayBackend.MACOS:
+        return {key: source[key] for key in MACOS_RENDERER_ENVIRONMENT_KEYS if key in source}
     keys = set(COMMON_RENDERER_ENVIRONMENT_KEYS)
     if backend is OverlayBackend.WAYLAND:
         keys.add("WAYLAND_DISPLAY")
@@ -208,7 +375,9 @@ class OverlayController:
         self._text_size_px = text_size_px
         self._transcript_panel = transcript_panel
         self._backend = backend or detect_overlay_backend()
-        self._helper_path = (helper_path or Path(__file__).with_name("overlay_renderer.py")).resolve()
+        self._helper_path = (
+            helper_path or renderer_script(self._backend if self._backend is not None else OverlayBackend.X11)
+        ).resolve()
         self._popen_factory = popen_factory
         self._socket_pair_factory = socket_pair_factory
         self._clock = clock
@@ -364,30 +533,10 @@ class OverlayController:
         child_transport = None
         try:
             parent_transport, child_transport = self._socket_pair_factory()
-            command = [
-                str(SYSTEM_PYTHON),
-                str(self._helper_path),
-                "--fd",
-                str(child_transport.fileno()),
-                "--bottom-margin-px",
-                str(self._bottom_margin_px),
-                "--text-size-px",
-                str(self._text_size_px),
-                "--backend",
-                self._backend.value,
-            ]
-            if self._reduced_motion:
-                command.append("--reduced-motion")
-            if self._transcript_panel:
-                command.append("--transcript-panel")
-            process = self._popen_factory(
-                command,
-                close_fds=True,
-                env=renderer_environment(self._backend),
-                pass_fds=(child_transport.fileno(),),
-                shell=False,
-                stdin=subprocess.DEVNULL,
-            )
+            if self._backend is OverlayBackend.WINDOWS:
+                process = self._spawn_windows_renderer(child_transport)
+            else:
+                process = self._spawn_posix_renderer(child_transport)
             child_transport.close()
             with self._transport_lock:
                 self._process = process
@@ -402,6 +551,89 @@ class OverlayController:
             self._set_health(False, f"Unable to launch overlay renderer: {error}")
             self._schedule_next_attempt()
             return False
+
+    def _renderer_path_argument(self, path: Path) -> str:
+        """Render `path` the way this backend's real launch would.
+
+        `.as_posix()` for every POSIX renderer -- X11 and Wayland run only on
+        Linux in real use, and macOS is POSIX too, so all three always render
+        a POSIX path regardless of which host's flavour `Path` would
+        otherwise render -- a Windows runner exercising this same launch
+        logic for any of them would otherwise get backslashes here. Windows
+        takes `str(path)` instead, because there its command line genuinely
+        is rendered by a `WindowsPath` on the host that actually launches it.
+        """
+        if self._backend is OverlayBackend.WINDOWS:
+            return str(path)
+        return path.as_posix()
+
+    def _renderer_command(self, fd_arguments: list[str]) -> list[str]:
+        command = [
+            self._renderer_path_argument(renderer_python(self._backend)),
+            self._renderer_path_argument(self._helper_path),
+            *fd_arguments,
+            "--bottom-margin-px",
+            str(self._bottom_margin_px),
+            "--text-size-px",
+            str(self._text_size_px),
+            "--backend",
+            self._backend.value,
+        ]
+        if self._reduced_motion:
+            command.append("--reduced-motion")
+        if self._transcript_panel:
+            command.append("--transcript-panel")
+        return command
+
+    def _spawn_posix_renderer(self, child_transport: object) -> object:
+        command = self._renderer_command(["--fd", str(child_transport.fileno())])
+        return self._popen_factory(
+            command,
+            close_fds=True,
+            env=renderer_environment(self._backend),
+            pass_fds=(child_transport.fileno(),),
+            shell=False,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def _spawn_windows_renderer(self, child_transport: object) -> object:
+        """Hand the child its half of the socketpair over stdin, `share()`d.
+
+        `pass_fds` is POSIX-only -- `subprocess` raises on Windows if it is
+        given a non-empty value -- and a `socket.socketpair()` socket has no
+        POSIX file descriptor a Windows child could inherit that way even if
+        it did not. `socket.socket.share(pid)` is Windows' own replacement,
+        and it needs the *target* process's id, which exists only once
+        `Popen` has already started it. So the child is spawned first, with
+        its stdin piped; the parent then shares `child_transport` for that
+        specific process id and writes the resulting bytes down the pipe,
+        closing it once they are sent. `overlay_renderer_qt.py`'s
+        `--fd-share-stdin` reads them with `sys.stdin.buffer.read()` and
+        reconstructs the socket with `socket.fromshare`.
+
+        Unverified on real Windows, unlike `_spawn_posix_renderer`: whether a
+        child spawned this way actually receives a usable socket, and whether
+        `.share()`/`.fromshare()` round-trip the way this assumes, can only be
+        confirmed there. See task 10.1.
+        """
+        command = self._renderer_command(["--fd-share-stdin"])
+        process = self._popen_factory(
+            command,
+            env=renderer_environment(self._backend),
+            shell=False,
+            stdin=subprocess.PIPE,
+        )
+        try:
+            share_data = child_transport.share(process.pid)
+            process.stdin.write(share_data)
+            process.stdin.close()
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:  # noqa: BLE001 - the original failure is what gets reported
+                pass
+            raise
+        return process
 
     def _send(self, encoded: bytes) -> bool:
         with self._transport_lock:

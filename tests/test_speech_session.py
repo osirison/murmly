@@ -11,6 +11,7 @@ import unittest.mock
 from pathlib import Path
 from types import ModuleType
 
+from channel_helpers import command_channel_address, connect_command_channel
 from fakes import FakeSynthesizer, fake_amplitude
 from module_stubs import injected_module
 from murmly.audio import SoundDeviceRecorder, SoundDevicePlayer, pcm16_from_float32
@@ -34,6 +35,7 @@ from murmly.speech import (
     EVENT_TRANSCRIPT,
     SpeechEngine,
 )
+from murmly.win_pipe import PIPE_BUFFER_BYTES
 from test_audio import FakeOutputStream, FakePortAudioError, FakeStream
 from test_speech import RecordingPlayer
 
@@ -92,10 +94,8 @@ class SessionClient:
     """
 
     def __init__(self, socket_path: Path, timeout: float = 5.0) -> None:
-        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._timeout = timeout
-        self._socket.settimeout(timeout)
-        self._socket.connect(str(socket_path))
+        self._socket = connect_command_channel(socket_path, timeout)
         self._payload = b""
 
     def declare(self) -> dict:
@@ -162,7 +162,7 @@ class SpeechSessionHarness(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
             tts_enabled=enabled,
@@ -260,7 +260,7 @@ class SessionDeclarationTests(SpeechSessionHarness):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
             tts_enabled=True,
@@ -282,7 +282,7 @@ class SessionDeclarationTests(SpeechSessionHarness):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             overlay_enabled=False,
             tts_enabled=True,
@@ -452,9 +452,8 @@ class OneShotCommandTests(SpeechSessionHarness):
         _daemon, socket_path, _engine, _player, _capture = self.serve()
         self.client(socket_path).declare()
 
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(3)
-            client.connect(str(socket_path))
+        client = connect_command_channel(socket_path, 3)
+        try:
             client.sendall(b'{"command": "status"}\n')
             payload = b""
             while not payload.endswith(b"\n"):
@@ -464,6 +463,8 @@ class OneShotCommandTests(SpeechSessionHarness):
                 payload += chunk
             self.assertTrue(json.loads(payload)["ok"])
             self.assertEqual(b"", client.recv(4096), "a second frame reached a one-shot caller")
+        finally:
+            client.close()
 
     def test_status_reports_the_state_that_means_output_is_active(self) -> None:
         _daemon, socket_path, _engine, player, _capture = self.serve()
@@ -523,12 +524,45 @@ class SessionLifetimeTests(SpeechSessionHarness):
         # Never reads. Every started event piles up in its outbox until the
         # backlog is reached, and then the session goes rather than the audio.
         # The broken pipe is the disconnection arriving, not a test failure.
-        for index in range(400):
+        #
+        # The outbox only grows once the writer is actually blocked -- a fixed
+        # frame count is a bet on how much data that takes, and it is a bet
+        # transport-dependent enough to lose: a `{"event": "started", "name":
+        # ...}` frame serializes to ~37 bytes, and a UNIX socket here blocks
+        # after roughly 70 of them (~2.6 KB, measured against this same
+        # harness -- far below the socket's advertised SO_SNDBUF, because the
+        # kernel accounts per-frame overhead against it too), while a named
+        # pipe's own fixed `PIPE_BUFFER_BYTES` buffer takes a full 64 KiB
+        # (~1,771 frames) before a write can block at all. 400 clears the
+        # first easily and never comes close to the second -- nothing ever
+        # blocks on a named pipe at that volume, so the backlog is never
+        # reached and the session is never dropped. Sending until the session
+        # actually goes, rather than a count picked to work on one transport,
+        # is what exercises the real backlog on both. A byte budget of four
+        # named-pipe buffers is the safety valve, not the expected exit: it
+        # covers the ~1,835 frames (~68 KB) the pipe transport needs to both
+        # fill its buffer and pile up the backlog on top, generously covers
+        # whatever the client -> server direction keeps accepting in the
+        # meantime while the daemon's own bounded pipe-flush-and-disconnect
+        # runs (see `win_pipe.PIPE_FLUSH_TIMEOUT_SECONDS`), and still fails
+        # loudly rather than hanging if neither bound is ever reached.
+        byte_budget = 4 * PIPE_BUFFER_BYTES
+        sent_bytes = 0
+        index = 0
+        while daemon._speech_session is not None and sent_bytes < byte_budget:
+            frame = {"command": "speak", "name": f"n{index}", "text": "Short."}
             try:
-                client.send({"command": "speak", "name": f"n{index}", "text": "Short."})
+                client.send(frame)
             except OSError:
                 break
+            sent_bytes += len(json.dumps(frame)) + 1
             player.play()
+            index += 1
+        if daemon._speech_session is not None and sent_bytes >= byte_budget:
+            self.fail(
+                f"sent {sent_bytes} bytes ({index} frames) without the "
+                "backlogged session being disconnected"
+            )
 
         self.wait_for(
             lambda: daemon._speech_session is None,
@@ -966,7 +1000,7 @@ class ProtocolDocumentationTests(unittest.TestCase):
         """
         page = (
             Path(__file__).parents[1] / "manual" / "for-developers.md"
-        ).read_text()
+        ).read_text(encoding="utf-8")
         # Anchored on the heading above it: the page carries two
         # "| Frame | Meaning |" tables, and the first lists what a sender may
         # send rather than what it will receive.
@@ -1314,7 +1348,7 @@ class CaptureNeverHearsSpeechTests(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
-            socket_path=Path(temp_dir.name) / "murmly.sock",
+            socket_path=command_channel_address(temp_dir.name),
             config_path=Path(temp_dir.name) / "config.toml",
             sample_rate_hz=24_000,
             tts_enabled=True,

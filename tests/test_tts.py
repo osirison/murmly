@@ -24,6 +24,7 @@ from murmly.config import (
     MurmlyConfig,
     load_config,
 )
+from murmly.platform import OperatingSystem, PlatformProfile
 from murmly.tts import (
     CALIBRATION_TEXT,
     CPU_PROVIDER,
@@ -202,7 +203,7 @@ class VoiceAndRateFallbackTests(unittest.TestCase):
     def _config_from(self, body: str) -> MurmlyConfig:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text(textwrap.dedent(body))
+            config_path.write_text(textwrap.dedent(body), encoding="utf-8")
             return load_config(config_path)
 
     def test_unrecognized_voice_falls_back_and_reports_what_was_asked_for(self) -> None:
@@ -287,6 +288,18 @@ class AvailabilityTests(unittest.TestCase):
             with (
                 patch("importlib.util.find_spec", return_value=object()),
                 patch("ctypes.util.find_library", return_value=None),
+                # An explicit Linux profile: since task 11.4, `resolve_espeak`
+                # takes a different branch on Windows that never calls
+                # `find_library` at all, resolving the real bundled
+                # `espeakng_loader` (installed here too, as a default `tts`
+                # dependency) instead -- which would make this probe succeed
+                # on a real Windows CI runner and this assertion false.
+                patch(
+                    "murmly.tts.resolve_platform",
+                    return_value=PlatformProfile(
+                        operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                    ),
+                ),
             ):
                 synthesizer = KokoroSynthesizer(make_config(temp_dir))
 
@@ -294,9 +307,15 @@ class AvailabilityTests(unittest.TestCase):
         self.assertIn("espeak-ng", synthesizer.unavailable_reason)
 
     def test_resolving_the_phoneme_library_names_what_to_install(self) -> None:
+        # An explicit Linux profile: on Windows, `resolve_espeak` takes the
+        # bundled-wheel branch (task 11.4) instead, which never calls
+        # `find_library` and would resolve the real, installed
+        # `espeakng_loader` rather than raise.
         with patch("ctypes.util.find_library", return_value=None):
             with self.assertRaises(RuntimeError) as raised:
-                resolve_espeak()
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+                )
 
         self.assertIn("espeak-ng", str(raised.exception))
 
@@ -305,6 +324,9 @@ class AvailabilityTests(unittest.TestCase):
 
         Reported here instead, because a caller that only watches for exceptions
         would see an empty result and call it success.
+
+        An explicit Linux profile for the same reason as the test above: the
+        Windows branch never calls `_espeak_data_path` at all.
         """
         with (
             patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
@@ -312,7 +334,9 @@ class AvailabilityTests(unittest.TestCase):
             patch("murmly.tts._espeak_data_path", return_value=None),
         ):
             with self.assertRaises(RuntimeError) as raised:
-                resolve_espeak()
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+                )
 
         self.assertIn("data directory", str(raised.exception))
 
@@ -322,6 +346,238 @@ class AvailabilityTests(unittest.TestCase):
 
         self.assertTrue(synthesizer.available)
         self.assertIsNone(synthesizer.unavailable_reason)
+
+    def test_the_loaded_library_path_comes_from_dlinfo_not_proc_self_maps(self) -> None:
+        """The replacement for the `/proc/self/maps` read task 3.1 removed.
+
+        Asserted against a fake `DLInfo` whose answer disagrees with the plain
+        soname, so a `library_path == soname` pass could not happen by
+        accident -- it would only happen if `dlinfo` were consulted and
+        returned this exact, distinguishable value.
+
+        A stub module injected under `dlinfo`'s own name, not `patch("dlinfo.
+        DLInfo", ...)`: that spelling still has to import the real package
+        first to find the attribute to patch, and the real `dlinfo` has no
+        Windows backend at all (`_loaded_library_path`'s own docstring) --
+        `dlinfo._glibc` runs glibc `link.h` field offsets against a loader
+        that does not have them, on the one platform this suite also runs on.
+        The explicit Linux profile is what still exercises the branch that
+        reaches this stub, on every host, the way `_loaded_library_path`
+        itself would only do it for real on Linux or macOS.
+        """
+        fake_handle = object()
+
+        class FakeDLInfo:
+            def __init__(self, handle: object) -> None:
+                self.handle = handle
+
+            @property
+            def path(self) -> str:
+                assert self.handle is fake_handle
+                return "/run/loader-resolved/libespeak-ng.so.1"
+
+        fake_dlinfo_module = ModuleType("dlinfo")
+        fake_dlinfo_module.DLInfo = FakeDLInfo
+
+        with (
+            patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
+            patch("ctypes.CDLL", return_value=fake_handle),
+            injected_module("dlinfo", fake_dlinfo_module),
+            patch(
+                "murmly.tts._espeak_data_path", return_value="/usr/share/espeak-ng-data"
+            ),
+        ):
+            library_path, data_path = resolve_espeak(
+                PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+            )
+
+        self.assertEqual("/run/loader-resolved/libespeak-ng.so.1", library_path)
+        self.assertEqual("/usr/share/espeak-ng-data", data_path)
+
+    def test_dlinfo_failing_falls_back_to_the_bare_soname(self) -> None:
+        """Cosmetic-only: a loader that will not answer costs a nicer path, not a refusal."""
+
+        def _raise_dlinfo_failed(_handle: object) -> None:
+            raise RuntimeError("dlinfo failed")
+
+        fake_dlinfo_module = ModuleType("dlinfo")
+        fake_dlinfo_module.DLInfo = _raise_dlinfo_failed
+
+        with (
+            patch("ctypes.util.find_library", return_value="libespeak-ng.so.1"),
+            patch("ctypes.CDLL", return_value=object()),
+            injected_module("dlinfo", fake_dlinfo_module),
+            patch(
+                "murmly.tts._espeak_data_path", return_value="/usr/share/espeak-ng-data"
+            ),
+        ):
+            library_path, data_path = resolve_espeak(
+                PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64")
+            )
+
+        self.assertEqual("libespeak-ng.so.1", library_path)
+        self.assertEqual("/usr/share/espeak-ng-data", data_path)
+
+    def test_macos_resolves_the_versioned_homebrew_name_not_find_library(self) -> None:
+        """`ctypes.util.find_library` guesses the unversioned `libespeak-ng`,
+        which Homebrew's build does not ship (`_espeak_library_name`'s own
+        docstring) -- so macOS must never reach `find_library` at all, unlike
+        the Linux branch just above."""
+        with (
+            patch("ctypes.util.find_library") as find_library,
+            patch("ctypes.CDLL", return_value=object()),
+            patch("murmly.tts._loaded_library_path", return_value=None),
+            patch("murmly.tts._espeak_data_path", return_value="/opt/homebrew/share/espeak-ng-data"),
+        ):
+            library_path, data_path = resolve_espeak(
+                PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+            )
+
+        find_library.assert_not_called()
+        self.assertEqual("libespeak-ng.1.dylib", library_path)
+        self.assertEqual("/opt/homebrew/share/espeak-ng-data", data_path)
+
+    def test_macos_without_homebrews_library_names_it_in_the_remedy(self) -> None:
+        """Task 15.5: the macOS twin of the Linux 'not found' remedy just
+        above, naming Homebrew rather than 'your distribution' -- macOS has
+        neither `dnf` nor `apt`. Before this task, this branch named nothing
+        to install at all.
+        """
+        with patch("ctypes.CDLL", side_effect=OSError("dlopen failed")):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.MACOS, architecture="arm64")
+                )
+
+        self.assertIn("brew install espeak-ng", str(raised.exception))
+
+    def test_windows_resolves_the_bundled_wheel_rather_than_a_system_install(self) -> None:
+        """Task 11.4: Windows has no espeak-ng package-manager route, so this
+        uses `espeakng_loader`'s own bundled library and data instead of
+        hunting a system install the way every other platform does.
+
+        Exercised against the real, installed `espeakng_loader` package
+        rather than a fake: it is a hard dependency of `kokoro-onnx`, already
+        in this environment, and its own `get_library_path()`/
+        `get_data_path()` read `platform.system()` rather than the
+        `PlatformProfile` passed in here -- so on this host they resolve to
+        its Linux build, not the `.dll` a real Windows machine would carry.
+        What this test proves is the whole mechanism around that call --
+        the import, both lookups, the `ctypes.CDLL` load, the returned tuple
+        -- for real, using the real package's own build standing in for its
+        Windows one. Which file suffix a real Windows machine resolves to is
+        the one thing this cannot confirm; see the section 11 report.
+        """
+        import espeakng_loader
+
+        library_path, data_path = resolve_espeak(
+            PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+        )
+
+        self.assertEqual(espeakng_loader.get_library_path(), library_path)
+        self.assertEqual(espeakng_loader.get_data_path(), data_path)
+
+    def test_windows_without_the_bundled_loader_names_the_remedy(self) -> None:
+        """`espeakng_loader` is a hard dependency of `kokoro-onnx`, so its
+        absence here means the same thing an absent `kokoro_onnx` does
+        elsewhere in this module: run `uv sync`.
+        """
+        with injected_module("espeakng_loader", None):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+                )
+
+        self.assertIn("uv sync", str(raised.exception))
+
+    def test_windows_with_corrupt_bundled_data_names_the_remedy(self) -> None:
+        """`espeakng_loader.get_data_path()` already raises `RuntimeError`
+        when its own data directory is missing -- a broken or partial
+        install, not the compiled-in-path defect this module otherwise
+        guards against. Wrapped here into the same reinstall remedy the
+        rest of this module gives a corrupt runtime.
+        """
+        with patch("espeakng_loader.get_data_path", side_effect=RuntimeError("data path not exists")):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+                )
+
+        self.assertIn("uv sync --reinstall", str(raised.exception))
+
+    def test_windows_bundled_library_that_will_not_load_is_reported(self) -> None:
+        with patch("ctypes.CDLL", side_effect=OSError("not a valid Win32 application")):
+            with self.assertRaises(RuntimeError) as raised:
+                resolve_espeak(
+                    PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
+                )
+
+        self.assertIn("could not be loaded", str(raised.exception))
+
+
+class WindowsBundledEspeakRuntimeTests(unittest.TestCase):
+    """Task 11.4, closed on the one machine the claim is actually about.
+
+    `test_windows_resolves_the_bundled_wheel_rather_than_a_system_install`
+    above proves the whole `_resolve_bundled_espeak` mechanism -- the import,
+    both lookups, the `ctypes.CDLL` load, the returned tuple -- for real, but
+    its own docstring names what it cannot: it runs on this Linux machine
+    against an injected `PlatformProfile(operating_system=WINDOWS)`, so
+    `espeakng_loader`'s real, installed package resolves to *its* Linux
+    build, not the `.dll` a real Windows machine would carry. This class
+    is that test's twin, gated to the machine where `resolve_platform()`
+    genuinely answers Windows, closing the one thing the other test's own
+    docstring says it cannot confirm.
+
+    Phonemising, not full synthesis: `tests.yml`'s own comment records that
+    `kokoro-v1.0.onnx` and `voices-v1.0.bin` are absent in CI -- the ~350 MB
+    pair is never downloaded there, and every synthesis test in this module
+    injects a `FakeKokoroModel` instead of a real one. Phonemising is the
+    ceiling this runner can prove, not a lesser test of the claim: the defect
+    docs/agent-notes/espeakng-loader-data-path.md and this module's own
+    `_resolve_bundled_espeak` describe lives entirely in `EspeakWrapper.
+    set_data_path`/`espeak_Initialize`, which phonemising already exercises
+    in full -- synthesis afterward runs the ONNX model, a separate concern
+    this defect has nothing to do with.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("proves the bundled espeak-ng wheel for real, on a real Windows machine")
+
+    def test_bundled_wheel_phonemizes_without_a_system_espeak_ng(self) -> None:
+        from kokoro_onnx import EspeakConfig
+        from kokoro_onnx.tokenizer import Tokenizer
+
+        # No profile passed: `resolve_platform()` resolves this runner for
+        # real, exactly the call `KokoroSynthesizer._construct_model` makes.
+        library_path, data_path = resolve_espeak()
+
+        # The gap named above, closed: which file suffix a real Windows
+        # machine resolves to.
+        self.assertTrue(library_path.endswith(".dll"), library_path)
+
+        tokenizer = Tokenizer(EspeakConfig(lib_path=library_path, data_path=data_path))
+        phonemes = tokenizer.phonemize("hello world")
+
+        # The defect's own symptom (docs/agent-notes/espeakng-loader-data-
+        # path.md's Symptom section) is not an exception -- the library
+        # prints to stderr and returns silently, so a caller that only
+        # watches for a raise sees an empty string and calls it success.
+        # Checked for IPA marks rather than the exact string this same call
+        # produces on Linux (`həlˈoʊ wˈɜːld`,
+        # recorded in that agent note), which would pin a suprasegmental
+        # detail this test is not about and could legitimately differ by
+        # espeak-ng version.
+        self.assertTrue(phonemes, "phonemize returned nothing: the bundled data was not found")
+        self.assertTrue(
+            any(mark in phonemes for mark in ("ˈ", "ə", "ː")),
+            f"phonemize returned {phonemes!r}, which carries no IPA marks -- "
+            "suggests the compiled-in build-machine path fired instead of "
+            "the bundled data this call passed explicitly (task 11.4's "
+            "premise would then be false: see this module's docstring for "
+            "the 'name what to install' remedy this would call for instead)",
+        )
 
 
 class AvailabilityNowTests(unittest.TestCase):
@@ -497,6 +753,34 @@ class RuntimeResolutionTests(unittest.TestCase):
             with self.assertNoLogs("murmly.tts", level="WARNING"):
                 self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("auto")))
 
+    def test_auto_prefers_coreml_on_a_machine_with_no_cuda(self) -> None:
+        """Task 15.4: `[tts] device = "auto"` on macOS's own accelerator.
+
+        CTranslate2 has no macOS GPU backend, which is why `[stt] device` and
+        `[tts] device` are separate settings -- but `onnxruntime`'s stock
+        macOS wheel does carry CoreML, so `auto` here should reach for it
+        exactly as it reaches for CUDA on a machine that has one, rather than
+        falling all the way to the CPU only because there is no NVIDIA device.
+        """
+        with (
+            patch(
+                "onnxruntime.get_available_providers",
+                return_value=[CPU_PROVIDER, "CoreMLExecutionProvider"],
+            ),
+            patch("murmly.tts.cuda_device_count_available", return_value=0),
+        ):
+            providers = resolve_providers(self._config("auto"))
+
+        self.assertEqual(["CoreMLExecutionProvider", CPU_PROVIDER], providers)
+
+    def test_coreml_is_not_offered_when_cpu_is_explicitly_configured(self) -> None:
+        """The explicit `cpu` shortcut returns before any provider is inspected."""
+        with patch(
+            "onnxruntime.get_available_providers",
+            return_value=[CPU_PROVIDER, "CoreMLExecutionProvider"],
+        ):
+            self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("cpu")))
+
     def test_a_machine_with_a_gpu_is_still_told_about_the_swap(self) -> None:
         """The remedy is right when there is a device it would put to use."""
         with (
@@ -587,7 +871,7 @@ class RuntimeResolutionTests(unittest.TestCase):
         # Parsed rather than grepped: adjacent string literals are joined by the
         # parser, and a line-wrapped remedy read as a bare command on the source
         # line where it happens to break.
-        tree = ast.parse(Path(murmly.tts.__file__).read_text())
+        tree = ast.parse(Path(murmly.tts.__file__).read_text(encoding="utf-8"))
         literals: list[str] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -922,6 +1206,29 @@ class SynthesisResidencyTests(unittest.TestCase):
         trim.assert_called_once_with()
         self.assertEqual([False], held, "the heap was trimmed while a lock was held")
 
+    def test_a_release_still_drops_the_session_where_the_allocator_cannot_be_asked(
+        self,
+    ) -> None:
+        """18.16: the model-residency spec's own scenario, against a real holder.
+
+        `return_free_heap` is not mocked here, so this goes through the real
+        function down to `_MALLOC_TRIM` -- patched to None to stand in for a
+        platform whose allocator offers no way to return freed memory -- and
+        proves the two halves of the requirement together: the session is
+        still dropped on schedule, and the platform still (correctly) reports
+        that it cannot return system memory, rather than the release silently
+        claiming success on both counts.
+        """
+        from murmly import idle
+
+        synthesizer = self._synthesizer()
+
+        with patch.object(idle, "_MALLOC_TRIM", None):
+            self.assertFalse(idle.system_memory_returnable())
+            self.assertTrue(synthesizer.release())
+
+        self.assertFalse(synthesizer.resident)
+
     def test_a_release_that_frees_nothing_does_not_trim(self) -> None:
         """An idle timer firing against an already released session walks no arenas."""
         synthesizer = self._synthesizer()
@@ -1095,6 +1402,35 @@ class SilenceMeasurementTests(unittest.TestCase):
         from murmly.tts import _median_internal_gap
 
         self.assertEqual(0.0, _median_internal_gap(np.full(1_000, 0.5, dtype=np.float32), 1_000))
+
+
+class MacosCoreMLRuntimeIntegrationTests(unittest.TestCase):
+    """Task 15.4, against the real `onnxruntime` build: `onnxruntime`'s own
+    `get_available_providers()` is not faked here, unlike every other test in
+    `RuntimeResolutionTests` above, because the entire claim under test is
+    that the stock macOS wheel carries `CoreMLExecutionProvider` -- something
+    no fake could prove either way. Follows `MacosAcceleratorRuntimeIntegrationTests`
+    (`test_stt.py`)'s pattern for the other half of the same design.md claim:
+    the two settings are independent, so `[stt] device` finding no
+    accelerator on this same machine is proven there, not here.
+    """
+
+    def setUp(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("Only the macOS onnxruntime wheel is what this claim is about")
+
+    def test_coreml_is_available(self) -> None:
+        import onnxruntime
+
+        self.assertIn("CoreMLExecutionProvider", onnxruntime.get_available_providers())
+
+    def test_auto_resolves_to_coreml(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = make_config(temp_dir, tts_device="auto")
+
+            self.assertEqual(
+                ["CoreMLExecutionProvider", CPU_PROVIDER], resolve_providers(config)
+            )
 
 
 if __name__ == "__main__":
