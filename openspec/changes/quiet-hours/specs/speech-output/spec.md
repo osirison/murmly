@@ -46,7 +46,8 @@ it did before quiet windows existed.
 #### Scenario: A window that spans midnight
 
 - **GIVEN** a quiet window whose start is later in the day than its end
-- **WHEN** a session is declared at a local time after the start or before the end
+- **WHEN** a session is declared at a local time at or after the start, or before
+  the end
 - **THEN** the session is refused
 - **AND** a session declared at any other local time is accepted
 
