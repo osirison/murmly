@@ -19,13 +19,20 @@ and wait for the acknowledgement before sending anything else:
 ```
 
 Murmly answers `{"ok": true, "session": "speech"}`, or one refusal frame and a
-closed connection. `speech_disabled`, `speech_unavailable`, and
-`speech_session_in_use` are the reasons specific to speech. A declaration can
-also be refused for the reasons any command can — `command_failed`,
-`over_capacity`, `shutting_down`, `malformed_request`, or `unsupported_command`
-— and with `busy` while a capture is running, because accepting one then would
-reopen the loudspeaker into a live microphone. `busy` is transient: retry once
-capture ends.
+closed connection. `speech_disabled`, `speech_unavailable`,
+`speech_quiet_hours`, and `speech_session_in_use` are the reasons specific to
+speech. A declaration can also be refused for the reasons any command can —
+`command_failed`, `over_capacity`, `shutting_down`, `malformed_request`, or
+`unsupported_command` — and with `busy` while a capture is running, because
+accepting one then would reopen the loudspeaker into a live microphone. `busy`
+is transient: retry once capture ends.
+
+`speech_quiet_hours` is transient too, but on a longer scale: the clock is
+inside the window set by [`tts.quiet_hours`](settings.md#tts-quiet-hours), and
+the message names the time speech resumes. Retry after that, not immediately.
+It is a separate code from `speech_disabled` and `speech_unavailable` precisely
+so you can tell "come back later" from "this will not work until someone
+changes something".
 
 Treat any frame carrying `"ok": false` as a refusal and report its message,
 rather than matching the speech reasons alone. One session is open at a time.

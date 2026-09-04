@@ -519,9 +519,8 @@ def _quiet_window(value: object) -> tuple[time | None, time | None, str | None]:
     """The window speech is refused in: a start, an end, and what was not honoured.
 
     Falls back to no window rather than to some other window, which is the point
-    of the fallback here. A person who believes they will not be disturbed and is
-    has a bug they can see; one silenced at hours they never wrote has one they
-    cannot.
+    of the fallback here. Someone who expects quiet and gets spoken to has a bug
+    they can see; someone silenced at hours they never wrote has one they cannot.
 
     A start equal to its end is read as no window rather than as a whole day.
     Someone who wants Murmly permanently silent has `enabled = false`, and
