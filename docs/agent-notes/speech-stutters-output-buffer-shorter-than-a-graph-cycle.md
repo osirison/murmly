@@ -3,8 +3,9 @@ title: Stuttering speech is measured in wall clock, not in dropped frames
 description: A playback buffer shorter than one cycle of the audio graph underneath stalls every cycle while reporting perfect frame counts; the fault is only visible as audio taking longer to play than it occupies, and the two counters that tell a device fault from a synthesis one
 trigger: speech stutters, jittery speech, choppy playback, murmly sounds horrible, playback_dropouts, playback_starvations, negotiated_output_buffer_ms, pw-top, MIN_PLAYBACK_LATENCY_SECONDS
 
-depends_on: src/murmly/audio.py, src/murmly/speech.py, openspec/changes/fix-jittery-speech-playback/repro.py
+depends_on: src/murmly/audio.py, src/murmly/speech.py, openspec/changes/archive/2026-09-05-fix-jittery-speech-playback/repro.py
 recorded: 2026-09-04
+updated: 2026-09-05
 ---
 
 # Stuttering speech is measured in wall clock, not in dropped frames
@@ -20,10 +21,12 @@ audio that takes eighteen seconds to come out is the fault, and nothing else
 sees it.
 
 ```bash
-PYTHONPATH="$PWD/src" python3 openspec/changes/.../repro.py --sentences 4 --seconds 2
+PYTHONPATH="$PWD/src" python3 \
+  openspec/changes/archive/2026-09-05-fix-jittery-speech-playback/repro.py \
+  --sentences 4 --seconds 2
 ```
 
-The harness is committed with the change that fixed this; after it is archived,
+The harness is committed with the change that fixed this, and
 `tests/test_audio.py::LivePlaybackTests` asserts the same thing against the real
 device and skips itself where there is none. `AMPLITUDE = 0.0` keeps a run
 silent -- the fault is in the timing, not the signal, so nothing has to be
@@ -35,7 +38,7 @@ audible to reproduce it.
 
 | Field | Above zero means |
 | --- | --- |
-| `playback_dropouts` | the device asked and could not be fed in time -- the buffer is too small for the audio graph |
+| `playback_dropouts` | the device asked and could not be fed in time -- **in the hundreds**, the buffer is too small for the audio graph; a handful is the machine being busy, see below |
 | `playback_starvations` | the device asked in good time, part-way through a piece of text, and nothing was synthesized yet -- synthesis is behind |
 
 `playback_starvations` counts only silence *inside* one piece of text, between two pieces
@@ -51,6 +54,31 @@ Do not conflate them. They send an investigation to opposite halves of the
 pipeline, which is why they are counted apart. Both read `null` beside a
 `playback_detail` when the running service predates them; `null` is "not
 measured", not zero.
+
+## A handful of dropouts is the machine being busy, not this fault
+
+Do not read a small non-zero `playback_dropouts` as this bug. The playback
+callback is Python, so anything holding the interpreter delays it, and synthesis
+on the CPU holds it plenty. Measured, 22 s of audio through the fixed 200 ms
+buffer:
+
+| | dropouts | wall clock |
+| --- | --- | --- |
+| idle machine | 0 | 22.02 s |
+| competing stream running throughout | 0 | 22.02 s |
+| another client joining and leaving mid-playback | 0 | -- |
+| four interpreter-holding threads | 21 | 27.84 s |
+
+A real spoken announcement over a competing stream, with synthesis on the CPU,
+reported 2 across 22 s and was inaudible. That is roughly two device periods out
+of four hundred. The fault this note is about was 213 across 8 s, with the wall
+clock more than double the audio -- one stall per graph cycle, not two in a
+minute.
+
+`playback_starvations` is 0 in both regimes, which is the point of keeping them
+apart: the producer kept up, the delivery was late. If the small count ever does
+start to matter, moving synthesis off the CPU is the lever -- see
+`onnxruntime-gpu-cuda-version.md` for the runtime swap that needs.
 
 ## The cause, when it is the first counter
 
