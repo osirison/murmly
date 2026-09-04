@@ -37,6 +37,13 @@ own, distinct from the one for speech output being disabled and from the one for
 being unavailable, because a caller that is told "not now" may sensibly try again
 in the morning while one told "not at all" or "not working" may not.
 
+The window SHALL include its start and exclude its end. A window written as
+22:00-07:00 therefore refuses a session declared at exactly 22:00:00 and accepts
+one declared at exactly 07:00:00. Leaving this unsaid puts the two boundary
+minutes of every window beyond the reach of any test, and makes the
+midnight-spanning case below read as a second convention rather than the same
+one stated for a different shape of window.
+
 The refusal MUST produce no sound of any kind, including any signal that would
 otherwise precede the words. A window whose purpose is that a person is asleep is
 not served by a chime announcing that they were not spoken to.
@@ -62,6 +69,13 @@ it did before quiet windows existed.
 - **WHEN** a quiet window is configured and a caller declares a speech session at a
   local time outside it
 - **THEN** the session is accepted and text sent on it is spoken
+
+#### Scenario: The window includes its start and excludes its end
+
+- **GIVEN** a quiet window whose start is earlier in the day than its end
+- **WHEN** a session is declared at exactly the window's start time
+- **THEN** the session is refused
+- **AND** a session declared at exactly the window's end time is accepted
 
 #### Scenario: The refusal is distinguishable from the other refusals
 
