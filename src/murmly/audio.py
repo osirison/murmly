@@ -444,13 +444,15 @@ class SoundDevicePlayer:
         # time the person dictated, which is exactly when they are investigating.
         self._underruns = 0
         self._starved_periods = 0
-        # The run of silent periods not yet decided either way, and whether
-        # anything has played at all. Both belong to the stream rather than to
+        # The run of silent periods not yet decided either way, whether audio
+        # has played for the piece being produced, and whether a producer is
+        # working on one at all. All three belong to the stream rather than to
         # the process, so unlike the two counters above they are reset by
         # `start()`: a run left open across a reopen would be committed by the
         # next session's first audio and counted against it.
         self._silent_periods = 0
         self._played_any = False
+        self._expecting_audio = False
         self._output_latency_seconds = 0.0
         self._device_detail: str | None = None
         self._device_name: str | None = None
@@ -550,6 +552,7 @@ class SoundDevicePlayer:
         self._frames_played = 0
         self._silent_periods = 0
         self._played_any = False
+        self._expecting_audio = False
         self._output_latency_seconds = 0.0
         self._device_detail = None
         self._device_name = None
@@ -633,6 +636,29 @@ class SoundDevicePlayer:
             self._output_latency_seconds = self._reported_latency(stream)
             return stream
 
+    def expect_audio(self, expected: bool) -> None:
+        """Say whether a producer is working on the audio this is playing.
+
+        The one thing the callback cannot see for itself. An empty queue looks
+        identical whether synthesis fell behind or the sender simply has not
+        sent the next piece of text yet, and only the first is a fault -- so
+        without this the starvation count reports a sender's think-time as a
+        synthesizer that is too slow, which is the opposite of where it would
+        send someone looking.
+
+        Both edges clear the pending run. Opening one starts the new piece with
+        nothing owed from the last; closing one discards the silence after its
+        final chunk, which is the tail every playback ends on rather than a gap
+        anybody heard.
+        """
+        self._expecting_audio = expected
+        self._silent_periods = 0
+        if expected:
+            # Silence before this piece has been heard from at all is the model
+            # working on its first sentence, which is expected and is not a
+            # dropout. Counting starts once it has produced something.
+            self._played_any = False
+
     def _forget_silent_run(self) -> None:
         """Drop the undecided run of silent periods, because playback was cut.
 
@@ -644,6 +670,7 @@ class SoundDevicePlayer:
         """
         self._silent_periods = 0
         self._played_any = False
+        self._expecting_audio = False
 
     @staticmethod
     def _reported_latency(stream) -> float:
@@ -726,11 +753,16 @@ class SoundDevicePlayer:
             # Silence rather than stale audio, and not counted as played: a
             # position that advanced through an underrun would report speech
             # nobody heard. Held as a pending run rather than counted: see
-            # above. Not opened at all until something has played, so the wait
-            # for the first sentence of a session -- which is synthesis latency,
-            # not a dropout -- never counts either.
+            # above. Counted only between two pieces of audio the *same* piece
+            # of text produced -- `_expecting_audio` says a producer is working
+            # on one, `_played_any` says that one has been heard from. Silence
+            # outside that pair is not synthesis falling behind: before the
+            # first audio it is the model working on the first sentence, and
+            # between two pieces of text it is a sender that has not sent the
+            # next one yet, which the player cannot tell from an empty queue
+            # and must not report as a synthesizer that is too slow.
             view[filled:wanted] = bytes(wanted - filled)
-            if self._played_any:
+            if self._played_any and self._expecting_audio:
                 self._silent_periods += 1
         self._frames_played += played
 

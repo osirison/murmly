@@ -929,12 +929,13 @@ class PlaybackTests(unittest.TestCase):
     def test_a_gap_in_the_middle_of_playback_counts_starvation_and_not_a_dropout(self) -> None:
         """The other half of the pipeline, and why one number cannot say both.
 
-        The device asked in good time, mid-utterance, and was given silence.
-        That is a producer that fell behind rather than a buffer the host could
-        not keep fed.
+        The device asked in good time, part-way through a piece of text whose
+        producer was still working, and was given silence. That is a producer
+        that fell behind rather than a buffer the host could not keep fed.
         """
         player, streams, _sd = self._player()
         player.start()
+        player.expect_audio(True)
         player.write(self._tone(480), 24_000)
         streams[0].pump(480)
 
@@ -946,6 +947,48 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(2, player.starved_periods)
         self.assertEqual(0, player.underruns, "the device never complained")
 
+    def test_a_sender_that_pauses_between_pieces_is_not_a_slow_synthesizer(self) -> None:
+        """The device cannot tell an empty queue apart from a sender thinking.
+
+        A session stays open while its sender decides what to say next, and the
+        stream keeps asking for audio the whole time. Counted, that reports a
+        synthesizer that is too slow for a session in which synthesis was never
+        late, and sends the reader to the wrong half of the pipeline. Only the
+        producer knows which it is, so only the producer says.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.expect_audio(True)
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+        player.expect_audio(False)
+
+        for _ in range(50):
+            streams[0].pump(480)
+
+        player.expect_audio(True)
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+
+        self.assertEqual(0, player.starved_periods)
+
+    def test_the_wait_for_a_piece_first_sentence_is_not_starvation(self) -> None:
+        """Between taking a piece of text and its first audio, the model is working.
+
+        Expected, and not a gap in anything: nothing of this piece has been
+        heard yet for there to be a gap in.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.expect_audio(True)
+
+        for _ in range(5):
+            streams[0].pump(480)
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+
+        self.assertEqual(0, player.starved_periods)
+
     def test_the_silence_before_the_first_word_is_not_starvation(self) -> None:
         """A device open while the first sentence is being synthesized.
 
@@ -956,6 +999,7 @@ class PlaybackTests(unittest.TestCase):
         """
         player, streams, _sd = self._player()
         player.start()
+        player.expect_audio(True)
 
         for _ in range(5):
             streams[0].pump(480)
@@ -973,6 +1017,7 @@ class PlaybackTests(unittest.TestCase):
         """
         player, streams, _sd = self._player()
         player.start()
+        player.expect_audio(True)
         player.write(self._tone(500), 24_000)
 
         streams[0].pump(480)
@@ -986,6 +1031,7 @@ class PlaybackTests(unittest.TestCase):
         """A person asking for silence is not synthesis failing to keep up."""
         player, streams, _sd = self._player()
         player.start()
+        player.expect_audio(True)
         player.write(self._tone(480), 24_000)
         streams[0].pump(480)
 
@@ -1005,6 +1051,7 @@ class PlaybackTests(unittest.TestCase):
         """
         player, streams, _sd = self._player()
         player.start()
+        player.expect_audio(True)
         player.write(self._tone(480), 24_000)
         streams[0].pump(480, status="output underflow")
         streams[0].pump(480)

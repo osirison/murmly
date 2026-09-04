@@ -44,6 +44,7 @@ class RecordingPlayer:
         self.aborted = 0
         self.active = False
         self.written: list[tuple[int, int]] = []
+        self.expecting: list[bool] = []
 
     def start(self) -> None:
         if self.start_error is not None:
@@ -69,6 +70,10 @@ class RecordingPlayer:
     @property
     def pending_frames(self) -> int:
         return max(self.frames_written - self.frames_played, 0)
+
+    def expect_audio(self, expected: bool) -> None:
+        """Recorded rather than acted on: this double has no callback to gate."""
+        self.expecting.append(expected)
 
     def play(self, frames: int | None = None) -> None:
         """Let the device consume what is queued, or `frames` of it."""
@@ -1038,6 +1043,21 @@ class FakeClock:
         self._now += seconds
 
 
+class InstantPlayer(RecordingPlayer):
+    """A device that consumes every write the moment it arrives.
+
+    Models the case the hold is most fragile in: the producer is delayed past
+    the remaining tail after its last write, so the first publish that follows
+    already finds the position caught up and never sees a pass with anything
+    outstanding to clear the previous batch's drain moment on.
+    """
+
+    def write(self, samples, sample_rate_hz: int) -> int:
+        frames = super().write(samples, sample_rate_hz)
+        self.frames_played += frames
+        return frames
+
+
 class HeardAllHoldTests(EngineHarness):
     """Everything reported heard has left the loudspeaker, not just the queue.
 
@@ -1140,3 +1160,49 @@ class HeardAllHoldTests(EngineHarness):
 
         self.assertIsNotNone(interruption, "the clock never moved and it still stopped")
         self.assertEqual(1, player.aborted)
+
+
+class SecondBatchHoldTests(EngineHarness):
+    """A session that speaks again after being told everything was heard.
+
+    The base spec keeps the session open for exactly this: "Murmly speaks the
+    next text the session sends". The second batch has to earn its own hold --
+    inheriting the first batch's drain moment means the hold has already
+    elapsed before the audio was written, and the report goes out with a whole
+    buffer still in the device for the session's close to discard.
+    """
+
+    @staticmethod
+    def _heard(events: list[dict]) -> int:
+        return len([event for event in events if event.get("event") == EVENT_HEARD_ALL])
+
+    def test_a_second_batch_waits_out_the_buffer_of_its_own(self) -> None:
+        clock = FakeClock()
+        held = InstantPlayer()
+        held.output_latency_seconds = 0.2
+        engine, _player, events = self.engine(player=held, now=clock)
+        self.begin(engine, events)
+
+        engine.speak("first", "A sentence.")
+        engine.end_input()
+        self.wait_for(lambda: held.frames_written > 0, message="the first batch")
+        clock.advance(0.2)
+        self.wait_for(lambda: self._heard(events) == 1, message="the first batch heard")
+
+        engine.speak("second", "Another sentence.")
+        engine.end_input()
+        # Several passes of the publish loop, with the clock standing still.
+        time.sleep(0.15)
+
+        self.assertEqual(
+            1,
+            self._heard(events),
+            "the second batch was reported heard against the first batch's drain",
+        )
+
+        clock.advance(0.2)
+
+        self.wait_for(
+            lambda: self._heard(events) == 2,
+            message="the second batch heard once its own buffer had emptied",
+        )

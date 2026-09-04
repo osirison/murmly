@@ -356,6 +356,15 @@ class SpeechEngine:
         with self._lock:
             self._queue.send(SpeechUnit(name=name, text=text))
             self._reported_heard_all = False
+            # Cleared beside the flag, not left for the next `_publish` pass to
+            # notice. That pass only clears it when it observes something still
+            # outstanding, and a batch whose audio is already inside the device
+            # by the time the producer publishes gives it nothing to observe --
+            # so the new batch inherits the old one's drain moment, the hold has
+            # already elapsed against it, and the report goes out with a whole
+            # buffer still unplayed. Which is the report this hold exists to
+            # stop.
+            self._drained_at = None
 
     def end_input(self) -> None:
         self._queue.end_input()
@@ -506,6 +515,11 @@ class SpeechEngine:
         with self._lock:
             generation = self._generation
         entry: _Scheduled | None = None
+        # From here until this unit is finished, silence reaching the device
+        # means synthesis did not keep up. Outside it, silence means the sender
+        # has not sent the next piece of text yet -- which the device cannot
+        # tell apart and must not report as a slow synthesizer.
+        self._player.expect_audio(True)
         try:
             for samples, sample_rate_hz in self._synthesizer.synthesize(unit.text):
                 if stop.is_set() or self._stale(generation):
@@ -547,6 +561,11 @@ class SpeechEngine:
             # entry's end_frame is only "where the audio so far ends", and a
             # played position that has caught up to it would otherwise read as
             # the whole unit having been heard.
+            #
+            # The device is told the same thing, and for the same reason: the
+            # silence after this unit's last chunk is the tail every playback
+            # ends on, not a gap in it.
+            self._player.expect_audio(False)
             if entry is not None:
                 with self._lock:
                     entry.produced = True

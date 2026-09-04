@@ -144,6 +144,19 @@ the first sentence is synthesis latency, which is expected, not a dropout. Measu
 against a real device afterwards: a clean 4.5 s playback reports zero, and a deliberate
 0.6 s gap mid-playback reports the twelve periods it occupied.
 
+Committing on the next audio is still not enough on its own, because a gap between two
+pieces of text is also followed by audio. A session stays open while its sender decides
+what to say next — the interface is documented as "sends it text as it produces it" — and
+the device keeps asking for audio throughout. The player cannot tell that empty queue
+apart from a synthesizer falling behind, and reporting it as the latter sends the reader
+to the wrong half of the pipeline. Only the producer knows, so the producer says: the
+engine marks the span in which it owes the device audio for the piece it is working on,
+and silence is only counted inside one. Silence before that piece's first audio is the
+model working on its first sentence, which is expected; silence after its last chunk is
+the tail; silence between pieces belongs to the sender. Measured against a real device:
+a clean unit and three seconds of sender think-time both report zero, and a deliberate
+0.6 s gap inside a piece reports twelve.
+
 ### Hold `heard_all` until the device has actually played the audio
 
 A deeper buffer breaks the completion path, and this has to be fixed in the same
@@ -164,6 +177,15 @@ The fix is to make the event mean what it says: once `pending_frames` first reac
 zero, hold the report until the stream's negotiated output latency has elapsed, then
 emit it. `_publish` already runs on a 20 ms poll, so this is one timestamp and one
 comparison, and it needs no new thread.
+
+The timestamp has to be cleared where the flag is, in `speak()`, not left for the next
+`_publish` pass to notice. That pass only clears it when it observes something still
+outstanding, and a batch whose audio is already inside the device by the time the
+producer publishes gives it nothing to observe — so the second batch inherits the first
+batch's drain moment, the hold has already elapsed against it, and the report goes out
+with a whole buffer unplayed. That is the report this hold exists to stop, and the
+sessions it happens to are exactly the ones this branch is about: the producer has to be
+delayed past the remaining tail, which is the loaded-audio-graph regime.
 
 Alternative considered and rejected: draining instead of aborting on a clean end —
 skip `abort()` in `end()` when nothing is outstanding and let `stream.stop()` play the

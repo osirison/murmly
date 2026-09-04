@@ -92,9 +92,11 @@ given it in time, since the service started. Anything above zero means the
 device is stalling, and stalling is what stuttering sounds like.
 
 `playback_starvations` beside it counts the other way of running dry: the device
-asked in good time and there was nothing synthesized yet. That one points at
-synthesis being slow rather than at the audio device, and
-[speed and memory](speed-and-memory.md) is where to take it.
+asked in good time, part-way through a piece of text, and there was nothing
+synthesized yet. That one points at synthesis being slow rather than at the audio
+device, and [speed and memory](speed-and-memory.md) is where to take it. It counts
+only silence inside a piece of text, so the pause while a program decides what to
+say next is not counted against the synthesizer.
 
 `negotiated_output_buffer_ms` is the size of the buffer murmly negotiated with
 the device, and it is what usually decides the first number. Murmly asks for at

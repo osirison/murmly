@@ -36,11 +36,16 @@ audible to reproduce it.
 | Field | Above zero means |
 | --- | --- |
 | `playback_dropouts` | the device asked and could not be fed in time -- the buffer is too small for the audio graph |
-| `playback_starvations` | the device asked in good time, mid-utterance, and nothing was synthesized yet -- synthesis is behind |
+| `playback_starvations` | the device asked in good time, part-way through a piece of text, and nothing was synthesized yet -- synthesis is behind |
 
-`playback_starvations` counts only gaps with audio on both sides. The wait before the
-first sentence, and the partial period every playback ends on, are both expected and are
-not counted -- otherwise the number would be non-zero for playback that was perfect.
+`playback_starvations` counts only silence *inside* one piece of text, between two pieces
+of audio that piece produced. Three things that look identical to the device are excluded,
+because counting any of them would make the number non-zero for playback that was perfect
+and point the reader at the wrong half of the pipeline: the wait before a piece's first
+sentence (the model working), the partial period every playback ends on (the tail), and
+the pause while the sender decides what to say next. The last needs a signal the callback
+does not have, so `SpeechEngine` tells the player when it owes it audio
+(`SoundDevicePlayer.expect_audio`).
 
 Do not conflate them. They send an investigation to opposite halves of the
 pipeline, which is why they are counted apart. Both read `null` beside a
