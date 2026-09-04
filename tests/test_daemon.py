@@ -2173,7 +2173,7 @@ class FailureCodeTests(unittest.TestCase):
     def test_every_category_maps_to_its_own_distinct_code(self) -> None:
         codes = [code.value for code in CommandCode]
 
-        self.assertEqual(11, len(codes))
+        self.assertEqual(12, len(codes))
         self.assertEqual(
             {
                 "busy",
@@ -2183,11 +2183,13 @@ class FailureCodeTests(unittest.TestCase):
                 "not_permitted",
                 "shutting_down",
                 "command_failed",
-                # Speech output. Three refusals a caller has to tell apart --
+                # Speech output. Four refusals a caller has to tell apart --
                 # turn it on, install what is missing, wait for the other
-                # session -- and the category an interruption reports itself as.
+                # session, come back in the morning -- and the category an
+                # interruption reports itself as.
                 "speech_disabled",
                 "speech_unavailable",
+                "speech_quiet_hours",
                 "speech_session_in_use",
                 "speech_interrupted",
             },

@@ -7,6 +7,7 @@ import re
 import tempfile
 import textwrap
 import unittest
+from datetime import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +38,7 @@ from murmly.config import (
     default_runtime_dir,
     default_socket_path,
     default_tts_model_dir,
+    is_quiet_at,
     load_config,
 )
 
@@ -560,6 +562,128 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(0, config.unload_after_idle_s)
         self.assertEqual(900, config.tts_unload_after_idle_s)
+
+
+class QuietWindowTests(unittest.TestCase):
+    """`[tts] quiet_hours`: what is read from it, and what a bad value costs."""
+
+    def load(self, body: str) -> object:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(textwrap.dedent(body), encoding="utf-8")
+            return load_config(config_path)
+
+    def window(self, value: str) -> tuple[object, object, object]:
+        config = self.load(f'\n[tts]\nquiet_hours = "{value}"\n')
+        return config.tts_quiet_start, config.tts_quiet_end, config.tts_quiet_rejected_value
+
+    def test_a_window_is_read_as_a_start_and_an_end(self) -> None:
+        self.assertEqual((time(22, 0), time(7, 0), None), self.window("22:00-07:00"))
+
+    def test_an_hour_written_without_its_leading_zero(self) -> None:
+        """`9:00` is what people write, and `09:00` is what they are told to."""
+        self.assertEqual((time(9, 0), time(17, 30), None), self.window("9:00-17:30"))
+        self.assertEqual((time(9, 0), time(17, 30), None), self.window("09:00-17:30"))
+
+    def test_surrounding_and_interior_whitespace(self) -> None:
+        self.assertEqual((time(22, 0), time(7, 0), None), self.window("  22:00 - 07:00  "))
+
+    def test_a_daytime_window_is_not_a_reversed_one(self) -> None:
+        """A start before its end is an ordinary window, not a mistyped night."""
+        self.assertEqual((time(7, 0), time(22, 0), None), self.window("07:00-22:00"))
+
+    def test_an_absent_setting_is_no_window(self) -> None:
+        config = self.load("\n[tts]\nenabled = true\n")
+        self.assertEqual(
+            (None, None, None),
+            (config.tts_quiet_start, config.tts_quiet_end, config.tts_quiet_rejected_value),
+        )
+
+    def test_an_empty_setting_is_no_window(self) -> None:
+        self.assertEqual((None, None, None), self.window(""))
+        self.assertEqual((None, None, None), self.window("   "))
+
+    def test_an_hour_or_minute_that_is_not_a_time_of_day(self) -> None:
+        """`24:00` and `07:60` have the shape and are still not times."""
+        self.assertEqual((None, None, "24:00-07:00"), self.window("24:00-07:00"))
+        self.assertEqual((None, None, "22:00-07:60"), self.window("22:00-07:60"))
+
+    def test_seconds_are_not_accepted(self) -> None:
+        self.assertEqual((None, None, "22:00:00-07:00:00"), self.window("22:00:00-07:00:00"))
+
+    def test_a_value_that_is_not_a_window_at_all(self) -> None:
+        self.assertEqual((None, None, "night"), self.window("night"))
+        self.assertEqual((None, None, "22:00"), self.window("22:00"))
+
+    def test_a_start_equal_to_its_end_is_no_window_and_is_still_reported(self) -> None:
+        """Not 24 hours of silence, and not silently ignored either.
+
+        Someone who wants Murmly permanently quiet has `enabled = false`. But a
+        report showing no window against a file that plainly sets one leaves its
+        owner with nothing to look at, so the value comes back as one that was
+        not honoured.
+        """
+        self.assertEqual((None, None, "22:00-22:00"), self.window("22:00-22:00"))
+
+    def test_a_value_toml_did_not_give_as_a_string(self) -> None:
+        """Carried as a string because the report it reaches is JSON.
+
+        An unquoted `22:00:00` is TOML's own local-time literal, which `json`
+        cannot encode -- and returning such a value raw once made `murmly doctor`
+        print no report at all for one mistyped setting.
+        """
+        config = self.load("\n[tts]\nquiet_hours = 22:00:00\n")
+        self.assertEqual(
+            (None, None, "22:00:00"),
+            (config.tts_quiet_start, config.tts_quiet_end, config.tts_quiet_rejected_value),
+        )
+
+        config = self.load("\n[tts]\nquiet_hours = 22\n")
+        self.assertEqual("22", config.tts_quiet_rejected_value)
+
+    def test_a_bad_window_leaves_every_other_setting_alone(self) -> None:
+        """A comfort setting nobody can read is not a reason to lose the rest."""
+        config = self.load(
+            """
+            [tts]
+            enabled = true
+            voice = "am_michael"
+            quiet_hours = "sometime after tea"
+            """
+        )
+        self.assertTrue(config.tts_enabled)
+        self.assertEqual("am_michael", config.tts_voice)
+        self.assertEqual("sometime after tea", config.tts_quiet_rejected_value)
+
+
+class IsQuietAtTests(unittest.TestCase):
+    """The whole of what decides whether Murmly is quiet, asked at every hour."""
+
+    def test_inside_and_outside_a_daytime_window(self) -> None:
+        start, end = time(9, 0), time(17, 0)
+        self.assertTrue(is_quiet_at(start, end, time(12, 0)))
+        self.assertFalse(is_quiet_at(start, end, time(8, 59)))
+        self.assertFalse(is_quiet_at(start, end, time(20, 0)))
+
+    def test_the_window_is_half_open(self) -> None:
+        """Quiet begins at the start and ends at the end, so 07:00 speaks."""
+        start, end = time(22, 0), time(7, 0)
+        self.assertTrue(is_quiet_at(start, end, time(22, 0)))
+        self.assertFalse(is_quiet_at(start, end, time(7, 0)))
+
+    def test_a_window_that_spans_midnight(self) -> None:
+        start, end = time(22, 0), time(7, 0)
+        self.assertTrue(is_quiet_at(start, end, time(23, 30)))
+        self.assertTrue(is_quiet_at(start, end, time(0, 0)))
+        self.assertTrue(is_quiet_at(start, end, time(3, 0)))
+        self.assertFalse(is_quiet_at(start, end, time(15, 0)))
+        self.assertFalse(is_quiet_at(start, end, time(21, 59)))
+
+    def test_no_window_is_quiet_at_no_hour(self) -> None:
+        for hour in range(24):
+            self.assertFalse(is_quiet_at(None, None, time(hour, 0)))
+            self.assertFalse(is_quiet_at(time(22, 0), None, time(hour, 0)))
+            self.assertFalse(is_quiet_at(None, time(7, 0), time(hour, 0)))
 
 
 class LinuxPathsAreUnmovedTests(unittest.TestCase):

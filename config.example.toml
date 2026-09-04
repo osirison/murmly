@@ -149,6 +149,32 @@ unload_after_idle_s = 0
 # let the system choose, which is what the capture side does too.
 output_device = ""
 
+# A window in which Murmly does not start speaking, written as "HH:MM-HH:MM" in
+# this machine's own local time. Empty, the default, means no window: Murmly
+# speaks whenever it is asked to, at any hour.
+#
+#     quiet_hours = "22:00-07:00"
+#
+# A start later than its end spans midnight, which is the shape almost every
+# night has. A start before its end is an ordinary daytime window. Quiet begins
+# at the start and ends at the end, so "22:00-07:00" is silent at 22:00:00 and
+# speaks again at 07:00:00.
+#
+# Keep the quotes. Unquoted, `22:00-07:00` is not valid TOML, and a file that
+# does not parse loses every setting in it rather than this one.
+#
+# Inside the window a speech session is refused before any sound is made, so
+# there is no chime either. Speech already playing when the window opens is
+# allowed to finish its sentence rather than being cut off. Dictation is
+# untouched: the hotkey, transcription and delivery work at every hour, because
+# speaking into the microphone at night is you choosing to make a noise.
+#
+# A value Murmly cannot read leaves it with no window rather than stopping the
+# daemon, and `murmly doctor` names what was not honoured under `speech_output`,
+# alongside `quiet_hours_in_force` -- which is how you tell a window doing its
+# job from a synthesizer that has stopped working.
+quiet_hours = ""
+
 # Where kokoro-v1.0.onnx and voices-v1.0.bin are. Defaults to
 # $XDG_DATA_HOME/murmly, which is ~/.local/share/murmly.
 # model_dir = "~/.local/share/murmly"

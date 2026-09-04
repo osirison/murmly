@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, time as time_of_day
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
@@ -2979,6 +2980,103 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
         self.assertTrue(report["enabled"])
         self.assertFalse(report["available"])
         self.assertIn("--extra tts", report["detail"])
+
+    @staticmethod
+    def _at(hour: int, minute: int = 0):
+        """A clock stopped at one local time, with the date pinned.
+
+        The window is a time of day, so the date must not be able to change the
+        answer; and the report must not depend on the hour the suite is run at.
+        """
+        return lambda: datetime(2026, 9, 4, hour, minute)
+
+    def test_no_quiet_window_is_reported_as_none_and_never_in_force(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for hour in (0, 3, 12, 23):
+                with self.subTest(hour=hour):
+                    report = speech_output_diagnostics(
+                        self._config(temp_dir), now=self._at(hour)
+                    )
+                    self.assertIsNone(report["quiet_hours"])
+                    self.assertFalse(report["quiet_hours_in_force"])
+                    self.assertNotIn("quiet_hours_rejected_value", report)
+
+    def test_a_window_in_force_is_named_and_said_to_be_in_force(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(
+                temp_dir, tts_quiet_start=time_of_day(22, 0), tts_quiet_end=time_of_day(7, 0)
+            )
+            report = speech_output_diagnostics(config, now=self._at(23, 30))
+
+        self.assertEqual("22:00-07:00", report["quiet_hours"])
+        self.assertTrue(report["quiet_hours_in_force"])
+
+    def test_a_window_not_in_force_is_still_named(self) -> None:
+        """Both halves matter. The window alone cannot tell a person which of a
+        working quiet period and a broken synthesizer they are looking at."""
+        from murmly.cli import speech_output_diagnostics
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(
+                temp_dir, tts_quiet_start=time_of_day(22, 0), tts_quiet_end=time_of_day(7, 0)
+            )
+            report = speech_output_diagnostics(config, now=self._at(15, 0))
+
+        self.assertEqual("22:00-07:00", report["quiet_hours"])
+        self.assertFalse(report["quiet_hours_in_force"])
+
+    def test_a_window_that_was_not_honoured_is_reported_beside_no_window(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+        from murmly.config import load_config
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text('[tts]\nquiet_hours = "half ten till dawn"\n')
+            report = speech_output_diagnostics(load_config(config_path), now=self._at(23))
+
+        self.assertIsNone(report["quiet_hours"])
+        self.assertFalse(report["quiet_hours_in_force"])
+        self.assertEqual("half ten till dawn", report["quiet_hours_rejected_value"])
+
+    def test_the_window_is_reported_when_speech_output_is_disabled(self) -> None:
+        """Disabled returns early, and a section that drops the window there
+        reads as one the report never asked about."""
+        from murmly.cli import speech_output_diagnostics
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(
+                temp_dir,
+                tts_enabled=False,
+                tts_quiet_start=time_of_day(22, 0),
+                tts_quiet_end=time_of_day(7, 0),
+            )
+            report = speech_output_diagnostics(config, now=self._at(23, 30))
+
+        self.assertFalse(report["enabled"])
+        self.assertEqual("22:00-07:00", report["quiet_hours"])
+        self.assertTrue(report["quiet_hours_in_force"])
+
+    def test_the_window_is_reported_when_speech_output_is_unavailable(self) -> None:
+        from murmly.cli import speech_output_diagnostics
+        from fakes import FakeSynthesizer
+
+        probe = FakeSynthesizer(available=False, unavailable_reason="kokoro-onnx is missing.")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = self._config(
+                temp_dir,
+                tts_enabled=True,
+                tts_quiet_start=time_of_day(22, 0),
+                tts_quiet_end=time_of_day(7, 0),
+            )
+            report = speech_output_diagnostics(config, probe, now=self._at(2, 0))
+
+        self.assertFalse(report["available"])
+        self.assertEqual("22:00-07:00", report["quiet_hours"])
+        self.assertTrue(report["quiet_hours_in_force"])
 
     def test_a_working_stack_names_the_voice_rate_and_output_device(self) -> None:
         from murmly.cli import speech_output_diagnostics
