@@ -27,27 +27,27 @@
 
 ## 2. Refusing the session
 
-- [ ] 2.1 Add `SPEECH_QUIET_HOURS = "speech_quiet_hours"` to `CommandCode` in
+- [x] 2.1 Add `SPEECH_QUIET_HOURS = "speech_quiet_hours"` to `CommandCode` in
       `src/murmly/daemon.py`, documented alongside `SPEECH_DISABLED` and
       `SPEECH_UNAVAILABLE` as the refusal a caller should retry later.
-- [ ] 2.2 Give the daemon an injectable `now: Callable[[], datetime]` defaulting to
+- [x] 2.2 Give the daemon an injectable `now: Callable[[], datetime]` defaulting to
       `datetime.now`, separate from the existing monotonic `clock`, and say in its
       docstring why the two are not the same thing.
-- [ ] 2.3 In `_declare_session`, check the window immediately after the
+- [x] 2.3 In `_declare_session`, check the window immediately after the
       `tts_enabled` check and before `self._speech.available` — so no filesystem or
       library probe is paid for a refusal a clock decided, and so the answer at
       02:00 is quiet hours rather than `BUSY`. Refuse with the new code and a
       message naming the resume time, as in `Quiet hours until 07:00.`
-- [ ] 2.4 Tests in `tests/test_speech_session.py`: a declaration inside the window
+- [x] 2.4 Tests in `tests/test_speech_session.py`: a declaration inside the window
       is refused with the new code; one outside it is accepted; a wrap-around window
       refuses before midnight and after it; no window configured accepts at every
       hour tested; the refusal happens with speech output enabled and the
       synthesizer available, so it is the window and nothing else doing it; and the
       refusal is returned without the output device being opened.
-- [ ] 2.5 Test that a session accepted before the window begins keeps speaking after
+- [x] 2.5 Test that a session accepted before the window begins keeps speaking after
       the clock passes the start, and that text sent on it afterwards is still
       spoken.
-- [ ] 2.6 Test that the quiet refusal wins over `BUSY`: a declaration inside the
+- [x] 2.6 Test that the quiet refusal wins over `BUSY`: a declaration inside the
       window while the daemon is not idle is refused with the quiet code.
 
 ## 3. Staying silent

@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import unittest.mock
+from datetime import datetime, time as time_of_day
 from pathlib import Path
 from types import ModuleType
 
@@ -158,7 +159,7 @@ class SessionClient:
 
 
 class SpeechSessionHarness(unittest.TestCase):
-    def serve(self, *, enabled: bool = True, session=None, engine=None, **overrides):
+    def serve(self, *, enabled: bool = True, session=None, engine=None, now=None, **overrides):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         config = MurmlyConfig(
@@ -176,6 +177,11 @@ class SpeechSessionHarness(unittest.TestCase):
             session=capture,
             overlay=NullOverlayController(),
             speech=engine,
+            # Left to the real clock unless a test says otherwise, so the suite
+            # keeps asserting what an ordinary daemon does. A test that names an
+            # hour supplies one, because a quiet window read off the wall clock
+            # would otherwise make the result depend on when the suite was run.
+            **({} if now is None else {"now": now}),
         )
         thread = threading.Thread(target=daemon.serve_forever, daemon=True)
         thread.start()
@@ -950,6 +956,178 @@ class DeclarationDuringCaptureTests(SpeechSessionHarness):
         self.wait_for(lambda: daemon._speech_session is None, message="the session to clear")
 
         self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
+
+
+class QuietHoursTests(SpeechSessionHarness):
+    """The window is read at the gate every spoken word passes, and nowhere else."""
+
+    NIGHT = {"tts_quiet_start": time_of_day(22, 0), "tts_quiet_end": time_of_day(7, 0)}
+
+    @staticmethod
+    def at(hour: int, minute: int = 0):
+        """A clock stopped at one local time, with the date deliberately fixed.
+
+        The window is a time of day, so the date must not be able to change the
+        answer. Pinning it is how that stays true rather than merely being true
+        today.
+        """
+        return lambda: datetime(2026, 9, 4, hour, minute)
+
+    def test_a_session_declared_inside_the_window_is_refused(self) -> None:
+        _daemon, socket_path, _engine, player, _capture = self.serve(
+            now=self.at(23, 30), **self.NIGHT
+        )
+
+        refusal = self.client(socket_path).declare()
+
+        self.assertFalse(refusal["ok"])
+        self.assertEqual(CommandCode.SPEECH_QUIET_HOURS, refusal["code"])
+        self.assertEqual(0, player.started, "an audio device was opened inside quiet hours")
+
+    def test_the_refusal_names_when_speech_resumes(self) -> None:
+        """A person reading this at 23:40 wants to know when, not that."""
+        _daemon, socket_path, _engine, _player, _capture = self.serve(
+            now=self.at(23, 40), **self.NIGHT
+        )
+
+        refusal = self.client(socket_path).declare()
+
+        self.assertIn("07:00", refusal["error"])
+
+    def test_the_refusal_happens_with_speech_output_enabled_and_available(self) -> None:
+        """So it is the window doing it, and not one of the other two refusals."""
+        _daemon, socket_path, engine, _player, _capture = self.serve(
+            now=self.at(2, 0), **self.NIGHT
+        )
+        self.assertTrue(engine.available, "the synthesizer was expected to be usable")
+
+        refusal = self.client(socket_path).declare()
+
+        self.assertEqual(CommandCode.SPEECH_QUIET_HOURS, refusal["code"])
+        self.assertNotEqual(CommandCode.SPEECH_DISABLED, refusal["code"])
+        self.assertNotEqual(CommandCode.SPEECH_UNAVAILABLE, refusal["code"])
+
+    def test_a_session_declared_outside_the_window_is_accepted(self) -> None:
+        _daemon, socket_path, _engine, _player, _capture = self.serve(
+            now=self.at(15, 0), **self.NIGHT
+        )
+
+        self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
+
+    def test_the_window_ends_at_its_end(self) -> None:
+        """Half-open: 22:00 is already quiet and 07:00 already speaks."""
+        _daemon, socket_path, _engine, _player, _capture = self.serve(
+            now=self.at(7, 0), **self.NIGHT
+        )
+        self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
+
+        _daemon, socket_path, _engine, _player, _capture = self.serve(
+            now=self.at(22, 0), **self.NIGHT
+        )
+        self.assertEqual(
+            CommandCode.SPEECH_QUIET_HOURS, self.client(socket_path).declare()["code"]
+        )
+
+    def test_a_window_spanning_midnight_refuses_on_both_sides_of_it(self) -> None:
+        for hour in (23, 0, 3):
+            with self.subTest(hour=hour):
+                _daemon, socket_path, _engine, _player, _capture = self.serve(
+                    now=self.at(hour), **self.NIGHT
+                )
+                self.assertEqual(
+                    CommandCode.SPEECH_QUIET_HOURS,
+                    self.client(socket_path).declare()["code"],
+                )
+
+    def test_a_daytime_window_refuses_only_inside_itself(self) -> None:
+        daytime = {"tts_quiet_start": time_of_day(9, 0), "tts_quiet_end": time_of_day(17, 0)}
+        _daemon, socket_path, _engine, _player, _capture = self.serve(now=self.at(12), **daytime)
+        self.assertEqual(
+            CommandCode.SPEECH_QUIET_HOURS, self.client(socket_path).declare()["code"]
+        )
+
+        _daemon, socket_path, _engine, _player, _capture = self.serve(now=self.at(2), **daytime)
+        self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
+
+    def test_no_window_configured_accepts_at_every_hour(self) -> None:
+        """The upgrade guarantee: an untouched configuration behaves as before."""
+        for hour in (0, 3, 12, 22, 23):
+            with self.subTest(hour=hour):
+                _daemon, socket_path, _engine, _player, _capture = self.serve(now=self.at(hour))
+                self.assertEqual(
+                    {"ok": True, "session": "speech"}, self.client(socket_path).declare()
+                )
+
+    def test_the_window_is_read_at_declaration_and_not_at_startup(self) -> None:
+        """A daemon started before the window refuses inside it, unrestarted."""
+        hour = [21]
+        _daemon, socket_path, _engine, _player, _capture = self.serve(
+            now=lambda: datetime(2026, 9, 4, hour[0], 0), **self.NIGHT
+        )
+
+        self.assertEqual({"ok": True, "session": "speech"}, self.client(socket_path).declare())
+
+        hour[0] = 23
+        self.assertEqual(
+            CommandCode.SPEECH_QUIET_HOURS, self.client(socket_path).declare()["code"]
+        )
+
+    def test_quiet_hours_answer_before_busy_does(self) -> None:
+        """At 02:00 the answer is the window, whatever else the daemon is doing.
+
+        `BUSY` would send a caller looking for a conflicting session that is not
+        the reason it was refused.
+        """
+        daemon, socket_path, _engine, _player, _capture = self.serve(
+            now=self.at(2, 0), **self.NIGHT
+        )
+        self.assertEqual("LISTENING", send_command(str(socket_path), "toggle")["state"])
+
+        refusal = self.client(socket_path).declare()
+
+        self.assertEqual(CommandCode.SPEECH_QUIET_HOURS, refusal["code"])
+        self.assertNotEqual(CommandCode.BUSY, refusal["code"])
+
+    def test_speech_output_disabled_still_answers_before_the_window(self) -> None:
+        """A person who never enabled speech does not need to hear about hours."""
+        _daemon, socket_path, _engine, _player, _capture = self.serve(
+            enabled=False, now=self.at(23, 30), **self.NIGHT
+        )
+
+        self.assertEqual(
+            CommandCode.SPEECH_DISABLED, self.client(socket_path).declare()["code"]
+        )
+
+    def test_a_session_open_when_the_window_begins_keeps_speaking(self) -> None:
+        """Not started, not stopped. Cutting a sentence in half is worse.
+
+        The session is declared at 21:59, the clock crosses 22:00 while it is
+        open, and the text sent after the crossing is still spoken.
+        """
+        clock = [datetime(2026, 9, 4, 21, 59)]
+        _daemon, socket_path, _engine, player, _capture = self.serve(
+            now=lambda: clock[0], **self.NIGHT
+        )
+        client = self.client(socket_path)
+        self.assertEqual({"ok": True, "session": "speech"}, client.declare())
+        client.send({"command": "speak", "name": "one", "text": "Before the hour."})
+        self.wait_for(lambda: player.frames_written > 0, message="the first text to play")
+        played_before = player.frames_written
+
+        clock[0] = datetime(2026, 9, 4, 22, 30)
+        self.assertEqual(
+            CommandCode.SPEECH_QUIET_HOURS,
+            self.client(socket_path).declare()["code"],
+            "the clock was expected to be inside the window by now",
+        )
+
+        client.send({"command": "speak", "name": "two", "text": "After the hour."})
+        self.wait_for(
+            lambda: player.frames_written > played_before,
+            message="text sent after the window opened to play",
+        )
+
+        self.assertTrue(player.active, "the open session's output device was closed")
 
 
 class TranscriptBindingTests(SpeechSessionHarness):

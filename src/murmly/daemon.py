@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 import ctypes
 import json
@@ -16,7 +17,7 @@ import threading
 import time
 
 from murmly.audio import SoundDeviceRecorder
-from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig
+from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, is_quiet_at
 from murmly.focus import (
     FocusObserver,
     WindowIdentity,
@@ -132,6 +133,11 @@ class CommandCode(StrEnum):
     COMMAND_FAILED = "command_failed"
     SPEECH_DISABLED = "speech_disabled"
     SPEECH_UNAVAILABLE = "speech_unavailable"
+    # Its own code, and not either of the two above, because the three call for
+    # different things from a caller. A sender refused for quiet hours is right
+    # to try again in the morning; one refused because speech output is off or
+    # broken is not, and would spend every turn until someone fixes it.
+    SPEECH_QUIET_HOURS = "speech_quiet_hours"
     SPEECH_SESSION_IN_USE = "speech_session_in_use"
     # Not a refusal: it is the category the interruption event reports itself
     # under, because a sender branching on what happened cannot branch on prose.
@@ -1094,8 +1100,15 @@ class MurmlyDaemon:
         profile: PlatformProfile | None = None,
         local_identity: Callable[[], object] | None = None,
         hotkey_registrar: object | None = None,
+        now: Callable[[], datetime] = datetime.now,
     ) -> None:
         self._config = config
+        # A second clock, and deliberately not the monotonic one `SpeechSession`
+        # takes. That one measures how long something has been going; this one
+        # answers what time it is where the person is, which is the only thing a
+        # quiet window can be decided against. Injected so the tests can ask
+        # about 02:00 without waiting for it.
+        self._now = now
         # Resolved once and kept, like every other platform-dependent decision
         # in this change (task 1.3) -- `serve_forever` and `shutdown` both read
         # it later to decide whether the channel is a UNIX socket or a named
@@ -1866,6 +1879,34 @@ class MurmlyDaemon:
                 CommandCode.SPEECH_DISABLED,
                 "Speech output is not enabled. Set enabled = true under [tts].",
             )
+
+        # Second, and before the two probes below. Those touch the filesystem and
+        # the synthesis runtime, and a refusal a clock decided should not pay for
+        # either. Before `BUSY` further down for a different reason: at 02:00 the
+        # answer is quiet hours whether or not the daemon happens to be
+        # recording, and reporting `BUSY` would send a caller looking for a
+        # conflict that is not the reason. After the check above because a person
+        # who has not enabled speech at all does not need to be told about a
+        # window.
+        #
+        # Read here rather than resolved at startup: configuration is read once,
+        # so a window resolved then would be resolved once for the life of the
+        # daemon. The local wall clock at the moment of the question also makes
+        # the daylight-saving change the operating system's problem rather than
+        # Murmly's, and needs no timer, no wake-up, and no state to keep correct
+        # across a suspend.
+        if is_quiet_at(
+            self._config.tts_quiet_start,
+            self._config.tts_quiet_end,
+            self._now().time(),
+        ):
+            return failure_response(
+                CommandCode.SPEECH_QUIET_HOURS,
+                "Quiet hours until "
+                f"{self._config.tts_quiet_end.strftime('%H:%M')}."
+                " Set quiet_hours under [tts] to change the window.",
+            )
+
         if not self._speech.available:
             return failure_response(
                 CommandCode.SPEECH_UNAVAILABLE,
