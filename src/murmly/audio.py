@@ -444,6 +444,13 @@ class SoundDevicePlayer:
         # time the person dictated, which is exactly when they are investigating.
         self._underruns = 0
         self._starved_periods = 0
+        # The run of silent periods not yet decided either way, and whether
+        # anything has played at all. Both belong to the stream rather than to
+        # the process, so unlike the two counters above they are reset by
+        # `start()`: a run left open across a reopen would be committed by the
+        # next session's first audio and counted against it.
+        self._silent_periods = 0
+        self._played_any = False
         self._output_latency_seconds = 0.0
         self._device_detail: str | None = None
         self._device_name: str | None = None
@@ -541,6 +548,8 @@ class SoundDevicePlayer:
         self._carry = b""
         self._frames_written = 0
         self._frames_played = 0
+        self._silent_periods = 0
+        self._played_any = False
         self._output_latency_seconds = 0.0
         self._device_detail = None
         self._device_name = None
@@ -615,18 +624,49 @@ class SoundDevicePlayer:
                     f"latency={latency!r}: {error}"
                 )
                 continue
-            # What the host gave, which is not always what was asked for. The
-            # everything-heard report waits this out, so it has to be the
-            # negotiated value rather than the requested one.
-            try:
-                self._output_latency_seconds = float(getattr(stream, "latency", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                # A host that reports its buffer as something other than seconds
-                # has still opened a working stream. Zero means the report is not
-                # held back rather than held forever, which is what shipped
-                # before the hold existed.
-                self._output_latency_seconds = 0.0
+            # What the host gave, which is not always what was asked for --
+            # `suggestedLatency` is a suggestion, and sounddevice says so:
+            # "It may differ significantly from the latency value(s) passed to
+            # Stream()". Measured: CoreAudio granted 174.8 ms for a 200 ms
+            # request. The everything-heard report waits this out, so it has to
+            # be the negotiated value rather than the requested one.
+            self._output_latency_seconds = self._reported_latency(stream)
             return stream
+
+    def _forget_silent_run(self) -> None:
+        """Drop the undecided run of silent periods, because playback was cut.
+
+        Called from `abort`, with the device already stopped so the callback
+        cannot be adding to it. The silence around an interruption is the person
+        asking for silence, not synthesis failing to keep up, and the silence
+        after one would otherwise be committed against whatever the session
+        speaks next.
+        """
+        self._silent_periods = 0
+        self._played_any = False
+
+    @staticmethod
+    def _reported_latency(stream) -> float:
+        """The output half of whatever shape the host reported its latency in.
+
+        `sounddevice` sets `_latency` to a bare float for a stream that is only
+        one direction and to an `(input, output)` pair for a duplex one. Nothing
+        here opens a duplex stream -- `RawOutputStream` is output only, so the
+        float is what this actually sees -- but reading the pair costs a line
+        and the alternative is falling back to zero, which would silently
+        release the everything-heard hold and report no buffer at all.
+        """
+        reported = getattr(stream, "latency", 0.0)
+        if isinstance(reported, (tuple, list)):
+            reported = reported[-1] if reported else 0.0
+        try:
+            return float(reported or 0.0)
+        except (TypeError, ValueError):
+            # A host that reports its buffer as something other than a number of
+            # seconds has still opened a working stream. Zero means the report is
+            # not held back rather than held forever, which is what shipped
+            # before the hold existed.
+            return 0.0
         return None
 
     def _candidate_latencies(self, sounddevice, device) -> list[float | str]:
@@ -668,15 +708,31 @@ class SoundDevicePlayer:
             view[filled : filled + take] = self._carry[:take]
             self._carry = self._carry[take:]
             filled += take
+        played = filled // (self._channels * 2)
+        if played:
+            # Audio after a silent stretch is what proves the stretch was a gap
+            # in the middle of playback. Committed here rather than counted as
+            # it happened, because the same shortfall means two different things
+            # depending on what follows it: a gap the person heard as a break in
+            # the words, or the last period of an utterance that simply ended.
+            # Every healthy playback ends on a partial period, so counting them
+            # where they occur makes the number non-zero for playback that was
+            # perfect and leaves it saying nothing.
+            if self._silent_periods:
+                self._starved_periods += self._silent_periods
+                self._silent_periods = 0
+            self._played_any = True
         if filled < wanted:
             # Silence rather than stale audio, and not counted as played: a
             # position that advanced through an underrun would report speech
-            # nobody heard. Counted apart from `_underruns`: the device asked
-            # and there was nothing to give it, which is a producer that fell
-            # behind rather than a buffer the host could not keep fed.
+            # nobody heard. Held as a pending run rather than counted: see
+            # above. Not opened at all until something has played, so the wait
+            # for the first sentence of a session -- which is synthesis latency,
+            # not a dropout -- never counts either.
             view[filled:wanted] = bytes(wanted - filled)
-            self._starved_periods += 1
-        self._frames_played += filled // (self._channels * 2)
+            if self._played_any:
+                self._silent_periods += 1
+        self._frames_played += played
 
     def write(self, samples, sample_rate_hz: int) -> int:
         """Queue one synthesized chunk, and report how many frames it became."""
@@ -713,10 +769,12 @@ class SoundDevicePlayer:
             self._frames_written = self._frames_played
         if stream is None:
             self._carry = b""
+            self._forget_silent_run()
             return self._frames_played
         # Cleared while the device is stopped, so the callback cannot be holding
         # a slice of it.
         self._carry = b""
+        self._forget_silent_run()
         try:
             # `abort` is Pa_AbortStream, which leaves the stream *stopped*. The
             # callback is not invoked again until the stream is started, so

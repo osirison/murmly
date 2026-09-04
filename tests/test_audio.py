@@ -926,20 +926,76 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(1, player.underruns)
         self.assertEqual(0, player.starved_periods, "the queue had everything asked for")
 
-    def test_a_period_with_nothing_produced_counts_starvation_and_not_a_dropout(self) -> None:
+    def test_a_gap_in_the_middle_of_playback_counts_starvation_and_not_a_dropout(self) -> None:
         """The other half of the pipeline, and why one number cannot say both.
 
-        Nothing had been synthesized yet. The device asked in good time and was
-        given silence, which is a producer that fell behind rather than a buffer
-        the host could not keep fed.
+        The device asked in good time, mid-utterance, and was given silence.
+        That is a producer that fell behind rather than a buffer the host could
+        not keep fed.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+
+        streams[0].pump(480)
+        streams[0].pump(480)
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+
+        self.assertEqual(2, player.starved_periods)
+        self.assertEqual(0, player.underruns, "the device never complained")
+
+    def test_the_silence_before_the_first_word_is_not_starvation(self) -> None:
+        """A device open while the first sentence is being synthesized.
+
+        The stream is started when the session is declared, so it asks for audio
+        for as long as the model takes. That is synthesis latency and it is
+        expected; counting it would make the number non-zero for every session
+        that ever spoke.
         """
         player, streams, _sd = self._player()
         player.start()
 
+        for _ in range(5):
+            streams[0].pump(480)
+        player.write(self._tone(480), 24_000)
         streams[0].pump(480)
 
-        self.assertEqual(1, player.starved_periods)
-        self.assertEqual(0, player.underruns, "the device never complained")
+        self.assertEqual(0, player.starved_periods)
+
+    def test_the_last_partial_period_of_a_healthy_playback_is_not_starvation(self) -> None:
+        """Every playback ends on a period the queue cannot fill.
+
+        Counted where it happens, that makes the number non-zero for playback
+        that was perfect, which leaves it saying nothing at all. It is only a
+        gap if audio follows it.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(500), 24_000)
+
+        streams[0].pump(480)
+        streams[0].pump(480)
+        streams[0].pump(480)
+
+        self.assertEqual(500, player.frames_played, "every frame written was played")
+        self.assertEqual(0, player.starved_periods)
+
+    def test_the_silence_after_an_interruption_is_not_charged_to_what_follows(self) -> None:
+        """A person asking for silence is not synthesis failing to keep up."""
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+
+        player.abort()
+        for _ in range(3):
+            streams[0].pump(480)
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
+
+        self.assertEqual(0, player.starved_periods)
 
     def test_the_counters_survive_an_abort_and_a_reopen(self) -> None:
         """A session suspended for capture and resumed is one playback.
@@ -949,7 +1005,11 @@ class PlaybackTests(unittest.TestCase):
         """
         player, streams, _sd = self._player()
         player.start()
+        player.write(self._tone(480), 24_000)
         streams[0].pump(480, status="output underflow")
+        streams[0].pump(480)
+        player.write(self._tone(480), 24_000)
+        streams[0].pump(480)
         player.abort()
         player.stop()
         player.start()
@@ -1353,13 +1413,23 @@ class LivePlaybackTests(unittest.TestCase):
         )
         self.assertEqual(0, player.underruns, "the device could not be kept fed")
 
-    def test_the_buffer_it_negotiated_clears_the_floor(self) -> None:
+    def test_a_buffer_far_larger_than_a_host_default_was_negotiated(self) -> None:
+        """Not an assertion that the host granted what was asked for.
+
+        `suggestedLatency` is a suggestion. sounddevice says the reported value
+        "may differ significantly from the latency value(s) passed to Stream()",
+        and CoreAudio granted 174.8 ms for a 200 ms request. The margin here is
+        wide on purpose: it catches the latency argument being dropped
+        altogether -- every host's own default is an order of magnitude smaller
+        than this -- without asserting a contract PortAudio does not make.
+        """
         player = self._player()
 
+        self.assertGreater(player.output_latency_seconds, 0.0, "no buffer was reported")
         self.assertGreaterEqual(
             player.output_latency_seconds,
-            MIN_PLAYBACK_LATENCY_SECONDS,
-            "a host that grants the floor must report it",
+            MIN_PLAYBACK_LATENCY_SECONDS / 2,
+            "the buffer looks like a host default, so the floor was not asked for",
         )
 
     def test_stopping_is_not_slowed_by_the_larger_buffer(self) -> None:

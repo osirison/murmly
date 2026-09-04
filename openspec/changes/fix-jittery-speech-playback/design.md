@@ -77,6 +77,14 @@ budget and is identical in the passing and failing runs.
 Open the stream with an explicit `latency` of 200 ms, falling back to smaller values
 and finally to the host's own `'high'` if a host refuses it.
 
+It is a floor on what is *asked for*, never an assertion about what is granted.
+`suggestedLatency` is a suggestion — sounddevice states that the reported value "may
+differ significantly from the latency value(s) passed to `Stream()`" — and CoreAudio was
+measured granting 174.8 ms for a 200 ms request. A device-backed test can therefore
+assert the behaviour (audio plays in the time it occupies, nothing is dropped) and that
+the buffer is far larger than any host's own default, but not that the number came back
+equal to the floor.
+
 Why a constant rather than a computed multiple: the quantity that must be covered is
 the host's scheduling cycle, and nothing portable reports it. A floor generous enough
 to cover any plausible cycle is therefore the only formulation that does not depend
@@ -123,6 +131,18 @@ synthesis problem rather than a device problem. Count it separately so the two d
 have to be told apart by guesswork. The spec asks for "playback dropouts"; report the
 device count under that name and keep the starvation count available for the same
 section, since they point at different halves of the pipeline.
+
+The starvation count has to be committed rather than counted where it happens, or it
+says nothing. The same shortfall — the callback asking for a period the queue cannot
+fill — means two different things depending on what follows it: a gap the person heard
+as a break in the words, or the last period of an utterance that simply ended. Every
+healthy playback ends on one of the latter, so counting them as they occur makes the
+number non-zero for playback that was perfect. A run of silent periods is therefore held
+undecided and added to the count only when audio follows it, discarded when the stream
+stops or is aborted, and never opened before the first audio of a session — the wait for
+the first sentence is synthesis latency, which is expected, not a dropout. Measured
+against a real device afterwards: a clean 4.5 s playback reports zero, and a deliberate
+0.6 s gap mid-playback reports the twelve periods it occupied.
 
 ### Hold `heard_all` until the device has actually played the audio
 

@@ -36,7 +36,11 @@ audible to reproduce it.
 | Field | Above zero means |
 | --- | --- |
 | `playback_dropouts` | the device asked and could not be fed in time -- the buffer is too small for the audio graph |
-| `playback_starvations` | the device asked in good time and nothing was synthesized yet -- synthesis is behind |
+| `playback_starvations` | the device asked in good time, mid-utterance, and nothing was synthesized yet -- synthesis is behind |
+
+`playback_starvations` counts only gaps with audio on both sides. The wait before the
+first sentence, and the partial period every playback ends on, are both expected and are
+not counted -- otherwise the number would be non-zero for playback that was perfect.
 
 Do not conflate them. They send an investigation to opposite halves of the
 pipeline, which is why they are counted apart. Both read `null` beside a
