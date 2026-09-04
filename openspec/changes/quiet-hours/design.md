@@ -116,9 +116,14 @@ A new `_quiet_window(value)` returns `(start, end, rejected)`. It does not reuse
 
 Falling back to *no* window rather than to some default window is the point: a
 person who believes they will not be disturbed and is, has a bug they can see; one
-who is silenced at hours they never wrote has a bug they cannot. An equal start and
-end is not a rejection — it parsed, it means no window — so it is reported as the
-configured value with the window not in force, not as a value that was refused.
+who is silenced at hours they never wrote has a bug they cannot.
+
+An equal start and end yields no window, and is returned as a value that was not
+honoured even though it parsed. `_rejected_value`'s own definition in this file is
+"the configured value when it was not the one used", which is exactly what
+`22:00-22:00` is. The alternative — reporting no window and nothing else — leaves a
+person whose config plainly sets a window looking at a report that says none is
+set, with nothing to explain the difference.
 
 ### Diagnostics report the window, the rejection, and whether it is in force
 

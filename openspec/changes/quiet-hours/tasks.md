@@ -1,25 +1,26 @@
 ## 1. Reading the setting
 
-- [ ] 1.1 Add `_quiet_window(value)` to `src/murmly/config.py`, returning
+- [x] 1.1 Add `_quiet_window(value)` to `src/murmly/config.py`, returning
       `(start, end, rejected)`: it accepts `"HH:MM-HH:MM"` in 24-hour local time
       with optional surrounding whitespace, returns `(None, None, None)` for an
       absent or empty value, returns `(None, None, str(value))` for anything it
-      cannot read, and returns `(None, None, None)` when start equals end — that
-      parsed, and it means no window.
-- [ ] 1.2 Add `tts_quiet_start: time | None`, `tts_quiet_end: time | None`, and
+      cannot read, and returns `(None, None, str(value))` when start equals end —
+      that parsed and it means no window, but a report showing none against a file
+      that plainly sets one leaves its owner nothing to look at.
+- [x] 1.2 Add `tts_quiet_start: time | None`, `tts_quiet_end: time | None`, and
       `tts_quiet_rejected_value: str | None` to `MurmlyConfig`, defaulting to no
       window, and populate them from `[tts] quiet_hours` in `load_config`.
-- [ ] 1.3 Add `is_quiet_at(start, end, now)` — a pure function, half-open, with
+- [x] 1.3 Add `is_quiet_at(start, end, now)` — a pure function, half-open, with
       `start > end` spanning midnight and no window when either bound is `None`.
       Place it beside the config it reads rather than in the daemon, so the tests
       for it need no daemon.
-- [ ] 1.4 Tests in `tests/test_config.py`: each accepted form; a leading zero and a
+- [x] 1.4 Tests in `tests/test_config.py`: each accepted form; a leading zero and a
       missing one; the empty string and an absent setting; a non-string value; an
       hour past 23 and a minute past 59; a value with seconds; a reversed-looking
-      window that is really a wrap-around; start equal to end reported as no window
-      and not as a rejection; and the rejected value carried as a string for a
-      value TOML gave as a type other than string.
-- [ ] 1.5 Tests for `is_quiet_at` covering, with a supplied `now`: inside a plain
+      window that is really a wrap-around; start equal to end yielding no window
+      while still reported as the value that was not honoured; and the rejected
+      value carried as a string for a value TOML gave as a type other than string.
+- [x] 1.5 Tests for `is_quiet_at` covering, with a supplied `now`: inside a plain
       window, outside it, exactly at the start (quiet), exactly at the end (not
       quiet), inside a wrap-around window before midnight and after it, outside a
       wrap-around window in the afternoon, and no window configured at any hour.
@@ -76,11 +77,11 @@
 
 ## 5. Documenting it
 
-- [ ] 5.1 Add `quiet_hours` to the `[tts]` block of `config.example.toml` with its
+- [x] 5.1 Add `quiet_hours` to the `[tts]` block of `config.example.toml` with its
       format, its empty default, what a wrap-around window means, and an explicit
       note that the value must be quoted — an unquoted `22:00-07:00` is not valid
       TOML and loses the whole file, not one setting.
-- [ ] 5.2 Add `### tts.quiet_hours { #tts-quiet-hours }` to `manual/settings.md`
+- [x] 5.2 Add `### tts.quiet_hours { #tts-quiet-hours }` to `manual/settings.md`
       among the other `[tts]` settings, and update the whole-file listing near the
       top of that page so it still matches `config.example.toml`.
 - [ ] 5.3 Mention the window in `manual/announcements.md` where it says what stops

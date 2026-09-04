@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import time
 from pathlib import Path
 import os
+import re
 import tomllib
 
 from murmly.platform import OperatingSystem, resolve_platform
@@ -138,6 +140,18 @@ DEFAULT_STT_UNLOAD_AFTER_IDLE_S = 300
 DEFAULT_TTS_UNLOAD_AFTER_IDLE_S = 0
 
 
+# The window speech is refused in, written as one string in the machine's own
+# local time. One setting rather than a start and an end because a window is one
+# thing and two settings can be half-written: a start with no end has no honest
+# reading -- silence forever, silence never, or a refusal to start, and each is a
+# bad answer to a typo.
+#
+# A single-digit hour is accepted because `9:00` is what people write. Seconds
+# are not: nobody sets a bedtime to the second, and accepting them widens the
+# parser for no gain.
+QUIET_HOURS_PATTERN = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$")
+
+
 #: Windows has no `AF_UNIX`, so the command channel there is a named pipe
 #: rather than a file (see design.md's "The command channel"). A module
 #: constant rather than a literal inline, so the daemon's actual pipe creation
@@ -220,6 +234,25 @@ def default_config_path(env: dict[str, str] | None = None) -> Path:
     return Path.home() / ".config" / "murmly" / "config.toml"
 
 
+def is_quiet_at(start: time | None, end: time | None, now: time) -> bool:
+    """Whether local time `now` falls inside the quiet window `start`-`end`.
+
+    Half-open, so quiet begins at the start and ends at the end: `22:00-07:00`
+    refuses at 22:00:00 and accepts at 07:00:00. A start later than its end spans
+    midnight, which is the shape almost every night has.
+
+    A pure function of three times, deliberately: it is the whole of what decides
+    whether Murmly is quiet, so it can be asked about any hour without a test
+    having to wait for one, and no state is kept that could be wrong across a
+    suspend, a resume, or a daylight-saving change.
+    """
+    if start is None or end is None:
+        return False
+    if start > end:
+        return now >= start or now < end
+    return start <= now < end
+
+
 @dataclass(slots=True)
 class MurmlyConfig:
     socket_path: Path
@@ -257,6 +290,9 @@ class MurmlyConfig:
     tts_unload_after_idle_s: int = DEFAULT_TTS_UNLOAD_AFTER_IDLE_S
     tts_output_device: str = ""
     tts_model_dir: Path = field(default_factory=default_tts_model_dir)
+    tts_quiet_start: time | None = None
+    tts_quiet_end: time | None = None
+    tts_quiet_rejected_value: str | None = None
 
     @property
     def model_name(self) -> str:
@@ -320,6 +356,9 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
     if tts_device not in VALID_DEVICES:
         tts_device_rejected_value = tts_device
         tts_device = DEFAULT_TTS_DEVICE
+    tts_quiet_start, tts_quiet_end, tts_quiet_rejected_value = _quiet_window(
+        tts.get("quiet_hours")
+    )
     model_dir = tts.get("model_dir")
     tts_model_dir = (
         Path(str(model_dir)).expanduser() if model_dir else default_tts_model_dir(env)
@@ -402,6 +441,9 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         ),
         tts_output_device=str(tts.get("output_device", "")),
         tts_model_dir=tts_model_dir,
+        tts_quiet_start=tts_quiet_start,
+        tts_quiet_end=tts_quiet_end,
+        tts_quiet_rejected_value=tts_quiet_rejected_value,
     )
 
 
@@ -471,6 +513,49 @@ def _rejected_value(value: object, resolved: int) -> object | None:
         # made `murmly doctor` print no report at all.
         return str(value)
     return value
+
+
+def _quiet_window(value: object) -> tuple[time | None, time | None, str | None]:
+    """The window speech is refused in: a start, an end, and what was not honoured.
+
+    Falls back to no window rather than to some other window, which is the point
+    of the fallback here. A person who believes they will not be disturbed and is
+    has a bug they can see; one silenced at hours they never wrote has one they
+    cannot.
+
+    A start equal to its end is read as no window rather than as a whole day.
+    Someone who wants Murmly permanently silent has `enabled = false`, and
+    reading an equal pair as 24 hours would turn a plausible typo into a daemon
+    that never speaks again. It is still returned as a value that was not
+    honoured, because a report showing no window against a file that plainly sets
+    one leaves its owner with nothing to look at.
+    """
+    if value is None:
+        return None, None, None
+    if not isinstance(value, str):
+        # Stringified for the reason `_rejected_value` gives: the report is
+        # serialised as JSON, and an unquoted `22:00:00` is TOML's own local-time
+        # literal, which json cannot encode. An unquoted `22:00-07:00` does not
+        # reach here at all -- it is not valid TOML, and the whole file is lost
+        # before this function is called, which is why the example must show the
+        # quotes.
+        return None, None, str(value)
+    if not value.strip():
+        return None, None, None
+    match = QUIET_HOURS_PATTERN.match(value)
+    if match is None:
+        return None, None, value
+    start_hour, start_minute, end_hour, end_minute = (int(part) for part in match.groups())
+    try:
+        start = time(start_hour, start_minute)
+        end = time(end_hour, end_minute)
+    except ValueError:
+        # An hour past 23 or a minute past 59 matched the shape and is still not
+        # a time of day.
+        return None, None, value
+    if start == end:
+        return None, None, value
+    return start, end, None
 
 
 def _boolean(value: object, default: bool) -> bool:

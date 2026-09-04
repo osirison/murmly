@@ -83,6 +83,7 @@ rate = 100             # Percentage of the model's own speaking rate, 50-200
 device = "cpu"         # auto | cpu | cuda, independent of [stt] device
 unload_after_idle_s = 0        # Drop the synthesis session after this idle time; 0 never
 output_device = ""     # Empty lets the system choose
+quiet_hours = ""       # "HH:MM-HH:MM" local time; empty means speak at any hour
 # model_dir = "~/.local/share/murmly"   # Where the model and voices are
 ```
 
@@ -266,6 +267,39 @@ explained, with what it costs and returns, on
 
 Default `""`. An empty value lets the system choose the
 audio output device. See [making murmly speak](making-murmly-speak.md).
+
+### `tts.quiet_hours` { #tts-quiet-hours }
+
+Default `""`, which is no window: murmly speaks whenever it is asked
+to, at any hour. Set it to a window and murmly will not start speaking
+inside that window:
+
+```toml
+[tts]
+quiet_hours = "22:00-07:00"
+```
+
+Both times are this machine's own local time, so the daylight-saving
+change looks after itself. A start later than its end spans midnight,
+which is the shape almost every night has; a start before its end is an
+ordinary daytime window. Quiet begins at the start and ends at the end,
+so `"22:00-07:00"` is silent at 22:00:00 and speaks again at 07:00:00.
+
+**Keep the quotes.** Unquoted, `22:00-07:00` is not valid TOML, and a
+file that does not parse loses every setting in it rather than this one.
+
+Inside the window murmly refuses to speak before it makes any sound at
+all, so there is no chime either. Speech that was already playing when
+the window opened finishes its sentence rather than being cut off —
+stopping mid-word is a worse interruption than the one being avoided.
+
+Dictation is untouched. The hotkey, transcription, and delivery work at
+every hour, because speaking into the microphone at night is you
+choosing to make a noise.
+
+A window murmly cannot read leaves it with no window rather than
+stopping the service. [`murmly doctor`](troubleshooting.md) names what
+was not honoured, and reports whether the window is in force right now.
 
 ### `tts.model_dir` { #tts-model-dir }
 
