@@ -2166,6 +2166,34 @@ class MurmlyDaemon:
             )
         return residency
 
+    def _playback(self) -> dict[str, object]:
+        """What speech playback has dropped since this daemon started.
+
+        Carried by `status` for the same reason residency is: the counters live
+        in this process, and `murmly doctor` runs in another one where a player
+        it opened itself would report zero however badly this daemon is
+        stuttering. Counted across the daemon's life rather than a session's,
+        because the person asking has heard several announcements and is asking
+        about all of them.
+
+        Two numbers rather than one. The device count says the output buffer
+        could not be kept fed, the starvation count says synthesis did not keep
+        up, and a single figure would send an investigation to whichever half
+        the reader guessed.
+
+        Nothing is locked and nothing is constructed, as `_residency` above.
+        """
+        playback: dict[str, object] = {}
+        try:
+            player = self._speech.player
+            playback["playback_dropouts"] = int(player.underruns)
+            playback["playback_starvations"] = int(player.starved_periods)
+        except Exception as error:  # noqa: BLE001 - status still owes an answer
+            playback["playback_dropouts"] = None
+            playback["playback_starvations"] = None
+            playback["playback_detail"] = f"Unable to determine playback dropouts: {error}"
+        return playback
+
     def _rebind_hotkeys(self) -> str:
         """Re-register every recorded hotkey, where this platform needs it.
 
@@ -2221,7 +2249,12 @@ class MurmlyDaemon:
             # caller talking to a daemon too old to include the fields sees them
             # absent -- which is the same case it must handle for a daemon that
             # does not answer at all.
-            response: dict[str, object] = {"ok": True, "state": self.state, **self._residency()}
+            response: dict[str, object] = {
+                "ok": True,
+                "state": self.state,
+                **self._residency(),
+                **self._playback(),
+            }
             # Present on every platform (platform-support's "What does not
             # depend on the platform is identical on every platform": the
             # command protocol's responses are the same shape everywhere,

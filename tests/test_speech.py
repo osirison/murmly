@@ -32,6 +32,11 @@ class RecordingPlayer:
         # the case that matters: a sink that goes away while capture is running.
         self.start_error = start_error
         self.sample_rate_hz = sample_rate_hz
+        # Zero by default so every existing scenario stays timing independent:
+        # a device that holds nothing has nothing to wait out, so the
+        # everything-heard report lands the moment the position catches up, as
+        # it did before the hold existed. A test about the hold sets it.
+        self.output_latency_seconds = 0.0
         self.frames_written = 0
         self.frames_played = 0
         self.started = 0
@@ -39,6 +44,7 @@ class RecordingPlayer:
         self.aborted = 0
         self.active = False
         self.written: list[tuple[int, int]] = []
+        self.expecting: list[bool] = []
 
     def start(self) -> None:
         if self.start_error is not None:
@@ -64,6 +70,10 @@ class RecordingPlayer:
     @property
     def pending_frames(self) -> int:
         return max(self.frames_written - self.frames_played, 0)
+
+    def expect_audio(self, expected: bool) -> None:
+        """Recorded rather than acted on: this double has no callback to gate."""
+        self.expecting.append(expected)
 
     def play(self, frames: int | None = None) -> None:
         """Let the device consume what is queued, or `frames` of it."""
@@ -136,7 +146,12 @@ class EngineHarness(unittest.TestCase):
         )
         player = overrides.pop("player", None) or RecordingPlayer()
         synthesizer = overrides.pop("synthesizer", None) or FakeSynthesizer()
-        engine = SpeechEngine(config, synthesizer=synthesizer, player=player)
+        now = overrides.pop("now", None)
+        engine = (
+            SpeechEngine(config, synthesizer=synthesizer, player=player)
+            if now is None
+            else SpeechEngine(config, synthesizer=synthesizer, player=player, now=now)
+        )
         events: list[dict] = []
         lock = threading.Lock()
 
@@ -1008,3 +1023,186 @@ class AvailabilityNowTests(EngineHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeClock:
+    """A monotonic clock the test moves itself.
+
+    The hold under test is measured in elapsed seconds, and a test that waited
+    them out would be asserting that the machine was not busy. Moved by hand,
+    the assertion is about the rule rather than about the schedule.
+    """
+
+    def __init__(self) -> None:
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+class InstantPlayer(RecordingPlayer):
+    """A device that consumes every write the moment it arrives.
+
+    Models the case the hold is most fragile in: the producer is delayed past
+    the remaining tail after its last write, so the first publish that follows
+    already finds the position caught up and never sees a pass with anything
+    outstanding to clear the previous batch's drain moment on.
+    """
+
+    def write(self, samples, sample_rate_hz: int) -> int:
+        frames = super().write(samples, sample_rate_hz)
+        self.frames_played += frames
+        return frames
+
+
+class HeardAllHoldTests(EngineHarness):
+    """Everything reported heard has left the loudspeaker, not just the queue.
+
+    `frames_played` counts frames copied *into* the output buffer, so it catches
+    up with the written position while that buffer still holds its whole depth
+    of unplayed audio. A sender closes its session on this report and closing
+    aborts the device, so reporting on the handover throws away whatever had not
+    been played -- which is the end of the last sentence.
+    """
+
+    def test_everything_heard_waits_for_the_buffer_to_empty(self) -> None:
+        clock = FakeClock()
+        held = RecordingPlayer()
+        held.output_latency_seconds = 0.2
+        engine, player, events = self.engine(player=held, now=clock)
+        self.begin(engine, events)
+
+        engine.speak("only", "A sentence.")
+        self.wait_for(lambda: player.pending_frames > 0, message="audio produced")
+        player.play()
+        engine.end_input()
+        # Several passes of the publish loop, with the clock standing still.
+        time.sleep(0.15)
+
+        self.assertEqual(
+            [],
+            [event for event in events if event.get("event") == EVENT_HEARD_ALL],
+            "reported as heard while the device still held it",
+        )
+
+        clock.advance(0.2)
+
+        self.wait_for(
+            lambda: any(event.get("event") == EVENT_HEARD_ALL for event in events),
+            message="heard_all once the buffer had emptied",
+        )
+
+    def test_a_device_that_holds_nothing_reports_without_waiting(self) -> None:
+        """Read from the player, never a constant.
+
+        A stream that negotiated a small buffer must not be made to wait for a
+        large one, and the wait has to fall to nothing when there is no buffer at
+        all -- which is what every other test in this file depends on.
+        """
+        clock = FakeClock()
+        engine, player, events = self.engine(now=clock)
+        self.begin(engine, events)
+
+        engine.speak("only", "A sentence.")
+        self.wait_for(lambda: player.pending_frames > 0, message="audio produced")
+        player.play()
+        engine.end_input()
+
+        self.wait_for(
+            lambda: any(event.get("event") == EVENT_HEARD_ALL for event in events),
+            message="heard_all with no buffer to wait out",
+        )
+
+    def test_more_text_arriving_restarts_the_wait(self) -> None:
+        """The hold is about this batch, not about the first time it drained.
+
+        A sender that said it had finished and then sent more must not have the
+        earlier drain's moment decide when the new text counts as heard.
+        """
+        clock = FakeClock()
+        held = RecordingPlayer()
+        held.output_latency_seconds = 0.2
+        engine, player, events = self.engine(player=held, now=clock)
+        self.begin(engine, events)
+
+        engine.speak("first", "A sentence.")
+        self.wait_for(lambda: player.pending_frames > 0, message="the first unit")
+        player.play()
+        engine.end_input()
+        time.sleep(0.1)
+
+        engine.speak("second", "Another sentence.")
+        self.wait_for(lambda: player.pending_frames > 0, message="the second unit")
+        clock.advance(0.2)
+        time.sleep(0.1)
+
+        self.assertEqual(
+            [],
+            [event for event in events if event.get("event") == EVENT_HEARD_ALL],
+            "the second unit had not been played, let alone heard",
+        )
+
+    def test_the_hold_does_not_delay_an_interruption(self) -> None:
+        """It gates one report. Stopping is not a report."""
+        clock = FakeClock()
+        held = RecordingPlayer()
+        held.output_latency_seconds = 0.2
+        engine, player, events = self.engine(player=held, now=clock)
+        self.begin(engine, events)
+
+        engine.speak("cut", "A sentence.")
+        self.wait_for(lambda: player.frames_written > 0, message="audio produced")
+
+        interruption = engine.interrupt()
+
+        self.assertIsNotNone(interruption, "the clock never moved and it still stopped")
+        self.assertEqual(1, player.aborted)
+
+
+class SecondBatchHoldTests(EngineHarness):
+    """A session that speaks again after being told everything was heard.
+
+    The base spec keeps the session open for exactly this: "Murmly speaks the
+    next text the session sends". The second batch has to earn its own hold --
+    inheriting the first batch's drain moment means the hold has already
+    elapsed before the audio was written, and the report goes out with a whole
+    buffer still in the device for the session's close to discard.
+    """
+
+    @staticmethod
+    def _heard(events: list[dict]) -> int:
+        return len([event for event in events if event.get("event") == EVENT_HEARD_ALL])
+
+    def test_a_second_batch_waits_out_the_buffer_of_its_own(self) -> None:
+        clock = FakeClock()
+        held = InstantPlayer()
+        held.output_latency_seconds = 0.2
+        engine, _player, events = self.engine(player=held, now=clock)
+        self.begin(engine, events)
+
+        engine.speak("first", "A sentence.")
+        engine.end_input()
+        self.wait_for(lambda: held.frames_written > 0, message="the first batch")
+        clock.advance(0.2)
+        self.wait_for(lambda: self._heard(events) == 1, message="the first batch heard")
+
+        engine.speak("second", "Another sentence.")
+        engine.end_input()
+        # Several passes of the publish loop, with the clock standing still.
+        time.sleep(0.15)
+
+        self.assertEqual(
+            1,
+            self._heard(events),
+            "the second batch was reported heard against the first batch's drain",
+        )
+
+        clock.advance(0.2)
+
+        self.wait_for(
+            lambda: self._heard(events) == 2,
+            message="the second batch heard once its own buffer had emptied",
+        )

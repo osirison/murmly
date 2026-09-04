@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import logging
 import threading
+import time
 
 from murmly.audio import SoundDevicePlayer
 from murmly.config import MurmlyConfig
@@ -225,8 +226,14 @@ class SpeechEngine:
         *,
         synthesizer=None,
         player=None,
+        now: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
+        # Injected for the everything-heard hold alone, the way `doctor` injects
+        # a clock for the quiet window: how long the device has held the last
+        # audio is a fact about elapsed time, so a test asserting it has to be
+        # able to name the moment rather than wait for one.
+        self._now = now
         # Not built at all when speech output is off: the probe runs espeak-ng
         # and reads distribution metadata, and a daemon that will never speak
         # should pay none of it.
@@ -246,6 +253,11 @@ class SpeechEngine:
         self._scheduled: deque[_Scheduled] = deque()
         self._generation = 0
         self._reported_heard_all = False
+        # When the written position was first caught, which is when the last
+        # audio reached the device rather than when it left the loudspeaker.
+        # None whenever anything is still outstanding, so a sender that resumes
+        # after a pause does not inherit the previous drain's moment.
+        self._drained_at: float | None = None
 
     @property
     def available(self) -> bool:
@@ -320,6 +332,7 @@ class SpeechEngine:
         self._stop = stop
         self._hold.clear()
         self._reported_heard_all = False
+        self._drained_at = None
         self._sink = sink
         thread = threading.Thread(
             target=self._run, args=(stop, sink), name="murmly-speech", daemon=True
@@ -343,6 +356,15 @@ class SpeechEngine:
         with self._lock:
             self._queue.send(SpeechUnit(name=name, text=text))
             self._reported_heard_all = False
+            # Cleared beside the flag, not left for the next `_publish` pass to
+            # notice. That pass only clears it when it observes something still
+            # outstanding, and a batch whose audio is already inside the device
+            # by the time the producer publishes gives it nothing to observe --
+            # so the new batch inherits the old one's drain moment, the hold has
+            # already elapsed against it, and the report goes out with a whole
+            # buffer still unplayed. Which is the report this hold exists to
+            # stop.
+            self._drained_at = None
 
     def end_input(self) -> None:
         self._queue.end_input()
@@ -493,6 +515,11 @@ class SpeechEngine:
         with self._lock:
             generation = self._generation
         entry: _Scheduled | None = None
+        # From here until this unit is finished, silence reaching the device
+        # means synthesis did not keep up. Outside it, silence means the sender
+        # has not sent the next piece of text yet -- which the device cannot
+        # tell apart and must not report as a slow synthesizer.
+        self._player.expect_audio(True)
         try:
             for samples, sample_rate_hz in self._synthesizer.synthesize(unit.text):
                 if stop.is_set() or self._stale(generation):
@@ -534,6 +561,11 @@ class SpeechEngine:
             # entry's end_frame is only "where the audio so far ends", and a
             # played position that has caught up to it would otherwise read as
             # the whole unit having been heard.
+            #
+            # The device is told the same thing, and for the same reason: the
+            # silence after this unit's last chunk is the tail every playback
+            # ends on, not a gap in it.
+            self._player.expect_audio(False)
             if entry is not None:
                 with self._lock:
                     entry.produced = True
@@ -573,13 +605,32 @@ class SpeechEngine:
             outstanding = any(not entry.heard for entry in self._scheduled)
             while self._scheduled and self._scheduled[0].heard:
                 self._scheduled.popleft()
-            heard_all = (
+            # Everything has reached the device. Not the same as everything
+            # having been heard: `frames_played` counts frames copied *into* the
+            # output buffer, so this is true while that buffer still holds up to
+            # its whole depth of unplayed audio.
+            drained = (
                 self._queue.input_ended
                 and not outstanding
                 and not self._queue.waiting
                 and not self._queue.holding
                 and self._player.pending_frames == 0
+            )
+            if not drained:
+                self._drained_at = None
+            elif self._drained_at is None:
+                self._drained_at = self._now()
+            # Held for the buffer's own depth before the report goes out. A
+            # sender closes its session on this event, and closing aborts the
+            # device rather than draining it -- so reporting on the handover
+            # throws away whatever the device had not played yet, which is the
+            # end of the last sentence. Read from the player rather than fixed,
+            # because it is that device's buffer that has to empty; a stream
+            # that negotiated a small one is not made to wait for a large one.
+            heard_all = (
+                drained
                 and not self._reported_heard_all
+                and self._now() - self._drained_at >= self._player.output_latency_seconds
             )
             if heard_all:
                 self._reported_heard_all = True

@@ -667,6 +667,11 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     # residency is meant to say what the daemon held when the question was put,
     # not what this report caused on its way past.
     (model_resident, model_resident_detail), synthesis_residency = daemon_residency(config)
+    # Asked here for the same reason and at the same moment. The speech probe
+    # below opens an output device of its own, and a count taken after that
+    # would still be the daemon's rather than the probe's -- but taking both
+    # answers from one point in the report keeps them describing one instant.
+    playback = daemon_playback(config)
 
     # `choose_clipboard_copy_command` has no Windows or macOS branch of its
     # own (task 9.1's clipboard is a Win32 API call, task 14.1's an
@@ -754,9 +759,12 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     # Guarded on its own, like every other probe: a speech stack that cannot be
     # inspected must not take the rest of the report with it.
     try:
-        speech = speech_output_diagnostics(config, residency=synthesis_residency)
+        speech = speech_output_diagnostics(
+            config, residency=synthesis_residency, playback=playback
+        )
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
         synthesis_resident, synthesis_resident_detail = synthesis_residency
+        playback_dropouts, playback_starvations, playback_detail = playback
         speech = {
             "enabled": config.tts_enabled,
             "available": False,
@@ -767,6 +775,12 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             # ran and nothing about the probe failing makes it less true.
             "unload_after_idle_s": config.tts_unload_after_idle_s,
             "resident": synthesis_resident,
+            # The counts survive a failed probe too, and can: they came from the
+            # daemon before the probe ran, and nothing about the probe failing
+            # makes them less true. A person whose speech is stuttering badly
+            # enough to break the probe is exactly the person who needs them.
+            "playback_dropouts": playback_dropouts,
+            "playback_starvations": playback_starvations,
             # The window survives a failed probe for the same reason, and can:
             # it is a configured value and a clock reading, neither of which the
             # synthesis probe can take down with it. A person whose agent has
@@ -783,6 +797,8 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             speech["quiet_hours_rejected_value"] = config.tts_quiet_rejected_value
         if synthesis_resident_detail is not None:
             speech["resident_detail"] = synthesis_resident_detail
+        if playback_detail is not None:
+            speech["playback_detail"] = playback_detail
 
     report: dict[str, object] = {
         "config_path": str(config.config_path),
@@ -1183,6 +1199,85 @@ def command_socket_diagnostics(
     return report
 
 
+def _daemon_status(
+    config: MurmlyConfig,
+    send: Callable[[str, str], dict[str, object]] | None,
+    subject: str,
+) -> tuple[dict[str, object], str | None]:
+    """The running daemon's `status` response, or the reason there is none.
+
+    Shared by everything `doctor` has to ask the daemon rather than answer for
+    itself, so those questions cannot drift apart on which failures they treat
+    as reportable. `subject` names what was being asked, because a reader is
+    owed which question went unanswered and not only that one did.
+
+    `send_command` rather than `send_command_with_recovery`: the recovery path
+    starts the installed service when nothing answers, which would have this
+    report boot a daemon and then say its models are idle, inverting the one
+    distinction it exists to draw. Its timeouts are not extended either. Doctor
+    is what someone runs when things are wrong, and a daemon that will not
+    answer in time is a fact to report rather than one to wait for.
+
+    An empty dict beside a reason rather than None beside one, so a caller that
+    goes on to read a key off it fails its own way rather than on an attribute
+    of None.
+    """
+    ask = send if send is not None else send_command
+    try:
+        response = ask(str(config.socket_path), COMMAND_STATUS)
+    except (FileNotFoundError, ConnectionRefusedError) as error:
+        return {}, f"No Murmly daemon is running, so {subject} could not be asked: {error}"
+    except DaemonNotRespondingError as error:
+        return {}, f"The Murmly daemon did not answer: {error}"
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        return {}, f"Unable to ask the Murmly daemon {subject}: {error}"
+    if not isinstance(response, dict):
+        return {}, "The Murmly daemon answered with something other than a status response."
+    return response, None
+
+
+def daemon_playback(
+    config: MurmlyConfig,
+    send: Callable[[str, str], dict[str, object]] | None = None,
+) -> tuple[int | None, int | None, str | None]:
+    """What speech playback has dropped in the running daemon, and why not.
+
+    Asked of the daemon for the reason `daemon_residency` below asks it about
+    models: the counters live in the daemon's process. `doctor` opens an output
+    device of its own to learn the rate and the buffer, and that device has
+    played nothing -- so counting dropouts there would report zero for a daemon
+    that has been stuttering all day.
+
+    Three outcomes, in the shape this file already uses for a value it could not
+    determine: two counts, or None for both beside a detail naming the reason. A
+    daemon too old to carry the fields is one of those reasons, reported as such
+    rather than as zero, because "no dropouts" and "not measured" send an
+    investigation to different places.
+    """
+    response, unavailable = _daemon_status(config, send, "its playback dropouts")
+    if unavailable is not None:
+        return None, None, unavailable
+    if "playback_dropouts" not in response:
+        return (
+            None,
+            None,
+            "The running Murmly daemon does not report playback dropouts. Restart "
+            "the service to pick up a version that does.",
+        )
+    detail = response.get("playback_detail")
+    dropouts = response.get("playback_dropouts")
+    starvations = response.get("playback_starvations")
+    if not isinstance(dropouts, int) or not isinstance(starvations, int):
+        return (
+            None,
+            None,
+            str(detail)
+            if isinstance(detail, str)
+            else "The Murmly daemon could not count its playback dropouts.",
+        )
+    return dropouts, starvations, None
+
+
 def daemon_residency(
     config: MurmlyConfig,
     send: Callable[[str, str], dict[str, object]] | None = None,
@@ -1206,22 +1301,9 @@ def daemon_residency(
     could not determine: True, False, or None beside a detail naming the reason.
     Nothing is loaded to produce any of them.
     """
-    ask = send if send is not None else send_command
-    try:
-        response = ask(str(config.socket_path), COMMAND_STATUS)
-    except (FileNotFoundError, ConnectionRefusedError) as error:
-        return _residency_unknown(
-            f"No Murmly daemon is running, so what it holds could not be asked: {error}"
-        )
-    except DaemonNotRespondingError as error:
-        return _residency_unknown(f"The Murmly daemon did not answer: {error}")
-    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
-        return _residency_unknown(f"Unable to ask the Murmly daemon what it holds: {error}")
-
-    if not isinstance(response, dict):
-        return _residency_unknown(
-            "The Murmly daemon answered with something other than a status response."
-        )
+    response, unavailable = _daemon_status(config, send, "what it holds")
+    if unavailable is not None:
+        return _residency_unknown(unavailable)
     if "model_resident" not in response:
         # Absent rather than null, which is how a daemon too old to know the
         # question answers it. A daemon that knows and cannot answer reports null
@@ -1290,6 +1372,7 @@ def speech_output_diagnostics(
     config: MurmlyConfig,
     synthesizer: KokoroSynthesizer | None = None,
     residency: tuple[bool | None, str | None] = (None, None),
+    playback: tuple[int | None, int | None, str | None] = (None, None, None),
     now: Callable[[], datetime] = datetime.now,
 ) -> dict[str, object]:
     """What `murmly doctor` says about speech output.
@@ -1304,11 +1387,17 @@ def speech_output_diagnostics(
     session this section is about lives in the daemon, and `daemon_residency`
     is what asked it.
 
+    The dropout counts are passed in for the same reason. The probe opens an
+    output device and plays nothing through it, so its own counts are a constant
+    zero however badly the daemon is stuttering; `daemon_playback` is what asked
+    the process that has been speaking.
+
     `now` is injected for the quiet window alone. Whether that window is in force
     is a fact about the moment the report is taken, so a test asserting it has to
     be able to name an hour rather than wait for one.
     """
     synthesis_resident, synthesis_resident_detail = residency
+    playback_dropouts, playback_starvations, playback_detail = playback
     report: dict[str, object] = {
         "enabled": config.tts_enabled,
         "voice": config.tts_voice,
@@ -1326,6 +1415,15 @@ def speech_output_diagnostics(
         # holding whatever it is holding regardless of what this file now reads.
         "unload_after_idle_s": config.tts_unload_after_idle_s,
         "resident": synthesis_resident,
+        # Stated as numbers, never omitted when they are zero. "No dropouts" and
+        # "not measured" send an investigation to different places, and a field
+        # that disappears when it is zero is indistinguishable from one this
+        # report never asked about. Carried through every early return below for
+        # the reason the release period's comment above gives, and the daemon's
+        # answer on all of them: a daemon running from before an edit that
+        # disabled speech output has still been speaking.
+        "playback_dropouts": playback_dropouts,
+        "playback_starvations": playback_starvations,
         # The window as it is in use, formatted back rather than echoed, so what
         # is reported is what the daemon will act on rather than what was typed.
         # Carried through every early return below for the reason the comment
@@ -1343,6 +1441,8 @@ def speech_output_diagnostics(
         report["quiet_hours_rejected_value"] = config.tts_quiet_rejected_value
     if synthesis_resident_detail is not None:
         report["resident_detail"] = synthesis_resident_detail
+    if playback_detail is not None:
+        report["playback_detail"] = playback_detail
     if config.tts_voice_rejected_value is not None:
         report["voice_rejected_value"] = config.tts_voice_rejected_value
     if config.tts_rate_rejected_value is not None:
@@ -1392,8 +1492,14 @@ def speech_output_diagnostics(
             f"Speech output resolved {CUDA_PROVIDER} and the session reports {in_use}."
         )
 
-    rate, device_name, device_detail, probe_detail = negotiated_output(config)
+    rate, output_latency, device_name, device_detail, probe_detail = negotiated_output(config)
     report["negotiated_output_rate_hz"] = rate
+    # Reported in milliseconds. The fault this exists for is a buffer measured
+    # against an audio graph's cycle, and cycles are talked about in
+    # milliseconds everywhere they are talked about at all.
+    report["negotiated_output_buffer_ms"] = (
+        None if output_latency is None else round(output_latency * 1000.0, 1)
+    )
     report["output_device_in_use"] = device_name
     if device_detail is not None:
         report["output_device_detail"] = device_detail
@@ -1461,20 +1567,31 @@ def _processor_name(provider: str) -> str:
 
 def negotiated_output(
     config: MurmlyConfig,
-) -> tuple[int | None, str | None, str | None, str | None]:
+) -> tuple[int | None, float | None, str | None, str | None, str | None]:
     """Open the output device briefly to learn what a session would get.
 
     The same reason the capture side is probed rather than reported from
     configuration: the device negotiates the rate, and the configured output
     device may not be the one that opens.
+
+    The buffer is negotiated the same way and reported beside the rate. It is
+    what decides whether speech stutters -- a buffer shorter than one cycle of
+    the audio graph underneath runs dry every cycle -- so a person looking at a
+    dropout count needs the number that explains it in the same section.
     """
     player = SoundDevicePlayer(config)
     try:
         player.start()
     except Exception as error:  # noqa: BLE001 - diagnostics must not raise
-        return None, None, None, f"No output device could be opened: {error}"
+        return None, None, None, None, f"No output device could be opened: {error}"
     try:
-        return player.sample_rate_hz, player.output_device, player.device_detail, None
+        return (
+            player.sample_rate_hz,
+            player.output_latency_seconds,
+            player.output_device,
+            player.device_detail,
+            None,
+        )
     finally:
         try:
             player.stop()

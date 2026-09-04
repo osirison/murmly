@@ -84,6 +84,30 @@ one.
 For how to turn speech output on and use it, see [making murmly
 speak](making-murmly-speak.md).
 
+## Speech stutters, and it is worse when something else is playing
+
+Check `playback_dropouts` in the `speech_output` section of `murmly doctor`. It
+counts the periods the audio device asked murmly for sound and could not be
+given it in time, since the service started. Anything above zero means the
+device is stalling, and stalling is what stuttering sounds like.
+
+`playback_starvations` beside it counts the other way of running dry: the device
+asked in good time, part-way through a piece of text, and there was nothing
+synthesized yet. That one points at synthesis being slow rather than at the audio
+device, and [speed and memory](speed-and-memory.md) is where to take it. It counts
+only silence inside a piece of text, so the pause while a program decides what to
+say next is not counted against the synthesizer.
+
+`negotiated_output_buffer_ms` is the size of the buffer murmly negotiated with
+the device, and it is what usually decides the first number. Murmly asks for at
+least 200 ms, because a buffer shorter than one cycle of the audio system
+underneath it runs dry on every cycle. A much smaller figure means the device
+refused what was asked for.
+
+Both counts read `null` with a `playback_detail` beside them when the running
+service predates them — restart it with `systemctl --user restart
+murmly.service`. `null` means not measured, which is not the same as zero.
+
 ## The overlay does not appear
 
 Inspect the same system-Python imports the overlay renderer uses:

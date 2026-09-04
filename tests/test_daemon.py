@@ -162,7 +162,14 @@ class FakeOverlay:
 # hotkeys in-process -- present on every platform (platform-support's
 # "identical on every platform"), empty here because these tests build a
 # daemon with no in-process hotkey registrar at all.
-IDLE_STATUS = {"ok": True, "state": "IDLE", "model_resident": False, "hotkeys_held": []}
+IDLE_STATUS = {
+    "ok": True,
+    "state": "IDLE",
+    "model_resident": False,
+    "playback_dropouts": 0,
+    "playback_starvations": 0,
+    "hotkeys_held": [],
+}
 
 
 def wait_until_served(
@@ -1447,11 +1454,23 @@ class StubSynthesizer:
         return True
 
 
+class StubPlayer:
+    """Enough of `SoundDevicePlayer` for `status` to count dropouts off."""
+
+    def __init__(self, underruns: int = 0, starved_periods: int = 0) -> None:
+        self.underruns = underruns
+        self.starved_periods = starved_periods
+
+
 class StubSpeechEngine:
     """Enough of `SpeechEngine` for the daemon to open and close a session on."""
 
     def __init__(self) -> None:
         self.synthesizer = StubSynthesizer()
+        # `status` reads the dropout counters off the player, so the stub needs
+        # one. Counts of its own rather than a shared constant: a test that
+        # wants a stuttering daemon sets them.
+        self.player = StubPlayer()
         self.available = True
         self.unavailable_reason = None
         # What the declaration asks for now, as opposed to what startup found.
@@ -3656,6 +3675,8 @@ class StatusResidencyTests(ServedDaemonTests):
                 "state": "IDLE",
                 "model_resident": True,
                 "synthesis_resident": True,
+                "playback_dropouts": 0,
+                "playback_starvations": 0,
                 "hotkeys_held": [],
             },
             response,

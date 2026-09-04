@@ -3086,7 +3086,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
             config = self._config(temp_dir, tts_enabled=True, tts_voice="bf_emma", tts_rate_percent=120)
             with patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "Studio Speakers", None, None),
+                return_value=(48_000, 0.2, "Studio Speakers", None, None),
             ):
                 report = speech_output_diagnostics(config, FakeSynthesizer())
 
@@ -3144,7 +3144,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
             config = self._config(temp_dir, tts_enabled=True)
             with patch(
                 "murmly.cli.negotiated_output",
-                return_value=(None, None, None, "No output device could be opened: nothing there"),
+                return_value=(None, None, None, None, "No output device could be opened: nothing there"),
             ):
                 report = speech_output_diagnostics(config, FakeSynthesizer())
 
@@ -3162,7 +3162,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
             config = self._config(temp_dir, tts_enabled=True, tts_output_device="Missing Headset")
             with patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "Built-in Audio", "The configured output device 'Missing Headset' could not be opened; using the system default instead.", None),
+                return_value=(48_000, 0.2, "Built-in Audio", "The configured output device 'Missing Headset' could not be opened; using the system default instead.", None),
             ):
                 report = speech_output_diagnostics(config, FakeSynthesizer())
 
@@ -3190,7 +3190,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
                 patch("murmly.tts.resolve_espeak", return_value=("libespeak-ng.so.1", "/data")),
                 patch(
                     "murmly.cli.negotiated_output",
-                    return_value=(48_000, "Studio Speakers", None, None),
+                    return_value=(48_000, 0.2, "Studio Speakers", None, None),
                 ),
                 # The weights are 326 MB and the report is asked for on a
                 # machine that may be about to explain why speech does not
@@ -3263,7 +3263,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
                 patch("onnxruntime.get_available_providers", return_value=[CPU_PROVIDER]),
                 patch(
                     "murmly.cli.negotiated_output",
-                    return_value=(48_000, "Studio Speakers", None, None),
+                    return_value=(48_000, 0.2, "Studio Speakers", None, None),
                 ),
                 self.assertLogs("murmly.tts", level="WARNING"),
             ):
@@ -3301,7 +3301,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
                 patch("murmly.tts.load_cuda_libraries", return_value=True),
                 patch(
                     "murmly.cli.negotiated_output",
-                    return_value=(48_000, "Studio Speakers", None, None),
+                    return_value=(48_000, 0.2, "Studio Speakers", None, None),
                 ),
             ):
                 report = speech_output_diagnostics(config, probe)
@@ -3331,7 +3331,7 @@ class SpeechOutputDiagnosticsTests(unittest.TestCase):
                 ),
                 patch(
                     "murmly.cli.negotiated_output",
-                    return_value=(48_000, "Studio Speakers", None, None),
+                    return_value=(48_000, 0.2, "Studio Speakers", None, None),
                 ),
             ):
                 report = speech_output_diagnostics(config, probe)
@@ -3518,7 +3518,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
             patch("murmly.cli.send_command", held),
             patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "Speakers", None, None),
+                return_value=(48_000, 0.2, "Speakers", None, None),
             ),
             patch("murmly.cli.KokoroSynthesizer", return_value=StubModelHolder()),
         ):
@@ -3547,7 +3547,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
             patch("murmly.cli.send_command", released),
             patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "Speakers", None, None),
+                return_value=(48_000, 0.2, "Speakers", None, None),
             ),
             patch("murmly.cli.KokoroSynthesizer", return_value=StubModelHolder()),
         ):
@@ -3568,7 +3568,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
             patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
             patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "Speakers", None, None),
+                return_value=(48_000, 0.2, "Speakers", None, None),
             ),
             patch("murmly.cli.KokoroSynthesizer", return_value=StubModelHolder()),
         ):
@@ -3746,7 +3746,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
             transcriber.resolve_runtime.return_value = ("cpu", "int8")
             with patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "Speakers", None, None),
+                return_value=(48_000, 0.2, "Speakers", None, None),
             ):
                 report = self._report(config)
 
@@ -3776,7 +3776,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
             patch("murmly.cli.KokoroSynthesizer", return_value=holder) as synthesizer,
             patch(
                 "murmly.cli.negotiated_output",
-                return_value=(48_000, "Speakers", None, None),
+                return_value=(48_000, 0.2, "Speakers", None, None),
             ),
         ):
             from murmly.cli import speech_output_diagnostics
@@ -4205,3 +4205,119 @@ class DaemonExitWithoutFinalizeTests(unittest.TestCase):
         self.assertEqual(["stderr"], flushed)
         logging_shutdown.assert_called_once_with()
         hard_exit.assert_called_once_with(0)
+
+
+class PlaybackDropoutDiagnosticsTests(unittest.TestCase):
+    """`murmly doctor` reports what speech playback has dropped, and the buffer.
+
+    The counters live in the daemon. Doctor opens an output device of its own to
+    learn the rate and the buffer, and that device has played nothing -- so a
+    count taken there would report zero however badly the daemon is stuttering.
+    """
+
+    def _config(self, **overrides: object) -> MurmlyConfig:
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        return MurmlyConfig(
+            socket_path=command_channel_address(temp_dir),
+            config_path=Path(temp_dir) / "config.toml",
+            tts_model_dir=Path(temp_dir) / "models",
+            **overrides,
+        )
+
+    def _speech_section(self, config: MurmlyConfig, send, **patches) -> dict[str, object]:
+        with (
+            patch("murmly.cli.choose_clipboard_copy_command", return_value=["xclip"]),
+            patch(
+                "murmly.cli.select_paste_injection",
+                return_value=PasteInjection("xdotool", ("xdotool", "key", "ctrl+v")),
+            ),
+            patch("murmly.cli.FasterWhisperTranscriber") as transcriber,
+            patch("murmly.cli.send_command", send),
+            patch("murmly.cli.KokoroSynthesizer", return_value=StubModelHolder()),
+            patch(
+                "murmly.cli.negotiated_output",
+                return_value=patches.get(
+                    "negotiated_output", (48_000, 0.2, "Speakers", None, None)
+                ),
+            ),
+            redirect_stdout(StringIO()) as output,
+        ):
+            transcriber.resolve_runtime.return_value = ("cpu", "int8")
+            _run_doctor(config)
+        return json.loads(output.getvalue())["speech_output"]
+
+    @staticmethod
+    def _idle(**extra: object) -> dict[str, object]:
+        return {"ok": True, "state": "IDLE", "model_resident": False, **extra}
+
+    def test_a_daemon_that_has_dropped_nothing_reports_zero_rather_than_nothing(self) -> None:
+        """"No dropouts" and "not measured" send an investigation to different places.
+
+        A field that disappears when it is zero is indistinguishable from one the
+        report never asked about.
+        """
+        speech = self._speech_section(
+            self._config(tts_enabled=True),
+            answering(self._idle(playback_dropouts=0, playback_starvations=0)),
+        )
+
+        self.assertEqual(0, speech["playback_dropouts"])
+        self.assertEqual(0, speech["playback_starvations"])
+        self.assertNotIn("playback_detail", speech)
+
+    def test_the_two_kinds_of_dropout_are_reported_apart(self) -> None:
+        """One number would send the reader to whichever half they guessed."""
+        speech = self._speech_section(
+            self._config(tts_enabled=True),
+            answering(self._idle(playback_dropouts=213, playback_starvations=4)),
+        )
+
+        self.assertEqual(213, speech["playback_dropouts"])
+        self.assertEqual(4, speech["playback_starvations"])
+
+    def test_a_daemon_too_old_to_count_is_reported_as_unmeasured_not_as_zero(self) -> None:
+        speech = self._speech_section(self._config(tts_enabled=True), answering(self._idle()))
+
+        self.assertIsNone(speech["playback_dropouts"])
+        self.assertIsNone(speech["playback_starvations"])
+        self.assertIn("Restart the service", speech["playback_detail"])
+
+    def test_a_daemon_that_cannot_be_reached_is_reported_rather_than_counted(self) -> None:
+        speech = self._speech_section(
+            self._config(tts_enabled=True),
+            refusing(DaemonNotRespondingError("Murmly daemon did not respond within 30 s.")),
+        )
+
+        self.assertIsNone(speech["playback_dropouts"])
+        self.assertIn("did not answer", speech["playback_detail"])
+
+    def test_the_negotiated_output_buffer_is_reported_beside_the_rate(self) -> None:
+        """The number that decides whether the count above is going to grow."""
+        speech = self._speech_section(
+            self._config(tts_enabled=True),
+            answering(self._idle(playback_dropouts=0, playback_starvations=0)),
+        )
+
+        self.assertEqual(48_000, speech["negotiated_output_rate_hz"])
+        self.assertEqual(200.0, speech["negotiated_output_buffer_ms"])
+
+    def test_a_device_that_will_not_open_reports_no_buffer_rather_than_zero(self) -> None:
+        speech = self._speech_section(
+            self._config(tts_enabled=True),
+            answering(self._idle(playback_dropouts=0, playback_starvations=0)),
+            negotiated_output=(None, None, None, None, "No output device could be opened: none"),
+        )
+
+        self.assertIsNone(speech["negotiated_output_buffer_ms"])
+        self.assertFalse(speech["available"])
+
+    def test_a_disabled_speech_stack_still_carries_the_counts(self) -> None:
+        """The daemon has been speaking whatever the configuration now reads."""
+        from murmly.cli import speech_output_diagnostics
+
+        report = speech_output_diagnostics(self._config(), playback=(9, 1, None))
+
+        self.assertFalse(report["enabled"])
+        self.assertEqual(9, report["playback_dropouts"])
+        self.assertEqual(1, report["playback_starvations"])
