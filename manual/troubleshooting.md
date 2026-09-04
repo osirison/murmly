@@ -92,10 +92,10 @@ given it in time, since the service started.
 
 A handful is normal and is not what stuttering sounds like: the machine being
 busy is enough to make murmly a fraction late once or twice, and a few missed
-periods spread over a minute of speech are inaudible. What the fault this
-section is about looks like is a number that climbs with every announcement,
-into the hundreds, alongside speech that visibly takes longer to finish than the
-words in it would. If the count is small and speech sounds fine, it is fine.
+periods spread over a minute of speech are inaudible. The fault this section is
+about looks different. The count climbs into the hundreds, it grows with every
+announcement, and the speech itself visibly takes longer to finish than the words
+in it would. If the count is small and speech sounds fine, it is fine.
 
 `playback_starvations` beside it counts the other way of running dry: the device
 asked in good time, part-way through a piece of text, and there was nothing

@@ -223,13 +223,13 @@ and what has reached the person's ears; it does not change what may be claimed.
 
 - **WHEN** another application is playing audio and a session sends a passage to speak
 - **THEN** the passage plays through in approximately the time the audio itself occupies
-- **AND** the number of device dropouts reported for that playback is zero
+- **AND** the reported count of device dropouts does not rise while it plays
 
 #### Scenario: Nothing else is playing
 
 - **WHEN** no other application is playing audio and a session sends the same passage
 - **THEN** the passage plays through in approximately the time the audio itself occupies
-- **AND** the number of device dropouts reported for that playback is zero
+- **AND** the reported count of device dropouts does not rise while it plays
 
 #### Scenario: The host refuses the preferred buffer
 
