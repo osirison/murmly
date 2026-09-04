@@ -24,6 +24,34 @@ MAX_LEVEL_DBFS = -6.0
 DEFAULT_PLAYBACK_RATE_HZ = 24_000
 MAX_PLAYBACK_CHANNELS = 2
 
+# The floor under the output buffer, in seconds, and the rungs tried when a host
+# refuses it.
+#
+# A host's own idea of its largest buffer is not necessarily larger than one
+# cycle of the audio graph underneath it, and a buffer shorter than a cycle runs
+# dry every cycle: the device stalls, recovers, and stalls again, which is heard
+# as stuttering rather than speech. Measured on PipeWire: `latency="high"` on the
+# ALSA default device resolved to 34.67 ms while the graph ran a 42.67 ms cycle,
+# and 8 seconds of audio took 18 seconds to play with 213 device underflows. The
+# same audio through 200 ms took 7.97 seconds with none.
+#
+# The two numbers are not independent, which is why raising the buffer works and
+# lowering it does not. PipeWire sizes its cycle from the buffer asked for and
+# rounds up -- 34.67 ms is 1664 frames at 48 kHz, which rounds to its 2048
+# maximum -- while PortAudio subdivides that same buffer into periods of its own.
+# Ask for less and the graph follows down; ask for more and the graph stops at
+# its maximum while the buffer keeps growing. So the buffer only has to clear the
+# largest cycle a graph will choose, and everything at or above it behaves the
+# same: 45 ms was already clean here, and 200 ms leaves room for a host whose
+# maximum is larger.
+#
+# In seconds rather than frames because a cycle is a duration, and the rate this
+# stream runs at is negotiated with the device rather than chosen here.
+MIN_PLAYBACK_LATENCY_SECONDS = 0.2
+# Tried in order when the buffer above is refused. `"high"` last is what shipped
+# before this floor existed, so the worst case is never worse than it was.
+PLAYBACK_LATENCY_FALLBACKS: tuple[float | str, ...] = (0.1, "high")
+
 
 def disable_portaudio_exit_teardown() -> None:
     """Stop PortAudio tearing its host APIs down when this process exits.
@@ -409,7 +437,14 @@ class SoundDevicePlayer:
         self._write_lock = threading.Lock()
         self._frames_written = 0
         self._frames_played = 0
+        # Counted for the life of the process, not the life of a stream. The
+        # spec asks how many dropouts there have been since the daemon started,
+        # and a session suspended for capture and resumed afterwards reopens the
+        # device -- so resetting these in `start()` would zero the count every
+        # time the person dictated, which is exactly when they are investigating.
         self._underruns = 0
+        self._starved_periods = 0
+        self._output_latency_seconds = 0.0
         self._device_detail: str | None = None
         self._device_name: str | None = None
 
@@ -452,7 +487,35 @@ class SoundDevicePlayer:
 
     @property
     def underruns(self) -> int:
+        """Periods the device reported it could not be fed in time.
+
+        The device's own complaint, raised by the host rather than counted here,
+        and the one that says the output buffer is too small for the audio graph
+        underneath it. Never reset by opening or reopening the stream: a session
+        suspended for capture and resumed is one playback to the person listening.
+        """
         return self._underruns
+
+    @property
+    def starved_periods(self) -> int:
+        """Periods filled with silence because nothing had been produced yet.
+
+        The other half of the pipeline, and the reason it is not folded into
+        `underruns`: this one says synthesis did not keep up, that one says the
+        device was not fed in time, and a person looking at a single number
+        cannot tell which of the two they are looking at.
+        """
+        return self._starved_periods
+
+    @property
+    def output_latency_seconds(self) -> float:
+        """The output buffer the stream negotiated, which is what it holds.
+
+        Audio counted as written has been handed to this buffer, not played out
+        of it, so this is how far ahead of the person's ears the written position
+        runs. Zero when no stream is open.
+        """
+        return self._output_latency_seconds
 
     @property
     def device_detail(self) -> str | None:
@@ -478,7 +541,7 @@ class SoundDevicePlayer:
         self._carry = b""
         self._frames_written = 0
         self._frames_played = 0
-        self._underruns = 0
+        self._output_latency_seconds = 0.0
         self._device_detail = None
         self._device_name = None
 
@@ -519,28 +582,68 @@ class SoundDevicePlayer:
             failures.append(f"device={device!r}, channels={channels}, rate={sample_rate_hz}: {error}")
             return None
 
-        stream = None
+        # The buffer is tried, never preflighted: `check_output_settings` takes
+        # no latency argument, so the only way to learn whether a host will give
+        # one is to ask for it. The ladder is walked here rather than around the
+        # candidate loop on purpose -- a host that refuses the preferred buffer
+        # on the best device should keep that device with a smaller buffer, not
+        # move to a worse device to hold the buffer.
+        for latency in self._candidate_latencies(sd, device):
+            stream = None
+            try:
+                stream = sd.RawOutputStream(
+                    device=device,
+                    samplerate=sample_rate_hz,
+                    channels=channels,
+                    dtype="int16",
+                    latency=latency,
+                    callback=self._callback,
+                )
+                # Published before the stream starts, not after it is chosen. The
+                # callback divides by this to count frames, and PortAudio can call
+                # it before `start()` returns -- with the previous open's value it
+                # reads the wrong number of bytes per frame and the played position
+                # is wrong from the first period. The retry above does not change
+                # this: every attempt publishes it before its own `start()`.
+                self._channels = channels
+                stream.start()
+            except (sd.PortAudioError, ValueError) as error:
+                if stream is not None:
+                    stream.close()
+                failures.append(
+                    f"device={device!r}, channels={channels}, rate={sample_rate_hz}, "
+                    f"latency={latency!r}: {error}"
+                )
+                continue
+            # What the host gave, which is not always what was asked for. The
+            # everything-heard report waits this out, so it has to be the
+            # negotiated value rather than the requested one.
+            try:
+                self._output_latency_seconds = float(getattr(stream, "latency", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                # A host that reports its buffer as something other than seconds
+                # has still opened a working stream. Zero means the report is not
+                # held back rather than held forever, which is what shipped
+                # before the hold existed.
+                self._output_latency_seconds = 0.0
+            return stream
+        return None
+
+    def _candidate_latencies(self, sounddevice, device) -> list[float | str]:
+        """The output buffers to try, largest first.
+
+        The device's own advertised largest is a floor to raise rather than the
+        value to use: see `MIN_PLAYBACK_LATENCY_SECONDS` for what it fails to
+        cover. A device that advertises more than the floor keeps its own answer,
+        because a host asking for a large buffer knows something about itself
+        that this constant does not.
+        """
+        advertised = self._device_property(sounddevice, device, "default_high_output_latency")
         try:
-            stream = sd.RawOutputStream(
-                device=device,
-                samplerate=sample_rate_hz,
-                channels=channels,
-                dtype="int16",
-                callback=self._callback,
-            )
-            # Published before the stream starts, not after it is chosen. The
-            # callback divides by this to count frames, and PortAudio can call
-            # it before `start()` returns -- with the previous open's value it
-            # reads the wrong number of bytes per frame and the played position
-            # is wrong from the first period.
-            self._channels = channels
-            stream.start()
-        except (sd.PortAudioError, ValueError) as error:
-            if stream is not None:
-                stream.close()
-            failures.append(f"device={device!r}, channels={channels}, rate={sample_rate_hz}: {error}")
-            return None
-        return stream
+            preferred = max(MIN_PLAYBACK_LATENCY_SECONDS, float(advertised or 0.0))
+        except (TypeError, ValueError):
+            preferred = MIN_PLAYBACK_LATENCY_SECONDS
+        return [preferred, *PLAYBACK_LATENCY_FALLBACKS]
 
     def _callback(self, outdata, frames: int, time_info: object, status: object) -> None:
         """Fill one device period from the queue, taking no lock.
@@ -568,8 +671,11 @@ class SoundDevicePlayer:
         if filled < wanted:
             # Silence rather than stale audio, and not counted as played: a
             # position that advanced through an underrun would report speech
-            # nobody heard.
+            # nobody heard. Counted apart from `_underruns`: the device asked
+            # and there was nothing to give it, which is a producer that fell
+            # behind rather than a buffer the host could not keep fed.
             view[filled:wanted] = bytes(wanted - filled)
+            self._starved_periods += 1
         self._frames_played += filled // (self._channels * 2)
 
     def write(self, samples, sample_rate_hz: int) -> int:

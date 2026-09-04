@@ -14,6 +14,8 @@ from unittest.mock import patch
 
 from module_stubs import injected_module, removed_module
 from murmly.audio import (
+    MIN_PLAYBACK_LATENCY_SECONDS,
+    PLAYBACK_LATENCY_FALLBACKS,
     LevelSmoother,
     SoundDeviceRecorder,
     SoundDevicePlayer,
@@ -81,11 +83,16 @@ class FakeOutputStream(FakeStream):
         sample_rate_hz: float = 48_000,
         channels: int = 1,
         sample_width: int = 2,
+        latency: float = 0.0,
     ) -> None:
         super().__init__(sample_rate_hz)
         self.callback = callback
         self.channels = channels
         self.frame_bytes = channels * sample_width
+        # What PortAudio reports the stream settled on. The fake grants whatever
+        # was asked for, which is the case worth modelling: a host that refuses
+        # is modelled by `open_error` below raising instead.
+        self.latency = latency
 
     def pump(self, frames: int, status: object = None) -> bytes:
         """Run one callback period and record what it produced.
@@ -118,6 +125,7 @@ def fake_sounddevice(
     check_output_settings=None,
     check_input_settings=None,
     query_devices=None,
+    open_error=None,
 ) -> ModuleType:
     """A fake sounddevice module carrying the output surface beside the input one.
 
@@ -139,10 +147,15 @@ def fake_sounddevice(
         return stream
 
     def raw_output_stream(**kwargs: object) -> FakeOutputStream:
+        # Called before the stream exists, so a host that refuses a buffer
+        # refuses it the way PortAudio does: at open, not at start.
+        if open_error is not None:
+            open_error(**kwargs)
         stream = FakeOutputStream(
             kwargs["callback"],
             sample_rate_hz=kwargs["samplerate"],
             channels=kwargs["channels"],
+            latency=kwargs.get("latency", 0.0),
         )
         stream.kwargs = kwargs
         if output_streams is not None:
@@ -815,6 +828,135 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(480, player.frames_played)
         self.assertEqual(pcm16_from_float32(self._tone(480)), bytes(streams[0].written))
 
+    # ------------------------------------------------ the output buffer floor
+
+    def test_the_buffer_floor_is_asked_for_before_anything_smaller(self) -> None:
+        """The fault this exists for: a host's own largest is not large enough.
+
+        Measured on PipeWire -- `latency="high"` gave a 34.67 ms buffer against a
+        42.67 ms graph cycle, and 8 s of audio took 18 s to play.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+
+        self.assertEqual(MIN_PLAYBACK_LATENCY_SECONDS, streams[0].kwargs["latency"])
+        self.assertEqual(MIN_PLAYBACK_LATENCY_SECONDS, player.output_latency_seconds)
+
+    def test_a_device_that_advertises_more_than_the_floor_keeps_its_own_answer(self) -> None:
+        """The floor raises a host's answer; it never lowers one.
+
+        A host asking for half a second knows something about itself that a
+        constant here does not.
+        """
+
+        def query_devices(device: int | None = None, kind: str | None = None):
+            found = AudioTests._fake_query_devices(device, kind)
+            if isinstance(found, dict):
+                return {**found, "default_high_output_latency": 0.5}
+            return [{**each, "default_high_output_latency": 0.5} for each in found]
+
+        player, streams, _sd = self._player(query_devices=query_devices)
+        player.start()
+
+        self.assertEqual(0.5, streams[0].kwargs["latency"])
+
+    def test_a_host_that_refuses_the_floor_takes_less_on_the_same_device(self) -> None:
+        """The retry is per device, not a second pass over all of them.
+
+        A host that will not give the preferred buffer on the best device should
+        keep that device with a smaller one rather than move to a worse device to
+        hold the buffer.
+        """
+        refused: list[object] = []
+
+        def open_error(**kwargs: object) -> None:
+            if kwargs["latency"] == MIN_PLAYBACK_LATENCY_SECONDS:
+                refused.append(kwargs["device"])
+                raise FakePortAudioError("buffer too large")
+
+        player, streams, _sd = self._player(open_error=open_error)
+        player.start()
+
+        self.assertEqual([None], refused, "the floor was tried once, on the first device")
+        self.assertEqual(1, len(streams), "no stream survived from the refused attempt")
+        self.assertEqual(PLAYBACK_LATENCY_FALLBACKS[0], streams[0].kwargs["latency"])
+        self.assertIsNone(streams[0].kwargs["device"], "the device must not have moved")
+
+    def test_the_ladder_ends_at_the_host_own_answer(self) -> None:
+        """Exhausting the ladder still opens a stream, on what shipped before.
+
+        `"high"` last is what makes the worst case no worse than the behaviour
+        this change replaces.
+        """
+
+        def open_error(**kwargs: object) -> None:
+            if kwargs["latency"] != "high":
+                raise FakePortAudioError("buffer too large")
+
+        player, streams, _sd = self._player(open_error=open_error)
+        player.start()
+
+        self.assertEqual("high", streams[0].kwargs["latency"])
+        self.assertTrue(player.active)
+        self.assertEqual(
+            0.0,
+            player.output_latency_seconds,
+            "a buffer that is not a number of seconds must not hold the report forever",
+        )
+
+    def test_a_device_that_refuses_every_buffer_is_reported_with_each_attempt(self) -> None:
+        def open_error(**_kwargs: object) -> None:
+            raise FakePortAudioError("no")
+
+        player, _streams, _sd = self._player(open_error=open_error)
+
+        with self.assertRaises(RuntimeError) as raised:
+            player.start()
+        self.assertIn("latency=", str(raised.exception), "the buffer tried names itself")
+
+    # ---------------------------------------------- the two kinds of dropout
+
+    def test_a_device_that_could_not_be_fed_counts_a_dropout_and_not_starvation(self) -> None:
+        player, streams, _sd = self._player()
+        player.start()
+        player.write(self._tone(480), 24_000)
+
+        streams[0].pump(480, status="output underflow")
+
+        self.assertEqual(1, player.underruns)
+        self.assertEqual(0, player.starved_periods, "the queue had everything asked for")
+
+    def test_a_period_with_nothing_produced_counts_starvation_and_not_a_dropout(self) -> None:
+        """The other half of the pipeline, and why one number cannot say both.
+
+        Nothing had been synthesized yet. The device asked in good time and was
+        given silence, which is a producer that fell behind rather than a buffer
+        the host could not keep fed.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+
+        streams[0].pump(480)
+
+        self.assertEqual(1, player.starved_periods)
+        self.assertEqual(0, player.underruns, "the device never complained")
+
+    def test_the_counters_survive_an_abort_and_a_reopen(self) -> None:
+        """A session suspended for capture and resumed is one playback.
+
+        Zeroing on reopen would clear the count every time the person dictated,
+        which is exactly when they are investigating.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+        streams[0].pump(480, status="output underflow")
+        player.abort()
+        player.stop()
+        player.start()
+
+        self.assertEqual(1, player.underruns)
+        self.assertEqual(1, player.starved_periods)
+
     def test_a_period_larger_than_the_queue_is_padded_and_counted_as_an_underrun(self) -> None:
         player, streams, _sd = self._player()
         player.start()
@@ -1140,6 +1282,107 @@ class ExitTeardownTests(unittest.TestCase):
             self.skipTest(f"sounddevice is not importable: {error}")
 
         self.assertTrue(callable(getattr(sounddevice, "_exit_handler", None)))
+
+
+class LivePlaybackTests(unittest.TestCase):
+    """Against a real output device, which is the only place the fault existed.
+
+    Every other playback test drives the callback itself, and a fake that is
+    always ready cannot show a device stalling. The original fault -- a buffer
+    shorter than one cycle of the audio graph underneath -- produced perfect
+    frame counts and took twice as long to play them, which no fake reproduces.
+
+    Silent audio throughout: the fault is in the timing, not the signal, so
+    nothing here has to be audible to anyone near the machine.
+
+    Skips itself rather than failing where there is no audio session, as the
+    rest of the suite does. CI has no sound card.
+    """
+
+    TONE_SECONDS = 2.0
+    RATE_HZ = 24_000
+
+    def _player(self) -> SoundDevicePlayer:
+        try:
+            import sounddevice  # noqa: F401 - imported to see whether it loads
+        except Exception as error:  # noqa: BLE001 - nothing to play through
+            self.skipTest(f"sounddevice is not importable: {error}")
+        temp_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            tts_enabled=True,
+        )
+        player = SoundDevicePlayer(config)
+        try:
+            player.start()
+        except Exception as error:  # noqa: BLE001 - no device is not a failure here
+            self.skipTest(f"no output device to play through: {error}")
+        self.addCleanup(player.stop)
+        return player
+
+    @staticmethod
+    def _silence(seconds: float, rate_hz: int) -> list[float]:
+        return [0.0] * int(seconds * rate_hz)
+
+    def test_audio_plays_in_the_time_it_occupies_and_drops_nothing(self) -> None:
+        """The assertion the original fault would have failed.
+
+        It played every frame it was given and reported perfect counts; it just
+        took 18 seconds to play 8 seconds of audio, because the device stalled
+        and recovered on every graph cycle. Wall clock is what sees that.
+        """
+        player = self._player()
+        chunk = self._silence(self.TONE_SECONDS, self.RATE_HZ)
+
+        started = time.monotonic()
+        for _ in range(2):
+            while player.pending_frames > int(3.0 * player.sample_rate_hz):
+                time.sleep(0.02)
+            player.write(chunk, self.RATE_HZ)
+        while player.pending_frames > 0:
+            time.sleep(0.02)
+        elapsed = time.monotonic() - started
+
+        audio_seconds = 2 * self.TONE_SECONDS
+        self.assertLess(
+            elapsed,
+            audio_seconds * 1.35,
+            f"{audio_seconds:.1f} s of audio took {elapsed:.2f} s: the device is stalling",
+        )
+        self.assertEqual(0, player.underruns, "the device could not be kept fed")
+
+    def test_the_buffer_it_negotiated_clears_the_floor(self) -> None:
+        player = self._player()
+
+        self.assertGreaterEqual(
+            player.output_latency_seconds,
+            MIN_PLAYBACK_LATENCY_SECONDS,
+            "a host that grants the floor must report it",
+        )
+
+    def test_stopping_is_not_slowed_by_the_larger_buffer(self) -> None:
+        """A deeper buffer holds more audio; the abort still discards it.
+
+        `Pa_AbortStream` rather than `Pa_StopStream` is what keeps barge-in
+        immediate, and enlarging the buffer is only safe while that stays true.
+        """
+        player = self._player()
+        player.write(self._silence(10.0, self.RATE_HZ), self.RATE_HZ)
+        # Enough for the device to have taken a period or two of it.
+        time.sleep(0.1)
+
+        started = time.monotonic()
+        player.abort()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed,
+            0.5,
+            "stopping waited for buffered audio instead of discarding it",
+        )
+        self.assertEqual(0, player.pending_frames, "audio survived the abort")
 
 
 class SampleConversionTests(unittest.TestCase):
