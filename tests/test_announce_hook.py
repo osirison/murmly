@@ -940,6 +940,31 @@ class SilenceWhenRefusedTests(unittest.TestCase):
         self.assertEqual([], played)
         self.assertIn("speech_session_in_use", outcome)
 
+    def test_quiet_hours_produce_no_notes(self) -> None:
+        """The window exists because someone is asleep.
+
+        Notes announcing an announcement that never comes would wake them for
+        nothing, which is the one outcome the window is there to prevent. No
+        change to this file was needed for it: the session is declared before
+        the notes sound, so every refusal the daemon can give is already silent.
+        """
+        outcome, played = self._announce("refused: speech_quiet_hours")
+
+        self.assertEqual([], played, "the notes played in front of a quiet window")
+
+    def test_the_diagnostic_line_names_quiet_hours(self) -> None:
+        """`refused: <code>` is the whole of what a person reading the log gets.
+
+        Without the code it says only that nothing was spoken, which is what a
+        disabled synthesizer, a held session and a working quiet window all look
+        like from the outside.
+        """
+        outcome, _played = self._announce("refused: speech_quiet_hours")
+
+        self.assertIn("speech_quiet_hours", outcome)
+        self.assertNotIn("speech_unavailable", outcome)
+        self.assertNotIn("speech_disabled", outcome)
+
     def test_an_accepted_session_does_play_them(self) -> None:
         """Pins the tests above, which would pass with the notes deleted."""
         outcome, played = self._announce("")

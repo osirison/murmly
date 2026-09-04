@@ -15,13 +15,20 @@ import sys
 import time
 import traceback
 from collections.abc import Callable
+from datetime import datetime
 
 from murmly.audio import (
     SoundDeviceRecorder,
     SoundDevicePlayer,
     disable_portaudio_exit_teardown,
 )
-from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, default_config_path, load_config
+from murmly.config import (
+    WINDOWS_PIPE_NAME,
+    MurmlyConfig,
+    default_config_path,
+    is_quiet_at,
+    load_config,
+)
 from murmly.daemon import (
     COMMAND_REBIND_HOTKEYS,
     COMMAND_STATUS,
@@ -760,8 +767,20 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             # ran and nothing about the probe failing makes it less true.
             "unload_after_idle_s": config.tts_unload_after_idle_s,
             "resident": synthesis_resident,
+            # The window survives a failed probe for the same reason, and can:
+            # it is a configured value and a clock reading, neither of which the
+            # synthesis probe can take down with it. A person whose agent has
+            # gone quiet is exactly the person running `doctor` after a probe
+            # failed, and dropping the window here would hide the likelier of
+            # the two explanations.
+            "quiet_hours": _quiet_window_in_use(config),
+            "quiet_hours_in_force": is_quiet_at(
+                config.tts_quiet_start, config.tts_quiet_end, datetime.now().time()
+            ),
             "detail": f"Unable to check speech output: {error}",
         }
+        if config.tts_quiet_rejected_value is not None:
+            speech["quiet_hours_rejected_value"] = config.tts_quiet_rejected_value
         if synthesis_resident_detail is not None:
             speech["resident_detail"] = synthesis_resident_detail
 
@@ -1257,10 +1276,21 @@ def _residency_field(
     )
 
 
+def _quiet_window_in_use(config: MurmlyConfig) -> str | None:
+    """The quiet window as `HH:MM-HH:MM`, or None when there is none."""
+    if config.tts_quiet_start is None or config.tts_quiet_end is None:
+        return None
+    return (
+        f"{config.tts_quiet_start.strftime('%H:%M')}"
+        f"-{config.tts_quiet_end.strftime('%H:%M')}"
+    )
+
+
 def speech_output_diagnostics(
     config: MurmlyConfig,
     synthesizer: KokoroSynthesizer | None = None,
     residency: tuple[bool | None, str | None] = (None, None),
+    now: Callable[[], datetime] = datetime.now,
 ) -> dict[str, object]:
     """What `murmly doctor` says about speech output.
 
@@ -1273,6 +1303,10 @@ def speech_output_diagnostics(
     never builds a session, so its own `resident` is a constant False; the
     session this section is about lives in the daemon, and `daemon_residency`
     is what asked it.
+
+    `now` is injected for the quiet window alone. Whether that window is in force
+    is a fact about the moment the report is taken, so a test asserting it has to
+    be able to name an hour rather than wait for one.
     """
     synthesis_resident, synthesis_resident_detail = residency
     report: dict[str, object] = {
@@ -1292,7 +1326,21 @@ def speech_output_diagnostics(
         # holding whatever it is holding regardless of what this file now reads.
         "unload_after_idle_s": config.tts_unload_after_idle_s,
         "resident": synthesis_resident,
+        # The window as it is in use, formatted back rather than echoed, so what
+        # is reported is what the daemon will act on rather than what was typed.
+        # Carried through every early return below for the reason the comment
+        # above gives about the release period.
+        "quiet_hours": _quiet_window_in_use(config),
+        # What makes this section diagnostic rather than decorative. A person
+        # whose agent has gone quiet needs to tell a window doing its job from a
+        # synthesizer that has stopped working, and the configured window alone
+        # does not tell them which they are looking at.
+        "quiet_hours_in_force": is_quiet_at(
+            config.tts_quiet_start, config.tts_quiet_end, now().time()
+        ),
     }
+    if config.tts_quiet_rejected_value is not None:
+        report["quiet_hours_rejected_value"] = config.tts_quiet_rejected_value
     if synthesis_resident_detail is not None:
         report["resident_detail"] = synthesis_resident_detail
     if config.tts_voice_rejected_value is not None:

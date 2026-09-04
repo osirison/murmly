@@ -73,6 +73,14 @@ restart murmly.service`.
 `speech_session_in_use` means another client already has the session open;
 only one session is open at a time.
 
+`quiet_hours_in_force` being `true` means murmly is silent on purpose: the
+clock is inside the window set by [`tts.quiet_hours`](settings.md#tts-quiet-hours),
+and `quiet_hours` beside it names that window. A client declaring a session
+inside it is refused `speech_quiet_hours` and no sound is made, chime included.
+If a window is set that you did not intend, `quiet_hours_rejected_value` names a
+value murmly could not read — it falls back to no window rather than guessing
+one.
+
 For how to turn speech output on and use it, see [making murmly
 speak](making-murmly-speak.md).
 

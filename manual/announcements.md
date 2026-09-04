@@ -63,10 +63,18 @@ The hook stays silent, and exits 0, for every ordinary reason it cannot
 speak:
 
 - speech output is disabled or unavailable
+- the clock is inside your [quiet
+  window](settings.md#tts-quiet-hours)
 - another client is already holding the session
 - a capture is running
 - the voice note is empty
 - there was nothing worth saying in the last message
+
+Silent means silent in all of these. The chime plays only once the
+speech session has been accepted, so a turn that will not be announced
+makes no sound at all — a signal in front of an announcement that never
+arrives is worse than nothing, and at one per turn it teaches you to
+ignore the signal.
 
 It never fails a turn. It also detaches into its own process before
 speaking, so an announcement never holds the agent up.

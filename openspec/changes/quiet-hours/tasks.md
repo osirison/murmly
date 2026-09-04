@@ -52,25 +52,25 @@
 
 ## 3. Staying silent
 
-- [ ] 3.1 Test in `tests/test_announce_hook.py` that a declaration refused with the
+- [x] 3.1 Test in `tests/test_announce_hook.py` that a declaration refused with the
       new code produces no chime and no other sound, and that the hook exits
       successfully — the existing chime-after-declaration order should make this
       pass without touching `hooks/murmly-announce.py`. If it does not, fix the
       order rather than the test.
-- [ ] 3.2 Test that the hook's diagnostic line names the quiet-hours code, so a
+- [x] 3.2 Test that the hook's diagnostic line names the quiet-hours code, so a
       person reading it can tell quiet hours from a refusal for any other reason.
 
 ## 4. Reporting it
 
-- [ ] 4.1 In `speech_output_diagnostics` (`src/murmly/cli.py`), report
+- [x] 4.1 In `speech_output_diagnostics` (`src/murmly/cli.py`), report
       `quiet_hours` (the configured string, or `None`), `quiet_hours_in_force`, and
       `quiet_hours_rejected_value` when there is one. Carry all of them through the
       early returns for speech output disabled and for speech output unavailable,
       for the reason the surrounding comment already gives about
       `unload_after_idle_s`.
-- [ ] 4.2 Give `speech_output_diagnostics` the same injectable `now`, so the report
+- [x] 4.2 Give `speech_output_diagnostics` the same injectable `now`, so the report
       can be tested at a fixed hour.
-- [ ] 4.3 Tests in `tests/test_cli.py`: the window reported and in force; the window
+- [x] 4.3 Tests in `tests/test_cli.py`: the window reported and in force; the window
       reported and not in force; no window configured; a rejected value reported
       beside no window in use; and all of these still reported when speech output is
       disabled and when it is unavailable.
@@ -84,15 +84,22 @@
 - [x] 5.2 Add `### tts.quiet_hours { #tts-quiet-hours }` to `manual/settings.md`
       among the other `[tts]` settings, and update the whole-file listing near the
       top of that page so it still matches `config.example.toml`.
-- [ ] 5.3 Mention the window in `manual/announcements.md` where it says what stops
+- [x] 5.3 Mention the window in `manual/announcements.md` where it says what stops
       an announcement being spoken, and in `manual/troubleshooting.md` beside the
       other reasons Murmly says nothing — naming `quiet_hours_in_force` in the
       doctor report as the way to tell.
-- [ ] 5.4 Check `README.md` for a list of speech settings and add it there if one
+- [x] 5.4 Check `README.md` for a list of speech settings and add it there if one
       exists; leave it alone if the README points at the manual instead.
 
 ## 6. Finishing
 
-- [ ] 6.1 Run `uv run --no-sync python -m unittest discover -s tests` and confirm it
-      passes with no test depending on the hour it was run at.
-- [ ] 6.2 Run `openspec validate quiet-hours --strict`.
+- [x] 6.1 Run the suite and confirm it passes with no test depending on the hour it
+      was run at. In a worktree the documented command leaves an unpopulated
+      `.venv`, so borrow the main checkout's interpreter as
+      `docs/agent-notes/unittest-discover-in-a-worktree.md` records:
+      `PYTHONPATH="$PWD/src:$PWD/tests" "$MAIN/.venv/bin/python3" -m unittest
+      discover -s tests`. 1566 tests pass. The hour-independence was checked by
+      re-running the whole suite under six timezones — 02:00, 04:57, 05:56, 15:55,
+      21:28 and 22:59 local — rather than argued: three of those fall inside a
+      typical night window.
+- [x] 6.2 Run `openspec validate quiet-hours --strict`.
