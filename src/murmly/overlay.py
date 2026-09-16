@@ -484,21 +484,36 @@ class OverlayController:
             self._condition.notify()
 
     def _run(self) -> None:
-        self._launch_renderer()
-        while True:
-            encoded, stop_after_send = self._next_message()
-            if encoded is None:
-                return
-            message = json.loads(encoded)
-            is_listening = message.get("type") == "state" and message.get("value") == "LISTENING"
-            if is_listening and not self._ensure_renderer_for_listening():
-                continue
-            sent = self._send(encoded)
-            if is_listening and not sent and self._ensure_renderer_for_listening():
-                self._send(encoded)
-            if stop_after_send:
-                self._close_transport()
-                return
+        # This thread, not `close()`, owns teardown: `close()` bounds how long it
+        # waits for this thread with two 0.5s joins, but `_launch_renderer` can
+        # still be inside `Popen()` past both of them, in which case `self._process`
+        # is still `None` when `close()` calls `_terminate_process()` and there is
+        # nothing left to make that renderer exit. Wrapping the whole loop -- launch
+        # included -- in `try/finally` means whichever way this thread leaves (the
+        # loop's two `return`s, or an uncaught exception) it closes the transport
+        # and terminates whatever process ended up in `self._process`, however late
+        # `_launch_renderer` assigned it. `close()`'s own `_terminate_process()` call
+        # stays: it is idempotent (`_transport_lock`-guarded, swaps `self._process`
+        # to `None`), so running it twice is harmless, and it is still what covers a
+        # thread that never reaches this `finally` at all.
+        try:
+            self._launch_renderer()
+            while True:
+                encoded, stop_after_send = self._next_message()
+                if encoded is None:
+                    return
+                message = json.loads(encoded)
+                is_listening = message.get("type") == "state" and message.get("value") == "LISTENING"
+                if is_listening and not self._ensure_renderer_for_listening():
+                    continue
+                sent = self._send(encoded)
+                if is_listening and not sent and self._ensure_renderer_for_listening():
+                    self._send(encoded)
+                if stop_after_send:
+                    return
+        finally:
+            self._close_transport()
+            self._terminate_process()
 
     def _next_message(self) -> tuple[bytes | None, bool]:
         level_interval = 1.0 / 30.0

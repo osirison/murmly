@@ -748,6 +748,49 @@ class OverlayTests(unittest.TestCase):
 
         self.assertIn({"type": "shutdown"}, [json.loads(message) for message in parent.messages])
         self.assertTrue(parent.closed)
+        self.assertTrue(process.terminated)
+
+    def test_close_terminates_a_renderer_still_launching_when_it_was_called(self) -> None:
+        """Regression: `close()` must not return leaving a renderer subprocess
+        alive because `_launch_renderer` was still inside `Popen()` when both of
+        `close()`'s bounded joins expired. `self._process` is `None` at that
+        point, so `close()`'s own `_terminate_process()` call has nothing to
+        kill; the fix makes `_run`'s `finally` responsible for teardown instead,
+        so the process gets terminated once `_launch_renderer` finally returns,
+        however long after `close()` itself already returned that is.
+
+        `terminated` polls with a deadline rather than being asserted right
+        after `close()`: the cleanup now happens on the `_run` thread after
+        `close()` has already returned, so asserting immediately would be
+        flaky by construction, not a check of the fix.
+        """
+        process = FakeProcess()
+        launch_started = threading.Event()
+
+        def slow_popen(*_args: object, **_kwargs: object) -> FakeProcess:
+            launch_started.set()
+            time.sleep(3.0)  # far longer than close()'s two 0.5s joins combined
+            return process
+
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=slow_popen,
+            socket_pair_factory=lambda: (FakeSocket(70), FakeSocket(71)),
+            restart_delays=(0.0,),
+        )
+        self.assertTrue(launch_started.wait(timeout=1))
+
+        closed_at = time.monotonic()
+        controller.close()
+        self.assertLess(time.monotonic() - closed_at, 2.0)
+
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and not process.terminated:
+            time.sleep(0.01)
+        self.assertTrue(process.terminated)
 
     def test_windows_backend_shares_the_socket_over_stdin_instead_of_pass_fds(self) -> None:
         """Task 10.1: the Windows launch seam. `pass_fds` is POSIX-only and a
