@@ -472,12 +472,26 @@ honoured, in addition to its existing sections. When speech output cannot run, t
 report MUST name the remedy. Reporting the processor MUST NOT itself construct a
 synthesis session.
 
-The report SHALL also state how many playback dropouts have been recorded since the
-daemon started. A person who hears stuttering speech otherwise has nothing to look
-at, and the report arrives as a description of a sound rather than a count that
-identifies where the fault is. A count of zero MUST be reported as such rather than
-omitted, because "no dropouts" and "not measured" send an investigation to different
-places.
+The report SHALL also state, as two separate counts, how many playback dropouts
+have been recorded since the daemon started: periods the output device reported
+it could not be fed in time, and periods filled with silence because a producer
+had not yet supplied the sound they needed. A person who hears stuttering speech
+otherwise has nothing to look at, and the report arrives as a description of a
+sound rather than a count that identifies where the fault is. Conflating the two
+counts would point that person at whichever half of the pipeline they happened to
+guess. A count of zero MUST be reported as such for either count rather than
+omitted, because "no dropouts" and "not measured" send an investigation to
+different places.
+
+The second of these counts SHALL count only silence that falls between two sounds
+the same piece of text produced. Silence before a piece of text has produced any
+sound at all, silence after its last sound, and silence between two separate
+pieces of text are not the fault of whatever is producing sound for the piece now
+being spoken, and MUST NOT be added to its count — including when the piece
+spoken immediately before it is still leaving the device at the moment the new
+piece begins. Two pieces of text following one another without a pause between
+them are routine, not a fault, and the count MUST NOT depend on how closely one
+piece's own trailing sound happens to overlap the next piece beginning.
 
 When a quiet window is in use, the report SHALL also state whether it is in force
 at the moment the report is taken. A person whose agent has gone quiet needs to
@@ -492,8 +506,20 @@ and the configured window alone does not tell them which they are looking at.
 #### Scenario: Dropouts are reported whether or not there were any
 
 - **WHEN** diagnostics run with speech output enabled
-- **THEN** the report states the number of playback dropouts recorded since the daemon started
-- **AND** states it as a number when there have been none, rather than omitting the field
+- **THEN** the report states both counts of playback dropouts recorded since the daemon started
+- **AND** states each as a number when there have been none, rather than omitting the field
+
+#### Scenario: One piece's trailing sound overlapping the next piece's start is not counted against it
+
+- **WHEN** one piece of text finishes speaking and the next piece begins before the first piece's own trailing sound has finished leaving the device
+- **THEN** the ordinary delay before the new piece's first sound is produced does not raise the count of periods a producer failed to keep up
+- **AND** the trailing sound of the piece that just finished is not counted either
+
+#### Scenario: A silence inside a piece's own playback is still counted
+
+- **WHEN** a piece of text has already produced sound and falls silent again before producing more
+- **THEN** the silence is counted against the count of periods a producer failed to keep up
+- **AND** this holds whether or not the piece spoken immediately before it also ended with sound still leaving the device
 
 #### Scenario: Speech output disabled
 
