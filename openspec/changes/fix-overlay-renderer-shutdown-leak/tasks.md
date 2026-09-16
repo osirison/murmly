@@ -37,6 +37,13 @@
       that `FakeProcess.terminated` was defined but never asserted anywhere.
 - [x] 3.4 Run the full suite: `uv run --no-sync python -m unittest discover -s
       tests`.
+- [x] 3.5 Add a regression test for the third exit path — an uncaught exception —
+      forcing `_send` to raise something other than the `BrokenPipeError`/`OSError`
+      it already handles, once a renderer is recorded, and asserting the transport
+      is closed and the process is terminated before `close()` runs (test cleanup
+      only). Confirmed it fails against the pre-fix code (swapped in `overlay.py`
+      from `main`, ran the single test, restored it) and passes with the fix
+      applied.
 
 ## 4. Spec
 

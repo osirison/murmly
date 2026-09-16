@@ -792,6 +792,58 @@ class OverlayTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(process.terminated)
 
+    def test_uncaught_exception_in_run_still_terminates_a_recorded_renderer(self) -> None:
+        """Regression: an uncaught exception is the third way `_run` can exit,
+        alongside its two `return`s, and it is the one path where nothing but
+        `_run`'s own `finally` ever runs cleanup. `close()` runs only as test
+        cleanup below, after the assertions have already passed, so its backstop
+        `_terminate_process()` call cannot be what is doing the work.
+
+        `_send` is the forced seam: its `except (BrokenPipeError, OSError)` clause
+        already handles a renderer that has gone away, so a `RuntimeError` from
+        `sendall` -- standing in for a genuine bug rather than an expected
+        transport failure -- reaches neither that clause nor anything else, and
+        propagates out of `_run`'s loop. By the time it is raised, `_launch_renderer`
+        has already run (it runs before the loop even reads its first message), so
+        the renderer is already recorded on `self._process`/`self._transport`.
+
+        `threading.excepthook` is recorded rather than left to print: swapping it
+        for a list-appending stand-in keeps the test's own output free of the
+        traceback Python prints for an uncaught thread exception by default, and
+        doubles as proof the thread actually died via that exception rather than
+        some other route.
+        """
+
+        class RaisingSocket(FakeSocket):
+            def sendall(self, message: bytes) -> None:
+                raise RuntimeError("boom")
+
+        parent = RaisingSocket(90)
+        child = FakeSocket(91)
+        process = FakeProcess()
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=lambda *_args, **_kwargs: process,
+            socket_pair_factory=lambda: (parent, child),
+            restart_delays=(0.0,),
+        )
+        # `close()` still runs, but only as cleanup after the assertions below
+        # have already passed -- it is not what this test is exercising.
+        self.addCleanup(controller.close)
+
+        hooked: list[object] = []
+        with patch("threading.excepthook", hooked.append):
+            controller.publish_state(OverlayState.LISTENING)
+            self._wait_for(lambda: not controller._thread.is_alive())
+
+        self.assertEqual(1, len(hooked))
+        self.assertIs(RuntimeError, hooked[0].exc_type)
+        self.assertTrue(parent.closed)
+        self.assertTrue(process.terminated)
+
     def test_windows_backend_shares_the_socket_over_stdin_instead_of_pass_fds(self) -> None:
         """Task 10.1: the Windows launch seam. `pass_fds` is POSIX-only and a
         `socket.socketpair()` socket has no fd a Windows child could inherit
