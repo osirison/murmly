@@ -43,7 +43,7 @@ Neither fault changes what is played. Both are diagnostics-only: the count
   actually advanced into audio that piece produced — not audio still leaving
   the device from the piece spoken immediately before it. Two pieces of text
   following one another with no pause between them, or with the first piece's
-  tail still draining when the second begins, is routine and is not counted
+  tail still draining when the second begins, are routine and are not counted
   against the second piece's producer.
 - A genuine gap inside one piece's own playback is still counted exactly as it
   is today; this narrows what counts as evidence of the gap, it does not

@@ -29,7 +29,7 @@ pieces of text are not the fault of whatever is producing sound for the piece no
 being spoken, and MUST NOT be added to its count — including when the piece
 spoken immediately before it is still leaving the device at the moment the new
 piece begins. Two pieces of text following one another without a pause between
-them is routine, not a fault, and the count MUST NOT depend on how closely one
+them are routine, not a fault, and the count MUST NOT depend on how closely one
 piece's own trailing sound happens to overlap the next piece beginning.
 
 When a quiet window is in use, the report SHALL also state whether it is in force

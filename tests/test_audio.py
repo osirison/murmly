@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
 import shutil
 import sys
@@ -116,6 +117,26 @@ class FakeOutputStream(FakeStream):
 class FailingStopStream(FakeStream):
     def stop(self) -> None:
         raise RuntimeError("stop failed")
+
+
+class RacingBlocks(deque):
+    """A queue whose first empty `popleft` fires a callback's worth of
+    producer activity before raising, standing in for a producer thread
+    that publishes an edge and writes the audio that goes with it in the
+    gap between the callback reading `_expect_state` and its first pop --
+    the one window that gap is driven synchronously and cannot otherwise
+    reach.
+    """
+
+    def __init__(self, race) -> None:
+        super().__init__()
+        self._race = race
+
+    def popleft(self):
+        if not self and self._race is not None:
+            race, self._race = self._race, None
+            race()
+        return super().popleft()
 
 
 def fake_sounddevice(
@@ -956,8 +977,9 @@ class PlaybackTests(unittest.TestCase):
         the output buffer floor is 200 ms -- when the second sentence's
         `expect_audio(True)` lands. The callback that drains that leftover
         must not let it stand in for the second sentence's own first sound,
-        or the second sentence's ordinary synthesis latency that follows is
-        counted as the first sentence's problem.
+        or the second sentence's ordinary synthesis latency that follows
+        reads as its own producer falling behind on the piece now being
+        spoken.
         """
         player, streams, _sd = self._player()
         player.start()
@@ -1006,6 +1028,68 @@ class PlaybackTests(unittest.TestCase):
         streams[0].pump(100)  # the rest of the new piece's audio; its queue is now empty
 
         streams[0].pump(100)  # a real gap: the new piece's next chunk is not ready yet
+        streams[0].pump(100)
+
+        player.write(self._tone(100), 24_000)
+        streams[0].pump(100)
+
+        self.assertEqual(2, player.starved_periods)
+
+    def test_an_edge_published_while_a_period_drains_does_not_commit_the_old_run(
+        self,
+    ) -> None:
+        """The tuple `_callback` reads is only current at the instant it reads it.
+
+        Every other test above drives `expect_audio` and `write` between two
+        `pump` calls, which is the ordinary case: the callback's next period
+        sees the edge before it sees any audio published after it. This one
+        puts both inside the *same* period, standing in for a producer thread
+        that runs between the callback reading `_expect_state` and its first
+        `popleft` -- one GIL switch away under load, not a contrived ordering.
+
+        Closing the first piece and opening the second have already decided
+        the pending run does not belong to either: the close discards it as
+        the first piece's tail, the open starts the second piece owing
+        nothing from the last. Committing it anyway, because the second
+        piece's own first chunk happened to be what finally broke the
+        silence, is exactly the boundary gap this whole change exists to
+        stop counting.
+        """
+        player, streams, _sd = self._player()
+        player.start()
+
+        player.expect_audio(True)
+        player.write(self._tone(100), 24_000)
+        streams[0].pump(100)  # the first piece's only chunk, played in full
+
+        streams[0].pump(100)  # the first piece stalls -- or so it looks so far
+        streams[0].pump(100)
+
+        # The producer closes the first piece, opens the second and writes its
+        # first chunk, all before this callback's own first `popleft` -- which
+        # is the only thing that makes the callback's already-stale `expecting`
+        # and watermark line up with audio that was written after them.
+        def race() -> None:
+            player.expect_audio(False)
+            player.expect_audio(True)
+            player.write(self._tone(100), 24_000)
+
+        player._blocks = RacingBlocks(race)
+        streams[0].pump(100)  # drains the second piece's own first chunk
+
+        self.assertEqual(
+            0,
+            player.starved_periods,
+            "the two stalled periods belonged to neither piece and must be dropped, "
+            "not credited to the second piece's own first sound",
+        )
+
+        # A real gap in the second piece must still be caught -- proving this
+        # is a targeted drop, not the counter going quiet altogether.
+        player.write(self._tone(100), 24_000)
+        streams[0].pump(100)  # lets `_played_any` resync now that the epoch has
+
+        streams[0].pump(100)  # a genuine gap in the second piece
         streams[0].pump(100)
 
         player.write(self._tone(100), 24_000)

@@ -793,7 +793,24 @@ class SoundDevicePlayer:
             # where they occur makes the number non-zero for playback that was
             # perfect and leaves it saying nothing.
             if self._silent_periods:
-                self._starved_periods += self._silent_periods
+                # Re-read rather than trust the tuple unpacked at the top:
+                # `write` can land new audio in the queue and `expect_audio`
+                # can publish the edge that goes with it while this very
+                # period is still draining the old one, and this commit is
+                # the one step above that has a lasting effect -- every other
+                # use of the stale `expecting`/`watermark` below is undone by
+                # the epoch-mismatch reset the next period runs, but a run
+                # added to `_starved_periods` here stays added. An edge in
+                # that window has already decided this run either way -- an
+                # open starts the new piece owing nothing from the last, a
+                # close discards the tail -- so a moved epoch drops the run
+                # instead of committing it against whichever piece the edge
+                # left behind. `_seen_epoch` is deliberately left alone: it is
+                # what makes the next period run its own reset, which is what
+                # clears `_played_any` before the new piece's watermark check
+                # runs again.
+                if epoch == self._expect_state[0]:
+                    self._starved_periods += self._silent_periods
                 self._silent_periods = 0
             # Credited to this piece only once the played position has moved
             # past the watermark recorded at its edge -- strictly past, because
