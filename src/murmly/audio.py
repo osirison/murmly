@@ -444,15 +444,26 @@ class SoundDevicePlayer:
         # time the person dictated, which is exactly when they are investigating.
         self._underruns = 0
         self._starved_periods = 0
-        # The run of silent periods not yet decided either way, whether audio
-        # has played for the piece being produced, and whether a producer is
-        # working on one at all. All three belong to the stream rather than to
-        # the process, so unlike the two counters above they are reset by
-        # `start()`: a run left open across a reopen would be committed by the
-        # next session's first audio and counted against it.
+        # Whether a producer is working on the audio playing now, and the
+        # frame count written at the moment that became true -- published as
+        # one tuple so the callback never reads a fresh `expecting` beside a
+        # stale watermark. `expect_audio` and `_forget_silent_run` are the
+        # only writers, both under `_write_lock`, which is what lets the
+        # callback below read it with no lock of its own: one attribute load
+        # is never torn. See `_publish_expect_state`.
+        self._expect_epoch = 0
+        self._expect_state: tuple[int, bool, int] = (0, False, 0)
+        # The run of silent periods not yet decided either way, and whether
+        # audio has played for the piece being produced. Both belong to the
+        # callback alone -- it is the only thread that ever reads or writes
+        # them, which is what makes them lock-free rather than merely
+        # lock-light. `_seen_epoch` is how it notices `_expect_state` moved
+        # and resyncs both fields to it. All three are reset by `start()`
+        # like the state above: a run left open across a reopen would be
+        # committed by the next session's first audio and counted against it.
         self._silent_periods = 0
         self._played_any = False
-        self._expecting_audio = False
+        self._seen_epoch = 0
         self._output_latency_seconds = 0.0
         self._device_detail: str | None = None
         self._device_name: str | None = None
@@ -550,9 +561,11 @@ class SoundDevicePlayer:
         self._carry = b""
         self._frames_written = 0
         self._frames_played = 0
+        self._expect_epoch = 0
+        self._expect_state = (0, False, 0)
         self._silent_periods = 0
         self._played_any = False
-        self._expecting_audio = False
+        self._seen_epoch = 0
         self._output_latency_seconds = 0.0
         self._device_detail = None
         self._device_name = None
@@ -650,14 +663,19 @@ class SoundDevicePlayer:
         nothing owed from the last; closing one discards the silence after its
         final chunk, which is the tail every playback ends on rather than a gap
         anybody heard.
+
+        Opening one also has a second job the callback cannot do without help:
+        audio still draining from the *previous* piece can reach the device
+        after this call, and the callback that copies it out has no way to
+        tell it from this piece's own first chunk -- which would count this
+        piece's ordinary synthesis latency as a dropout, blaming a slow
+        synthesizer for what is really the last piece's tail. The frame count
+        already written is recorded as a watermark below the frame that starts
+        this piece; the callback only credits this piece with having played
+        once the played position has advanced past it, so a period that only
+        drains the old tail cannot arm the count.
         """
-        self._expecting_audio = expected
-        self._silent_periods = 0
-        if expected:
-            # Silence before this piece has been heard from at all is the model
-            # working on its first sentence, which is expected and is not a
-            # dropout. Counting starts once it has produced something.
-            self._played_any = False
+        self._publish_expect_state(expected)
 
     def _forget_silent_run(self) -> None:
         """Drop the undecided run of silent periods, because playback was cut.
@@ -668,9 +686,27 @@ class SoundDevicePlayer:
         after one would otherwise be committed against whatever the session
         speaks next.
         """
-        self._silent_periods = 0
-        self._played_any = False
-        self._expecting_audio = False
+        self._publish_expect_state(False)
+
+    def _publish_expect_state(self, expecting: bool) -> None:
+        """Publish `(epoch, expecting, watermark)` as the one attribute the
+        callback reads to learn either of the above.
+
+        Under `_write_lock` -- the same lock `write()` takes -- for two
+        reasons. It serialises this against a concurrent `write()` so the
+        watermark is always exactly "frames written before this edge", never a
+        value racing a chunk landing at the same instant; and it serialises
+        the two callers of this method against each other, since `abort` can
+        run on a different thread than the one calling `expect_audio`. The
+        epoch is what lets the callback -- which owns `_played_any` and
+        `_silent_periods` and takes no lock at all -- notice the edge and
+        resync to it instead of needing a lock to see a consistent pair of
+        fields.
+        """
+        with self._write_lock:
+            self._expect_epoch += 1
+            watermark = self._frames_written if expecting else 0
+            self._expect_state = (self._expect_epoch, expecting, watermark)
 
     @staticmethod
     def _reported_latency(stream) -> float:
@@ -722,6 +758,17 @@ class SoundDevicePlayer:
         del time_info
         if status:
             self._underruns += 1
+        # One attribute read, never torn: `_publish_expect_state` always
+        # assigns a whole new tuple, so this is either the edge before or the
+        # edge after, never a mix of the two. An edge since the last period
+        # discards whatever run was pending -- committing it here would credit
+        # (or blame) a piece of text the run has nothing to do with, which is
+        # exactly what the previous edge already decided this run does not.
+        epoch, expecting, watermark = self._expect_state
+        if epoch != self._seen_epoch:
+            self._seen_epoch = epoch
+            self._played_any = False
+            self._silent_periods = 0
         wanted = frames * self._channels * 2
         view = memoryview(outdata).cast("B")
         filled = 0
@@ -748,21 +795,31 @@ class SoundDevicePlayer:
             if self._silent_periods:
                 self._starved_periods += self._silent_periods
                 self._silent_periods = 0
-            self._played_any = True
+            # Credited to this piece only once the played position has moved
+            # past the watermark recorded at its edge -- strictly past, because
+            # a period that exactly drains the previous piece's tail and no
+            # further must not arm this. Audio still short of the watermark is
+            # the previous piece's own residue, still leaving the device from
+            # before this piece existed, and crediting it here is the bug this
+            # guards: the previous piece's tail standing in for this piece's
+            # first sound.
+            if self._frames_played + played > watermark:
+                self._played_any = True
         if filled < wanted:
             # Silence rather than stale audio, and not counted as played: a
             # position that advanced through an underrun would report speech
             # nobody heard. Held as a pending run rather than counted: see
             # above. Counted only between two pieces of audio the *same* piece
-            # of text produced -- `_expecting_audio` says a producer is working
-            # on one, `_played_any` says that one has been heard from. Silence
-            # outside that pair is not synthesis falling behind: before the
-            # first audio it is the model working on the first sentence, and
-            # between two pieces of text it is a sender that has not sent the
-            # next one yet, which the player cannot tell from an empty queue
-            # and must not report as a synthesizer that is too slow.
+            # of text produced -- `expecting` says a producer is working on
+            # one, `_played_any` says that one has been heard from, past its
+            # own watermark. Silence outside that pair is not synthesis
+            # falling behind: before the first audio it is the model working
+            # on the first sentence, and between two pieces of text it is a
+            # sender that has not sent the next one yet, which the player
+            # cannot tell from an empty queue and must not report as a
+            # synthesizer that is too slow.
             view[filled:wanted] = bytes(wanted - filled)
-            if self._played_any and self._expecting_audio:
+            if self._played_any and expecting:
                 self._silent_periods += 1
         self._frames_played += played
 
