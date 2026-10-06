@@ -162,8 +162,13 @@ jobs:
         with:
           node-version: "22"
 
+      # Pinned, because `--strict` fails on warnings and a new release can add
+      # one: 1.14.1 started warning on any requirement over 500 characters, and
+      # every baseline spec but one failed at once with no change to the specs.
+      # Move the pin on purpose, with the specs brought into line in the same
+      # change.
       - name: Install the OpenSpec CLI
-        run: npm install -g @fission-ai/openspec
+        run: npm install -g @fission-ai/openspec@1.14.0
 
       # Behavioral changes are planned as OpenSpec changes, so a delta spec that
       # does not parse -- a scenario written with three hashes, a requirement
