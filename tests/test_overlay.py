@@ -237,6 +237,18 @@ class FakeSocket:
         self.closed = True
 
 
+class RaisingSocket(FakeSocket):
+    """A transport whose `sendall` fails with something `_send` does not handle.
+
+    `_send` catches `BrokenPipeError` and `OSError`, so a `RuntimeError` -- standing
+    in for a genuine bug rather than an expected transport failure -- escapes it and
+    ends `_run`'s thread.
+    """
+
+    def sendall(self, message: bytes) -> None:
+        raise RuntimeError("boom")
+
+
 class FakeProcess:
     def __init__(self) -> None:
         self.return_code: int | None = None
@@ -814,10 +826,6 @@ class OverlayTests(unittest.TestCase):
         some other route.
         """
 
-        class RaisingSocket(FakeSocket):
-            def sendall(self, message: bytes) -> None:
-                raise RuntimeError("boom")
-
         parent = RaisingSocket(90)
         child = FakeSocket(91)
         process = FakeProcess()
@@ -843,6 +851,317 @@ class OverlayTests(unittest.TestCase):
         self.assertIs(RuntimeError, hooked[0].exc_type)
         self.assertTrue(parent.closed)
         self.assertTrue(process.terminated)
+
+    def test_a_thread_that_died_from_an_exception_leaves_the_overlay_unavailable(self) -> None:
+        """Regression: health was written only by `_send`'s own handler and by
+        `_launch_renderer`, so an exception neither handles ended the thread with
+        whatever they last wrote still standing -- `available`, because the launch
+        had succeeded -- for a runtime that no longer exists.
+        """
+        controller, _parent, _process = self._controller_whose_thread_died()
+
+        self.assertFalse(controller.health.available)
+        self.assertIn("RuntimeError", controller.health.detail)
+        self.assertIn("boom", controller.health.detail)
+
+    def test_a_thread_that_died_before_its_loop_reports_the_cause_not_a_stale_one(self) -> None:
+        """The launch at the top of `_run` is inside the same guarded region as
+        the loop. Health already says unavailable there ("has not started"), so
+        the cause is what has to replace it rather than the flag that has to flip.
+        """
+
+        def failing_clock() -> float:
+            raise RuntimeError("clock failed")
+
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=lambda *_args, **_kwargs: FakeProcess(),
+            socket_pair_factory=lambda: (FakeSocket(95), FakeSocket(96)),
+            clock=failing_clock,
+            restart_delays=(0.0,),
+            autostart=False,
+        )
+        self.addCleanup(controller.close)
+
+        with patch("threading.excepthook", lambda _args: None):
+            controller.start()
+            controller._thread.join(timeout=5)
+
+        self.assertFalse(controller._thread.is_alive())
+        self.assertFalse(controller.health.available)
+        self.assertIn("clock failed", controller.health.detail)
+
+    def test_publishes_after_the_thread_died_are_dropped_not_queued(self) -> None:
+        """Regression: only `close()` set `_closed`, so after the thread died every
+        publish kept appending to a queue nothing would ever read again -- unbounded
+        growth over the life of the daemon, not only messages going nowhere.
+        """
+        controller, _parent, _process = self._controller_whose_thread_died()
+
+        for _ in range(100):
+            controller.publish_state(OverlayState.THINKING)
+        controller.publish_error()
+        controller.publish_partial("late")
+        controller.publish_level(0.5)
+
+        self.assertEqual([], list(controller._control_messages))
+        self.assertIsNone(controller._latest_level)
+
+    def test_whatever_was_queued_when_the_thread_died_is_released(self) -> None:
+        """Messages still waiting behind the one that killed the thread have no
+        reader left either; they are dropped with it rather than held for good.
+        """
+        parent = RaisingSocket(97)
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=lambda *_args, **_kwargs: FakeProcess(),
+            socket_pair_factory=lambda: (parent, FakeSocket(98)),
+            restart_delays=(0.0,),
+            autostart=False,
+        )
+        self.addCleanup(controller.close)
+        # Queued before the thread exists, so LISTENING is certainly the message
+        # that kills it and everything after it is certainly still waiting.
+        controller.publish_state(OverlayState.LISTENING)
+        controller.publish_state(OverlayState.THINKING)
+        controller.publish_partial("waiting")
+        controller.publish_level(0.5)
+
+        with patch("threading.excepthook", lambda _args: None):
+            controller.start()
+            controller._thread.join(timeout=5)
+
+        self.assertFalse(controller._thread.is_alive())
+        self.assertEqual([], list(controller._control_messages))
+        self.assertIsNone(controller._latest_level)
+
+    def test_a_publish_that_was_mid_flight_when_the_thread_died_is_dropped(self) -> None:
+        """A publisher that has already encoded its message when the thread dies
+        takes the lock only afterwards. It must see the death there, not only when
+        it first looked, or its message lands in a queue with no reader.
+
+        The publisher is parked between encoding and queueing, the thread is then
+        killed, and only after that is the publisher released -- so the order is
+        forced rather than hoped for.
+        """
+        encoded = threading.Event()
+        release = threading.Event()
+        real_encode = encode_overlay_message
+
+        def parked_encode(message: dict[str, object]) -> bytes:
+            result = real_encode(message)
+            if threading.current_thread().name == "mid-flight-publisher":
+                encoded.set()
+                release.wait(timeout=5)
+            return result
+
+        parent = RaisingSocket(99)
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=lambda *_args, **_kwargs: FakeProcess(),
+            socket_pair_factory=lambda: (parent, FakeSocket(100)),
+            restart_delays=(0.0,),
+        )
+        self.addCleanup(controller.close)
+        publisher = threading.Thread(
+            target=controller.publish_state,
+            args=(OverlayState.THINKING,),
+            name="mid-flight-publisher",
+        )
+
+        with (
+            patch("murmly.overlay.encode_overlay_message", parked_encode),
+            patch("threading.excepthook", lambda _args: None),
+        ):
+            publisher.start()
+            self.assertTrue(encoded.wait(timeout=5))
+            controller.publish_state(OverlayState.LISTENING)
+            controller._thread.join(timeout=5)
+            self.assertFalse(controller._thread.is_alive())
+            release.set()
+            publisher.join(timeout=5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertEqual([], list(controller._control_messages))
+
+    def test_close_after_the_thread_died_returns_and_keeps_the_cause(self) -> None:
+        controller, parent, process = self._controller_whose_thread_died()
+        cause = controller.health.detail
+
+        started_at = time.monotonic()
+        controller.close()
+        controller.close()
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 5.0)
+        self.assertTrue(parent.closed)
+        self.assertTrue(process.terminated)
+        self.assertFalse(controller.health.available)
+        self.assertEqual(cause, controller.health.detail)
+        self.assertEqual([], list(controller._control_messages))
+
+    def test_close_while_the_dying_thread_is_still_tearing_down_waits_for_the_renderer(self) -> None:
+        """The thread records its death, which sets `_closed`, and only then starts
+        tearing the renderer down. A `close()` that lands in between must not take
+        the flag as proof that teardown is done: the renderer has to be terminated
+        by the time `close()` returns, whichever thread ends up doing it.
+
+        The transport's own `close` is parked, so the thread is held inside the
+        teardown it starts after recording, before it has terminated the process --
+        the order is forced rather than hoped for.
+        """
+
+        class ParkedCloseSocket(RaisingSocket):
+            def __init__(self, descriptor: int) -> None:
+                super().__init__(descriptor)
+                self.parked = threading.Event()
+                self.release = threading.Event()
+
+            def close(self) -> None:
+                self.parked.set()
+                self.release.wait(timeout=10)
+                super().close()
+
+        parent = ParkedCloseSocket(103)
+        process = FakeProcess()
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=lambda *_args, **_kwargs: process,
+            socket_pair_factory=lambda: (parent, FakeSocket(104)),
+            restart_delays=(0.0,),
+        )
+        # Registered last, so it runs first: a failure below must not leave the
+        # thread parked for `close()`'s own cleanup to wait out.
+        self.addCleanup(controller.close)
+        self.addCleanup(parent.release.set)
+
+        hooked: list[object] = []
+        with patch("threading.excepthook", hooked.append):
+            controller.publish_state(OverlayState.LISTENING)
+            try:
+                self.assertTrue(parent.parked.wait(timeout=5))
+                # The window under test: death recorded, renderer still running.
+                self.assertFalse(controller.health.available)
+                self.assertFalse(process.terminated)
+                cause = controller.health.detail
+
+                controller.close()
+                terminated_when_close_returned = process.terminated
+            finally:
+                parent.release.set()
+                controller._thread.join(timeout=5)
+
+        self.assertTrue(terminated_when_close_returned)
+        self.assertEqual(cause, controller.health.detail)
+        self.assertEqual(1, len(hooked))
+        self.assertIs(RuntimeError, hooked[0].exc_type)
+
+    def test_start_after_the_thread_died_neither_restarts_it_nor_replaces_the_cause(self) -> None:
+        """A thread can be started once. Asking again used to raise inside
+        `start()`, whose own handler then overwrote the real cause with "threads
+        can only be started once". There is no restart; the cause has to survive.
+        """
+        controller, _parent, _process = self._controller_whose_thread_died()
+        cause = controller.health.detail
+
+        controller.start()
+
+        self.assertFalse(controller._thread.is_alive())
+        self.assertEqual(cause, controller.health.detail)
+
+    def test_a_thread_that_cannot_start_holds_nothing_and_close_still_returns(self) -> None:
+        """Regression: `start()` recorded only health when the thread would not
+        start (the process is out of threads, say). `_closed` stayed unset, so every
+        publish after it appended to a queue no thread would ever read -- the same
+        unbounded growth as a thread that died, from a thread that never ran.
+        """
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=lambda *_args, **_kwargs: FakeProcess(),
+            socket_pair_factory=lambda: (FakeSocket(105), FakeSocket(106)),
+            restart_delays=(0.0,),
+            autostart=False,
+        )
+        self.addCleanup(controller.close)
+        # Queued before the start that fails, so the clear is covered too.
+        controller.publish_state(OverlayState.LISTENING)
+        controller.publish_partial("waiting")
+        controller.publish_level(0.5)
+
+        with patch.object(controller._thread, "start", side_effect=RuntimeError("can't start new thread")):
+            controller.start()
+        for _ in range(100):
+            controller.publish_state(OverlayState.THINKING)
+            controller.publish_error()
+            controller.publish_partial("late")
+            controller.publish_level(0.5)
+
+        cause = "Unable to start overlay controller: can't start new thread"
+        self.assertEqual([], list(controller._control_messages))
+        self.assertIsNone(controller._latest_level)
+        self.assertFalse(controller.health.available)
+        self.assertEqual(cause, controller.health.detail)
+
+        # No retry: a later `start()` leaves the thread unstarted and the cause as it was.
+        controller.start()
+
+        self.assertFalse(controller._thread.is_alive())
+        self.assertEqual(cause, controller.health.detail)
+
+        started_at = time.monotonic()
+        controller.close()
+        controller.close()
+        elapsed = time.monotonic() - started_at
+
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual([], list(controller._control_messages))
+        self.assertEqual(cause, controller.health.detail)
+
+    def test_a_failure_while_closing_is_recorded_and_close_still_returns(self) -> None:
+        """The shutdown message is sent through the same path, so a bug there ends
+        the thread the same way. `close()` has to return, tear the renderer down,
+        and leave the cause behind rather than a health that still says available.
+        """
+        parent = RaisingSocket(101)
+        process = FakeProcess()
+        hooked: list[object] = []
+
+        with patch("threading.excepthook", hooked.append):
+            controller = OverlayController(
+                bottom_margin_px=32,
+                reduced_motion=False,
+                backend=OverlayBackend.X11,
+                helper_path=Path("/tmp/renderer.py"),
+                popen_factory=lambda *_args, **_kwargs: process,
+                socket_pair_factory=lambda: (parent, FakeSocket(102)),
+                restart_delays=(0.0,),
+            )
+            self.addCleanup(controller.close)
+            controller.close()
+            controller._thread.join(timeout=5)
+
+        self.assertFalse(controller._thread.is_alive())
+        self.assertEqual(1, len(hooked))
+        self.assertIs(RuntimeError, hooked[0].exc_type)
+        self.assertTrue(parent.closed)
+        self.assertTrue(process.terminated)
+        self.assertFalse(controller.health.available)
+        self.assertIn("boom", controller.health.detail)
 
     def test_windows_backend_shares_the_socket_over_stdin_instead_of_pass_fds(self) -> None:
         """Task 10.1: the Windows launch seam. `pass_fds` is POSIX-only and a
@@ -913,6 +1232,41 @@ class OverlayTests(unittest.TestCase):
         environment = launches[0]["env"]
         self.assertNotIn("GDK_BACKEND", environment)
         self.assertNotIn("PYTHONNOUSERSITE", environment)
+
+    def _controller_whose_thread_died(
+        self,
+    ) -> tuple[OverlayController, RaisingSocket, FakeProcess]:
+        """A controller whose message thread has already died from an exception
+        `_send` does not handle -- the seam the uncaught-exception test above
+        forces -- with `close()` registered as cleanup.
+
+        Death is waited for with `join`, not polled for, and `threading.excepthook`
+        is recorded rather than left to print: it keeps the traceback Python prints
+        for an uncaught thread exception out of the test output, and proves the
+        thread died through that exception rather than some other route.
+        """
+        parent = RaisingSocket(92)
+        process = FakeProcess()
+        controller = OverlayController(
+            bottom_margin_px=32,
+            reduced_motion=False,
+            backend=OverlayBackend.X11,
+            helper_path=Path("/tmp/renderer.py"),
+            popen_factory=lambda *_args, **_kwargs: process,
+            socket_pair_factory=lambda: (parent, FakeSocket(93)),
+            restart_delays=(0.0,),
+        )
+        self.addCleanup(controller.close)
+
+        hooked: list[object] = []
+        with patch("threading.excepthook", hooked.append):
+            controller.publish_state(OverlayState.LISTENING)
+            controller._thread.join(timeout=5)
+
+        self.assertFalse(controller._thread.is_alive())
+        self.assertEqual(1, len(hooked))
+        self.assertIs(RuntimeError, hooked[0].exc_type)
+        return controller, parent, process
 
     def _wait_for(self, condition: callable, timeout: float = 1.0) -> None:
         deadline = time.monotonic() + timeout

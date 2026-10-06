@@ -410,6 +410,9 @@ class OverlayController:
             elif not self._thread.is_alive() and not self._closed:
                 self._thread.start()
         except Exception as error:
+            # A thread that would not start will never read the queue, same as one
+            # that died: close it off, not only record the cause.
+            self._abandon_queue()
             self._set_health(False, f"Unable to start overlay controller: {error}")
 
     def publish_state(self, state: OverlayState) -> None:
@@ -461,12 +464,17 @@ class OverlayController:
 
     def close(self) -> None:
         try:
+            # `_closed` guards only the shutdown message, not the teardown below: the
+            # thread also sets it when it dies from an uncaught exception, and that
+            # is before its `finally` has terminated the renderer. Returning on it
+            # would let `close()` return with the renderer still running. Every step
+            # after the message is safe to repeat -- a dead thread skips both joins,
+            # and `_terminate_process()` is idempotent.
             with self._condition:
-                if self._closed:
-                    return
-                self._closed = True
-                self._control_messages.append(encode_overlay_message({"type": "shutdown"}))
-                self._condition.notify_all()
+                if not self._closed:
+                    self._closed = True
+                    self._control_messages.append(encode_overlay_message({"type": "shutdown"}))
+                    self._condition.notify_all()
             if self._thread.is_alive():
                 self._thread.join(timeout=0.5)
             if self._thread.is_alive():
@@ -475,6 +483,20 @@ class OverlayController:
             self._terminate_process()
         except Exception as error:
             self._set_health(False, f"Unable to close overlay cleanly: {error}")
+
+    def _abandon_queue(self) -> None:
+        """Nothing will read the queue again: stop taking updates and drop what is held.
+
+        One critical section, under the lock every publisher appends under, so a
+        publish on another thread either landed before it and is cleared with the
+        rest, or sees `_closed` and is dropped. Done as two separate locked steps,
+        clearing first and setting the flag after would leave a window for one to
+        land in.
+        """
+        with self._condition:
+            self._closed = True
+            self._control_messages.clear()
+            self._latest_level = None
 
     def _enqueue_control(self, encoded: bytes) -> None:
         with self._condition:
@@ -496,6 +518,14 @@ class OverlayController:
         # stays: it is idempotent (`_transport_lock`-guarded, swaps `self._process`
         # to `None`), so running it twice is harmless, and it is still what covers a
         # thread that never reaches this `finally` at all.
+        #
+        # An uncaught exception is also the one exit nothing else records: the two
+        # `return`s are reached only once `close()` has set `_closed`, but this one
+        # leaves `_closed` unset and `_health` holding whatever the last successful
+        # launch wrote, with no thread left to read the queue. It is recorded here
+        # through `_abandon_queue()`, which takes the lock every publisher appends
+        # under. The exception is re-raised for `threading.excepthook`; this only
+        # records it.
         try:
             self._launch_renderer()
             while True:
@@ -511,6 +541,12 @@ class OverlayController:
                     self._send(encoded)
                 if stop_after_send:
                     return
+        except Exception as error:
+            self._abandon_queue()
+            # `repr`, not `str`: a bug's type is the part worth reading, and some
+            # exceptions have no message at all.
+            self._set_health(False, f"Overlay controller stopped unexpectedly: {error!r}")
+            raise
         finally:
             self._close_transport()
             self._terminate_process()
