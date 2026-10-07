@@ -11,6 +11,13 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/pages.yml"
+  # A Dependabot update merged by .github/workflows/dependabot-auto-merge.yml
+  # starts no push run (GitHub does not create runs for events caused by
+  # GITHUB_TOKEN), so a new mkdocs or mkdocs-material would never be built into
+  # the published manual. This weekly rebuild picks it up. The environment
+  # allows main only, and a scheduled run is on the default branch.
+  schedule:
+    - cron: "17 5 * * 1"
   workflow_dispatch:
 
 permissions:

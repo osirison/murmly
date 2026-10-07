@@ -1,0 +1,111 @@
+name: Dependabot auto-merge
+
+# Turns on GitHub's auto-merge for the pull requests Dependabot opens, so a
+# dependency update lands once the required checks pass and not before. This
+# workflow merges nothing itself: auto-merge waits for the checks the ruleset on
+# the default branch requires, which are the jobs in tests.yml. If one fails,
+# the pull request stays open for a person.
+#
+# Read before editing:
+#
+#  1. `gh pr merge --auto` merges at once when nothing is holding the pull
+#     request back, and the ruleset is what holds it back. The step below
+#     therefore refuses to turn auto-merge on unless a required-checks rule
+#     applies to the base branch. It reads rulesets only, so classic branch
+#     protection would not satisfy it.
+#  2. "Allow auto-merge" has to be on in the repository settings. With it off,
+#     `gh pr merge --auto` fails and every Dependabot pull request gets a red
+#     job.
+#  3. Updates to GitHub Actions are left for a person. They edit files under
+#     .github/workflows/, GITHUB_TOKEN cannot be granted the `workflows`
+#     permission (listing it makes this file invalid), and GitHub has been
+#     reported to refuse auto-merge for a token without it. CI also would not
+#     prove much: the Pages actions run only on a push to main, not on a pull
+#     request. Arming them would take a token with the `workflows` permission
+#     kept as a Dependabot secret, which could rewrite these workflows, so
+#     that is a credential to create on purpose and not by default.
+#  4. A merge made on behalf of GITHUB_TOKEN starts no workflow runs, because
+#     GitHub does not create runs for events that token causes. After a
+#     Dependabot merge, Tests is not expected to run on the new commit on main;
+#     the run on the pull request is what vouched for it. Pages is not
+#     redeployed by the merge either, so pages.yml has a weekly schedule that
+#     rebuilds the manual with the updated docs toolchain. Removing that
+#     schedule leaves the manual on the old toolchain until a person pushes a
+#     change to one of the paths pages.yml watches, or runs it by hand.
+#  5. There is no approval step. The ruleset requires no review, and Actions may
+#     not approve pull requests in this repository.
+#  6. Dependabot rebasing its branch runs this again and arms auto-merge again,
+#     so turning it off by hand does not last. Close the pull request to stop
+#     it.
+
+on:
+  pull_request:
+
+permissions: {}
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    name: auto-merge
+    # Dependabot's own pushes only: a person's push to the branch, or a person
+    # reopening the pull request, does not arm it.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # What GitHub's own example for this job grants. A pull request run
+    # triggered by Dependabot gets a read-only token unless the workflow asks for
+    # more, and this asks. If arming ever fails with "Resource not accessible by
+    # integration", the trigger has to become pull_request_target: keep both
+    # guards above, and never check out the pull request's code there.
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      # Fails the job unless the pull request is Dependabot's and its first
+      # commit is signed, which is what keeps the next step from running on
+      # anything else. Pinned to a commit rather than a tag because this job can
+      # write to the repository; Dependabot moves the pin and the version comment
+      # together.
+      - name: Read Dependabot's metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          ECOSYSTEM: ${{ steps.metadata.outputs.package-ecosystem }}
+          NAMES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+
+          # The ecosystem is read from the branch name, dependabot/github_actions/...
+          if [ "$ECOSYSTEM" = "github_actions" ]; then
+            echo "::notice title=Not armed::This pull request edits workflow files, which GITHUB_TOKEN cannot be relied on to merge. Merge it by hand."
+            exit 0
+          fi
+
+          # CI installs no CUDA wheels, so a green run says nothing about these.
+          case "$NAMES" in
+            *nvidia-*)
+              echo "::notice title=Not armed::CI never installs the cuda extra, so passing checks say nothing about nvidia-* packages. Merge it by hand."
+              exit 0
+              ;;
+          esac
+
+          required=$(gh api "repos/$REPO/rules/branches/$BASE" \
+            --jq '[.[] | select(.type == "required_status_checks")] | length')
+          if [ "$required" -eq 0 ]; then
+            echo "::error title=No required checks::No rule requiring status checks applies to $BASE, so auto-merge would merge this pull request at once. Not arming it."
+            exit 1
+          fi
+
+          gh pr merge --auto --squash "$PR_URL"
