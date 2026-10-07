@@ -48,7 +48,7 @@ jobs:
             name: macOS
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # sounddevice loads libportaudio at import. Without it, the tests that
       # exercise the real module skip themselves rather than fail -- including
@@ -65,7 +65,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y libportaudio2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -128,10 +128,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: "3.12"
@@ -155,10 +155,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
