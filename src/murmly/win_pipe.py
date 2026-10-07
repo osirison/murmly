@@ -14,8 +14,8 @@ read access -- and its actual protection is an application-layer HMAC challenge
 keyed by `authkey`, not an OS access check. The command channel starts and
 stops the microphone; a shared secret in a process's memory is a different
 guarantee from one the kernel enforces, and the requirement (`command-interface`
-spec, "The command socket is reachable only by the account that owns it") is
-the kernel one.
+spec, "Murmly uses the platform's own local channel where it provides no socket
+in the filesystem") is the kernel one.
 
 Every `pywin32` name is imported inside the function that uses it, never at
 module level, so this module stays importable on Linux -- `pywin32` is

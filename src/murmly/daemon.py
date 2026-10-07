@@ -854,8 +854,10 @@ class SpeechSessionConnection:
     socket a sender holds open while it streams text and reads what was heard.
 
     Reads many frames and writes many, which is the exception
-    `command-interface` carves for exactly this. Every other connection is still
-    read by `_read_request` and answered once by `_write_response`.
+    `command-interface` carves for exactly this ("A connection that declares
+    itself a speech session is exempt from the one-response rule"). Every other
+    connection is still read by `_read_request` and answered once by
+    `_write_response`.
     """
 
     def __init__(
@@ -1685,7 +1687,7 @@ class MurmlyDaemon:
                 # The connection itself failed. There is nothing left to
                 # answer on, so this is reported rather than replied to.
                 raise
-            except Exception as error:  # noqa: BLE001 - an accepted connection is answered
+            except Exception as error:  # noqa: BLE001 - A response is sent when a request cannot be served
                 response = self._unexpected_failure(error)
             if isinstance(response, _Adopted):
                 # A speech session now. It owes no single response, it must not

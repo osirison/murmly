@@ -1214,10 +1214,12 @@ class SynthesisResidencyTests(unittest.TestCase):
         `return_free_heap` is not mocked here, so this goes through the real
         function down to `_MALLOC_TRIM` -- patched to None to stand in for a
         platform whose allocator offers no way to return freed memory -- and
-        proves the two halves of the requirement together: the session is
-        still dropped on schedule, and the platform still (correctly) reports
-        that it cannot return system memory, rather than the release silently
-        claiming success on both counts.
+        proves the two requirements it combines, "A model is dropped on
+        schedule even where system memory cannot be returned" and "Murmly
+        reports when the platform cannot return system memory", together: the
+        session is still dropped on schedule, and the platform still
+        (correctly) reports that it cannot return system memory, rather than
+        the release silently claiming success on both counts.
         """
         from murmly import idle
 

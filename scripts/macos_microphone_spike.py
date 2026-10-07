@@ -60,7 +60,7 @@ WHAT TO RUN, IN ORDER
    itself already holds the microphone grant (macOS will have prompted for it
    the first time something run from Terminal used the microphone) -- this
    script does not grant anything itself, per the `platform-support` spec's
-   "MUST NOT attempt to grant a permission on the person's behalf" rule.
+   "Murmly does not grant a permission on the person's behalf" rule.
    `AssociatedBundleIdentifiers` requires the bundle identifier to already be
    installed and already hold the grant Murmly wants; Murmly ships no bundle
    of its own to name here (that is task 12.4's `.app` wrapper, not built by
