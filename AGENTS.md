@@ -34,5 +34,30 @@ build on a machine that has had the swap applied. The suite still passes, and ev
 synthesis measurement taken afterwards silently reports a CPU session. This is the
 command CI runs. See `docs/agent-notes/onnxruntime-gpu-cuda-version.md`.
 
+## Dependencies
+
+Dependency updates arrive as Dependabot pull requests a few days after a release
+(`.github/dependabot.yml`), and `.github/workflows/dependabot-auto-merge.yml` turns on
+auto-merge for them, so they merge themselves once the required checks pass. Two kinds
+are left for a person to merge: GitHub Actions updates, because they edit workflow
+files, and the `nvidia-*` packages, because CI never installs the `cuda` extra.
+Security updates skip the few days' wait and the major-version ignores, and are
+auto-merged the same way.
+
+A merge made by the workflow starts no workflow runs on `main`: Tests does not run on
+the new commit (the run on the pull request is the check), and the manual is rebuilt by
+the weekly schedule in `pages.yml`, not by the merge.
+
+The required checks are listed by exact name in a repository ruleset on the default
+branch (Settings, Rules), not in the workflow files. Renaming a job in `tests.yml`, or
+changing a matrix label such as the Python version or the operating system, leaves the
+old name waiting for a result that never comes, and every pull request stays blocked,
+yours included, until the ruleset is edited to match, or you use the admin bypass on
+the pull request. A job added to `tests.yml` gates nothing until it is added to the
+ruleset too.
+
+The OpenSpec CLI pin in `tests.yml` is an `npm install` inside a step, which Dependabot
+cannot see. Move it by hand, together with any spec rewrites the new version needs.
+
 # Commit Comments
 NEVER USE `🤖 Generated with Claude Code`
