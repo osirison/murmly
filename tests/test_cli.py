@@ -3811,7 +3811,8 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
         speech = report["speech_output"]
         self.assertIn("the probe exploded", speech["detail"])
         # A section that drops these reads as one the report never asked about,
-        # which is the distinction the residency requirement exists to preserve.
+        # which is the distinction "Diagnostics report unknown residency when no
+        # daemon can be asked" exists to preserve.
         # The daemon's answer was taken before the probe ran, and the probe
         # failing does not make it less true.
         self.assertEqual(900, speech["unload_after_idle_s"])

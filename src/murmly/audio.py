@@ -438,8 +438,9 @@ class SoundDevicePlayer:
         self._frames_written = 0
         self._frames_played = 0
         # Counted for the life of the process, not the life of a stream. The
-        # spec asks how many dropouts there have been since the daemon started,
-        # and a session suspended for capture and resumed afterwards reopens the
+        # spec's "Diagnostics report playback dropouts as two separate counts"
+        # asks how many dropouts there have been since the daemon started, and
+        # a session suspended for capture and resumed afterwards reopens the
         # device -- so resetting these in `start()` would zero the count every
         # time the person dictated, which is exactly when they are investigating.
         self._underruns = 0

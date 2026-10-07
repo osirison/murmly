@@ -73,8 +73,9 @@ theme:
 #   repo_url
 #       Material's repository widget fetches api.github.com at view time for
 #       star and fork counts. That is an off-origin request on every page load,
-#       and a star count is social proof, which the claims requirement forbids
-#       outright.
+#       and a star count is social proof, which the "Measured figures keep their
+#       qualification and no comparisons or social proof are presented"
+#       requirement forbids outright.
 #
 #   theme.palette with any toggle: entry
 #       The light/dark switch writes __palette to localStorage. No page may

@@ -168,7 +168,7 @@ jobs:
       # Move the pin on purpose, with the specs brought into line in the same
       # change.
       - name: Install the OpenSpec CLI
-        run: npm install -g @fission-ai/openspec@1.14.0
+        run: npm install -g @fission-ai/openspec@1.14.1
 
       # Behavioral changes are planned as OpenSpec changes, so a delta spec that
       # does not parse -- a scenario written with three hashes, a requirement

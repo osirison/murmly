@@ -100,7 +100,9 @@ def refuse_before_sync(profile: "PlatformProfile") -> str | None:
     where" table: musl Linux, Windows on ARM64, Intel macOS). Both fail at
     `uv sync` today with a resolver error naming a package instead of the
     machine characteristic that has no build of it -- exactly what the
-    `platform-support` spec forbids surfacing in the runtime's own words.
+    `platform-support` spec's "A runtime's own failure to load is not surfaced
+    in place of the report of its missing build" forbids surfacing in the
+    runtime's own words.
     """
     from murmly.platform import SUPPORTED_OPERATING_SYSTEMS, transcription_runtime_gap
 

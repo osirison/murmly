@@ -10,8 +10,6 @@ Defines how a completed transcript reaches the application the user was dictatin
 
 Murmly SHALL determine the intended delivery target at the moment capture stops or a segment closes, before transcription of that audio begins. The target MUST NOT be determined after transcription completes. A session that closes more than one segment MUST record a target for each segment independently, and MUST NOT reuse an earlier segment's target.
 
-Capture started by the hotkey designated for an open speech session is the one exception. Its transcript's recipient is that speech session, so Murmly MUST NOT record a window as its target and MUST NOT verify one before delivering. The recipient is known when capture starts and cannot change while capture runs, which is what recording a target before transcription exists to guarantee. Capture started by the hotkey designated for the focused window records and verifies a target exactly as it does today, whether or not a speech session is open.
-
 #### Scenario: Target captured when recording stops
 
 - **WHEN** the user stops capture and the session can observe the focused window
@@ -36,6 +34,10 @@ Capture started by the hotkey designated for an open speech session is the one e
 - **THEN** Murmly does not attempt delivery for that segment
 - **AND** the session continues under its configured auto-transcribe mode
 
+### Requirement: Capture bound for a speech session records no window
+
+Capture started by the hotkey designated for an open speech session is the one exception to the requirement that a delivery target is recorded before transcription. Its transcript's recipient is that speech session, so Murmly MUST NOT record a window as its target and MUST NOT verify one before delivering. The recipient is known when capture starts and cannot change while capture runs, which is what recording a target before transcription exists to guarantee.
+
 #### Scenario: Capture bound for a speech session records no window
 
 - **WHEN** capture started by the speech-session hotkey stops and a speech session is open
@@ -47,6 +49,10 @@ Capture started by the hotkey designated for an open speech session is the one e
 - **WHEN** capture started by the speech-session hotkey runs and the focused window changes before capture stops
 - **THEN** the transcript is still delivered to that speech session
 - **AND** no window receives it
+
+### Requirement: Window-bound capture is unchanged by an open speech session
+
+Capture started by the hotkey designated for the focused window SHALL record and verify a target exactly as it does today, whether or not a speech session is open.
 
 #### Scenario: Window-bound capture is unchanged by an open speech session
 
@@ -98,9 +104,7 @@ When delivery is refused, Murmly SHALL leave the transcript on the clipboard and
 
 ### Requirement: Previous clipboard restored after a bounded delay
 
-When clipboard restoration is enabled and delivery was injected, Murmly SHALL wait a configurable interval before restoring the previous clipboard contents, so the receiving application has time to read the transcript. The interval MUST be bounded, so no configured value can delay Murmly's return to idle indefinitely, and a value outside those bounds MUST fall back to the default.
-
-Murmly cannot observe whether the receiving application has read the clipboard: a desktop clipboard manager takes a copy of every clipboard change immediately, so a selection-request signal reports the manager rather than the application. The interval is therefore a margin, not a guarantee.
+When clipboard restoration is enabled and delivery was injected, Murmly SHALL wait a configurable interval before restoring the previous clipboard contents, so the receiving application has time to read the transcript. The interval is a margin, not a guarantee: a desktop clipboard manager copies every change at once, so a selection-request signal reports the manager, not the application, and Murmly cannot observe whether the receiving application has read the clipboard.
 
 #### Scenario: Delivered transcript is restored after the interval
 
@@ -108,17 +112,21 @@ Murmly cannot observe whether the receiving application has read the clipboard: 
 - **THEN** Murmly waits the configured interval
 - **AND** then restores the clipboard contents present before capture
 
-#### Scenario: Interval outside the supported bounds
-
-- **WHEN** the configured interval is negative or larger than the supported maximum
-- **THEN** Murmly uses the default interval
-- **AND** Murmly returns to idle within the supported maximum
-
 #### Scenario: Restoration disabled
 
 - **WHEN** clipboard restoration is disabled in configuration
 - **THEN** the transcript remains on the clipboard after delivery
 - **AND** Murmly does not read the previous clipboard contents at any point
+
+### Requirement: The restoration interval is bounded
+
+The restoration interval MUST be bounded, so no configured value can delay Murmly's return to idle indefinitely, and a value outside those bounds MUST fall back to the default.
+
+#### Scenario: Interval outside the supported bounds
+
+- **WHEN** the configured interval is negative or larger than the supported maximum
+- **THEN** Murmly uses the default interval
+- **AND** Murmly returns to idle within the supported maximum
 
 ### Requirement: Sessions without observable focus deliver without verification
 
@@ -291,8 +299,6 @@ When no usable paste injection method is available, or the selected method fails
 
 `murmly doctor` SHALL report whether Murmly can inject a paste in the active session and which method it would use. When it cannot inject, the report MUST name what the user has to install, enable, or grant to make injection work in this session, and MUST distinguish an injection tool that is absent from one that is installed but unusable here, and both from one that is installed and usable but whose required permission has not been granted.
 
-Those three states have three different remedies, and only the first is fixed by installing something. A method the platform gates behind a permission MUST NOT be reported as available while that permission is ungranted, because on some platforms such a method reports success while nothing reaches the focused window — which is precisely the failure a person would otherwise spend their time attributing to Murmly.
-
 #### Scenario: Injection available
 
 - **WHEN** diagnostics run in a session where Murmly can inject a paste
@@ -317,6 +323,10 @@ Those three states have three different remedies, and only the first is fixed by
 - **THEN** the report states that the permission is what is missing
 - **AND** names where the person grants it
 - **AND** does not report paste injection as available
+
+### Requirement: A method gated behind an ungranted permission is not reported as available
+
+An absent tool, an unusable one, and an ungranted permission have three different remedies, and only the first is fixed by installing something. A method the platform gates behind a permission MUST NOT be reported as available while that permission is ungranted, because on some platforms such a method reports success while nothing reaches the focused window — which is precisely the failure a person would otherwise spend their time attributing to Murmly.
 
 #### Scenario: The permission state cannot be read
 

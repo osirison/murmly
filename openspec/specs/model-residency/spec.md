@@ -15,23 +15,8 @@ the memory held by the synthesis session, after each has been unused for its own
 configured idle period. Releasing MUST return the memory to the system rather than
 to an internal pool, so that another process can allocate it.
 
-Accelerator memory SHALL be returned on every platform, because the runtime holding
-it frees it when the model is dropped. System memory is the platform's allocator to
-return, and not every allocator can be asked to. Where the platform provides no way
-to ask, Murmly MUST report that it cannot rather than claiming it did, because the
-person set an idle period to get memory back and is entitled to know the setting
-did not do that here. Murmly MUST still drop the model on schedule in that case:
-the memory becomes available for reuse within the process even where it is not
-handed back to the system, and the next release on a platform that can ask depends
-on nothing being held.
-
-Each is governed independently: the transcription model and the synthesis session
-have separate idle periods and are released separately. The memory each reclaims
-and the time each costs to restore differ by roughly a factor of four in opposite
-directions, so one shared period cannot serve both.
-
-Murmly MUST NOT release a model that is in use. A release MUST NOT interrupt a
-transcription pass, a synthesis in progress, or playback.
+Accelerator memory SHALL be returned on every platform, because the runtime
+holding it frees it when the model is dropped.
 
 #### Scenario: Transcription model released after its idle period
 
@@ -39,19 +24,6 @@ transcription pass, a synthesis in progress, or playback.
 - **WHEN** no capture has been active for longer than that period
 - **THEN** Murmly releases the accelerator memory the model held
 - **AND** the memory is observable as free to other processes
-
-#### Scenario: Synthesis session released on its own period
-
-- **GIVEN** both models are resident and each has a different idle period
-- **WHEN** only the synthesis period has elapsed
-- **THEN** Murmly releases the synthesis session
-- **AND** the transcription model remains resident
-
-#### Scenario: A pass in progress is never interrupted
-
-- **GIVEN** an idle period has elapsed
-- **WHEN** a transcription pass or a synthesis is still running
-- **THEN** Murmly does not release that model until the work completes
 
 #### Scenario: A platform whose allocator cannot be asked to return memory
 
@@ -62,6 +34,60 @@ transcription pass, a synthesis in progress, or playback.
 - **AND** the accelerator memory it held is returned
 - **AND** diagnostics report that system memory is not returned to the system here
 - **AND** Murmly does not report that it returned memory it did not
+
+### Requirement: Murmly reports when the platform cannot return system memory
+
+System memory is the platform's allocator to return, and not every allocator can
+be asked to. Where the platform provides no way to ask, Murmly MUST report that it
+cannot rather than claiming it did, because the person set an idle period to get
+memory back and is entitled to know the setting did not do that here.
+
+#### Scenario: A release on a platform with no way to ask for system memory back
+
+- **GIVEN** a platform that offers no way to ask the allocator to return freed
+  system memory
+- **WHEN** a model is released after its idle period
+- **THEN** Murmly reports that it cannot return system memory to the system here
+- **AND** Murmly does not claim to have returned memory it did not
+
+### Requirement: A model is dropped on schedule even where system memory cannot be returned
+
+Where the platform provides no way to ask the allocator to return system memory,
+Murmly MUST still drop the model on schedule: the memory becomes available for
+reuse within the process even where it is not handed back to the system, and the
+next release on a platform that can ask depends on nothing being held.
+
+#### Scenario: The model is still dropped when the allocator cannot be asked
+
+- **GIVEN** a platform that offers no way to ask the allocator to return freed
+  system memory
+- **WHEN** a model's idle period elapses
+- **THEN** Murmly drops the model on schedule
+
+### Requirement: The transcription model and the synthesis session are released independently
+
+The transcription model and the synthesis session SHALL be governed independently:
+each has its own idle period and is released separately. The memory each reclaims
+and the time each costs to restore differ by roughly a factor of four in opposite
+directions, so one shared period cannot serve both.
+
+#### Scenario: Synthesis session released on its own period
+
+- **GIVEN** both models are resident and each has a different idle period
+- **WHEN** only the synthesis period has elapsed
+- **THEN** Murmly releases the synthesis session
+- **AND** the transcription model remains resident
+
+### Requirement: A model that is in use is never released
+
+Murmly MUST NOT release a model that is in use. A release MUST NOT interrupt a
+transcription pass, a synthesis in progress, or playback.
+
+#### Scenario: A pass in progress is never interrupted
+
+- **GIVEN** an idle period has elapsed
+- **WHEN** a transcription pass or a synthesis is still running
+- **THEN** Murmly does not release that model until the work completes
 
 ### Requirement: Idle means no capture is active
 
@@ -147,13 +173,6 @@ absent setting SHALL take that setting's default. A value outside the supported
 bounds MUST fall back to that setting's default rather than being applied or
 refused.
 
-The two defaults differ, because the two releases are not alike. Transcription
-release SHALL be enabled by default: it returns accelerator memory, and its reload
-is already started when capture begins, so the wait is absorbed while the person
-is still speaking. Synthesis release SHALL be disabled by default: it returns
-system memory rather than accelerator memory, and what it costs is silence before
-speech resumes, which has nothing to overlap it.
-
 #### Scenario: Transcription release is enabled without configuration
 
 - **GIVEN** no transcription idle period is configured
@@ -177,6 +196,22 @@ speech resumes, which has nothing to overlap it.
 - **WHEN** an idle period is configured outside the supported bounds
 - **THEN** Murmly uses the default for that setting and starts normally
 
+### Requirement: The idle release defaults differ between transcription and synthesis
+
+The two defaults differ, because the two releases are not alike. Transcription
+release SHALL be enabled by default: it returns accelerator memory, and its reload
+is already started when capture begins, so the wait is absorbed while the person
+is still speaking. Synthesis release SHALL be disabled by default: it returns
+system memory rather than accelerator memory, and what it costs is silence before
+speech resumes, which has nothing to overlap it.
+
+#### Scenario: The two defaults differ
+
+- **GIVEN** neither idle period is configured and both models are resident
+- **WHEN** Murmly is left idle indefinitely
+- **THEN** the transcription model's accelerator memory is released after its default period
+- **AND** the synthesis session stays resident and its memory is not released
+
 ### Requirement: Diagnostics report residency and configuration
 
 Murmly's diagnostics SHALL report, for the transcription model and for the
@@ -184,18 +219,6 @@ synthesis session, whether it is currently resident and what idle period is in
 effect. Residency SHALL be reported for the models the running daemon holds, not
 for the process producing the report, because those are different processes and
 only the daemon's answer describes the system.
-
-When no running daemon can be asked, diagnostics MUST say so rather than report
-the models as not resident. "Nothing is holding a model" and "nobody was there to
-ask" are different facts, and reporting the second as the first makes the report
-wrong exactly when a person is checking whether their daemon is running.
-
-Reporting residency MUST NOT itself load a model that is not loaded. Diagnostics
-MAY include other sections that load a model, and any such section MUST state
-that it does.
-
-A daemon that cannot answer, or that answers unusably, MUST NOT prevent the rest
-of the report. The reason MUST be named alongside the affected fields.
 
 #### Scenario: Residency reported for the daemon's models
 
@@ -211,12 +234,25 @@ of the report. The reason MUST be named alongside the affected fields.
 - **THEN** the report says the transcription model is not resident
 - **AND** names the configured idle period
 
+### Requirement: Diagnostics report unknown residency when no daemon can be asked
+
+When no running daemon can be asked, diagnostics MUST say so rather than report
+the models as not resident. "Nothing is holding a model" and "nobody was there to
+ask" are different facts, and reporting the second as the first makes the report
+wrong exactly when a person is checking whether their daemon is running.
+
 #### Scenario: No daemon to ask is not the same as not resident
 
 - **GIVEN** no daemon is running
 - **WHEN** the user runs diagnostics
 - **THEN** the report states that residency could not be determined because no daemon answered
 - **AND** it does not report either model as resident or as not resident
+
+### Requirement: Reporting residency never loads a model
+
+Reporting residency MUST NOT itself load a model that is not loaded. Diagnostics
+MAY include other sections that load a model, and any such section MUST state
+that it does.
 
 #### Scenario: Residency reported without loading
 
@@ -231,6 +267,11 @@ of the report. The reason MUST be named alongside the affected fields.
 - **WHEN** that section runs
 - **THEN** the report states that the measurement loaded a model
 - **AND** the residency it reports is what was held before that section ran
+
+### Requirement: A daemon that cannot answer does not prevent the rest of the report
+
+A daemon that cannot answer, or that answers unusably, MUST NOT prevent the rest
+of the report. The reason MUST be named alongside the affected fields.
 
 #### Scenario: A daemon that cannot be asked does not abandon the report
 

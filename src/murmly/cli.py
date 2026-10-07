@@ -770,9 +770,10 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             "available": False,
             # Both residency keys survive a failed probe. A section that drops
             # them reads as one the report never asked about, which is the
-            # distinction the residency requirement exists to preserve. The
-            # daemon's answer survives it too: it was taken before this probe
-            # ran and nothing about the probe failing makes it less true.
+            # distinction "Diagnostics report unknown residency when no daemon
+            # can be asked" exists to preserve. The daemon's answer survives it
+            # too: it was taken before this probe ran and nothing about the
+            # probe failing makes it less true.
             "unload_after_idle_s": config.tts_unload_after_idle_s,
             "resident": synthesis_resident,
             # The counts survive a failed probe too, and can: they came from the

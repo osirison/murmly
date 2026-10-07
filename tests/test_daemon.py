@@ -2891,9 +2891,10 @@ class AnsweredConnectionTests(ServedDaemonTests):
             )
 
     def test_a_daemon_that_holds_the_connection_open_is_reported_not_waited_on(self) -> None:
-        # The other half of "no command terminates with an unhandled error": a
-        # daemon that answers nothing at all is as unhelpful as one that closes,
-        # and a hotkey press has nowhere to show a caller that never returns.
+        # The other half of "An unanswered command, an unreadable configuration
+        # file and a refused start are each reported": a daemon that answers
+        # nothing at all is as unhelpful as one that closes, and a hotkey press
+        # has nowhere to show a caller that never returns.
         if not hasattr(socket, "AF_UNIX"):
             # Builds its own bare UNIX-socket server by hand, the same as
             # `test_a_client_that_receives_nothing_raises_a_named_type` above.

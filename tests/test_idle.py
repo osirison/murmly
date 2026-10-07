@@ -23,7 +23,8 @@ class ReturnFreeHeapTests(unittest.TestCase):
         trim.assert_called_once_with(0)
 
     def test_a_platform_that_cannot_be_asked_reports_memory_not_returned(self) -> None:
-        """Task 3.2 / 18.16: silence is exactly what the requirement forbids."""
+        """Task 3.2 / 18.16: silence is exactly what the requirement forbids
+        ("Murmly reports when the platform cannot return system memory")."""
         with patch.object(idle, "_MALLOC_TRIM", None):
             self.assertFalse(return_free_heap())
 
