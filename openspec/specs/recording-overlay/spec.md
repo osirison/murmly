@@ -76,7 +76,7 @@ Murmly SHALL allow users to disable the recording overlay and configure its bott
 
 ### Requirement: Visual failure isolation
 
-Murmly SHALL preserve capture, transcription, clipboard, and paste behavior when the visual runtime is missing, unsupported, or terminates unexpectedly. Visual failures MUST be reported through diagnostics without changing the existing toggle command response contract. An overlay Murmly cannot place as this specification requires MUST be treated as an unavailable visual runtime: Murmly MUST NOT present an overlay whose position, stacking, or focus behavior differs from the specified presentation.
+Murmly SHALL preserve capture, transcription, clipboard, and paste behavior when the visual runtime is missing, unsupported, or terminates unexpectedly. Visual failures MUST be reported through diagnostics without changing the existing toggle command response contract.
 
 #### Scenario: Visual dependencies are unavailable
 
@@ -87,6 +87,10 @@ Murmly SHALL preserve capture, transcription, clipboard, and paste behavior when
 
 - **WHEN** the overlay terminates unexpectedly while Murmly is listening
 - **THEN** microphone capture continues and the next toggle still initiates transcription
+
+### Requirement: An overlay that cannot be placed as specified is treated as an unavailable visual runtime
+
+An overlay Murmly cannot place as this specification requires MUST be treated as an unavailable visual runtime under "Visual failure isolation": Murmly MUST NOT present an overlay whose position, stacking, or focus behavior differs from the specified presentation.
 
 #### Scenario: The overlay cannot be placed as specified
 
@@ -99,23 +103,12 @@ Murmly SHALL preserve capture, transcription, clipboard, and paste behavior when
 
 When Murmly shuts down, it SHALL terminate any overlay renderer process it
 launched, including one whose launch was still under way at the moment shutdown
-began. Shutdown MUST NOT wait indefinitely for a launch still in progress before
-returning; it SHALL return within its existing bounded time regardless of how long
-the renderer takes to start. A renderer whose launch was still in progress when
-that bound was reached MUST still be terminated once the launch completes, even
-though shutdown itself has already returned.
+began.
 
-This requirement covers Murmly shutting down through its own control flow — the
-ordinary stop of the daemon and the equivalent cleanup on every other path that
-stops serving. It does not cover the daemon process being killed outright.
-
-#### Scenario: Shutdown begins while the renderer is still launching
-
-- **WHEN** Murmly shuts down while the overlay's renderer process is still being
-  started
-- **THEN** shutdown does not wait for that launch to finish before returning
-- **AND** the renderer process is terminated once the launch completes, even though
-  shutdown has already returned
+This requirement and "A renderer launch still in progress does not delay shutdown"
+cover Murmly shutting down through its own control flow — the ordinary stop of the
+daemon and the equivalent cleanup on every other path that stops serving. They do
+not cover the daemon process being killed outright.
 
 #### Scenario: Shutdown after the renderer is already running
 
@@ -129,24 +122,30 @@ stops serving. It does not cover the daemon process being killed outright.
 - **THEN** the second close returns without attempting to terminate a process a
   second time in a way that raises an error
 
+### Requirement: A renderer launch still in progress does not delay shutdown
+
+Shutdown MUST NOT wait indefinitely for a launch still in progress before
+returning; it SHALL return within its existing bounded time regardless of how long
+the overlay renderer takes to start. A renderer whose launch was still in progress
+when that bound was reached MUST still be terminated once the launch completes,
+even though shutdown itself has already returned.
+
+#### Scenario: Shutdown begins while the renderer is still launching
+
+- **WHEN** Murmly shuts down while the overlay's renderer process is still being
+  started
+- **THEN** shutdown does not wait for that launch to finish before returning
+- **AND** the renderer process is terminated once the launch completes, even though
+  shutdown has already returned
+
 ### Requirement: The overlay reports when its own control work has failed
 
 When the background work that drives the overlay cannot be started, or ends because
 of an unexpected failure, Murmly SHALL report the overlay as unavailable and SHALL
-name that failure as the cause, replacing whatever the overlay reported before. From
-then on Murmly MUST drop every update meant for the overlay — a state change, an
-audio level, a partial transcript, or an error presentation — rather than hold it, so
-that nothing accumulates for work that no longer exists or never began. Updates that
-were already waiting when the work ended, or when it could not be started, MUST be
-discarded with it. Murmly MUST NOT try to start that work again. An overlay renderer
-process still running when the work ended MUST be terminated, as it is when Murmly
-shuts down, and a request to close the overlay that arrives while that is still
-happening MUST NOT return before the process has been terminated.
-
-This requirement covers the overlay's own control work failing to start or ending
-unexpectedly, not the renderer process terminating, which "Visual failure isolation"
-already covers. It changes nothing about microphone capture, transcription, clipboard
-and paste handling, or the toggle command response contract.
+name that failure as the cause, replacing whatever the overlay reported before.
+Every rule about the overlay's own control work failing to start or ending
+unexpectedly changes nothing about microphone capture, transcription, clipboard and
+paste handling, or the toggle command response contract.
 
 #### Scenario: The overlay's control work fails
 
@@ -165,6 +164,29 @@ and paste handling, or the toggle command response contract.
 - **AND** the reported cause names why it could not be started
 - **AND** updates that were already waiting for the overlay are discarded
 - **AND** every update meant for the overlay afterwards is dropped rather than held
+
+#### Scenario: The work fails before it has processed anything
+
+- **WHEN** the overlay's control work ends because of an unexpected failure before it
+  has handled a single update, while the overlay was still reporting that it had not
+  started
+- **THEN** the reported cause names that failure rather than the earlier report
+
+#### Scenario: The work fails while Murmly is shutting down
+
+- **WHEN** the overlay's control work fails while Murmly is shutting down
+- **THEN** shutdown returns within its existing bounded time
+- **AND** the overlay's renderer process is terminated
+- **AND** the overlay is reported as unavailable with that failure as the cause
+
+### Requirement: Updates meant for the overlay are dropped once its control work has failed
+
+From the moment the background work that drives the overlay cannot be started, or
+ends because of an unexpected failure, Murmly MUST drop every update meant for the
+overlay — a state change, an audio level, a partial transcript, or an error
+presentation — rather than hold it, so that nothing accumulates for work that no
+longer exists or never began. Updates that were already waiting when the work
+ended, or when it could not be started, MUST be discarded with it.
 
 #### Scenario: Updates arrive after the work has failed
 
@@ -185,12 +207,10 @@ and paste handling, or the toggle command response contract.
 - **THEN** the update is not held for later, whichever side of the failure it reaches
   the overlay on
 
-#### Scenario: The work fails before it has processed anything
+### Requirement: The overlay's control work is not started again once it has failed
 
-- **WHEN** the overlay's control work ends because of an unexpected failure before it
-  has handled a single update, while the overlay was still reporting that it had not
-  started
-- **THEN** the reported cause names that failure rather than the earlier report
+Murmly MUST NOT try to start the background work that drives the overlay again once
+it could not be started or ended because of an unexpected failure.
 
 #### Scenario: The overlay is asked to start after the work has failed
 
@@ -199,12 +219,14 @@ and paste handling, or the toggle command response contract.
 - **THEN** the control work is not started again
 - **AND** the reported cause is still the original failure
 
-#### Scenario: The work fails while Murmly is shutting down
+### Requirement: A renderer process still running when the overlay's control work ends is terminated
 
-- **WHEN** the overlay's control work fails while Murmly is shutting down
-- **THEN** shutdown returns within its existing bounded time
-- **AND** the overlay's renderer process is terminated
-- **AND** the overlay is reported as unavailable with that failure as the cause
+Every rule about the overlay's own control work failing to start or ending
+unexpectedly covers that work, not the renderer process terminating, which "Visual
+failure isolation" already covers. An overlay renderer process still running when
+that work ended MUST be terminated, as it is when Murmly shuts down, and a request
+to close the overlay that arrives while that is still happening MUST NOT return
+before the process has been terminated.
 
 #### Scenario: The overlay is closed while the failed work is still tearing down
 
@@ -311,12 +333,6 @@ ordinary application windows, MUST NOT request keyboard focus, MUST NOT intercep
 pointer input, and MUST NOT move or resize in response to animation. Neither the
 platform nor the display protocol MUST change the visible recording lifecycle.
 
-Where a platform cannot provide one of those properties, Murmly SHALL NOT present
-the overlay at all, and MUST report that property as the reason. An overlay that
-takes focus from what the person is dictating into, or that swallows their clicks,
-defeats the thing Murmly exists to do; not drawing it is the lesser failure and the
-one Murmly already takes when the visual runtime is missing.
-
 #### Scenario: Overlay appears over the focused application
 
 - **WHEN** the overlay becomes visible while another application has focus
@@ -340,6 +356,15 @@ one Murmly already takes when the visual runtime is missing.
   supports
 - **THEN** it provides the same position, stacking, focus, input, dimensions, and
   visual states as it does on every other
+
+### Requirement: A platform that cannot provide a required property gets no overlay
+
+Where a platform cannot provide one of the properties that "Non-disruptive
+placement on every platform" requires, Murmly SHALL NOT present the overlay at all,
+and MUST report that property as the reason. An overlay that takes focus from what the
+person is dictating into, or that swallows their clicks, defeats the thing Murmly
+exists to do; not drawing it is the lesser failure and the one Murmly already takes
+when the visual runtime is missing.
 
 #### Scenario: A platform that cannot present it without taking input
 

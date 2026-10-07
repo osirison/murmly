@@ -12,6 +12,12 @@ Behavioral changes are planned with OpenSpec. `openspec/specs/` holds the curren
 capability baseline; `openspec/changes/` holds in-flight changes and their archive.
 Run `openspec list` to see what is active.
 
+A requirement's text, the prose between its heading and its first scenario, must be
+500 characters or fewer: CI's `openspec validate --all --strict` fails on anything
+longer, in a baseline spec or in a change's ADDED requirement. When a requirement
+grows past that, split it into requirements that each state one behaviour, or move
+its examples and edge cases into scenarios.
+
 ## Tests
 
 ```bash

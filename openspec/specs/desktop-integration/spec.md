@@ -13,17 +13,6 @@ desktop session becomes available and stops when that session ends. The service
 MUST NOT start before the graphical session environment exists, because the
 daemon's clipboard, paste, focus, and overlay behavior all depend on it.
 
-The service SHALL be registered with the platform's own per-user service manager,
-and installation MUST NOT require administrative rights, because a background
-service for one person's session is not a machine-wide change.
-
-Where the platform's service manager can express an ordering against the session's
-audio server, the service SHALL be ordered after it, so that Murmly is stopped
-before the audio server it captures and plays through rather than racing it at
-logout. Where the platform's service manager cannot express that ordering, Murmly
-MUST NOT depend on it: the daemon has to survive the audio server disappearing
-underneath it, which it is separately required to do.
-
 #### Scenario: Session start
 
 - **WHEN** the user logs into a graphical desktop session after installation
@@ -47,11 +36,33 @@ underneath it, which it is separately required to do.
 - **WHEN** the machine boots and no graphical session is started
 - **THEN** the daemon is not started
 
+### Requirement: The service is registered per user without administrative rights
+
+The service SHALL be registered with the platform's own per-user service manager,
+and installation MUST NOT require administrative rights, because a background
+service for one person's session is not a machine-wide change.
+
 #### Scenario: Installation needs no administrative rights
 
 - **WHEN** installation runs as an ordinary user account on any supported platform
 - **THEN** the service is registered and started
 - **AND** nothing outside that account's own files and settings is written
+
+### Requirement: The service is ordered after the audio server only where the platform can express it
+
+Where the platform's service manager can express an ordering against the session's
+audio server, the service SHALL be ordered after it, so that Murmly is stopped
+before the audio server it captures and plays through rather than racing it at
+logout. Where the platform's service manager cannot express that ordering, Murmly
+MUST NOT depend on it: the daemon has to survive the audio server disappearing
+underneath it, which it is separately required to do.
+
+#### Scenario: A service manager that can order against the audio server
+
+- **GIVEN** a platform whose per-user service manager can express an ordering
+  against the audio server
+- **WHEN** the service is installed
+- **THEN** the service is ordered after the audio server
 
 #### Scenario: A service manager that cannot order against the audio server
 
@@ -96,14 +107,6 @@ desktop. When a binding cannot be confirmed within a bounded time, Murmly MUST
 report that plainly rather than reporting success, and MUST name which hotkey it
 could not confirm.
 
-Where the platform registers the hotkey inside Murmly's own process rather than in
-the desktop's shortcut system, the binding exists only while the daemon is running.
-Installation MUST therefore start the daemon before it reports a hotkey as bound,
-and Murmly MUST report such a binding as depending on the running daemon rather
-than as a registration the desktop holds independently. A hotkey the daemon holds
-MUST be released when the daemon stops, so that it does not remain claimed against
-another application after Murmly is no longer there to receive it.
-
 #### Scenario: Hotkey bound and usable immediately
 
 - **WHEN** installation completes successfully in a running desktop session
@@ -120,12 +123,26 @@ another application after Murmly is no longer there to receive it.
 - **AND** states whether the binding will take effect at next login
 - **AND** does not report success
 
+### Requirement: A hotkey held by the daemon's own process depends on the running daemon
+
+Where the platform registers the hotkey inside Murmly's own process rather than in
+the desktop's shortcut system, the binding exists only while the daemon is running.
+Installation MUST therefore start the daemon before it reports a hotkey as bound,
+and Murmly MUST report such a binding as depending on the running daemon rather
+than as a registration the desktop holds independently.
+
 #### Scenario: A hotkey held by the daemon's own process
 
 - **GIVEN** a platform on which Murmly registers the hotkey in its own process
 - **WHEN** installation completes
 - **THEN** the daemon is running and the hotkey works
 - **AND** the report states that the hotkey is held by the running daemon
+
+### Requirement: A hotkey held by the daemon is released when the daemon stops
+
+A hotkey the daemon holds MUST be released when the daemon stops, so that it does
+not remain claimed against another application after Murmly is no longer there to
+receive it.
 
 #### Scenario: The daemon holding a hotkey stops
 
@@ -141,11 +158,7 @@ the current owner where the platform allows it to be determined.
 
 How that is established depends on the platform. Where the platform arbitrates the
 claim — refusing a registration for a key another application already holds —
-Murmly SHALL treat that refusal as the collision and report it. Where the platform
-does not arbitrate, Murmly MUST determine whether the key is already claimed before
-binding it and fail closed, because there a second claimant registers without error
-and silently never receives the keypress. Murmly MUST NOT report a hotkey as bound
-on the strength of a registration the platform accepted without arbitrating.
+Murmly SHALL treat that refusal as the collision and report it.
 
 #### Scenario: Hotkey already owned by another application
 
@@ -173,6 +186,23 @@ on the strength of a registration the platform accepted without arbitrating.
 - **WHEN** verification after binding shows more than one owner for the hotkey
 - **THEN** installation reports a failed binding
 - **AND** removes the registration it created
+
+### Requirement: A hotkey is checked for an existing claim before binding where the platform does not arbitrate
+
+Where the platform does not arbitrate, Murmly MUST determine whether the key is
+already claimed before binding it and fail closed, because there a second claimant
+registers without error and silently never receives the keypress. Murmly MUST NOT
+report a hotkey as bound on the strength of a registration the platform accepted
+without arbitrating.
+
+#### Scenario: A platform that does not arbitrate the claim
+
+- **GIVEN** a platform that accepts a registration for a key another application
+  already holds, without refusing it
+- **WHEN** installation requests a key that is already claimed
+- **THEN** Murmly determines that the key is already claimed before binding it
+- **AND** installation fails without binding the hotkey and does not report it as
+  bound
 
 ### Requirement: A binding is verified before installation reports success
 
@@ -268,18 +298,9 @@ to other applications.
 
 Where the hotkey reaches Murmly by invoking it as a command, and the daemon is not
 accepting commands, Murmly SHALL attempt to start the installed service, wait a
-bounded time for it, and retry once. A hotkey press MUST NOT surface an unhandled
-error, because a hotkey has no visible output channel. A daemon that accepts the
-connection and then closes it without responding MUST be treated as not having
-answered, not as an error to raise. Starting the service SHALL be done through the
+bounded time for it, and retry once. Starting the service SHALL be done through the
 platform's own service manager rather than by a mechanism belonging to one
 platform.
-
-Where the hotkey is held by the daemon's own process, there is no press to recover
-from: a stopped daemon holds no hotkey and receives nothing. On such a platform
-Murmly MUST make the state legible instead — diagnostics report the hotkey as not
-currently held and name the daemon as the reason — and the service manager's own
-restart behaviour is what returns it, rather than a press that starts it.
 
 #### Scenario: Daemon not running but installed
 
@@ -302,6 +323,12 @@ restart behaviour is what returns it, rather than a press that starts it.
   be started
 - **AND** does not retry indefinitely
 
+### Requirement: A hotkey press never surfaces an unhandled error
+
+A hotkey press MUST NOT surface an unhandled error, because a hotkey has no visible
+output channel. A daemon that accepts the connection and then closes it without
+responding MUST be treated as not having answered, not as an error to raise.
+
 #### Scenario: Daemon accepts the connection but does not respond
 
 - **WHEN** the hotkey is pressed, the connection is accepted, and it closes before
@@ -309,6 +336,14 @@ restart behaviour is what returns it, rather than a press that starts it.
 - **THEN** Murmly exits non-zero with a message stating that the daemon did not
   respond
 - **AND** no unhandled error is raised
+
+### Requirement: A stopped daemon that held the hotkey is named as the reason it is not held
+
+Where the hotkey is held by the daemon's own process, there is no press to recover
+from: a stopped daemon holds no hotkey and receives nothing. On such a platform
+Murmly MUST make the state legible instead — diagnostics report the hotkey as not
+currently held and name the daemon as the reason — and the service manager's own
+restart behaviour is what returns it, rather than a press that starts it.
 
 #### Scenario: The daemon holding the hotkey is not running
 
@@ -324,13 +359,6 @@ Murmly SHALL accept a hotkey only when it can be parsed unambiguously into a kno
 key with at least one modifier, and MUST reject anything else rather than binding
 a key the user did not intend. Rejection MUST identify what was not understood.
 
-One hotkey specification SHALL mean the same key on every platform. Murmly SHALL
-accept the names each platform's own users write for a modifier and normalise them
-to one meaning, so that a specification written for one platform is not silently
-read as a different key on another. A specification naming a modifier the resolved
-platform does not have MUST be refused, naming it, rather than dropped or
-substituted.
-
 #### Scenario: Unrecognized key name
 
 - **WHEN** the requested hotkey names a key Murmly does not recognize
@@ -342,6 +370,13 @@ substituted.
 - **WHEN** the requested hotkey carries no modifier
 - **THEN** Murmly refuses and states that at least one modifier is required
 
+### Requirement: One hotkey specification means the same key on every platform
+
+One hotkey specification SHALL mean the same key on every platform. Murmly SHALL
+accept the names each platform's own users write for a modifier and normalise them
+to one meaning, so that a specification written for one platform is not silently
+read as a different key on another.
+
 #### Scenario: Accepted modifier aliases
 
 - **WHEN** the requested hotkey uses a common alias for the platform modifier key
@@ -352,6 +387,11 @@ substituted.
 - **WHEN** one hotkey specification is installed on two different supported
   platforms
 - **THEN** the same physical key combination is bound on both
+
+### Requirement: A modifier the resolved platform does not have is refused
+
+A specification naming a modifier the resolved platform does not have MUST be
+refused, naming it, rather than dropped or substituted.
 
 #### Scenario: A modifier this platform does not have
 
@@ -392,10 +432,6 @@ platform on which Murmly registers hotkeys but this desktop offers no route, fro
 a platform Murmly registers hotkeys on generally, because only one of those is
 something a person can act on by changing desktops.
 
-Declining the hotkey MUST NOT decline the installation. A person on such a desktop
-gets a working daemon, a working command, and an instruction they can follow, which
-is the honest outcome when the desktop offers Murmly no programmatic route.
-
 #### Scenario: Unsupported desktop environment
 
 - **WHEN** installation runs on a desktop environment whose hotkey registration
@@ -418,6 +454,15 @@ is the honest outcome when the desktop offers Murmly no programmatic route.
 - **THEN** the report names this desktop as the reason rather than the platform
 - **AND** the service is installed and started
 
+### Requirement: Declining the hotkey does not decline the installation
+
+Where Murmly declines a hotkey because it does not support registration on this
+desktop, whether the desktop environment is unsupported or the platform registers
+hotkeys only on other desktops, declining it MUST NOT decline the installation. A
+person on such a desktop gets a working daemon, a working command, and an
+instruction they can follow, which is the honest outcome when the desktop offers
+Murmly no programmatic route.
+
 #### Scenario: Everything else still installs
 
 - **WHEN** a hotkey is declined for any of these reasons
@@ -428,8 +473,6 @@ is the honest outcome when the desktop offers Murmly no programmatic route.
 ### Requirement: Installation reports whether a transcript can be pasted
 
 Installation SHALL report whether Murmly can inject a paste in the session it installed into, and when it cannot, MUST name what the user has to install, enable, or grant. Because Murmly still copies every transcript to the clipboard, this MUST NOT fail the installation, and Murmly MUST NOT change system state outside the files it owns in order to satisfy it.
-
-Where the platform gates injection behind a permission, installation MUST report an ungranted permission as the reason rather than reporting the method as unavailable, and MUST name where the permission is granted. It MUST NOT request the permission as a side effect of installing, because a permission dialog raised by an install the person did not connect to it is one they cannot answer usefully.
 
 #### Scenario: Paste injection available
 
@@ -443,6 +486,16 @@ Where the platform gates injection behind a permission, installation MUST report
 - **AND** the report states that transcripts will be copied but not pasted
 - **AND** names what the user has to install, enable, or grant for this session
 
+#### Scenario: Murmly does not install the injector itself
+
+- **WHEN** installation finds no usable injection method
+- **THEN** Murmly installs no package and enables no system service
+- **AND** the remedy is reported as commands for the user to run
+
+### Requirement: An ungranted injection permission is reported as the reason and never requested
+
+Where the platform gates injection behind a permission, installation MUST report an ungranted permission as the reason rather than reporting the method as unavailable, and MUST name where the permission is granted. It MUST NOT request the permission as a side effect of installing, because a permission dialog raised by an install the person did not connect to it is one they cannot answer usefully.
+
 #### Scenario: Injection gated behind an ungranted permission
 
 - **WHEN** installation completes where an injection method exists but the
@@ -450,11 +503,11 @@ Where the platform gates injection behind a permission, installation MUST report
 - **THEN** the report names the ungranted permission and where to grant it
 - **AND** does not report the method as absent
 
-#### Scenario: Murmly does not install the injector itself
+#### Scenario: Installation does not request the permission
 
-- **WHEN** installation finds no usable injection method
-- **THEN** Murmly installs no package and enables no system service
-- **AND** the remedy is reported as commands for the user to run
+- **WHEN** installation runs where an injection method exists but the platform
+  gates it behind a permission that has not been granted
+- **THEN** installation does not request that permission itself
 
 ### Requirement: Murmly binds more than one hotkey
 
@@ -464,10 +517,6 @@ session. Every requirement in this capability governing how a hotkey is claimed,
 bound, verified, rebound, released, and reported SHALL apply to each bound hotkey
 independently, and a failure affecting one MUST NOT be reported as a failure of
 another.
-
-Murmly MUST refuse an installation that requests the same key for both, naming the
-collision. Two Murmly bindings on one key cannot be told apart by the desktop, so
-one of them would silently never receive the keypress.
 
 #### Scenario: Both hotkeys installed
 
@@ -480,6 +529,12 @@ one of them would silently never receive the keypress.
 - **WHEN** one requested hotkey is claimed by another application and the other is free
 - **THEN** installation fails naming which hotkey collided and which application owns it
 - **AND** no service, launcher, or hotkey registration is left behind
+
+### Requirement: The same key cannot be requested for both hotkeys
+
+Murmly MUST refuse an installation that requests the same key for both, naming the
+collision. Two Murmly bindings on one key cannot be told apart by the desktop, so
+one of them would silently never receive the keypress.
 
 #### Scenario: The same key requested for both purposes
 
@@ -495,10 +550,6 @@ stream — before the process exits. Murmly MUST NOT leave releasing a device to
 interpreter teardown, which runs after the daemon has stopped answering and
 whose ordering against the audio server is not Murmly's to control.
 
-A stream that will not close MUST be reported and MUST NOT stop the rest of the
-shutdown: the socket, the overlay, and the remaining streams still have to be
-released.
-
 #### Scenario: Stopped while capture is running
 
 - **WHEN** the daemon is asked to stop while a recording is in progress
@@ -509,6 +560,12 @@ released.
 
 - **WHEN** the daemon is asked to stop and no recording is in progress
 - **THEN** shutdown completes without error
+
+### Requirement: A stream that will not close does not stop the rest of the shutdown
+
+A stream that will not close MUST be reported and MUST NOT stop the rest of the
+shutdown: the socket, the overlay, and the remaining streams still have to be
+released.
 
 #### Scenario: A stream will not close
 
@@ -523,17 +580,19 @@ the audio server it was using has already terminated. It MUST NOT abort, and it
 MUST NOT dump core, so the service is left inactive and startable rather than
 failed.
 
-Murmly MUST NOT let the audio library tear down the audio backends at process
-exit. That teardown asserts on a call that fails once the audio server is gone,
-and it covers backends Murmly never opened a stream on, so its outcome does not
-depend on anything Murmly did.
-
 #### Scenario: The audio server stops first
 
 - **WHEN** the daemon is stopped after the audio server it was using has already terminated
 - **THEN** the process exits with a success status
 - **AND** no core dump is produced
 - **AND** the service is left inactive rather than failed
+
+### Requirement: The daemon does not let the audio library tear down the audio backends at exit
+
+Murmly MUST NOT let the audio library tear down the audio backends when the
+daemon's process exits. That teardown asserts on a call that fails once the audio
+server is gone, and it covers backends Murmly never opened a stream on, so its
+outcome does not depend on anything Murmly did.
 
 #### Scenario: Startup refused
 
