@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -25,6 +27,7 @@ from murmly.cli import (
 )
 from murmly.config import MurmlyConfig
 from murmly.daemon import DaemonNotRespondingError
+from murmly.platform import OperatingSystem, PlatformProfile
 from murmly.speakers import (
     EMBEDDING_DIMENSION,
     SPEAKER_MODEL_FILENAME,
@@ -176,7 +179,7 @@ class RefusalOrderTests(EnrolTestCase):
         self.assert_refused_before_recording(code)
         self.assertEqual("", out)
         self.assertIn(str(self.model), err)
-        self.assertIn("setup.sh upgrade", err)
+        self.assertIn("bootstrap.ps1 upgrade" if sys.platform == "win32" else "setup.sh upgrade", err)
         self.assertEqual([], self.asked)
         self.assertEqual([], FakeEmbedder.instances)
 
@@ -401,7 +404,11 @@ class ReportTests(EnrolTestCase):
     def test_a_name_with_a_space_is_quoted_in_the_remove_command(self) -> None:
         _code, out, _err = self.enrol("Mary Ann")
 
-        self.assertIn("murmly speakers remove 'Mary Ann'", out)
+        # Quoted for the shell the command is pasted into: shlex quoting on
+        # POSIX, the Windows command-line quoting `cmd` and PowerShell accept
+        # on Windows, where single quotes are not quoting.
+        quoted = subprocess.list2cmdline(["Mary Ann"]) if sys.platform == "win32" else "'Mary Ann'"
+        self.assertIn(f"murmly speakers remove {quoted}", out)
 
     def test_enrolling_a_name_again_in_another_case_reports_the_replacement(self) -> None:
         self.enrol("Milo")
@@ -597,6 +604,12 @@ class ParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.toml"
             with (
+                # Pinned to a supported platform: on the macOS runner the real
+                # profile is refused before any command runs.
+                patch(
+                    "murmly.cli.resolve_platform",
+                    return_value=PlatformProfile(OperatingSystem.LINUX, "x86_64"),
+                ),
                 patch("murmly.cli.default_data_dir", return_value=Path(directory) / "data"),
                 patch("murmly.cli.send_command") as sent,
                 patch("murmly.cli.SoundDeviceRecorder") as recorder,

@@ -287,7 +287,12 @@ install_models() {
 speaker_model_verified() {
     local file="$1" actual
     [ -s "$file" ] || return 1
-    actual="$(sha256sum -- "$file" | cut -d' ' -f1)"
+    # macOS ships `shasum` and no `sha256sum`.
+    if have sha256sum; then
+        actual="$(sha256sum -- "$file" | cut -d' ' -f1)"
+    else
+        actual="$(shasum -a 256 -- "$file" | cut -d' ' -f1)"
+    fi
     [ "$actual" = "$SPEAKER_MODEL_SHA256" ]
 }
 
