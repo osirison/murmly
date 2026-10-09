@@ -285,7 +285,8 @@ that ends it. Nothing about unknown voices is written to disk.
 
 A `SpeakerEmbedder` holder follows the synthesis session's pattern:
 
-- It builds an `onnxruntime.InferenceSession` lazily under a load lock.
+- It builds an `onnxruntime.InferenceSession` lazily under a load lock, after
+  checking the file's SHA-256 against the pinned one; a mismatch fails the build.
 - It names `["CPUExecutionProvider"]` explicitly, even on a machine with
   `onnxruntime-gpu`.
 - It sets `enable_cpu_mem_arena = False` and leaves intra-op threads at their
@@ -481,6 +482,10 @@ this clean audio. See Risks for what it showed for short parts.
 the publisher's own release URL, pinned to an exact file. Each verifies a
 SHA-256 recorded in the script and deletes the download on a mismatch. These
 are the first checksums either script carries. The daemon never downloads it.
+It does not trust the scripts' check either: the embedder hashes the file before
+building a session, on the background build thread, and refuses one that is not
+the pinned model, so a hand-placed or damaged file is never used. `murmly enrol`
+hits the same refusal when it loads the model.
 When the file is absent, speaker recognition is unavailable, and both `doctor`
 and `murmly enrol` name the file and the setup command. The model's licence text
 goes in `licenses/`.

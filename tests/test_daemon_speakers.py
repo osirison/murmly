@@ -10,6 +10,7 @@ wrong rate or with the wrong channel count gives the wrong speaker.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import tempfile
 import threading
@@ -679,6 +680,30 @@ class FailingOpenTests(SpeakerDaemonCase):
         self.assertIn("could not be loaded", logs.records[0].getMessage())
         self.assertEqual(0, self.embedder.embeds)
 
+    def test_a_model_with_the_wrong_checksum_is_never_used_and_is_delivered_as_off(self) -> None:
+        # The stand-in file is empty, which is not the pinned model.
+        self.make_embedder.side_effect = SpeakerEmbedder
+        daemon = self.build("label-everyone")
+        self.recorder.finals.append(self.audio((ME, "all of it", 2.0), (STRANGER_A, "and this", 2.0)))
+
+        with patch("onnxruntime.InferenceSession") as constructor, self.assertLogs(
+            "murmly.daemon", level=logging.WARNING
+        ) as logs:
+            daemon.handle_command("toggle")
+            response = daemon.handle_command("toggle")
+            status = daemon.handle_command("status")
+
+        constructor.assert_not_called()
+        self.assertEqual("all of it and this", response["text"])
+        self.assertEqual(["all of it and this"], self.paster.pasted)
+        self.assertEqual(1, len(logs.records))
+        message = logs.records[0].getMessage()
+        self.assertIn("does not match the expected checksum", message)
+        self.assertNotIn("all of it", message)
+        self.assertNotIn("and this", message)
+        self.assertIs(False, status["speaker_model_resident"])
+        self.assertIn("does not match the expected checksum", status["speaker_model_resident_detail"])
+
     def test_a_failure_while_getting_ready_never_costs_the_capture(self) -> None:
         daemon = self.build("label-everyone")
         self.store.refresh = Mock(side_effect=OSError("disk gone"))
@@ -793,7 +818,10 @@ class BackgroundBuildTests(SpeakerDaemonCase):
         )
 
     def test_the_daemon_builds_a_cpu_only_session_for_the_speaker_model(self) -> None:
-        self.make_embedder.side_effect = SpeakerEmbedder
+        # The stand-in model file is empty, so its checksum is the empty one.
+        self.make_embedder.side_effect = lambda path: SpeakerEmbedder(
+            path, expected_sha256=hashlib.sha256(b"").hexdigest()
+        )
         session = Mock()
         session.get_providers.return_value = [CPU_PROVIDER]
         daemon = self.build("label-everyone")

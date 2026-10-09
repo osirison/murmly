@@ -25,7 +25,12 @@ from murmly.cli import (
 )
 from murmly.config import MurmlyConfig
 from murmly.daemon import DaemonNotRespondingError
-from murmly.speakers import EMBEDDING_DIMENSION, SPEAKER_MODEL_FILENAME, l2_normalised
+from murmly.speakers import (
+    EMBEDDING_DIMENSION,
+    SPEAKER_MODEL_FILENAME,
+    SpeakerEmbedder,
+    l2_normalised,
+)
 from murmly.voiceprints import VOICEPRINTS_FILENAME, VoiceprintStore
 
 RATE = 16_000
@@ -183,6 +188,27 @@ class RefusalOrderTests(EnrolTestCase):
         self.assertIn("could not be loaded", err)
         self.assertIn("bad protobuf", err)
         self.assertEqual(1, FakeEmbedder.instances[0].released)
+
+    def test_a_model_with_the_wrong_checksum_is_refused_before_recording(self) -> None:
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err), patch(
+            "onnxruntime.InferenceSession"
+        ) as constructor:
+            code = _run_enrol(
+                self.config,
+                "Milo",
+                ENROL_SECONDS,
+                embedder_factory=SpeakerEmbedder,
+                speech_regions=self.find_speech,
+                send=self.send,
+            )
+
+        self.assert_refused_before_recording(code)
+        constructor.assert_not_called()
+        self.assertEqual("", out.getvalue())
+        self.assertIn("could not be loaded", err.getvalue())
+        self.assertIn("does not match the expected checksum", err.getvalue())
+        self.assertIn(str(self.model), err.getvalue())
 
     def test_a_busy_daemon_is_refused_for_each_busy_state(self) -> None:
         for state, doing in (("LISTENING", "listening"), ("THINKING", "transcribing"), ("SPEAKING", "speaking")):

@@ -10,6 +10,7 @@ boundary testable without a tolerance.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import tempfile
 import threading
@@ -38,7 +39,9 @@ from murmly.speakers import (
     validate_name,
 )
 
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "fbank_reference.npz"
+EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 #: Four orthogonal directions, so any two differ by exactly zero similarity.
 E0 = (1.0, 0.0, 0.0, 0.0)
@@ -170,7 +173,7 @@ class EmbedderTests(unittest.TestCase):
         with tempfile_model() as model_path, patch(
             "onnxruntime.InferenceSession", return_value=session
         ) as constructor:
-            embedder = SpeakerEmbedder(model_path)
+            embedder = SpeakerEmbedder(model_path, expected_sha256=EMPTY_SHA256)
             self.assertFalse(embedder.resident)
             constructor.assert_not_called()
 
@@ -188,13 +191,13 @@ class EmbedderTests(unittest.TestCase):
         with tempfile_model() as model_path, patch(
             "onnxruntime.InferenceSession", return_value=session
         ):
-            embedder = SpeakerEmbedder(model_path)
+            embedder = SpeakerEmbedder(model_path, expected_sha256=EMPTY_SHA256)
             embedder.embed(one_second())
 
         self.assertEqual("SomethingElseProvider", embedder.provider)
 
     def test_a_missing_model_is_reported_and_retried(self) -> None:
-        embedder = SpeakerEmbedder(Path("/nonexistent/model.onnx"))
+        embedder = SpeakerEmbedder(Path("/nonexistent/model.onnx"), expected_sha256=EMPTY_SHA256)
 
         with self.assertRaises(FileNotFoundError):
             embedder.embed(one_second())
@@ -273,7 +276,7 @@ class EmbedderTests(unittest.TestCase):
         with tempfile_model() as model_path, patch(
             "onnxruntime.InferenceSession", side_effect=sessions
         ) as constructor:
-            embedder = SpeakerEmbedder(model_path)
+            embedder = SpeakerEmbedder(model_path, expected_sha256=EMPTY_SHA256)
             embedder.embed(one_second())
             embedder.release()
             embedder.embed(one_second())
@@ -355,12 +358,75 @@ class EmbedderTests(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def tempfile_model():
-    """A real file for the existence check; the session itself is a stand-in."""
+def tempfile_model(contents: bytes = b""):
+    """A real file for the existence and checksum checks; the session itself is a stand-in.
+
+    Its checksum is `EMPTY_SHA256` unless other contents are given.
+    """
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "model.onnx"
-        path.write_bytes(b"")
+        path.write_bytes(contents)
         yield path
+
+
+class ModelChecksumTests(unittest.TestCase):
+    def test_a_model_with_the_wrong_checksum_is_refused_and_no_session_is_built(self) -> None:
+        with tempfile_model(b"not the model") as model_path, patch(
+            "onnxruntime.InferenceSession"
+        ) as constructor:
+            embedder = SpeakerEmbedder(model_path, expected_sha256=EMPTY_SHA256)
+
+            with self.assertRaises(ValueError) as raised:
+                embedder.embed(one_second())
+
+        constructor.assert_not_called()
+        self.assertFalse(embedder.resident)
+        self.assertIn("does not match the expected checksum", str(raised.exception))
+        self.assertIn(str(model_path), embedder.resident_detail)
+        self.assertIn("does not match the expected checksum", embedder.resident_detail)
+
+    def test_the_pinned_checksum_is_expected_by_default(self) -> None:
+        with tempfile_model() as model_path, patch(
+            "onnxruntime.InferenceSession"
+        ) as constructor:
+            embedder = SpeakerEmbedder(model_path)
+
+            with self.assertRaises(ValueError):
+                embedder.load()
+
+        constructor.assert_not_called()
+        self.assertNotEqual(EMPTY_SHA256, speakers.SPEAKER_MODEL_SHA256)
+
+    def test_each_build_hashes_the_file_once_and_a_replaced_file_is_checked_again(self) -> None:
+        session = RecordingSession()
+        with tempfile_model() as model_path, patch(
+            "onnxruntime.InferenceSession", return_value=session
+        ), patch.object(speakers, "file_sha256", wraps=speakers.file_sha256) as hashed:
+            embedder = SpeakerEmbedder(model_path, expected_sha256=EMPTY_SHA256)
+            embedder.embed(one_second())
+            embedder.embed(one_second())
+            self.assertEqual(1, hashed.call_count)
+
+            embedder.release()
+            model_path.write_bytes(b"swapped while released")
+            with self.assertRaises(ValueError):
+                embedder.embed(one_second())
+
+        self.assertEqual(2, hashed.call_count)
+        self.assertFalse(embedder.resident)
+
+    def test_an_injected_session_is_used_without_reading_any_file(self) -> None:
+        embedder = SpeakerEmbedder(Path("/nonexistent/model.onnx"), session=RecordingSession())
+
+        embedder.embed(one_second())
+
+        self.assertTrue(embedder.resident)
+
+    def test_the_hash_reads_in_chunks(self) -> None:
+        with tempfile_model(b"x" * 100) as model_path, patch.object(
+            speakers, "_HASH_CHUNK_BYTES", 16
+        ):
+            self.assertEqual(hashlib.sha256(b"x" * 100).hexdigest(), speakers.file_sha256(model_path))
 
 
 class RealModelTests(unittest.TestCase):

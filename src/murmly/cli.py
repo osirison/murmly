@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from array import array
 from dataclasses import replace
-import hashlib
 import json
 import logging
 import math
@@ -94,6 +93,8 @@ from murmly.speakers import (
     SPEAKER_MODEL_SHA256,
     SpeakerEmbedder,
     InvalidSpeakerName,
+    checksum_mismatch_message,
+    file_sha256,
     l2_normalised,
     validate_name,
 )
@@ -1827,18 +1828,12 @@ def _speaker_model_state(model_path: Path) -> tuple[bool, bool | None, str | Non
     """
     if not model_path.is_file():
         return False, None, f"the speaker model is missing: {model_path}"
-    digest = hashlib.sha256()
     try:
-        with open(model_path, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(chunk)
+        checksum = file_sha256(model_path)
     except OSError as error:
         return True, None, f"the speaker model cannot be read: {model_path}: {error}"
-    if digest.hexdigest() != SPEAKER_MODEL_SHA256:
-        return True, False, (
-            f"the speaker model does not match the expected checksum: {model_path}. "
-            "Download it again with the setup script."
-        )
+    if checksum != SPEAKER_MODEL_SHA256:
+        return True, False, checksum_mismatch_message(model_path)
     return True, True, None
 
 
@@ -1852,8 +1847,7 @@ def _speaker_availability(
     """Whether the daemon could use the mode, and the reason when it could not.
 
     The same checks, in the same order and terms, as the daemon's warning at
-    capture start. The checksum is stricter than the daemon's, which trusts the
-    setup scripts' check.
+    capture start, the checksum included.
     """
     if mode == "off":
         return False, "the speaker mode is off"

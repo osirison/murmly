@@ -27,6 +27,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 import functools
+import hashlib
 import logging
 from pathlib import Path
 import re
@@ -46,6 +47,8 @@ SPEAKER_MODEL_URL = (
 SPEAKER_MODEL_FILENAME = "voxceleb_resnet34_LM.onnx"
 SPEAKER_MODEL_SHA256 = "7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068"
 EMBEDDING_DIMENSION = 256
+
+_HASH_CHUNK_BYTES = 1 << 20
 
 #: The one rate the model takes. Callers resample to it before embedding.
 SAMPLE_RATE_HZ = 16_000
@@ -182,6 +185,23 @@ class Embedder(Protocol):
         ...
 
 
+def file_sha256(path: Path) -> str:
+    """The SHA-256 of a file, read in chunks. Raises `OSError` when it cannot be read."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def checksum_mismatch_message(model_path: Path) -> str:
+    """How `doctor` and the daemon's warning word a model that is not the pinned one."""
+    return (
+        f"the speaker model does not match the expected checksum: {model_path}. "
+        "Download it again with the setup script."
+    )
+
+
 class SpeakerEmbedder:
     """The speaker model's ONNX session, built when first used and droppable.
 
@@ -192,10 +212,19 @@ class SpeakerEmbedder:
     is named explicitly: the model is small enough that a GPU gains nothing, and
     the 2026-08-26 measurement had the CUDA provider holding 876 MB against 65 MB
     on the CPU and never returning it.
+
+    The file is hashed before a session is built from it, and one that is not
+    the pinned model is refused: voiceprints carry the pinned checksum, so the
+    output of any other model must never be compared with them. A session passed
+    in is trusted as it stands, because no file is read to build it.
+    `expected_sha256` is for tests; it defaults to the pinned checksum.
     """
 
-    def __init__(self, model_path: Path, session=None) -> None:
+    def __init__(
+        self, model_path: Path, session=None, *, expected_sha256: str | None = None
+    ) -> None:
         self._model_path = Path(model_path)
+        self._expected_sha256 = expected_sha256
         self._session = session
         self._provider: str | None = CPU_PROVIDER if session is not None else None
         self._load_error: str | None = None
@@ -296,6 +325,9 @@ class SpeakerEmbedder:
     def _construct(self):
         if not self._model_path.is_file():
             raise FileNotFoundError(f"the speaker model is missing: {self._model_path}")
+        expected = self._expected_sha256 or SPEAKER_MODEL_SHA256
+        if file_sha256(self._model_path) != expected:
+            raise ValueError(checksum_mismatch_message(self._model_path))
         import onnxruntime
 
         options = onnxruntime.SessionOptions()
