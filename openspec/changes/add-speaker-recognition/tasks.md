@@ -41,8 +41,8 @@ description: Track verification, implementation and validation of voice enrolmen
 
 ## 4. Speaker attribution core
 
-- [ ] 4.1 Extend `src/murmly/speakers.py` with filterbank features chosen in 1.5 and utterance mean normalisation. On the numpy path, commit a small reference fixture produced once with the reference implementation. Done when the computed features match the fixture within a stated tolerance.
-- [ ] 4.2 Add an `Embedder` protocol and `SpeakerEmbedder`:
+- [x] 4.1 Extend `src/murmly/speakers.py` with filterbank features chosen in 1.5 and utterance mean normalisation. On the numpy path, commit a small reference fixture produced once with the reference implementation. Done when the computed features match the fixture within a stated tolerance.
+- [x] 4.2 Add an `Embedder` protocol and `SpeakerEmbedder`:
   - an ONNX session with `providers=["CPUExecutionProvider"]` and `enable_cpu_mem_arena = False`;
   - a load lock and a use lock;
   - a `resident` property that takes no lock;
@@ -50,22 +50,22 @@ description: Track verification, implementation and validation of voice enrolmen
   - the provider read back through `get_providers()`.
 
   Done when a unit test with a stub session shows that `release()` waits for an inference in progress.
-- [ ] 4.3 Add attribution over timed parts:
+- [x] 4.3 Add attribution over timed parts:
   - L2-normalised embeddings;
   - the best enrolled match at or above the threshold;
   - online clustering of unknown voices with running centroids, held in a per-session state object;
   - unknown voices numbered by first appearance.
 
   Done when the fake-embedder tests in 4.8 pass.
-- [ ] 4.4 Apply the short-part rule. A part below the minimum duration takes the speaker of the nearest identifiable part, preferring the one before it. When no part is identifiable, return a "no identifiable part" result so the caller delivers as with `off`. Done when all three short-part scenarios in the spec pass as tests.
-- [ ] 4.5 Add formatting:
+- [x] 4.4 Apply the short-part rule. A part below the minimum duration takes the speaker of the nearest identifiable part, preferring the one before it. When no part is identifiable, return a "no identifiable part" result so the caller delivers as with `off`. Done when all three short-part scenarios in the spec pass as tests.
+- [x] 4.5 Add formatting:
   - Mine-only joins the owner's parts with single spaces and adds no labels.
   - Label-everyone merges consecutive parts from the same speaker and writes `Label: words`.
   - Label-everyone separates parts with one space and always begins with a label.
   - Neither mode ever emits a line break.
 
   Done when tests assert the spec's example string exactly and assert that no output contains a line break.
-- [ ] 4.6 Add name validation and case-insensitive name comparison. Refuse a name that is:
+- [x] 4.6 Add name validation and case-insensitive name comparison. Refuse a name that is:
   - empty, or over 32 characters;
   - contains a line break, a control character, or a colon;
   - equal to "You" or "Speaker N" in any letter case.
@@ -78,7 +78,7 @@ description: Track verification, implementation and validation of voice enrolmen
   - the owner on a second microphone.
 
   Set the default threshold and the minimum part duration against a false-accept and false-reject target stated before measuring. Done when the figures, the target, and whether each was met are recorded in `design.md`, and the defaults in code match.
-- [ ] 4.8 Add `tests/test_speakers.py`, using a fake embedder that returns chosen vectors. Cover:
+- [x] 4.8 Add `tests/test_speakers.py`, using a fake embedder that returns chosen vectors. Cover:
   - the threshold boundary;
   - the owner against another enrolled voice;
   - unknown numbering, stable across calls in one session and reset for a new session;
@@ -90,12 +90,12 @@ description: Track verification, implementation and validation of voice enrolmen
 
 ## 5. Voiceprint store
 
-- [ ] 5.1 Add the store at `<data dir>/voiceprints.json`, with `version`, `model_sha256`, `dimension` and `voices[{name, embedding}]`. Write each update to a temporary file in the same directory and move it into place with `os.replace`. Done when an interrupted write in a test leaves the previous file intact.
-- [ ] 5.2 Create the file with mode 0600, and any directory Murmly creates with mode 0700, on POSIX. Apply the Windows decision from 1.7. Done when a POSIX test reads the modes back. The test skips itself elsewhere.
-- [ ] 5.3 Ignore voiceprints whose `model_sha256` differs from the installed model, and expose that state for diagnostics. Done when a test with a mismatched hash yields no voices and the flag set.
-- [ ] 5.4 Add change detection by `(st_mtime_ns, st_size)`, and treat a missing file as no voices. Done when tests cover an unchanged file, a changed file and a deleted file.
-- [ ] 5.5 Add remove-one and remove-all. Removing the last voice, or all voices, deletes the file. Done when tests show the file is gone and that a remaining voice is byte-identical after removing another.
-- [ ] 5.6 Add a test that the stored JSON holds only the documented keys, with no audio and no timestamps. Done when the suite passes with `--no-sync`.
+- [x] 5.1 Add the store at `<data dir>/voiceprints.json`, with `version`, `model_sha256`, `dimension` and `voices[{name, embedding}]`. Write each update to a temporary file in the same directory and move it into place with `os.replace`. Done when an interrupted write in a test leaves the previous file intact.
+- [x] 5.2 Create the file with mode 0600, and any directory Murmly creates with mode 0700, on POSIX. Apply the Windows decision from 1.7. Done when a POSIX test reads the modes back. The test skips itself elsewhere.
+- [x] 5.3 Ignore voiceprints whose `model_sha256` differs from the installed model, and expose that state for diagnostics. Done when a test with a mismatched hash yields no voices and the flag set.
+- [x] 5.4 Add change detection by `(st_mtime_ns, st_size)`, and treat a missing file as no voices. Done when tests cover an unchanged file, a changed file and a deleted file.
+- [x] 5.5 Add remove-one and remove-all. Removing the last voice, or all voices, deletes the file. Done when tests show the file is gone and that a remaining voice is byte-identical after removing another.
+- [x] 5.6 Add a test that the stored JSON holds only the documented keys, with no audio and no timestamps. Done when the suite passes with `--no-sync`.
 
 ## 6. Enrolment and voice commands
 
