@@ -13,8 +13,9 @@ point was confirmed by reading the code unless it says otherwise.
   `" ".join(segment.text.strip() for segment in segments).strip()`. Each segment
   carries `start` and `end` that nothing reads. The final pass writes a temporary
   WAV at the capture rate, which may be 44.1 or 48 kHz, and faster-whisper
-  resamples it. It is unverified whether `start`/`end` are in original-audio time
-  when `vad_filter=True`; task 1.6 checks this.
+  resamples it. With `vad_filter=True` the times are in original-audio seconds;
+  this was checked in faster-whisper's source (task 1.6, source half). See
+  "Segment times".
 - **Every delivered transcript passes through two methods.**
   `SpeechSession.process_recording` (window-bound) and
   `SpeechSession.process_for_session` (speech-session-bound) both call
@@ -64,7 +65,12 @@ point was confirmed by reading the code unless it says otherwise.
   general data directory: `$XDG_DATA_HOME/murmly`, `%LOCALAPPDATA%\murmly`, or
   `~/Library/Application Support/murmly`. `setup.sh` fetches the Kokoro files
   there with `curl` from a GitHub release, without a checksum. `bootstrap.ps1`
-  does the same on Windows.
+  fetches nothing today: it installs `uv` if needed and runs
+  `uv run --project <repo> murmly`, and the manual tells Windows users to place
+  the Kokoro files by hand. The speaker model will be the first download that
+  script makes. `setup.sh` also refuses macOS ("Murmly does not support macOS.
+  It supports Linux and Windows."), so the macOS path above is never reached
+  through it.
 - **A command that records in its own process exists.** `murmly spike` builds a
   `SoundDeviceRecorder` in the CLI process and calls `record_for_seconds`.
 - **Synthetic audio cannot test speaker code.** Speaker embeddings of tones or
@@ -156,6 +162,39 @@ A segment with less audio than the minimum (a placeholder of 1.0 s, set by
 measurement in task 4.7) is not embedded. It takes its neighbour's speaker, as
 the spec requires. Continuous mode already cuts segments at a configured silence
 of 2 s by default, so most units contain one speaker's turn.
+
+### Segment times are original-audio seconds, rounded to 0.01 s
+
+Murmly builds a plain `WhisperModel`, not a batched one, and `_decode` calls
+`model.transcribe(audio, language="en", beam_size=..., vad_filter=...)` with no
+`clip_timestamps`, `without_timestamps` or `word_timestamps`. Those keep their
+defaults (`clip_timestamps="0"`, `without_timestamps=False`,
+`word_timestamps=False`). Checked in faster-whisper's source (task 1.6, source
+half):
+
+- `transcribe.py` lines 885-892: `if vad_filter and clip_timestamps == "0":`
+  speech chunks are found with `get_speech_timestamps(audio, vad_parameters)` and
+  the audio becomes `np.concatenate(audio_chunks, axis=0)`, with the silence
+  removed.
+- Lines 1009-1010: `if speech_chunks: segments = restore_speech_timestamps(...)`.
+- Lines 1867-1868: `segment.start = ts_map.get_original_time(segment.start)` and
+  `segment.end = ts_map.get_original_time(segment.end, is_end=True)`.
+- `vad.py` lines 274-275: `return round(total_silence_before + time,
+  self.time_precision)`, with `time_precision` 2.
+
+So `start` and `end` are seconds from the start of the original audio, rounded
+to 0.01 s. Each end is mapped separately, so a segment that spans removed
+silence includes that silence when the audio is sliced at its times.
+`decode_audio` resamples to 16 kHz mono (`audio.py` lines 37-40), and the times
+do not depend on the capture rate.
+
+Slicing the capture PCM uses these times directly. Murmly's `_write_wav` writes
+`config.channels` channels, so the PCM can be interleaved. The slice is
+downmixed to mono before `resample_float32` is called.
+
+**Still open.** The other half of task 1.6, a real recording with a known pause
+where the slice at a segment's reported times plays back as that segment's words,
+has not been done. It needs a person to record and listen.
 
 *Alternatives considered.* **Full diarization** runs a segmentation model (for
 example pyannote segmentation-3.0, which sherpa-onnx ships as ONNX), clusters the
@@ -275,12 +314,7 @@ add configuration without a use.
 `status` gains `speaker_model_resident`, plus `speaker_model_resident_detail` on
 error, read without loading or locking.
 
-**Model.** The candidates are CAM++ trained on VoxCeleb (3D-Speaker, about 7M
-parameters, about 28 MB as fp32 ONNX) and WeSpeaker ResNet34 trained on VoxCeleb
-(about 25 MB). Both take 80-dimensional Kaldi filterbank features at 16 kHz with
-mean normalisation. Task group 1 picks one after checking its licence and the
-terms of its training data. The figures above are from memory and are not
-verified.
+**Model.** WeSpeaker ResNet34-LM. See "The model: WeSpeaker ResNet34-LM".
 
 *Alternatives considered.*
 - **sherpa-onnx** offers a speaker-embedding extractor and full diarization, and
@@ -294,15 +328,149 @@ verified.
 `numpy` and `onnxruntime` become direct dependencies with lower bounds the
 current lock already meets, so resolution does not move.
 
-### Filterbank features
+### Dependencies: `numpy>=2.0.2` and `onnxruntime>=1.20.1`
 
-If task group 1 confirms wheels for every CI cell, `kaldi-native-fbank` computes
-the features: 25 ms frames, 10 ms shift, 80 mel bins, dither 0. Otherwise the
-fallback is a numpy implementation of the same Kaldi recipe: Povey window,
-pre-emphasis 0.97, log mel energies, and mean normalisation over the utterance.
-It is checked against a small reference fixture produced once with the reference
-implementation and committed. Either way, mean normalisation is applied
-identically at enrolment and at recognition.
+Verified in task group 1 (task 1.2). The lock holds `numpy` 2.5.2 and
+`onnxruntime` 1.28.0. The floors are the ones the existing dependents already
+require: `kokoro-onnx` 0.6.1 asks for `onnxruntime>=1.20.1` and `numpy>=2.0.2`,
+and `faster-whisper` for `onnxruntime<2,>=1.14`. The change declares the same
+floors, so the resolver has nothing new to decide.
+
+The `onnxruntime` floor has to stay at 1.24 or below, and any API the speaker
+code calls has to exist in 1.24. GPU machines swap in `onnxruntime-gpu` 1.24.4
+under the same import name, and a floor above that would make the swap
+unsatisfiable.
+
+The locked wheels, by filename from `uv.lock`. `onnxruntime` 1.28.0 has no sdist.
+
+| Cell | `onnxruntime` 1.28.0 | `numpy` 2.5.2 |
+| --- | --- | --- |
+| cp312 manylinux x86_64 | `onnxruntime-1.28.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` | `numpy-2.5.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` |
+| cp312 win_amd64 | `onnxruntime-1.28.0-cp312-cp312-win_amd64.whl` | `numpy-2.5.2-cp312-cp312-win_amd64.whl` |
+| cp312 macOS arm64 | `onnxruntime-1.28.0-cp312-cp312-macosx_14_0_arm64.whl` | `numpy-2.5.2-cp312-cp312-macosx_11_0_arm64.whl` and `-macosx_14_0_arm64.whl` |
+| cp314 manylinux x86_64 | `onnxruntime-1.28.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` | the same name with `cp314` |
+| cp314 win_amd64 | `onnxruntime-1.28.0-cp314-cp314-win_amd64.whl` | the same name with `cp314` |
+| cp314 macOS arm64 | `onnxruntime-1.28.0-cp314-cp314-macosx_14_0_arm64.whl` | the same two with `cp314` |
+
+### The model: WeSpeaker ResNet34-LM
+
+Chosen in task 1.3, with the training-data terms accepted by the user on
+2026-10-09 (see Risks).
+
+| Fact | Value |
+| --- | --- |
+| Publisher | The WeSpeaker project. The Hugging Face organisation `Wespeaker` is the official one: WeSpeaker's `docs/pretrained.md` links to it, and the model card says "Official model provided by Wespeaker project". |
+| Repository | `Wespeaker/wespeaker-voxceleb-resnet34-LM`, commit `f0c48c298fd835726c27956a5d617bad7115627e` |
+| Pinned URL | `https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/f0c48c298fd835726c27956a5d617bad7115627e/voxceleb_resnet34_LM.onnx` |
+| Filename | `voxceleb_resnet34_LM.onnx` |
+| Size | 26,530,309 bytes (26.5 MB) |
+| SHA-256 | `7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068` |
+| Download | HTTP 302 to `us.aws.cdn.hf.co`, so `curl` needs `--location`. The `x-linked-etag` header equals the SHA-256. |
+| Input | `feats`, float32, shape `['B', 'T', 80]` |
+| Output | `embs`, float32, shape `['B', 256]` |
+| Embedding dimension | 256 |
+| ONNX metadata | None. `custom_metadata_map` is empty, as it is in every publisher ONNX file considered. The feature facts below come from the pinned `config.yaml` and the publisher's scripts. |
+| Output scale | Not L2-normalised. A dummy input gave a norm of about 0.81. |
+| Training | VoxCeleb2 dev, 5994 speakers. The LM variant is fine-tuned on inputs of about 6 s (`num_frms` 600). |
+| Licence | CC BY 4.0 |
+
+Dummy inputs of 100, 200 and 500 frames each returned shape `(1, 256)`.
+
+The pinned `config.yaml` sets `num_mel_bins` 80, `frame_length` 25,
+`frame_shift` 10, `dither` 1.0 (for training only) and `embed_dim` 256.
+
+**Licence.** The repository is tagged `cc-by-4.0`. WeSpeaker's
+[`docs/pretrained.md`](https://github.com/wenet-e2e/wespeaker/blob/c28dfb71f557a7eee05be164edce2577bf8708f8/docs/pretrained.md)
+(lines 19-23) says: "The pretrained model in WeNet follows the license of it's
+corresponding dataset. For example, the pretrained model on VoxCeleb follows
+Creative Commons Attribution 4.0 International License." Murmly treats the file
+as [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/legalcode), which
+allows commercial use and redistribution with attribution, a licence notice and
+a note of changes. Murmly does not redistribute the file at all: setup downloads
+it from the publisher onto the user's machine. The licence text and attribution
+go in `licenses/`. The repository's own licence is Apache-2.0.
+
+**Why not CAM++.** The CAM++ VoxCeleb model (3D-Speaker, 512 dimensions) is
+Apache-2.0 by its ModelScope card and repository, and is also trained on
+VoxCeleb2. It was rejected for two reasons:
+
+- The publisher ships only a PyTorch checkpoint (`campplus_voxceleb.bin`). The
+  only ONNX file is a re-export by k2-fsa/sherpa-onnx, whose release assets were
+  re-uploaded on 2024-10-14 after publishing on 2023-12-08, so a fixed release
+  URL can change. That fails the rule that the source is the publisher's own
+  release.
+- Both CAM++ ONNX files tried, sherpa-onnx's and WeSpeaker's own, gave wrong
+  embeddings at most input lengths. They were good only at 200, 400 and 600
+  frames. At 150, 202, 250 and 300 frames every speaker looked about 0.9 similar
+  to every other, on three clips. The cause is inferred, not confirmed: shapes
+  fixed at export.
+
+**Comparison candidate for task 4.7.** The non-LM ResNet34 has the same inputs and
+outputs: `https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34/resolve/ff1ac5bca8ef11e90662b879aa923979e0bd277b/voxceleb_resnet34.onnx`,
+26,534,127 bytes, SHA-256
+`9fea6516d7ad6bf0a76c7689f5a49b65d330fad6dde96c91bb4435ffbfe056a1`. Its
+repository is tagged `apache-2.0` with a 31-byte README, while WeSpeaker's
+documentation says CC BY 4.0. If the LM model's fine-tuning on long inputs hurts short parts in
+task 4.7, this one is the model to compare it with.
+
+### Filterbank features: a numpy implementation
+
+`kaldi-native-fbank` is not used. Task 1.1 listed the wheels of its latest
+release, 1.22.3 (2025-10-09, Apache-2.0, no abi3 wheels), for the six cells of
+the CI matrix:
+
+| Cell | Wheel |
+| --- | --- |
+| cp312 manylinux x86_64 | `kaldi_native_fbank-1.22.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl` |
+| cp312 win_amd64 | `kaldi_native_fbank-1.22.3-cp312-cp312-win_amd64.whl` |
+| cp312 macOS arm64 | `kaldi_native_fbank-1.22.3-cp312-cp312-macosx_11_0_arm64.whl` |
+| cp314 manylinux x86_64 | `kaldi_native_fbank-1.22.3-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl` |
+| cp314 win_amd64 | **missing**: only `cp314-cp314-win32` exists, and no version ever shipped a cp314 win_amd64 wheel |
+| cp314 macOS arm64 | `kaldi_native_fbank-1.22.3-cp314-cp314-macosx_11_0_arm64.whl` |
+
+The package has an sdist, so `uv sync --locked` on `windows-latest` with Python
+3.14 would try a CMake and MSVC source build. That is the reason for the numpy
+fallback. The cp312 win_amd64 wheel was also inspected: it installs
+`_kaldi_native_fbank.cp312-win_amd64.pyd` and `kaldi-native-fbank-core.dll` and
+`.lib` into the root of site-packages, with duplicates under
+`kaldi_native_fbank/lib/`. The `.pyd` is PE32+ x86-64 and imports
+`MSVCP140.dll`, `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` and `api-ms-win-crt-*`,
+none of which the wheel bundles, so a Visual C++ runtime would also be required.
+
+The numpy implementation follows the publisher's recipe
+(`wespeaker/bin/infer_onnx.py` and `wespeaker/cli/speaker.py` at commit
+`9fecd6cb4f47475d01761d87c826298dff4ef18c`), which calls
+`kaldi.fbank(num_mel_bins=80, frame_length=25, frame_shift=10, dither=0.0,
+window_type='hamming', use_energy=False)`. The remaining parameters are
+torchaudio's `compliance/kaldi.py` defaults (v2.8.0). The full recipe:
+
+- 16 kHz mono input, scaled to the int16 range: `waveform * 32768`. WeSpeaker's
+  `infer_onnx.py` does `waveform = waveform * (1 << 15)`, and sherpa-onnx's
+  `add_meta_data.py` says "all models from wespeaker expect input samples in the
+  range [-32768, 32767]".
+- Frames of 25 ms every 10 ms, with `snip_edges=True`: no padding, and a trailing
+  partial frame is dropped.
+- Remove the DC offset of each frame.
+- Pre-emphasis 0.97.
+- Hamming window, `torch.hamming_window(periodic=False)`, that is 0.54 and 0.46.
+  It is not the Povey window.
+- FFT size 512 (the frame length rounded up to a power of two).
+- Power spectrum.
+- 80 mel bins from 20 Hz (`low_freq`) to the Nyquist frequency.
+- Natural log with a floor at the float32 epsilon.
+- Dither 0.
+- Mean normalisation over the utterance (CMN) without variance normalisation
+  (no CVN): `mat = mat - mean(mat, axis=0)`. It is applied identically at
+  enrolment and at recognition.
+
+The implementation is checked against a small reference fixture produced once
+with the reference implementation and committed (task 4.1).
+
+An ad hoc check, not yet against a reference, ran ResNet34-LM on ModelScope's
+three 16 kHz example clips (two speakers) with a numpy filterbank. Whole clips
+scored 0.718 for the same speaker and -0.095 and -0.205 for different speakers.
+Changes to the window or the scale moved the similarities by less than 0.02 on
+this clean audio. See Risks for what it showed for short parts.
 
 ### The model is fetched at setup, pinned and checksummed
 
@@ -317,20 +485,29 @@ goes in `licenses/`.
 The model's identity is the SHA-256 of its file. That identity is stored with
 the voiceprints and compared on load.
 
+The download is 26.5 MB. `bootstrap.ps1` has never fetched anything before, so
+this is its first download, made with `Invoke-WebRequest` and checked with
+`Get-FileHash`. `setup.sh` refuses macOS, so on macOS the model is not fetched by
+either script. The Linux download was repeated on a second fetch and gave the
+same size and SHA-256 as recorded (task 1.9, Linux half). The Windows half is
+open.
+
 ### Voiceprint store
 
 The voiceprints are stored in `<data dir>/voiceprints.json`:
 
 ```json
-{"version": 1, "model_sha256": "…", "dimension": 192,
+{"version": 1, "model_sha256": "…", "dimension": 256,
  "voices": [{"name": "Milo", "embedding": [0.012, …]}]}
 ```
 
 - **Writing.** Every write goes to a temporary file in the same directory, then
   `os.replace`. On POSIX the file is created through `os.open(..., 0o600)`, and a
   directory Murmly creates gets mode `0o700`. On Windows the file inherits the
-  per-user ACL of `%LOCALAPPDATA%`; task 1.7 confirms that ACL excludes other
-  standard accounts.
+  per-user ACL of `%LOCALAPPDATA%`. **Task 1.7 is still open.** It needs
+  `icacls %LOCALAPPDATA%\murmly` on a Windows machine, and nothing has been
+  run. This design keeps the assumption that the inherited ACL excludes other
+  standard accounts, and the Windows part of task 5.2 depends on the result.
 - **No audio is written.** `murmly enrol` computes the embedding from the PCM it
   holds in memory. No WAV is ever written, which is stronger than deleting one.
 - **Removing.** Removing the last voice, or `--all`, deletes the file.
@@ -460,9 +637,42 @@ Speech-session replies go through the same helper, through
   option.
 - **Overlapping speech is not separated.** → The same documented limit applies.
 - **Added latency between capture stop and delivery.** One embedding is computed
-  per segment on the CPU. → Task 7.5 measures it on real recordings and records
-  the figure. If it exceeds 500 ms per minute of speech, the approach is revisited
-  before shipping.
+  per segment on the CPU. A rough first measurement (i9-11980HK, 16 threads,
+  `onnxruntime-gpu` 1.24.4 on its CPU provider, random features, one run each)
+  gave about 340 ms for 30 calls of 2 s, which is one minute of speech, and about
+  500 ms for one 60 s call. The limit is 500 ms per minute of speech, so this is
+  close to it on a fast CPU. → Task 7.5
+  measures it on real recordings and records the figure. If it exceeds 500 ms per
+  minute of speech, the approach is revisited before shipping.
+- **Short parts may not match the owner at the placeholder threshold.** In the ad
+  hoc check under "Filterbank features", slices of 2 s from the same speaker
+  scored 0.49 and slices of 1 s scored 0.35, against different speakers below 0.
+  The placeholder threshold is 50, so in this one sample the owner would be
+  rejected on 1 to 2 s parts. This is one sample of two speakers, and it is
+  indicative only. The LM model is fine-tuned on inputs of about 6 s, which may
+  make this worse. → Task 4.7 sets the threshold and the minimum part length on
+  real recordings, and compares the non-LM model.
+- **The model's training data has unclean terms.** The model is trained on
+  VoxCeleb2, and the terms published for VoxCeleb disagree:
+  - KAIST ([mm.kaist.ac.kr/datasets/voxceleb](https://mm.kaist.ac.kr/datasets/voxceleb/)):
+    "The VoxCeleb dataset is available to download for research purposes under a
+    Creative Commons Attribution 4.0 International License. The copyright remains
+    with the original owners of the video."
+  - KAIST's `files/license.txt`: "The copyright of both the original and cropped
+    versions of the videos remains with the original owners. The data is covered
+    under a Creative Commons Attribution 4.0 International license".
+  - Oxford VGG ([vox1](https://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox1.html),
+    [vox2](https://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox2.html)): "The
+    provided VoxCeleb metadata is licensed under a Creative Commons
+    Attribution-ShareAlike 4.0 International License."
+
+  The model itself is CC BY 4.0. Augmentation data is MUSAN (CC BY 4.0,
+  [openslr.org/17](https://www.openslr.org/17/)) and RIRS_NOISES (Apache 2.0,
+  [openslr.org/28](https://www.openslr.org/28/)). Every candidate considered was
+  trained on VoxCeleb2, so the choice of model does not avoid this. The user
+  accepted the ambiguity on 2026-10-09. → The licence file in `licenses/` and the
+  manual both state the training-data terms. Murmly does not redistribute the
+  file.
 - **Daemon memory.** The session costs tens of megabytes while resident.
   `onnxruntime` is usually already imported, through the VAD filter. → The
   session is built only in a speaker mode and released with the transcription
@@ -471,12 +681,13 @@ Speech-session replies go through the same helper, through
   → It is stored locally only, in a file private to the user, and can be listed
   and removed. The manual says to ask before enrolling someone, and says that
   uninstalling leaves voiceprints in place until they are removed.
-- **Licence or wheel availability may fail verification.** → Task group 1 is a
-  gate. If neither candidate model's licence and data terms are acceptable, the
-  change stops there. If `kaldi-native-fbank` lacks a wheel for any CI cell, the
-  numpy fallback is used and no dependency is added. A required dependency with
-  no macOS arm64 wheel would break the `macos-14` CI job, so any such dependency
-  gets a marker, and `doctor` reports speaker recognition unavailable on macOS.
+- **Licence or wheel availability may fail verification.** → Task group 1 was a
+  gate, and it passed: ResNet34-LM is CC BY 4.0, `numpy` and `onnxruntime` have
+  wheels for all six cells, and `kaldi-native-fbank` lacks a cp314 win_amd64
+  wheel, so the numpy fallback is used and no dependency is added. The two
+  dependencies that are added have wheels on `macos-14`, so no marker is needed.
+  A future required dependency with no macOS arm64 wheel would break that CI job,
+  and would need a marker.
 - **Adding dependencies resyncs the environment.** On GPU machines that
   reinstalls CPU `onnxruntime` over the GPU build. → Task 2.4 re-applies the swap
   according to the agent note. Tests always run with `--no-sync`.

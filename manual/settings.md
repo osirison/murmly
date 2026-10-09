@@ -85,6 +85,11 @@ unload_after_idle_s = 0        # Drop the synthesis session after this idle time
 output_device = ""     # Empty lets the system choose
 quiet_hours = ""       # "HH:MM-HH:MM" local time; empty means speak at any hour
 # model_dir = "~/.local/share/murmly"   # Where the model and voices are
+
+[speakers]
+mode = "off"           # off | mine-only | label-everyone
+owner = ""             # The enrolled name that is you; empty means no owner
+match_threshold = 50   # How alike a voice must sound to count as an enrolled one, 30-90
 ```
 
 ## `[daemon]` — the background service
@@ -305,6 +310,45 @@ was not honoured, and reports whether the window is in force right now.
 
 Not set by default; commented out in the example. Its own default is
 `~/.local/share/murmly`. Where the speech model and its voices are stored.
+
+## `[speakers]` — whose voice murmly types
+
+Voices are enrolled once by name, with `murmly enrol <name>`. This section says
+what murmly does with them.
+
+### `speakers.mode` { #speakers-mode }
+
+Default `"off"`. Permitted words: `off | mine-only | label-everyone`.
+
+- `off` types every voice, exactly as murmly did before this setting existed.
+  Nothing about speakers is read or loaded.
+- `mine-only` types only the voice named in `speakers.owner`. Everything else
+  the microphone hears is left out.
+- `label-everyone` types every voice on one line, each part labelled: `You:` for
+  the owner, the enrolled name for other enrolled people, and `Speaker 1:`,
+  `Speaker 2:` for voices that are not enrolled, in the order they first speak.
+
+A word that is not one of these falls back to `"off"`.
+[`murmly doctor`](troubleshooting.md) reports the word you wrote and the one in
+use. When the mode cannot run, murmly types everything as `off` would, writes a
+warning to its log, and `murmly doctor` says why.
+
+### `speakers.owner` { #speakers-owner }
+
+Default `""`, which is no owner. The enrolled name that is you. With no owner,
+`mine-only` has nothing to keep, so it cannot run and murmly types everything,
+and `label-everyone` labels no part `You:`.
+
+### `speakers.match_threshold` { #speakers-match-threshold }
+
+Default `50`. Range `30-90`. How alike a voice must sound to an enrolled one to
+count as that person, as a whole-number percent. Higher is stricter: fewer
+strangers pass, and more of your own words may be left out in `mine-only`.
+
+A fraction such as `0.55` is not a whole number, so it is not read as 55.
+Like any value outside the range, it falls back to `50`, and
+[`murmly doctor`](troubleshooting.md) reports what you wrote. The default is a
+starting point rather than a measured value.
 
 ## After you change something
 

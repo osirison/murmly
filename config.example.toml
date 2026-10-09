@@ -178,3 +178,31 @@ quiet_hours = ""
 # Where kokoro-v1.0.onnx and voices-v1.0.bin are. Defaults to
 # $XDG_DATA_HOME/murmly, which is ~/.local/share/murmly.
 # model_dir = "~/.local/share/murmly"
+
+[speakers]
+# Which voices Murmly types. Voices are enrolled once by name with
+# `murmly enrol <name>`; this table says what to do with them.
+#
+#   off             Every voice is typed, exactly as before. Nothing is loaded.
+#   mine-only       Only the voice named in `owner` is typed.
+#   label-everyone  Every voice is typed on one line, each part labelled: "You:"
+#                   for the owner, an enrolled name for other enrolled people,
+#                   "Speaker 1:", "Speaker 2:" for voices that are not enrolled.
+#
+# An unrecognized mode falls back to "off", and `murmly doctor` reports both the
+# value you wrote and the one in use. A mode that cannot run -- no owner
+# enrolled for mine-only, the speaker model file missing -- types everything as
+# "off" would, logs a warning, and `murmly doctor` says why.
+mode = "off"
+
+# The enrolled name that is you. Empty means no owner: mine-only then has
+# nothing to keep and falls back to typing everything, and label-everyone labels
+# no part "You:".
+owner = ""
+
+# How alike a voice must sound to an enrolled one to count as that person, as an
+# integer percent, 30-90. Higher is stricter: fewer strangers pass, and more of
+# your own words may be dropped in mine-only. A fraction such as 0.55 is not an
+# integer; it falls back to the default and `murmly doctor` reports it. The
+# default is a starting point, not a measured value.
+match_threshold = 50

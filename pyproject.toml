@@ -13,6 +13,13 @@ authors = [{ name = "osirison" }]
 dependencies = [
     "faster-whisper>=1.2.1",
     "sounddevice>=0.5.5",
+    # Direct since the speaker model: filterbank features are computed in numpy
+    # and the model runs through onnxruntime. Both were already installed through
+    # faster-whisper and kokoro-onnx, whose floors these match. Keep the
+    # onnxruntime floor at or below 1.24, the version of the `onnxruntime-gpu`
+    # build GPU machines swap in under the same import name.
+    "numpy>=2.0.2",
+    "onnxruntime>=1.20.1",
     # The command channel's named-pipe transport (section 7): CPython exposes no
     # `AF_UNIX` on Windows, and `win32pipe`/`win32security` are what build a pipe
     # whose DACL grants only the creating user's SID. Markered so no other

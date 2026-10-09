@@ -139,6 +139,22 @@ MAX_UNLOAD_AFTER_IDLE_S = 86_400
 DEFAULT_STT_UNLOAD_AFTER_IDLE_S = 300
 DEFAULT_TTS_UNLOAD_AFTER_IDLE_S = 0
 
+# What `[speakers] mode` does with the people the microphone hears. `off` is the
+# default and runs no speaker code at all; `mine-only` delivers only the
+# configured owner's speech; `label-everyone` delivers all of it, prefixed by
+# who said it.
+VALID_SPEAKER_MODES = {"off", "mine-only", "label-everyone"}
+DEFAULT_SPEAKER_MODE = "off"
+
+# The similarity, as an integer percent, at which a voice counts as an enrolled
+# one. An integer for the reason `[tts] rate` is: the existing helpers read
+# integers, and `0.55` then reads as 0, falls back and is reported rather than
+# being silently truncated. The default is a placeholder until it is measured on
+# real voices (the change's design.md, task 4.7).
+DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT = 50
+MIN_SPEAKER_MATCH_THRESHOLD_PERCENT = 30
+MAX_SPEAKER_MATCH_THRESHOLD_PERCENT = 90
+
 
 # The window speech is refused in, written as one string in the machine's own
 # local time. One setting rather than a start and an end because a window is one
@@ -197,8 +213,12 @@ def default_socket_path(env: dict[str, str] | None = None) -> Path:
     return runtime_dir / "murmly.sock"
 
 
-def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
-    """Where the synthesis model and its voices are looked for by default."""
+def default_data_dir(env: dict[str, str] | None = None) -> Path:
+    """Where Murmly keeps the files it downloads or writes for itself.
+
+    The synthesis model and its voices live directly in it, and so will the
+    speaker model and the voiceprints.
+    """
     profile = resolve_platform(env)
     if profile.operating_system is OperatingSystem.WINDOWS:
         environment = env or os.environ
@@ -214,6 +234,11 @@ def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
     if xdg_data_home:
         return Path(xdg_data_home) / "murmly"
     return Path.home() / ".local" / "share" / "murmly"
+
+
+def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
+    """Where the synthesis model and its voices are looked for by default."""
+    return default_data_dir(env)
 
 
 def default_config_path(env: dict[str, str] | None = None) -> Path:
@@ -293,6 +318,11 @@ class MurmlyConfig:
     tts_quiet_start: time | None = None
     tts_quiet_end: time | None = None
     tts_quiet_rejected_value: str | None = None
+    speaker_mode: str = DEFAULT_SPEAKER_MODE
+    speaker_mode_rejected_value: str | None = None
+    speaker_owner: str = ""
+    speaker_match_threshold_percent: int = DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT
+    speaker_match_threshold_rejected_value: object | None = None
 
     @property
     def model_name(self) -> str:
@@ -319,6 +349,7 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
     clipboard = _get_table(data, "clipboard")
     overlay = _get_table(data, "overlay")
     tts = _get_table(data, "tts")
+    speakers = _get_table(data, "speakers")
 
     socket_path = Path(str(daemon.get("socket_path", default_socket_path(env))))
     model_profile = str(stt.get("model_profile", "balanced"))
@@ -358,6 +389,21 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         tts_device = DEFAULT_TTS_DEVICE
     tts_quiet_start, tts_quiet_end, tts_quiet_rejected_value = _quiet_window(
         tts.get("quiet_hours")
+    )
+    speaker_mode = str(speakers.get("mode", DEFAULT_SPEAKER_MODE))
+    speaker_mode_rejected_value: str | None = None
+    if speaker_mode not in VALID_SPEAKER_MODES:
+        speaker_mode_rejected_value = speaker_mode
+        speaker_mode = DEFAULT_SPEAKER_MODE
+    speaker_match_threshold_percent = _bounded_int(
+        speakers.get("match_threshold"),
+        DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT,
+        minimum=MIN_SPEAKER_MATCH_THRESHOLD_PERCENT,
+        maximum=MAX_SPEAKER_MATCH_THRESHOLD_PERCENT,
+    )
+    speaker_match_threshold_rejected_value = _rejected_value(
+        speakers.get("match_threshold"),
+        speaker_match_threshold_percent,
     )
     model_dir = tts.get("model_dir")
     tts_model_dir = (
@@ -444,6 +490,11 @@ def load_config(path: str | Path | None = None, env: dict[str, str] | None = Non
         tts_quiet_start=tts_quiet_start,
         tts_quiet_end=tts_quiet_end,
         tts_quiet_rejected_value=tts_quiet_rejected_value,
+        speaker_mode=speaker_mode,
+        speaker_mode_rejected_value=speaker_mode_rejected_value,
+        speaker_owner=str(speakers.get("owner", "")).strip(),
+        speaker_match_threshold_percent=speaker_match_threshold_percent,
+        speaker_match_threshold_rejected_value=speaker_match_threshold_rejected_value,
     )
 
 

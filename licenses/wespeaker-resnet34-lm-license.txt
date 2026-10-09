@@ -1,0 +1,63 @@
+WeSpeaker ResNet34-LM (VoxCeleb) speaker-embedding model
+---------------------------------------------------------
+
+Model:        WeSpeaker ResNet34-LM, trained on VoxCeleb2 (dev)
+Publisher:    the WeSpeaker project (https://github.com/wenet-e2e/wespeaker)
+Source:       https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM
+Pinned file:  https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/f0c48c298fd835726c27956a5d617bad7115627e/voxceleb_resnet34_LM.onnx
+File:         voxceleb_resnet34_LM.onnx, 26530309 bytes
+SHA-256:      7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068
+
+License
+-------
+
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+Legal text: https://creativecommons.org/licenses/by/4.0/legalcode
+Summary:    https://creativecommons.org/licenses/by/4.0/
+
+The repository on Hugging Face is tagged cc-by-4.0, and the WeSpeaker
+documentation states the rule the tag follows
+(https://github.com/wenet-e2e/wespeaker/blob/c28dfb71f557a7eee05be164edce2577bf8708f8/docs/pretrained.md):
+
+    "The pretrained model in WeNet follows the license of it's corresponding
+    dataset. For example, the pretrained model on VoxCeleb follows Creative
+    Commons Attribution 4.0 International License."
+
+Attribution
+-----------
+
+Speaker recognition in Murmly uses the WeSpeaker ResNet34-LM model, published
+by the WeSpeaker project under CC BY 4.0. Murmly gives the licence above and
+links to the source. The model file was changed in no way.
+
+Murmly does not modify or redistribute this file. It is not in the Murmly
+repository, the Murmly package or the published manual. `setup.sh` and
+`bootstrap.ps1` download it from the URL above onto the user's own machine, and
+check its SHA-256 before keeping it.
+
+Training data
+-------------
+
+The model was trained on the VoxCeleb2 development set, with MUSAN
+(CC BY 4.0, https://www.openslr.org/17/) and RIRS_NOISES (Apache 2.0,
+https://www.openslr.org/28/) used for augmentation. The terms published for
+VoxCeleb are not consistent with each other, and the licence of a model trained
+on it is therefore not entirely clean:
+
+  - KAIST (https://mm.kaist.ac.kr/datasets/voxceleb/): "The VoxCeleb dataset is
+    available to download for research purposes under a Creative Commons
+    Attribution 4.0 International License. The copyright remains with the
+    original owners of the video."
+  - The licence file of that distribution states: "The copyright of both the
+    original and cropped versions of the videos remains with the original
+    owners. The data is covered under a Creative Commons Attribution 4.0
+    International license".
+  - Oxford VGG (https://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox1.html and
+    https://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox2.html): "The provided
+    VoxCeleb metadata is licensed under a Creative Commons Attribution-ShareAlike
+    4.0 International License."
+
+Every speaker-embedding model considered for Murmly was trained on VoxCeleb2, so
+this does not distinguish between them. It was reviewed and accepted when the
+model was chosen (2026-10-09). The model's own licence, CC BY 4.0, is the one
+that applies to the file.

@@ -708,6 +708,8 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "faster-whisper" },
+    { name = "numpy" },
+    { name = "onnxruntime" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "sounddevice" },
 ]
@@ -737,12 +739,14 @@ tts = [
 [package.metadata]
 requires-dist = [
     { name = "faster-whisper", specifier = ">=1.2.1" },
+    { name = "numpy", specifier = ">=2.0.2" },
     { name = "nvidia-cublas-cu12", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=12,<13" },
     { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=12,<13" },
     { name = "nvidia-cudnn-cu12", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=9,<10" },
     { name = "nvidia-cufft-cu12", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=11,<12" },
     { name = "nvidia-curand-cu12", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=10,<11" },
     { name = "nvidia-nvjitlink-cu12", marker = "sys_platform != 'darwin' and extra == 'cuda'", specifier = ">=12,<13" },
+    { name = "onnxruntime", specifier = ">=1.20.1" },
     { name = "pyside6", marker = "(sys_platform == 'darwin' and extra == 'overlay') or (sys_platform == 'win32' and extra == 'overlay')", specifier = ">=6.7,<7" },
     { name = "pywin32", marker = "sys_platform == 'win32'", specifier = "==312" },
     { name = "sounddevice", specifier = ">=0.5.5" },

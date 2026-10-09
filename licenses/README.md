@@ -9,6 +9,12 @@ are here because the site carries them.
 | --- | --- |
 | `pictogrammers-free-license.txt` | The icons Material for MkDocs draws into the manual |
 | `mkdocs-material-license.txt` | Material for MkDocs itself, the theme that generates the manual |
+| `wespeaker-resnet34-lm-license.txt` | The speaker model `setup.sh` and `bootstrap.ps1` download; not part of the site |
+
+The last row is the one entry that is not about the site. Murmly does not carry
+or modify the speaker model: setup downloads it from its publisher onto the
+user's machine. The file names the model, the pinned source and the licence so
+the attribution lives with the other licenses.
 
 ## Why the icons need this
 
