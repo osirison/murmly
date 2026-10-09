@@ -162,8 +162,8 @@ description: Track verification, implementation and validation of voice enrolmen
 
 ## 9. Diagnostics and documentation
 
-- [ ] 9.1 Add a `speaker_recognition` section to `murmly doctor`, with every key from the design always present. Check the model's presence and checksum without building a session, and take residency from the daemon answer that `daemon_residency` already obtains. Done when `murmly doctor` prints the section with the mode `off` and with each speaker mode.
-- [ ] 9.2 Add diagnostics tests covering:
+- [x] 9.1 Add a `speaker_recognition` section to `murmly doctor`, with every key from the design always present. Check the model's presence and checksum without building a session, and take residency from the daemon answer that `daemon_residency` already obtains. Done when `murmly doctor` prints the section with the mode `off` and with each speaker mode.
+- [x] 9.2 Add diagnostics tests covering:
   - the same keys in every mode and for every platform profile;
   - no vector values anywhere in the output;
   - unknown residency when no daemon answers;
@@ -173,7 +173,7 @@ description: Track verification, implementation and validation of voice enrolmen
   - a missing model named by path.
 
   Done when the suite passes with `--no-sync`.
-- [ ] 9.3 Add a manual page titled by what the reader wants to do, for example "Typing only your own voice". It covers enrolment, the three modes, the one-line label format, and the limits:
+- [x] 9.3 Add a manual page titled by what the reader wants to do, for example "Typing only your own voice". It covers enrolment, the three modes, the one-line label format, and the limits:
   - two speakers inside one segment;
   - overlapping speech;
   - unfiltered partial text;
@@ -181,6 +181,6 @@ description: Track verification, implementation and validation of voice enrolmen
   - no access control.
 
   Register the page in the `mkdocs.yml` nav. Done when the manual builds as `docs/agent-notes/building-the-manual.md` describes and the page appears in the nav.
-- [ ] 9.4 Update `manual/where-your-words-go.md`. Say that a voiceprint is stored and never the audio, where it is stored, that only the user can read it, and that it stays on the machine. Cover the list and remove commands, that uninstalling leaves voiceprints in place, and asking before enrolling someone else. Done when the manual builds as `docs/agent-notes/building-the-manual.md` describes.
+- [x] 9.4 Update `manual/where-your-words-go.md`. Say that a voiceprint is stored and never the audio, where it is stored, that only the user can read it, and that it stays on the machine. Cover the list and remove commands, that uninstalling leaves voiceprints in place, and asking before enrolling someone else. Done when the manual builds as `docs/agent-notes/building-the-manual.md` describes.
 - [ ] 9.5 Record a field note under `docs/agent-notes/` if wheel inspection, the model fetch, the GPU-swap resync, or the enrolment exit turned up an undocumented precondition. Done when each such precondition has a note, or none was found.
 - [ ] 9.6 Run `openspec validate --all --strict` and `uv run --no-sync python -m unittest discover -s tests`, then use mine-only and label-everyone end to end in a live desktop session. Use toggle and continuous modes, a second enrolled voice, and a television. Done when both commands pass and the live session behaves as the spec's scenarios state.

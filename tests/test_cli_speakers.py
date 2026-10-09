@@ -14,6 +14,7 @@ import numpy as np
 
 from murmly.cli import (
     ENROL_MIN_SPEECH_SECONDS,
+    ENROL_PASSAGE,
     ENROL_SECONDS,
     _capture_as_speaker_audio,
     _run_enrol,
@@ -224,6 +225,16 @@ class RefusalOrderTests(EnrolTestCase):
         self.assertEqual(0, code, err)
         self.assertEqual(["Milo"], self.stored_names())
         self.assertEqual([float(ENROL_SECONDS)], FakeRecorder.instances[0].requested)
+
+    def test_the_passage_is_shorter_than_the_recording_so_the_reader_is_told_to_keep_going(self) -> None:
+        code, out, err = self.enrol()
+
+        self.assertEqual(0, code, err)
+        self.assertIn(ENROL_PASSAGE, out)
+        instruction = "Keep reading until the recording stops. If you reach the end, start again from the top."
+        self.assertIn(instruction, out)
+        # Said before the recording begins, not after.
+        self.assertLess(out.index(instruction), out.index("Recording now."))
 
 
 class SampleTests(EnrolTestCase):

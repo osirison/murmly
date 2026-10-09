@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from array import array
 from dataclasses import replace
+import hashlib
 import json
 import logging
 import math
@@ -87,8 +88,10 @@ from murmly.platform import (
 from murmly.silence import SilenceDetector
 from murmly.speakers import (
     MIN_PART_SECONDS,
+    CPU_PROVIDER as SPEAKER_CPU_PROVIDER,
     SAMPLE_RATE_HZ as SPEAKER_SAMPLE_RATE_HZ,
     SPEAKER_MODEL_FILENAME,
+    SPEAKER_MODEL_SHA256,
     SpeakerEmbedder,
     InvalidSpeakerName,
     l2_normalised,
@@ -870,6 +873,10 @@ def _enrol_recording(
     recorder = SoundDeviceRecorder(config)
     print(f'Enrolling "{name}". Recording for {seconds:g} seconds. Read this aloud:\n')
     print(ENROL_PASSAGE)
+    print(
+        "\nKeep reading until the recording stops. If you reach the end, start again "
+        "from the top."
+    )
     print("\nRecording now.", flush=True)
     try:
         clip = recorder.record_for_seconds(seconds)
@@ -973,7 +980,11 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     # transcription is enabled, and the speech probe opens the output device;
     # residency is meant to say what the daemon held when the question was put,
     # not what this report caused on its way past.
-    (model_resident, model_resident_detail), synthesis_residency = daemon_residency(config)
+    (
+        (model_resident, model_resident_detail),
+        synthesis_residency,
+        speaker_residency,
+    ) = daemon_residency(config)
     # Asked here for the same reason and at the same moment. The speech probe
     # below opens an output device of its own, and a count taken after that
     # would still be the daemon's rather than the probe's -- but taking both
@@ -1062,6 +1073,14 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             "available": False,
             "detail": f"Unable to check the microphone: {error}",
         }
+
+    # Guarded like every other probe. The residency was asked of the daemon above,
+    # before anything here could have changed it; this section reads files and
+    # builds no session.
+    try:
+        speaker_recognition = speaker_recognition_diagnostics(config, residency=speaker_residency)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        speaker_recognition = speaker_recognition_failure(config, speaker_residency, error)
 
     # Guarded on its own, like every other probe: a speech stack that cannot be
     # inspected must not take the rest of the report with it.
@@ -1170,6 +1189,7 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             None if memory_returnable else system_memory_unreturnable_reason()
         ),
         "live_transcription": live_transcription_diagnostics(config),
+        "speaker_recognition": speaker_recognition,
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
         "speech_output": speech,
@@ -1589,8 +1609,15 @@ def daemon_playback(
 def daemon_residency(
     config: MurmlyConfig,
     send: Callable[[str, str], dict[str, object]] | None = None,
-) -> tuple[tuple[bool | None, str | None], tuple[bool | None, str | None]]:
+) -> tuple[
+    tuple[bool | None, str | None],
+    tuple[bool | None, str | None],
+    tuple[bool | None, str | None],
+]:
     """What the running daemon holds, as a value and a reason for each model.
+
+    The models are transcription, synthesis and speaker recognition, in that
+    order, all out of the one `status` answer.
 
     Asked of the daemon rather than answered here. `murmly doctor` runs in its
     own process and holds neither model, so its own residency is a constant
@@ -1607,6 +1634,7 @@ def daemon_residency(
 
     Three outcomes per model, in the shape this file already uses for a value it
     could not determine: True, False, or None beside a detail naming the reason.
+    A speaker model that failed to build is False beside the daemon's reason.
     Nothing is loaded to produce any of them.
     """
     response, unavailable = _daemon_status(config, send, "what it holds")
@@ -1634,14 +1662,37 @@ def daemon_residency(
             "The Murmly daemon holds no synthesis session: speech output is not "
             "enabled in the daemon that is running.",
         )
-    return transcription, synthesis
+    return transcription, synthesis, _speaker_residency_field(response)
 
 
 def _residency_unknown(
     detail: str,
-) -> tuple[tuple[None, str], tuple[None, str]]:
-    """Both models unanswered for the same reason, which is one reason each."""
-    return (None, detail), (None, detail)
+) -> tuple[tuple[None, str], tuple[None, str], tuple[None, str]]:
+    """Every model unanswered for the same reason, which is one reason each."""
+    return (None, detail), (None, detail), (None, detail)
+
+
+def _speaker_residency_field(response: dict[str, object]) -> tuple[bool | None, str | None]:
+    """The speaker model's residency out of the daemon's answer.
+
+    Unlike the other two, a False can carry the daemon's reason: a model that
+    could not be built is not held, and the daemon says why.
+    """
+    if "speaker_model_resident" not in response:
+        return None, (
+            "The running Murmly daemon does not report speaker model residency. "
+            "Restart the service to pick up a version that does."
+        )
+    value = response.get("speaker_model_resident")
+    detail = response.get("speaker_model_resident_detail")
+    if isinstance(value, bool):
+        return value, detail if isinstance(detail, str) and detail else None
+    if isinstance(detail, str) and detail:
+        return None, f"The Murmly daemon could not read speaker model residency: {detail}"
+    return None, (
+        f"The Murmly daemon reported speaker model residency as {value!r}, which is "
+        "not an answer."
+    )
 
 
 def _residency_field(
@@ -1674,6 +1725,159 @@ def _quiet_window_in_use(config: MurmlyConfig) -> str | None:
         f"{config.tts_quiet_start.strftime('%H:%M')}"
         f"-{config.tts_quiet_end.strftime('%H:%M')}"
     )
+
+
+def speaker_recognition_diagnostics(
+    config: MurmlyConfig,
+    residency: tuple[bool | None, str | None] = (None, None),
+    data_dir: Path | None = None,
+) -> dict[str, object]:
+    """The `speaker_recognition` section of `murmly doctor`.
+
+    Every key is present in every mode and on every platform, `None` where it
+    does not apply. Works in every mode: the mode restricts the daemon, not the
+    report.
+
+    The model is checked by hashing the file. No session is built and
+    `onnxruntime` is not imported, so the report loads nothing. Only names,
+    their count and the owner are reported about the voices; the store's
+    vectors are never read into the report.
+
+    Residency is passed in, taken from the daemon's `status` answer by
+    `daemon_residency`. `(None, reason)` means no daemon could say.
+    """
+    resident, resident_detail = residency
+    directory = data_dir if data_dir is not None else default_data_dir()
+    model_path = directory / SPEAKER_MODEL_FILENAME
+    model_present, checksum_matches, model_problem = _speaker_model_state(model_path)
+
+    store = VoiceprintStore(directory)
+    store.refresh()
+    names = store.names
+    owner = config.speaker_owner or None
+    owner_enrolled = (
+        None if owner is None else any(name.casefold() == owner.casefold() for name in names)
+    )
+
+    available, detail = _speaker_availability(
+        config.speaker_mode, model_problem, store, owner, owner_enrolled
+    )
+    return {
+        "mode": config.speaker_mode,
+        "mode_rejected_value": config.speaker_mode_rejected_value,
+        "match_threshold": config.speaker_match_threshold_percent,
+        "match_threshold_rejected_value": config.speaker_match_threshold_rejected_value,
+        "owner": owner,
+        "owner_enrolled": owner_enrolled,
+        "enrolled_count": len(names),
+        "enrolled_names": names,
+        "voiceprints_path": str(store.path),
+        "voiceprints_need_reenrolment": store.needs_reenrolment,
+        "model_path": str(model_path),
+        "model_present": model_present,
+        "model_checksum_matches": checksum_matches,
+        "available": available,
+        "detail": detail,
+        "provider": SPEAKER_CPU_PROVIDER,
+        "resident": resident,
+        "resident_detail": resident_detail,
+        "unload_after_idle_s": config.unload_after_idle_s,
+    }
+
+
+def speaker_recognition_failure(
+    config: MurmlyConfig,
+    residency: tuple[bool | None, str | None],
+    error: BaseException,
+) -> dict[str, object]:
+    """The section when the probe itself failed: the same keys, and why.
+
+    What the configuration says survives, as does the daemon's answer, which was
+    taken before the probe ran.
+    """
+    resident, resident_detail = residency
+    return {
+        "mode": config.speaker_mode,
+        "mode_rejected_value": config.speaker_mode_rejected_value,
+        "match_threshold": config.speaker_match_threshold_percent,
+        "match_threshold_rejected_value": config.speaker_match_threshold_rejected_value,
+        "owner": config.speaker_owner or None,
+        "owner_enrolled": None,
+        "enrolled_count": None,
+        "enrolled_names": None,
+        "voiceprints_path": None,
+        "voiceprints_need_reenrolment": None,
+        "model_path": None,
+        "model_present": None,
+        "model_checksum_matches": None,
+        "available": False,
+        "detail": f"Unable to check speaker recognition: {error}",
+        "provider": SPEAKER_CPU_PROVIDER,
+        "resident": resident,
+        "resident_detail": resident_detail,
+        "unload_after_idle_s": config.unload_after_idle_s,
+    }
+
+
+def _speaker_model_state(model_path: Path) -> tuple[bool, bool | None, str | None]:
+    """Whether the model file is there, whether it is the pinned one, and why not.
+
+    The reason is worded as the daemon words its warnings. `None` for the
+    checksum when there is no file to hash.
+    """
+    if not model_path.is_file():
+        return False, None, f"the speaker model is missing: {model_path}"
+    digest = hashlib.sha256()
+    try:
+        with open(model_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError as error:
+        return True, None, f"the speaker model cannot be read: {model_path}: {error}"
+    if digest.hexdigest() != SPEAKER_MODEL_SHA256:
+        return True, False, (
+            f"the speaker model does not match the expected checksum: {model_path}. "
+            "Download it again with the setup script."
+        )
+    return True, True, None
+
+
+def _speaker_availability(
+    mode: str,
+    model_problem: str | None,
+    store: VoiceprintStore,
+    owner: str | None,
+    owner_enrolled: bool | None,
+) -> tuple[bool, str | None]:
+    """Whether the daemon could use the mode, and the reason when it could not.
+
+    The same checks, in the same order and terms, as the daemon's warning at
+    capture start. The checksum is stricter than the daemon's, which trusts the
+    setup scripts' check.
+    """
+    if mode == "off":
+        return False, "the speaker mode is off"
+    if model_problem is not None:
+        return False, model_problem
+    if mode == "mine-only" and not owner_enrolled:
+        if store.needs_reenrolment:
+            return False, (
+                "the enrolled voices were made with a different speaker model and "
+                "must be enrolled again"
+            )
+        if store.detail:
+            return False, f"mine-only needs an enrolled owner, and {store.detail}"
+        if owner is None:
+            return False, "mine-only needs an enrolled owner, and no owner is set"
+        return False, f'mine-only needs an enrolled owner, and "{owner}" is not enrolled'
+    if store.needs_reenrolment:
+        return True, (
+            "voices made with a different speaker model are ignored; "
+            "enrol those voices again"
+        )
+    if store.detail:
+        return True, store.detail
+    return True, None
 
 
 def speech_output_diagnostics(
