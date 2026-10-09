@@ -16,8 +16,8 @@ import struct
 import threading
 import time
 
-from murmly.audio import SoundDeviceRecorder
-from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, is_quiet_at
+from murmly.audio import SoundDeviceRecorder, capture_as_mono_float32
+from murmly.config import WINDOWS_PIPE_NAME, MurmlyConfig, default_data_dir, is_quiet_at
 from murmly.focus import (
     FocusObserver,
     WindowIdentity,
@@ -42,6 +42,15 @@ from murmly.platform import (
     resolve_platform,
 )
 from murmly.silence import SilenceDetector
+from murmly.speakers import (
+    SAMPLE_RATE_HZ as SPEAKER_SAMPLE_RATE_HZ,
+    SPEAKER_MODEL_FILENAME,
+    SpeakerEmbedder,
+    SpeakerState,
+    Voice,
+    find_voice,
+    speaker_text,
+)
 from murmly.speech import (
     EVENT_INTERRUPTED,
     EVENT_SHUTTING_DOWN,
@@ -51,6 +60,7 @@ from murmly.speech import (
     SpeechSuspendError,
 )
 from murmly.stt import FasterWhisperTranscriber
+from murmly.voiceprints import VoiceprintStore
 from murmly.win_pipe import is_pipe_name
 
 
@@ -522,6 +532,38 @@ class ProcessingResult:
     detail: str | None = None
 
 
+class _EmbedderBuild:
+    """One capture's background build of the speaker model.
+
+    Started when capture starts and never awaited there. Attribution waits on it
+    only once the segments are ready, and a build that failed means that capture
+    is delivered as with the mode off, after the one warning logged here.
+    """
+
+    def __init__(self, embedder: SpeakerEmbedder) -> None:
+        self._embedder = embedder
+        self._failed = False
+        self._thread = threading.Thread(target=self._run, name="murmly-speaker-build", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def succeeded(self) -> bool:
+        """Wait for the build, and report whether the model is there to use."""
+        self._thread.join()
+        return not self._failed
+
+    def _run(self) -> None:
+        try:
+            self._embedder.load()
+        except Exception as error:  # noqa: BLE001 - a failed build is a warning, not a failed capture
+            self._failed = True
+            logger.warning(
+                "Speaker recognition disabled for this capture: the speaker model could not be loaded: %s",
+                error,
+            )
+
+
 class SpeechSession:
     def __init__(
         self,
@@ -554,6 +596,18 @@ class SpeechSession:
         self._live_stop = threading.Event()
         self._live_threads: list[threading.Thread] = []
         self._delivery_lock = threading.Lock()
+        # Nothing below exists until a capture starts in a speaker mode: the
+        # voiceprint file is not read, and no embedder is built, in mode `off`,
+        # at daemon start, or to answer `status`.
+        self._speaker_store: VoiceprintStore | None = None
+        self._speaker_embedder: SpeakerEmbedder | None = None
+        self._speaker_state = SpeakerState()
+        self._speaker_voices: list[Voice] = []
+        self._speaker_ready = False
+        self._speaker_build: _EmbedderBuild | None = None
+        # Held across one attribution, so an idle release never lands between
+        # two parts of it. The embedder's own use lock only covers one inference.
+        self._attribution_lock = threading.Lock()
 
     @property
     def focus_observer(self) -> FocusObserver:
@@ -574,6 +628,9 @@ class SpeechSession:
             except Exception as stop_error:
                 logger.warning("Unable to close capture after a failed start: %s", stop_error)
             raise
+        # Outside the handler above, which closes the stream on any error: a
+        # speaker problem must never cost the capture.
+        self._prepare_speakers()
 
     def stop_recording(self) -> bytes:
         # Refuse new passes first: a tick already past its wait would otherwise
@@ -619,8 +676,32 @@ class SpeechSession:
         built, one already released, and a runtime that cannot be asked all the
         same way, and it waits for a pass in flight rather than interrupting
         one -- so a countdown that expires mid-transcription is late, not wrong.
+
+        The speaker model, if a speaker mode ever built one, goes with it, so it
+        follows the same period, and waits for an attribution in progress.
         """
-        self._transcriber.release()
+        try:
+            self._transcriber.release()
+        finally:
+            self._release_speaker_model()
+
+    @property
+    def speaker_model_resident(self) -> bool:
+        """Whether the speaker model is held right now, asked without loading or locking.
+
+        A model that was never created, in mode `off` or before the first capture
+        in a speaker mode, is not held.
+        """
+        embedder = self._speaker_embedder
+        return embedder is not None and bool(embedder.resident)
+
+    def _release_speaker_model(self) -> None:
+        """Release the speaker model with the transcription model, after any attribution."""
+        embedder = self._speaker_embedder
+        if embedder is None:
+            return
+        with self._attribution_lock:
+            embedder.release()
 
     def take_segment(self) -> bytes:
         """Close the current segment and start speech tracking over for the next."""
@@ -637,7 +718,7 @@ class SpeechSession:
         pcm_audio: bytes,
         target: WindowIdentity | None = None,
     ) -> ProcessingResult:
-        text = self._transcriber.transcribe_pcm16(pcm_audio, self._recorder.sample_rate_hz)
+        text = self._transcribe_final(pcm_audio)
         if not text:
             return ProcessingResult(text=text, state="DONE")
         # Held across delivery because clipboard restoration runs inside
@@ -674,7 +755,7 @@ class SpeechSession:
         person still said the words, but the destination they chose no longer
         exists and Murmly must not substitute one for it.
         """
-        text = self._transcriber.transcribe_pcm16(pcm_audio, self._recorder.sample_rate_hz)
+        text = self._transcribe_final(pcm_audio)
         if not text:
             return ProcessingResult(text=text, state="DONE")
         if deliver(text):
@@ -688,6 +769,116 @@ class SpeechSession:
             delivered=False,
             detail="No speech session to deliver to. Transcript copied to the clipboard.",
         )
+
+    def _transcribe_final(self, pcm_audio: bytes) -> str:
+        """The transcript to deliver, with the speaker mode applied.
+
+        The one place both delivery paths get their text from. In mode `off`, or
+        when the mode cannot run for this capture, this is `transcribe_pcm16`
+        and nothing else. Otherwise the decode is kept as timed parts and each is
+        attributed. An empty string means mine-only dropped everything, which the
+        callers already treat as a transcription that yielded no text; a failure
+        in attribution (not in the decode) returns the plain text instead.
+        """
+        rate = self._recorder.sample_rate_hz
+        if self._config.speaker_mode == "off" or not self._speaker_ready:
+            return self._transcriber.transcribe_pcm16(pcm_audio, rate)
+        parts = self._transcriber.transcribe_segments_pcm16(pcm_audio, rate)
+        plain = " ".join(part.text for part in parts).strip()
+        try:
+            with self._attribution_lock:
+                text = self._attributed_text(parts, pcm_audio, rate)
+        except Exception as error:  # noqa: BLE001 - the transcript is delivered regardless
+            # The class only: a message could carry a name or the words.
+            logger.warning(
+                "Speaker attribution failed; delivering the transcript as with the mode off: %s",
+                type(error).__name__,
+            )
+            return plain
+        # `is None`, not falsiness: "" is mine-only dropping every part.
+        return plain if text is None else text
+
+    def _attributed_text(self, parts, pcm_audio: bytes, rate: int) -> str | None:
+        build = self._speaker_build
+        if build is not None and not build.succeeded():
+            return None
+        channels = max(self._config.channels, 1)
+        frame_bytes = 2 * channels
+        frames = len(pcm_audio) // frame_bytes
+
+        def audio_for(part):
+            first = min(max(round(part.start_s * rate), 0), frames)
+            last = min(max(round(part.end_s * rate), first), frames)
+            return capture_as_mono_float32(
+                pcm_audio[first * frame_bytes : last * frame_bytes],
+                rate,
+                channels,
+                SPEAKER_SAMPLE_RATE_HZ,
+            )
+
+        return speaker_text(
+            parts,
+            audio_for,
+            mode=self._config.speaker_mode,
+            voices=self._speaker_voices,
+            owner=self._config.speaker_owner,
+            embedder=self._speaker_embedder,
+            state=self._speaker_state,
+            threshold_percent=self._config.speaker_match_threshold_percent,
+        )
+
+    def _prepare_speakers(self) -> None:
+        """Get a capture session ready for its speaker mode. Never raises.
+
+        Runs once per capture session; a continuous session's segments come from
+        `take_segment` and do not come through here, so unknown voices keep their
+        numbers until the toggle that ends the session.
+        """
+        self._speaker_ready = False
+        self._speaker_build = None
+        if self._config.speaker_mode == "off":
+            return
+        self._speaker_state.reset()
+        try:
+            reason = self._speakers_unavailable_reason()
+            if reason is not None:
+                # The reason only, never text or a name, like the silence detector's.
+                logger.warning("Speaker recognition disabled for this capture: %s", reason)
+                return
+            embedder = self._speaker_embedder
+            if not embedder.resident:
+                build = _EmbedderBuild(embedder)
+                build.start()
+                self._speaker_build = build
+            self._speaker_ready = True
+        except Exception as error:  # noqa: BLE001 - capture goes ahead without the mode
+            logger.warning(
+                "Speaker recognition disabled for this capture: %s", type(error).__name__
+            )
+
+    def _speakers_unavailable_reason(self) -> str | None:
+        """Why the selected mode cannot run for this capture, or None when it can.
+
+        Reloads the voiceprints if the file changed, so a voice enrolled or
+        removed since the last capture is seen by this one.
+        """
+        data_dir = default_data_dir()
+        model_path = data_dir / SPEAKER_MODEL_FILENAME
+        if not model_path.is_file():
+            return f"the speaker model is missing: {model_path}"
+        if self._speaker_store is None:
+            self._speaker_store = VoiceprintStore(data_dir)
+        self._speaker_store.refresh()
+        self._speaker_voices = self._speaker_store.voices
+        if self._config.speaker_mode == "mine-only" and find_voice(
+            self._speaker_voices, self._config.speaker_owner
+        ) is None:
+            if self._speaker_store.needs_reenrolment:
+                return "the enrolled voices were made with a different speaker model and must be enrolled again"
+            return "no owner is enrolled"
+        if self._speaker_embedder is None:
+            self._speaker_embedder = SpeakerEmbedder(model_path)
+        return None
 
     def _create_silence_detector(self) -> SilenceDetector | None:
         if self._config.auto_transcribe == "off":
@@ -2148,6 +2339,16 @@ class MurmlyDaemon:
             residency["model_resident"] = None
             residency["model_resident_detail"] = (
                 f"Unable to determine transcription residency: {error}"
+            )
+        # Always present, False for a model that was never created: the daemon
+        # answered, so "not held" is known. Absent would read to `murmly doctor`
+        # as a daemon too old to be asked.
+        try:
+            residency["speaker_model_resident"] = bool(self._session.speaker_model_resident)
+        except Exception as error:  # noqa: BLE001 - status still owes an answer
+            residency["speaker_model_resident"] = None
+            residency["speaker_model_resident_detail"] = (
+                f"Unable to determine speaker model residency: {error}"
             )
         try:
             synthesizer = self._speech.synthesizer

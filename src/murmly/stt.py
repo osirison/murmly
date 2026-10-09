@@ -14,6 +14,7 @@ import wave
 from murmly.config import MurmlyConfig
 from murmly.idle import return_free_heap
 from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
+from murmly.speakers import TimedText
 
 
 logger = logging.getLogger(__name__)
@@ -340,6 +341,19 @@ class FasterWhisperTranscriber:
             return ""
         return self._transcribe(pcm_audio, sample_rate_hz)
 
+    def transcribe_segments_pcm16(
+        self, pcm_audio: bytes, sample_rate_hz: int | None = None
+    ) -> list[TimedText]:
+        """The same decode as `transcribe_pcm16`, kept as Whisper's timed segments.
+
+        Times are seconds from the start of the audio handed in, whatever the
+        capture rate. Joining the texts with a space and stripping gives exactly
+        what `transcribe_pcm16` returns for the same decode.
+        """
+        if not pcm_audio or not any(pcm_audio):
+            return []
+        return self._transcribe(pcm_audio, sample_rate_hz, timed=True)
+
     def transcribe_partial(self, pcm_audio: bytes, sample_rate_hz: int | None = None) -> str | None:
         """Transcribe captured audio for display only.
 
@@ -375,8 +389,10 @@ class FasterWhisperTranscriber:
         sample_rate_hz: int | None,
         *,
         allow_array: bool = False,
-    ) -> str:
+        timed: bool = False,
+    ) -> str | list[TimedText]:
         model = self._load_model()
+        decode = self._decode_timed if timed else self._decode
         rate = sample_rate_hz or self._config.sample_rate_hz
         # Mono 16 kHz only: the array path has no de-interleaving, and handing
         # Whisper interleaved stereo would show nonsense in the panel while the
@@ -390,7 +406,7 @@ class FasterWhisperTranscriber:
         if audio is not None:
             with self._model_lock:
                 self._ensure_resident_locked(model)
-                return self._decode(model, audio)
+                return decode(model, audio)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
             wav_path = Path(handle.name)
@@ -401,18 +417,33 @@ class FasterWhisperTranscriber:
                 # that skipped it would fail inside CTranslate2 on an evicted
                 # model, and only for the audio shape that reaches that site.
                 self._ensure_resident_locked(model)
-                return self._decode(model, str(wav_path))
+                return decode(model, str(wav_path))
         finally:
             wav_path.unlink(missing_ok=True)
 
     def _decode(self, model, audio) -> str:
+        return " ".join(segment.text.strip() for segment in self._segments(model, audio)).strip()
+
+    def _decode_timed(self, model, audio) -> list[TimedText]:
+        return [
+            TimedText(segment.start, segment.end, segment.text.strip())
+            for segment in self._segments(model, audio)
+        ]
+
+    def _segments(self, model, audio) -> list:
+        """The one decode both entry points share.
+
+        Listed here, while `_model_lock` is held: faster-whisper decodes as the
+        generator is iterated, so handing the generator back would let an idle
+        release take the weights away part-way through.
+        """
         segments, _info = model.transcribe(
             audio,
             language="en",
             beam_size=self._config.beam_size,
             vad_filter=self._config.vad_filter,
         )
-        return " ".join(segment.text.strip() for segment in segments).strip()
+        return list(segments)
 
     @staticmethod
     def _as_array(pcm_audio: bytes):

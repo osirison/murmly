@@ -217,6 +217,14 @@ class SpeakerEmbedder:
         """The provider the session reports, or None while none exists."""
         return self._provider
 
+    def load(self) -> None:
+        """Build the session now if there is none, so the next `embed` finds it.
+
+        The daemon calls this on a background thread when capture starts. It
+        raises what the build raises; a session that already exists is left alone.
+        """
+        self._load()
+
     def embed(self, samples):
         """The L2-normalised embedding of 16 kHz mono float32 audio.
 

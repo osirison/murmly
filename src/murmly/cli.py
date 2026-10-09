@@ -21,8 +21,8 @@ from datetime import datetime
 from murmly.audio import (
     SoundDeviceRecorder,
     SoundDevicePlayer,
+    capture_as_mono_float32,
     disable_portaudio_exit_teardown,
-    resample_float32,
 )
 from murmly.config import (
     WINDOWS_PIPE_NAME,
@@ -753,14 +753,7 @@ def _enrol_speech_regions(audio) -> list[tuple[int, int]]:
 
 def _capture_as_speaker_audio(clip: bytes, sample_rate_hz: int, channels: int):
     """Interleaved 16-bit PCM at the capture rate, as 16 kHz mono float32."""
-    import numpy as np
-
-    channels = max(channels, 1)
-    usable = len(clip) - (len(clip) % (2 * channels))
-    samples = np.frombuffer(clip[:usable], dtype="<i2").astype(np.float32) / 32_768.0
-    if channels > 1:
-        samples = samples.reshape(-1, channels).mean(axis=1)
-    return resample_float32(samples, sample_rate_hz, SPEAKER_SAMPLE_RATE_HZ)
+    return capture_as_mono_float32(clip, sample_rate_hz, channels, SPEAKER_SAMPLE_RATE_HZ)
 
 
 def _voiceprint_from_speech(audio, regions, embedder):

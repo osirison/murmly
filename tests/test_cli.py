@@ -3433,6 +3433,7 @@ class StubDaemonSession:
 
     def __init__(self, *, model_resident: bool = False) -> None:
         self.model_resident = model_resident
+        self.speaker_model_resident = False
 
     def capture_delivery_target(self):
         return None

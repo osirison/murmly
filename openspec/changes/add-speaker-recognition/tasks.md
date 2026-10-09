@@ -123,10 +123,10 @@ description: Track verification, implementation and validation of voice enrolmen
 
 ## 7. Daemon integration
 
-- [ ] 7.1 Add `transcribe_segments_pcm16` to `FasterWhisperTranscriber`, returning timed parts from the same decode. Done when a fake-model test shows `transcribe_pcm16` output is byte-identical before and after the change.
-- [ ] 7.2 Add one `SpeechSession` helper, used by `process_recording` and `process_for_session` before their empty-text check. With `off` it calls `transcribe_pcm16` unchanged. Otherwise it slices each part's PCM, converts it to 16 kHz mono with `resample_float32`, attributes and formats. Done when 7.6 passes.
-- [ ] 7.3 Catch any attribution error inside the helper, log it without text, and return the plain joined text. Done when a test with a raising embedder shows the transcript delivered and a continuous session still listening.
-- [ ] 7.4 In `start_recording`, when a speaker mode is set:
+- [x] 7.1 Add `transcribe_segments_pcm16` to `FasterWhisperTranscriber`, returning timed parts from the same decode. Done when a fake-model test shows `transcribe_pcm16` output is byte-identical before and after the change.
+- [x] 7.2 Add one `SpeechSession` helper, used by `process_recording` and `process_for_session` before their empty-text check. With `off` it calls `transcribe_pcm16` unchanged. Otherwise it slices each part's PCM, converts it to 16 kHz mono with `resample_float32`, attributes and formats. Done when 7.6 passes.
+- [x] 7.3 Catch any attribution error inside the helper, log it without text, and return the plain joined text. Done when a test with a raising embedder shows the transcript delivered and a continuous session still listening.
+- [x] 7.4 In `start_recording`, when a speaker mode is set:
   - reset the unknown-voice state;
   - reload voiceprints if they changed;
   - decide whether the mode can run (an owner for mine-only, the model present);
@@ -135,7 +135,7 @@ description: Track verification, implementation and validation of voice enrolmen
 
   Done when a test with a slow fake build shows capture starting immediately.
 - [ ] 7.5 Measure the added time between capture stop and delivery, per minute of speech, on this machine's CPU. Done when the figure is recorded in `design.md`. If it is above 500 ms per minute, revisit the approach before continuing.
-- [ ] 7.6 Add daemon tests with a fake transcriber that returns timed parts and a fake embedder. Cover:
+- [x] 7.6 Add daemon tests with a fake transcriber that returns timed parts and a fake embedder. Cover:
   - `off` byte-identical, with no store read and no embedder built;
   - mine-only through toggle, stop mode and continuous mode;
   - a dropped continuous segment: the session keeps listening, the segment is not counted, and no failure is signalled;
@@ -149,9 +149,9 @@ description: Track verification, implementation and validation of voice enrolmen
 
 ## 8. Residency and status
 
-- [ ] 8.1 Release the embedder from the transcription `IdleRelease` callback, so it follows `stt.unload_after_idle_s`, including 0, and never releases while the use lock is held. Done when 8.3 passes.
-- [ ] 8.2 Add `speaker_model_resident`, and `speaker_model_resident_detail` on error, to the daemon's `_residency`, read without loading or locking. Done when a test shows `status` neither builds the embedder nor waits on its locks.
-- [ ] 8.3 Add tests covering:
+- [x] 8.1 Release the embedder from the transcription `IdleRelease` callback, so it follows `stt.unload_after_idle_s`, including 0, and never releases while the use lock is held. Done when 8.3 passes.
+- [x] 8.2 Add `speaker_model_resident`, and `speaker_model_resident_detail` on error, to the daemon's `_residency`, read without loading or locking. Done when a test shows `status` neither builds the embedder nor waits on its locks.
+- [x] 8.3 Add tests covering:
   - release together with the transcription model, and no release when the period is 0;
   - no release during attribution;
   - a rebuild at the next capture;
