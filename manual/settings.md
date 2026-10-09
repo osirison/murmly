@@ -314,7 +314,8 @@ Not set by default; commented out in the example. Its own default is
 ## `[speakers]` — whose voice murmly types
 
 Voices are enrolled once by name, with `murmly enrol <name>`. This section says
-what murmly does with them.
+what murmly does with them. For the steps from nothing to working, see
+[typing only your own voice](typing-only-your-own-voice.md).
 
 ### `speakers.mode` { #speakers-mode }
 
@@ -328,6 +329,7 @@ Default `"off"`. Permitted words: `off | mine-only | label-everyone`.
   the owner, the enrolled name for other enrolled people, and `Speaker 1:`,
   `Speaker 2:` for voices that are not enrolled, in the order they first speak.
 
+See [setting it up](typing-only-your-own-voice.md#configure).
 A word that is not one of these falls back to `"off"`.
 [`murmly doctor`](troubleshooting.md) reports the word you wrote and the one in
 use. When the mode cannot run, murmly types everything as `off` would, writes a
