@@ -99,11 +99,11 @@ description: Track verification, implementation and validation of voice enrolmen
 
 ## 6. Enrolment and voice commands
 
-- [ ] 6.1 Add `murmly enrol <name> [--seconds N]` to `build_parser` and `_dispatch`. It validates the name, checks the model file, then asks the daemon for `status`. It proceeds when no daemon answers or the daemon reports `IDLE`, and refuses `LISTENING`, `THINKING` and `SPEAKING`. Done when 6.8 covers each branch.
-- [ ] 6.2 Record in the CLI process as `_run_spike` does, print a passage to read aloud, and keep the audio in memory only. Done when a test with a fake recorder shows no file other than the voiceprint store is created.
-- [ ] 6.3 Measure the sample's speech with the Silero VAD that faster-whisper ships. Below the minimum, refuse with "too little speech" and store nothing. Otherwise, embed the speech in windows, average, L2-normalise and store. Done when tests cover a silent sample, a short sample and an accepted sample.
-- [ ] 6.4 Report the stored path, how to remove the voice, and whether an existing voiceprint was replaced. When no owner is configured, also print the `[speakers] owner` line to add. Done when tests assert each message.
-- [ ] 6.5 Add three commands, none of which prints a vector:
+- [x] 6.1 Add `murmly enrol <name> [--seconds N]` to `build_parser` and `_dispatch`. It validates the name, checks the model file, then asks the daemon for `status`. It proceeds when no daemon answers or the daemon reports `IDLE`, and refuses `LISTENING`, `THINKING` and `SPEAKING`. Done when 6.8 covers each branch.
+- [x] 6.2 Record in the CLI process as `_run_spike` does, print a passage to read aloud, and keep the audio in memory only. Done when a test with a fake recorder shows no file other than the voiceprint store is created.
+- [x] 6.3 Measure the sample's speech with the Silero VAD that faster-whisper ships. Below the minimum, refuse with "too little speech" and store nothing. Otherwise, embed the speech in windows, average, L2-normalise and store. Done when tests cover a silent sample, a short sample and an accepted sample.
+- [x] 6.4 Report the stored path, how to remove the voice, and whether an existing voiceprint was replaced. When no owner is configured, also print the `[speakers] owner` line to add. Done when tests assert each message.
+- [x] 6.5 Add three commands, none of which prints a vector:
   - `murmly speakers list`, which prints names and marks the owner;
   - `murmly speakers remove <name>`;
   - `murmly speakers remove --all`.
@@ -111,7 +111,7 @@ description: Track verification, implementation and validation of voice enrolmen
   A name that is not enrolled exits non-zero. Done when tests cover list, remove, remove-all and an unknown name.
 - [ ] 6.6 Check the enrolment process's exit against `docs/agent-notes/portaudio-jack-exit-abort.md`, and apply the exit handling it calls for, if any. Done when a real enrolment on PipeWire leaves no core dump in `coredumpctl`.
 - [ ] 6.7 Measure, on real voices, the enrolment length and the minimum speech needed to reach the threshold from 4.7. Done when the measured values are recorded in `design.md` and set as the defaults.
-- [ ] 6.8 Add `tests/test_cli_speakers.py` with a fake recorder, a fake VAD and a fake embedder. Cover:
+- [x] 6.8 Add `tests/test_cli_speakers.py` with a fake recorder, a fake VAD and a fake embedder. Cover:
   - a busy daemon refused, and no daemon proceeding;
   - a silent sample refused;
   - a missing model refused before recording;
