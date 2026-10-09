@@ -109,7 +109,7 @@ description: Track verification, implementation and validation of voice enrolmen
   - `murmly speakers remove --all`.
 
   A name that is not enrolled exits non-zero. Done when tests cover list, remove, remove-all and an unknown name.
-- [ ] 6.6 Check the enrolment process's exit against `docs/agent-notes/portaudio-jack-exit-abort.md`, and apply the exit handling it calls for, if any. Done when a real enrolment on PipeWire leaves no core dump in `coredumpctl`.
+- [x] 6.6 Check the enrolment process's exit against `docs/agent-notes/portaudio-jack-exit-abort.md`, and apply the exit handling it calls for, if any. Done when a real enrolment on PipeWire leaves no core dump in `coredumpctl`.
 - [ ] 6.7 Measure, on real voices, the enrolment length and the minimum speech needed to reach the threshold from 4.7. Done when the measured values are recorded in `design.md` and set as the defaults.
 - [x] 6.8 Add `tests/test_cli_speakers.py` with a fake recorder, a fake VAD and a fake embedder. Cover:
   - a busy daemon refused, and no daemon proceeding;
@@ -183,5 +183,5 @@ description: Track verification, implementation and validation of voice enrolmen
 
   Register the page in the `mkdocs.yml` nav. Done when the manual builds as `docs/agent-notes/building-the-manual.md` describes and the page appears in the nav.
 - [x] 9.4 Update `manual/where-your-words-go.md`. Say that a voiceprint is stored and never the audio, where it is stored, that only the user can read it, and that it stays on the machine. Cover the list and remove commands, that uninstalling leaves voiceprints in place, and asking before enrolling someone else. Done when the manual builds as `docs/agent-notes/building-the-manual.md` describes.
-- [ ] 9.5 Record a field note under `docs/agent-notes/` if wheel inspection, the model fetch, the GPU-swap resync, or the enrolment exit turned up an undocumented precondition. Done when each such precondition has a note, or none was found.
+- [x] 9.5 Record a field note under `docs/agent-notes/` if wheel inspection, the model fetch, the GPU-swap resync, or the enrolment exit turned up an undocumented precondition. Done when each such precondition has a note, or none was found.
 - [ ] 9.6 Run `openspec validate --all --strict` and `uv run --no-sync python -m unittest discover -s tests`, then use mine-only and label-everyone end to end in a live desktop session. Use toggle and continuous modes, a second enrolled voice, and a television. Done when both commands pass and the live session behaves as the spec's scenarios state.
