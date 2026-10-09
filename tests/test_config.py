@@ -837,7 +837,7 @@ class SpeakerSettingsTests(unittest.TestCase):
         self.assertIsNone(config.speaker_mode_rejected_value)
         self.assertEqual("", config.speaker_owner)
         self.assertEqual(DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT, config.speaker_match_threshold_percent)
-        self.assertEqual(50, config.speaker_match_threshold_percent)
+        self.assertEqual(30, config.speaker_match_threshold_percent)
         self.assertIsNone(config.speaker_match_threshold_rejected_value)
 
     def test_the_valid_modes_are_exactly_the_three(self) -> None:
@@ -890,19 +890,19 @@ class SpeakerSettingsTests(unittest.TestCase):
         ):
             with self.subTest(percent=percent):
                 config = self._load(f"[speakers]\nmatch_threshold = {percent}\n")
-                self.assertEqual(50, config.speaker_match_threshold_percent)
+                self.assertEqual(30, config.speaker_match_threshold_percent)
                 self.assertEqual(percent, config.speaker_match_threshold_rejected_value)
 
     def test_a_fractional_threshold_is_rejected_and_reported_not_truncated(self) -> None:
         config = self._load("[speakers]\nmatch_threshold = 0.55\n")
 
-        self.assertEqual(50, config.speaker_match_threshold_percent)
+        self.assertEqual(30, config.speaker_match_threshold_percent)
         self.assertEqual(0.55, config.speaker_match_threshold_rejected_value)
 
     def test_a_non_numeric_threshold_never_raises(self) -> None:
         config = self._load('[speakers]\nmatch_threshold = "high"\n')
 
-        self.assertEqual(50, config.speaker_match_threshold_percent)
+        self.assertEqual(30, config.speaker_match_threshold_percent)
         self.assertEqual("high", config.speaker_match_threshold_rejected_value)
 
     def test_a_speakers_entry_that_is_not_a_table_is_ignored(self) -> None:

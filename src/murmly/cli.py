@@ -114,13 +114,14 @@ DAEMON_POLL_INTERVAL_SECONDS = 0.1
 #: Subcommands whose daemon-side name differs from the one argparse takes.
 DAEMON_COMMANDS = {"toggle-session": "toggle_session"}
 
-#: How long `murmly enrol` records by default. A placeholder until task 6.7
-#: measures it on real voices.
+#: How long `murmly enrol` records by default: the measured need is 5 s of
+#: speech (about 7 s recorded), and twice that is kept for other days and
+#: voice conditions (design.md, task 6.7).
 ENROL_SECONDS = 20.0
 #: The longest `--seconds` accepted. The whole recording is held in memory.
 ENROL_MAX_SECONDS = 120.0
 #: The least speech, found by the voice activity model, that enrolment accepts.
-#: A placeholder until task 6.7 measures it.
+#: Twice the 5 s that met both targets in the measurement (task 6.7).
 ENROL_MIN_SPEECH_SECONDS = 10.0
 #: The speech is embedded in windows this long and the embeddings averaged. A
 #: few seconds is what the model was trained on, and averaging several windows

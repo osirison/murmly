@@ -122,7 +122,15 @@ murmly speakers list
 - **Short parts are weak evidence.** A part shorter than one second is not
   checked. It goes to the speaker of the nearest longer part. Voices are also
   harder to match over a second or two, so in `mine-only` some of your own words
-  may be left out. If that happens, lower the threshold.
+  may be left out. The default threshold is already the lowest allowed.
+- **Very short replies in a conversation.** A reply of a word or two, such as
+  "yes" or "three", is too short to check, so it takes the speaker of the part
+  next to it. If someone else spoke just before, your "yes" counts as theirs and
+  `mine-only` leaves it out. Said on its own, the same word is kept.
+- **One person can get two numbers.** In `label-everyone`, if someone you have
+  not enrolled says something very short, murmly may not recognise them and
+  start a new `Speaker` number for it. The same person then appears as two
+  speakers.
 - **It fails open.** See above: when a mode cannot run, murmly types everything.
 - **It is not a lock.** `mine-only` does not check who is there. A recording of
   your voice, played near the microphone, passes as you. Do not use it to keep

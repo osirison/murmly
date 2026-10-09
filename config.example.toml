@@ -204,5 +204,7 @@ owner = ""
 # integer percent, 30-90. Higher is stricter: fewer strangers pass, and more of
 # your own words may be dropped in mine-only. A fraction such as 0.55 is not an
 # integer; it falls back to the default and `murmly doctor` reports it. The
-# default is a starting point, not a measured value.
-match_threshold = 50
+# default of 30 was measured: in testing your voice usually scored 60-70, and
+# other voices stayed under 15. Raise it to be stricter (fewer strangers pass,
+# more of your own words may be dropped); lowering below 30 is not allowed.
+match_threshold = 30

@@ -149,9 +149,10 @@ DEFAULT_SPEAKER_MODE = "off"
 # The similarity, as an integer percent, at which a voice counts as an enrolled
 # one. An integer for the reason `[tts] rate` is: the existing helpers read
 # integers, and `0.55` then reads as 0, falls back and is reported rather than
-# being silently truncated. The default is a placeholder until it is measured on
-# real voices (the change's design.md, task 4.7).
-DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT = 50
+# being silently truncated. 30 is the highest value that kept every one of the
+# owner's parts and let no other voice through in the recordings measured for
+# the change's design.md (task 4.7).
+DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT = 30
 MIN_SPEAKER_MATCH_THRESHOLD_PERCENT = 30
 MAX_SPEAKER_MATCH_THRESHOLD_PERCENT = 90
 

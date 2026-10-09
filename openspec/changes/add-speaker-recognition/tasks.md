@@ -71,7 +71,7 @@ description: Track verification, implementation and validation of voice enrolmen
   - equal to "You" or "Speaker N" in any letter case.
 
   Done when each rejected form has a test.
-- [ ] 4.7 Measure on real recordings:
+- [x] 4.7 Measure on real recordings:
   - the owner alone;
   - the owner with another person;
   - the owner with a television;
@@ -110,7 +110,7 @@ description: Track verification, implementation and validation of voice enrolmen
 
   A name that is not enrolled exits non-zero. Done when tests cover list, remove, remove-all and an unknown name.
 - [x] 6.6 Check the enrolment process's exit against `docs/agent-notes/portaudio-jack-exit-abort.md`, and apply the exit handling it calls for, if any. Done when a real enrolment on PipeWire leaves no core dump in `coredumpctl`.
-- [ ] 6.7 Measure, on real voices, the enrolment length and the minimum speech needed to reach the threshold from 4.7. Done when the measured values are recorded in `design.md` and set as the defaults.
+- [x] 6.7 Measure, on real voices, the enrolment length and the minimum speech needed to reach the threshold from 4.7. Done when the measured values are recorded in `design.md` and set as the defaults.
 - [x] 6.8 Add `tests/test_cli_speakers.py` with a fake recorder, a fake VAD and a fake embedder. Cover:
   - a busy daemon refused, and no daemon proceeding;
   - a silent sample refused;

@@ -61,8 +61,8 @@ CPU_PROVIDER = "CPUExecutionProvider"
 MODEL_INPUT_NAME = "feats"
 
 #: A part shorter than this is not embedded: the LM model is fine-tuned on about
-#: 6 s and similarities fall off steeply below 2 s. A placeholder until task 4.7
-#: measures it on real recordings.
+#: 6 s and similarities fall off steeply below 2 s. At 1 s both targets were met
+#: on real recordings, and at 0.5 s they were not (design.md, task 4.7).
 MIN_PART_SECONDS = 1.0
 
 #: The longest name an enrolled voice may have, and the labels Murmly reserves.

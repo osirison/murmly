@@ -595,7 +595,7 @@ class ParserTests(unittest.TestCase):
                     parser.parse_args(arguments)
                 self.assertEqual(2, raised.exception.code)
 
-    def test_enrol_defaults_to_the_placeholder_length(self) -> None:
+    def test_enrol_defaults_to_the_measured_length(self) -> None:
         args = build_parser().parse_args(["enrol", "Milo"])
 
         self.assertEqual(ENROL_SECONDS, args.seconds)

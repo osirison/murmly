@@ -89,7 +89,7 @@ quiet_hours = ""       # "HH:MM-HH:MM" local time; empty means speak at any hour
 [speakers]
 mode = "off"           # off | mine-only | label-everyone
 owner = ""             # The enrolled name that is you; empty means no owner
-match_threshold = 50   # How alike a voice must sound to count as an enrolled one, 30-90
+match_threshold = 30   # How alike a voice must sound to count as an enrolled one, 30-90
 ```
 
 ## `[daemon]` — the background service
@@ -341,14 +341,21 @@ and `label-everyone` labels no part `You:`.
 
 ### `speakers.match_threshold` { #speakers-match-threshold }
 
-Default `50`. Range `30-90`. How alike a voice must sound to an enrolled one to
+Default `30`. Range `30-90`. How alike a voice must sound to an enrolled one to
 count as that person, as a whole-number percent. Higher is stricter: fewer
 strangers pass, and more of your own words may be left out in `mine-only`.
+`30` is also the lowest value allowed.
+
+The default was measured. In testing, your own voice usually scored 60 to 70,
+and other voices, including a television, stayed under 15. At 30, none of your
+own parts of a second or longer were dropped and no one else's were kept. Raise
+it, for example to 50, if a voice that sounds like yours gets through. The
+higher it goes, the more of your own quieter or shorter words are dropped: at
+50, three of nine of your parts were dropped in testing.
 
 A fraction such as `0.55` is not a whole number, so it is not read as 55.
-Like any value outside the range, it falls back to `50`, and
-[`murmly doctor`](troubleshooting.md) reports what you wrote. The default is a
-starting point rather than a measured value.
+Like any value outside the range, it falls back to `30`, and
+[`murmly doctor`](troubleshooting.md) reports what you wrote.
 
 ## After you change something
 

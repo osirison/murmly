@@ -190,8 +190,8 @@ word alignment smears them: on a synthetic clip with 0.5 s between turns every
 word gap was 0.00 s. Quick back-and-forth still merges into one part. Only a
 pause of about 2 s or more splits.
 
-A segment with less audio than the minimum (a placeholder of 1.0 s, set by
-measurement in task 4.7) is not embedded. It takes its neighbour's speaker, as
+A segment with less audio than the minimum (1.0 s, confirmed by measurement in
+task 4.7) is not embedded. It takes its neighbour's speaker, as
 the spec requires. Continuous mode already cuts segments at a configured silence
 of 2 s by default, so most units contain one speaker's turn.
 
@@ -453,7 +453,8 @@ outputs: `https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34/resolve/f
 `9fea6516d7ad6bf0a76c7689f5a49b65d330fad6dde96c91bb4435ffbfe056a1`. Its
 repository is tagged `apache-2.0` with a 31-byte README, while WeSpeaker's
 documentation says CC BY 4.0. If the LM model's fine-tuning on long inputs hurts short parts in
-task 4.7, this one is the model to compare it with.
+task 4.7, this one is the model to compare it with. Task 4.7 found no problem
+at 1 s or longer, so this model was not compared.
 
 ### Filterbank features: a numpy implementation
 
@@ -583,10 +584,10 @@ daemon's memory at the next capture start, as the spec requires.
    When the daemon answers `IDLE`, enrolment proceeds. `LISTENING`, `THINKING`
    and `SPEAKING` are refused.
 
-It then prints a passage to read aloud and records for the placeholder default
+It then prints a passage to read aloud and records for the default
 of 20 s, in its own process as `spike` does. Silero VAD, the one `silence.py`
-loads from faster-whisper, measures the speech. Enrolment needs at least the
-placeholder minimum of 10 s of speech, otherwise it is refused and nothing is
+loads from faster-whisper, measures the speech. Enrolment needs at least
+10 s of speech (task 6.7), otherwise it is refused and nothing is
 stored. The speech regions are embedded in windows of a few seconds, and the
 average is L2-normalised to form the voiceprint. The command prints where the
 voiceprint is stored and how to remove it. When no owner is configured, it also
@@ -608,7 +609,7 @@ A new `[speakers]` table:
 | --- | --- | --- | --- |
 | `mode` | `off` \| `mine-only` \| `label-everyone` | `off` | unrecognised value falls back to `off`; `mode_rejected_value` recorded |
 | `owner` | string | empty, meaning no owner | none |
-| `match_threshold` | integer percent, 30–90 | placeholder 50, set by measurement in task 4.7 | `_bounded_int` and `_rejected_value` |
+| `match_threshold` | integer percent, 30–90 | 30, set by measurement in task 4.7 | `_bounded_int` and `_rejected_value` |
 
 The threshold is an integer percent, not a float. That is how `tts.rate` already
 works, and it reuses the existing helpers. A float such as `0.55` reads as 0,
@@ -673,8 +674,11 @@ Speech-session replies go through the same helper, through
 - **The owner's own words can be dropped.** A different microphone, a cold, or
   room noise can push the owner's similarity below the threshold, and mine-only
   then silently drops what they said. This is the costliest failure for the
-  mode. → The threshold is configurable with bounds, and its default is
-  measured on real voices (task 4.7). Short parts take a neighbour's speaker.
+  mode. → The threshold is configurable with bounds, and its default of
+  30 is measured on real voices (task 4.7): no part of a second or longer was
+  dropped in testing. Parts under 1 s take a neighbour's speaker, so the owner's
+  very short replies inside a conversation can still be dropped (see "Measured
+  results").
   The manual says to enrol with the microphone used every day, and to re-enrol
   after changing it.
 - **Two speakers inside one part are attributed as one.** Parts split at word
@@ -721,14 +725,14 @@ Speech-session replies go through the same helper, through
   Whisper resident and the machine loaded. The cause was not isolated. The first
   rough estimate of about 340 ms (random features, 30 calls of 2 s) was that
   unloaded figure and does not hold in use.
-- **Short parts may not match the owner at the placeholder threshold.** In the ad
-  hoc check under "Filterbank features", slices of 2 s from the same speaker
-  scored 0.49 and slices of 1 s scored 0.35, against different speakers below 0.
-  The placeholder threshold is 50, so in this one sample the owner would be
-  rejected on 1 to 2 s parts. This is one sample of two speakers, and it is
-  indicative only. The LM model is fine-tuned on inputs of about 6 s, which may
-  make this worse. → Task 4.7 sets the threshold and the minimum part length on
-  real recordings, and compares the non-LM model.
+- **Short parts may not match the owner at a high threshold.** In the ad hoc
+  check under "Filterbank features", slices of 2 s from the same speaker scored
+  0.49 and slices of 1 s scored 0.35, against different speakers below 0. At 50
+  the owner would have been rejected on those parts. → Task 4.7 measured it on
+  real recordings: the default threshold is 30, the minimum part length stays
+  1.0 s, and at 30 no owner part of 1 s or longer was rejected. Parts under 1 s
+  still score low (the owner's two such parts scored 0.27 and below), which is
+  why they take a neighbour's speaker rather than being checked.
 - **The model's training data has unclean terms.** The model is trained on
   VoxCeleb2, and the terms published for VoxCeleb disagree:
   - KAIST ([mm.kaist.ac.kr/datasets/voxceleb](https://mm.kaist.ac.kr/datasets/voxceleb/)):
@@ -778,6 +782,92 @@ identical session, and the daemon reads no voiceprint file. To roll back, set
 `mode = "off"`, run `murmly speakers remove --all`, and delete the model file
 from the data directory, or revert the change. Nothing else persists.
 
+## Measured results
+
+Tasks 4.7 and 6.7, measured on 2026-10-09 and 10 in one session. One person's
+daily microphone. Whisper large-v3-turbo on CUDA with the word-gap split, and
+ResNet34-LM on the CPU. Recordings: the owner reading (82 s), the owner
+dictating (67 s), one other person alone (40 s), a television alone (120 s), the
+owner with the television (48 s), and the owner and the other person taking turns
+(59 s).
+
+### Task 4.7: threshold and minimum part length
+
+Targets, fixed on 2026-10-09 before measuring: in mine-only, false-reject at
+most 5% (the owner's parts dropped) and false-accept at most 5% (other voices
+kept), on parts of 1 s or longer.
+
+Method: the owner's parts come from the dictation. The other voices' parts come
+from the other person alone and the television alone. Each part's similarity to
+the owner's voiceprint is compared with each threshold.
+
+| Threshold | Owner dropped (of 9) | Others kept (of 24) | Both targets |
+| --- | --- | --- | --- |
+| 30 and 35 | 0 | 0 | met |
+| 40 and 45 | 1 | 0 | missed |
+| 50 to 60 | 3 | 0 | missed |
+| 65 | 5 | 0 | missed |
+| 70 | 7 | 0 | missed |
+| 75 and up | 9 | 0 | missed |
+
+Other voices never got in at any threshold. Scores to the owner's voiceprint:
+the owner's median is 0.64 (lowest 0.27, a part under 1 s). The other person's
+highest is 0.08. The television's highest is 0.12.
+
+Labelled mixed recordings at 30%, parts of 1 s or longer:
+
+| Recording | Owner dropped | Others kept |
+| --- | --- | --- |
+| Owner with television | 0 of 2 | 0 of 1 |
+| Owner and other person taking turns | 0 of 5 | 0 of 7 |
+
+Every long part was attributed correctly.
+
+Decision: the default threshold is 30%, the middle of the passing range, which is
+30 to 35. The lowest allowed value is also 30, so a user cannot go lower.
+
+Minimum part length at 30%:
+
+| Minimum part | Owner dropped | Others kept |
+| --- | --- | --- |
+| 0.5 s | 1 of 10 (10%, missed) | 0 of 24 |
+| 1.0 s | 0 of 9 | 0 of 24 |
+
+`MIN_PART_SECONDS` stays 1.0 s. The non-LM model was not compared, because the
+LM model met the targets at 1 s.
+
+Weak spots, both with parts under 1 s, which are not checked and take a neighbour's
+speaker:
+
+- The owner's very short replies in a conversation ("Yes, please", scoring 0.25,
+  and "Three.", scoring 0.14) took the other person's speaker, so mine-only
+  dropped them. The same short words said alone in the dictation took the
+  owner's speaker and were kept.
+- In label-everyone the other person got two numbers. A 1.0 s line scored under
+  30% against the first unknown voice and became "Speaker 2". Two short replies
+  then took that number. Decision: this is documented as a limit in the manual,
+  and the clustering rule is not changed.
+
+Not measured: the owner on a second microphone. There is no second microphone.
+The rates are optimistic: the same recordings chose the threshold and measured it.
+
+### Task 6.7: enrolment length
+
+From 82.4 s of enrolment recording, the voice activity model found 58.6 s of
+speech (ratio 0.71). Voiceprints were built the production way from the first N
+seconds of speech, then scored at 30% on the same parts as above.
+
+| Speech used | Owner dropped (of 9) | Others kept (of 24) | Both targets |
+| --- | --- | --- | --- |
+| 5, 8, 10, 15, 20, 30 and 45 s | 0 | 0 | met |
+| All 58.6 s | 0 | 0 | met |
+| The voiceprint enrolled for real (20 s recording) | 0 | 0 | met |
+
+Measured minimum: 5 s of speech, about 7 s of recording at that ratio. Decision:
+keep the enrolment at 20 s of recording and 10 s of minimum speech, twice the
+measured need. One session cannot show how the owner's voice changes between
+days or with a cold, and a longer sample costs the user only a few seconds.
+
 ## Open Questions
 
 Each item below is decided for this change. Reversing one would change a spec
@@ -793,12 +883,13 @@ scenario but not the approach or the task breakdown.
   mine-only?
 - **Speech-session replies.** Should label-everyone label replies sent to an
   agent, or only filter them?
-- **Placeholder values pending measurement.** These are tuned by task 4.7 and
-  task 6.7 without changing the specs:
-  - the default threshold (placeholder 50);
-  - the minimum part length (1.0 s);
-  - the enrolment length (20 s);
-  - the minimum enrolment speech (10 s).
+- **Measured values.** Tasks 4.7 and 6.7 set these without changing the specs:
+  - the default threshold: 30%;
+  - the minimum part length: 1.0 s;
+  - the enrolment length: 20 s;
+  - the minimum enrolment speech: 10 s.
+
+  See "Measured results" below for the figures and the limits that remain.
 - **Implicit owner.** Should a lone enrolled voice become the owner when `owner`
   is unset?
 - **Uninstall.** Should `murmly uninstall` offer to delete voiceprints?
