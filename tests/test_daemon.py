@@ -63,6 +63,7 @@ class DummySession:
         self.model_resident = False
         # Never created unless a speaker mode is selected, so not held.
         self.speaker_model_resident = False
+        self.speaker_model_resident_detail = None
         self.targets_captured = 0
         self.received_targets: list[WindowIdentity | None] = []
         self.target = WindowIdentity(window_id=1, pid=10, window_class="editor")
@@ -3619,6 +3620,7 @@ class UnaskableTranscriber:
         self.stopped = 0
         self.released = 0
         self.speaker_model_resident = False
+        self.speaker_model_resident_detail = None
 
     @property
     def model_resident(self) -> bool:

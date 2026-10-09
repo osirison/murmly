@@ -280,6 +280,79 @@ class EmbedderTests(unittest.TestCase):
 
         self.assertEqual(2, constructor.call_count)
 
+    def test_embedding_many_equals_embedding_each_alone(self) -> None:
+        class VaryingSession(RecordingSession):
+            def run(self, output_names, feeds):
+                self.runs += 1
+                raw = np.zeros((1, EMBEDDING_DIMENSION), dtype=np.float32)
+                raw[0, 0] = float(feeds[speakers.MODEL_INPUT_NAME].shape[1])
+                raw[0, 1] = 1.0
+                return [raw]
+
+        audios = [one_second(), one_second()[:8000], one_second()[:4000]]
+        embedder = SpeakerEmbedder(Path("model.onnx"), session=VaryingSession())
+
+        many = embedder.embed_many(audios)
+        alone = [embedder.embed(audio) for audio in audios]
+
+        self.assertEqual(3, len(many))
+        for batched, single in zip(many, alone):
+            np.testing.assert_array_equal(single, batched)
+        self.assertEqual([], embedder.embed_many([]))
+
+    def test_every_audio_has_its_features_before_the_first_run(self) -> None:
+        events: list[str] = []
+
+        class OrderedSession(RecordingSession):
+            def run(self, output_names, feeds):
+                events.append("run")
+                return super().run(output_names, feeds)
+
+        def features(samples):
+            events.append("features")
+            return normalised_features(samples)
+
+        embedder = SpeakerEmbedder(Path("model.onnx"), session=OrderedSession())
+        with patch("murmly.speakers.normalised_features", side_effect=features):
+            embedder.embed_many([one_second(), one_second(), one_second()])
+
+        self.assertEqual(["features"] * 3 + ["run"] * 3, events)
+
+    def test_audio_too_short_for_a_frame_fails_before_any_run(self) -> None:
+        session = RecordingSession()
+        embedder = SpeakerEmbedder(Path("model.onnx"), session=session)
+
+        with self.assertRaises(ValueError):
+            embedder.embed_many([one_second(), np.zeros(100, dtype=np.float32)])
+
+        self.assertEqual(0, session.runs)
+
+    def test_a_release_waits_for_the_whole_batch_not_just_one_run(self) -> None:
+        session = GatedSession()
+        embedder = SpeakerEmbedder(Path("model.onnx"), session=session)
+        order: list[str] = []
+
+        inference = threading.Thread(
+            target=lambda: embedder.embed_many([one_second(), one_second(), one_second()])
+        )
+        inference.start()
+        self.assertTrue(session.entered.wait(GATE_TIMEOUT_SECONDS))
+
+        def release() -> None:
+            embedder.release()
+            order.append(f"released after {session.runs} runs")
+
+        releaser = threading.Thread(target=release)
+        releaser.start()
+        releaser.join(0.05)
+        self.assertTrue(releaser.is_alive(), "the release did not wait for the batch")
+        session.gate.set()
+        inference.join(GATE_TIMEOUT_SECONDS)
+        releaser.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertEqual(["released after 3 runs"], order)
+        self.assertFalse(embedder.resident)
+
 
 @contextlib.contextmanager
 def tempfile_model():
@@ -327,6 +400,9 @@ class FakeEmbedder:
     def embed(self, samples):
         self.calls += 1
         return np.asarray(samples, dtype=np.float64)
+
+    def embed_many(self, audios):
+        return [self.embed(samples) for samples in audios]
 
 
 def part(text: str, start: float, end: float, vector=None) -> tuple[TimedText, object]:
@@ -522,7 +598,7 @@ class AttributionTests(unittest.TestCase):
 
     def test_an_error_from_the_embedder_propagates_to_the_caller(self) -> None:
         class Failing:
-            def embed(self, samples):
+            def embed_many(self, audios):
                 raise RuntimeError("session failed")
 
         with self.assertRaises(RuntimeError):
@@ -536,6 +612,21 @@ class AttributionTests(unittest.TestCase):
 
 
 class ShortPartTests(unittest.TestCase):
+    def test_the_embedder_is_asked_once_and_only_for_the_long_parts(self) -> None:
+        batches: list[int] = []
+
+        class BatchRecorder(FakeEmbedder):
+            def embed_many(self, audios):
+                batches.append(len(audios))
+                return super().embed_many(audios)
+
+        run(
+            [part("Long one.", 0, 3, E0), part("Yes.", 3, 3.4, E1), part("Long two.", 3.4, 7, E1)],
+            embedder=BatchRecorder(),
+        )
+
+        self.assertEqual([2], batches)
+
     def test_owner_answers_briefly_after_speaking(self) -> None:
         text, embedder = run(
             [part("I will be there at noon.", 0, 3, E0), part("Yes.", 3, 3.4, E1)],

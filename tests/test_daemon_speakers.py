@@ -57,6 +57,7 @@ class FakeEmbedder:
 
     def __init__(self) -> None:
         self.resident = False
+        self.resident_detail: str | None = None
         self.loads = 0
         self.embeds = 0
         self.releases = 0
@@ -88,6 +89,9 @@ class FakeEmbedder:
         self.embeds += 1
         voice = round(float(np.mean(samples)) * 32_768 / AMPLITUDE_STEP)
         return np.asarray(VECTORS[voice], dtype=np.float32)
+
+    def embed_many(self, audios):
+        return [self.embed(samples) for samples in audios]
 
     def release(self) -> bool:
         was_resident = self.resident
@@ -927,6 +931,37 @@ class StatusIsReadOnlyTests(SpeakerDaemonCase):
         self.assertIs(True, answers[0]["speaker_model_resident"])
         constructor.assert_not_called()
         self.make_embedder.assert_not_called()
+
+    def test_a_failed_build_is_reported_with_its_reason_without_locking_or_building(self) -> None:
+        daemon = self.build("label-everyone")
+        real = SpeakerEmbedder(self.data_dir / "missing.onnx")
+        with self.assertRaises(FileNotFoundError):
+            real.embed(np.zeros(16_000, dtype=np.float32))
+        self.session._speaker_embedder = real
+        answers: list[dict] = []
+        asked = threading.Thread(
+            target=lambda: answers.append(daemon.handle_command("status")), daemon=True
+        )
+
+        with real._load_lock, real._use_lock, patch("onnxruntime.InferenceSession") as constructor:
+            asked.start()
+            asked.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertFalse(asked.is_alive(), "status waited on the speaker model's locks")
+        self.assertIs(False, answers[0]["speaker_model_resident"])
+        self.assertIn("missing", answers[0]["speaker_model_resident_detail"])
+        constructor.assert_not_called()
+
+    def test_no_detail_is_carried_when_the_build_has_not_failed(self) -> None:
+        daemon = self.build("label-everyone")
+        self.session._speaker_embedder = SpeakerEmbedder(
+            self.data_dir / SPEAKER_MODEL_FILENAME, session=Mock()
+        )
+
+        response = daemon.handle_command("status")
+
+        self.assertIs(True, response["speaker_model_resident"])
+        self.assertNotIn("speaker_model_resident_detail", response)
 
     def test_a_session_that_cannot_say_costs_the_field_and_nothing_else(self) -> None:
         daemon = self.build("label-everyone")

@@ -695,6 +695,12 @@ class SpeechSession:
         embedder = self._speaker_embedder
         return embedder is not None and bool(embedder.resident)
 
+    @property
+    def speaker_model_resident_detail(self) -> str | None:
+        """Why the last speaker model build failed, or None. Read without loading or locking."""
+        embedder = self._speaker_embedder
+        return None if embedder is None else embedder.resident_detail
+
     def _release_speaker_model(self) -> None:
         """Release the speaker model with the transcription model, after any attribution."""
         embedder = self._speaker_embedder
@@ -2345,6 +2351,11 @@ class MurmlyDaemon:
         # as a daemon too old to be asked.
         try:
             residency["speaker_model_resident"] = bool(self._session.speaker_model_resident)
+            # A build that failed (model missing or corrupt) leaves the model not
+            # held and says why; a build that works clears it.
+            detail = self._session.speaker_model_resident_detail
+            if detail:
+                residency["speaker_model_resident_detail"] = detail
         except Exception as error:  # noqa: BLE001 - status still owes an answer
             residency["speaker_model_resident"] = None
             residency["speaker_model_resident_detail"] = (

@@ -290,7 +290,10 @@ A `SpeakerEmbedder` holder follows the synthesis session's pattern:
   `onnxruntime-gpu`.
 - It sets `enable_cpu_mem_arena = False` and leaves intra-op threads at their
   default (journal 2026-08-25).
-- Inference runs under a use lock, so a release waits for it.
+- Inference runs under a use lock, so a release waits for it. The features of
+  every part of a capture are computed first, and the runs then happen back to
+  back under one hold of the use lock, so a release also cannot land between two
+  runs of one batch (task 7.5, variant B).
 - `resident` reads a field without taking either lock.
 - `release()` drops the session and calls `return_free_heap()`.
 
@@ -637,13 +640,43 @@ Speech-session replies go through the same helper, through
   option.
 - **Overlapping speech is not separated.** → The same documented limit applies.
 - **Added latency between capture stop and delivery.** One embedding is computed
-  per segment on the CPU. A rough first measurement (i9-11980HK, 16 threads,
-  `onnxruntime-gpu` 1.24.4 on its CPU provider, random features, one run each)
-  gave about 340 ms for 30 calls of 2 s, which is one minute of speech, and about
-  500 ms for one 60 s call. The limit is 500 ms per minute of speech, so this is
-  close to it on a fast CPU. → Task 7.5
-  measures it on real recordings and records the figure. If it exceeds 500 ms per
-  minute of speech, the approach is revisited before shipping.
+  per Whisper segment on the CPU. The limit was 500 ms per minute of speech. Task
+  7.5 measured it and no variant met it, so the limit is now 1500 ms per minute
+  of speech, and the figure that is shipped is about 1.3 s. → The user accepted
+  the cost. Speaker modes are opt-in and mode `off` is unaffected. A 10 s
+  dictation takes about 0.2 s longer.
+
+  How it was measured (2026-10-09), by a script and not the daemon:
+  - Config: the user's own. `[stt]` `device = "cuda"`, `model_profile =
+    "balanced"` (large-v3-turbo), compute type resolved to float16, on an RTX
+    3080 Laptop. i9-11980HK, 16 threads. `onnxruntime-gpu` 1.24.4 with the
+    embedder on its CPU provider. Whisper was loaded in the same process.
+  - Audio: three real 16 kHz speech clips (ModelScope examples, two speakers),
+    looped to 60 s and upsampled to 48 kHz, so the resample was measured too. A
+    stereo run of 7 rounds and a mono run of 5 rounds. Whisper cut 13 segments of
+    3.2 to 6.8 s. Decoding took 1.75 s per minute of speech.
+  - Load: the machine was not quieted. Load average was 3 to 9.6.
+  - Variants alternated within each round. The figures are medians of the added
+    milliseconds per minute of speech.
+
+  | Variant | Stereo | Mono |
+  |---|---|---|
+  | A: features and embedding per part (the first code) | 1827 | 1607 |
+  | B: features of every part first, then the embeddings back to back | 1320 | 1294 |
+  | C: B with `allow_spinning=0`, default threads | 1250 | 1243 |
+  | C, 1 thread | 3305 | 3248 |
+  | C, 2 threads | 2099 | 1768 |
+  | C, 4 threads | 1316 | 1187 |
+
+  The model run dominates at 1.0 to 1.5 s per minute. The filterbank takes 0.1 to
+  0.25 s per minute. Slicing, downmixing and resampling are negligible. The
+  embeddings were bit-identical across all variants. Variant B is used: it is
+  20 to 28% faster than A, and C gains under 6% more, which does not justify
+  setting runtime options. An earlier back-to-back run with no Whisper loaded
+  measured about 330 ms per minute, so the model runs about 3 times slower with
+  Whisper resident and the machine loaded. The cause was not isolated. The first
+  rough estimate of about 340 ms (random features, 30 calls of 2 s) was that
+  unloaded figure and does not hold in use.
 - **Short parts may not match the owner at the placeholder threshold.** In the ad
   hoc check under "Filterbank features", slices of 2 s from the same speaker
   scored 0.49 and slices of 1 s scored 0.35, against different speakers below 0.

@@ -134,7 +134,7 @@ description: Track verification, implementation and validation of voice enrolmen
   - start a background build of the embedder, without delaying capture.
 
   Done when a test with a slow fake build shows capture starting immediately.
-- [ ] 7.5 Measure the added time between capture stop and delivery, per minute of speech, on this machine's CPU. Done when the figure is recorded in `design.md`. If it is above 500 ms per minute, revisit the approach before continuing.
+- [x] 7.5 Measure the added time between capture stop and delivery, per minute of speech, on this machine's CPU. Done when the figure is recorded in `design.md`. If it is above 500 ms per minute, revisit the approach before continuing.
 - [x] 7.6 Add daemon tests with a fake transcriber that returns timed parts and a fake embedder. Cover:
   - `off` byte-identical, with no store read and no embedder built;
   - mine-only through toggle, stop mode and continuous mode;

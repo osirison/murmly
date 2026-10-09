@@ -177,6 +177,10 @@ class Embedder(Protocol):
         """16 kHz mono float32 audio to an L2-normalised embedding."""
         ...
 
+    def embed_many(self, audios):
+        """One embedding per audio, in order, as `embed` would give each."""
+        ...
+
 
 class SpeakerEmbedder:
     """The speaker model's ONNX session, built when first used and droppable.
@@ -231,15 +235,34 @@ class SpeakerEmbedder:
         The raw model output has a norm of about 0.8, so it is normalised here
         and nothing downstream has to remember to.
         """
+        return self.embed_many([samples])[0]
+
+    def embed_many(self, audios):
+        """The L2-normalised embedding of each audio, in order.
+
+        The features of every audio are computed first and the model is then run
+        for each back to back. Interleaving the two cost 24 to 38% more
+        (design.md, "Added latency"). The use lock is held across the runs, so a
+        release waits for the whole batch rather than landing between two runs.
+        Each embedding equals what `embed` gives for that audio alone.
+        """
         import numpy as np
 
-        features = normalised_features(samples)
-        if features.shape[0] == 0:
-            raise ValueError("audio is shorter than one 25 ms frame")
+        batch = []
+        for samples in audios:
+            features = normalised_features(samples)
+            if features.shape[0] == 0:
+                raise ValueError("audio is shorter than one 25 ms frame")
+            batch.append(features[None, :, :])
+        if not batch:
+            return []
         session = self._load()
         with self._use_lock:
-            outputs = session.run(None, {MODEL_INPUT_NAME: features[None, :, :]})
-        return l2_normalised(np.asarray(outputs[0], dtype=np.float32)[0]).astype(np.float32)
+            outputs = [session.run(None, {MODEL_INPUT_NAME: features}) for features in batch]
+        return [
+            l2_normalised(np.asarray(output[0], dtype=np.float32)[0]).astype(np.float32)
+            for output in outputs
+        ]
 
     def release(self) -> bool:
         """Drop the session and hand its memory back. Waits for an inference.
@@ -457,12 +480,18 @@ def attribute(
     owner_voice = find_voice(voices, owner)
     enrolled = [(voice, l2_normalised(voice.embedding)) for voice in voices]
 
+    long_enough = [
+        round(part.end_s - part.start_s, 2) >= min_part_seconds for part, _text in words
+    ]
+    audios = [audio_for(part) for (part, _text), keep in zip(words, long_enough) if keep]
+    embeddings = iter(embedder.embed_many(audios) if audios else [])
+    # Matching stays in part order: unknown voices are numbered as they are heard.
     speakers: list[Speaker | None] = []
-    for part, _text in words:
-        if round(part.end_s - part.start_s, 2) < min_part_seconds:
+    for keep in long_enough:
+        if not keep:
             speakers.append(None)
             continue
-        embedding = l2_normalised(embedder.embed(audio_for(part)))
+        embedding = l2_normalised(next(embeddings))
         speakers.append(_who(embedding, enrolled, owner_voice, state, threshold))
 
     identified = [index for index, speaker in enumerate(speakers) if speaker is not None]
