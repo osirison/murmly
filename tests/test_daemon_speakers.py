@@ -489,7 +489,7 @@ class LabelEveryoneTests(SpeakerDaemonCase):
 
         self.assertEqual(["Milo: Milo speaking Speaker 1: unknown now"], self.paster.pasted)
 
-    def test_a_recording_too_short_to_identify_is_delivered_as_with_the_mode_off(self) -> None:
+    def test_a_recording_too_short_to_identify_is_delivered_unlabelled_and_unfiltered(self) -> None:
         daemon = self.build("label-everyone")
         self.recorder.finals.append(self.audio((ME, "yes", 0.5)))
 
@@ -666,7 +666,7 @@ class FailingOpenTests(SpeakerDaemonCase):
         self.assertFalse(response["ok"])
         self.assertIn("decode failed", response["error"])
 
-    def test_a_build_that_fails_is_delivered_as_off_with_one_warning(self) -> None:
+    def test_a_build_that_fails_is_delivered_unlabelled_with_one_warning(self) -> None:
         daemon = self.build("label-everyone")
         self.embedder.load_error = RuntimeError("cannot open the model")
         self.recorder.finals.append(self.audio((ME, "all of it", 2.0), (STRANGER_A, "and this", 2.0)))

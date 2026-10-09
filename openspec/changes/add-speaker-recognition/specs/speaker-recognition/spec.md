@@ -147,7 +147,7 @@ Murmly SHALL provide a configuration option naming the owner, and the enrolled v
 
 ### Requirement: Mine-only delivers only the owner's speech
 
-In mine-only mode Murmly SHALL deliver only the parts of a transcript attributed to the owner, in the order they were spoken and without labels. It MUST drop the parts attributed to any other enrolled person or to an unknown voice, including speech from a television or a loudspeaker. This holds except where this capability delivers a transcript as it would with the speaker mode off.
+In mine-only mode Murmly SHALL deliver only the parts of a transcript attributed to the owner, in the order they were spoken and without labels. It MUST drop the parts attributed to any other enrolled person or to an unknown voice, including speech from a television or a loudspeaker. This holds except where this capability delivers a transcript unlabelled and unfiltered.
 
 #### Scenario: Owner dictates with a television on
 
@@ -163,11 +163,11 @@ In mine-only mode Murmly SHALL deliver only the parts of a transcript attributed
 #### Scenario: Only the owner speaks
 
 - **WHEN** only the owner speaks during a recording in mine-only mode
-- **THEN** the delivered transcript is the same as it would be with the speaker mode off
+- **THEN** all of the owner's words are delivered, without labels
 
 ### Requirement: Label-everyone labels each speaker's part
 
-In label-everyone mode Murmly SHALL deliver every part of a transcript, each preceded by its speaker's label: You for the owner, the enrolled name for any other enrolled person, and Speaker followed by a number for an unknown voice. Unknown voices MUST be numbered from 1 in the order in which they are first heard. Labels are omitted only where this capability delivers a transcript as it would with the speaker mode off.
+In label-everyone mode Murmly SHALL deliver every part of a transcript, each preceded by its speaker's label: You for the owner, the enrolled name for any other enrolled person, and Speaker followed by a number for an unknown voice. Unknown voices MUST be numbered from 1 in the order in which they are first heard. Labels are omitted only where this capability delivers a transcript unlabelled and unfiltered.
 
 #### Scenario: Owner and an enrolled person
 
@@ -187,6 +187,11 @@ In label-everyone mode Murmly SHALL deliver every part of a transcript, each pre
 - **THEN** enrolled people are labelled by their enrolled names
 - **AND** no part is labelled "You:"
 
+#### Scenario: A pause between speakers
+
+- **WHEN** one speaker finishes and a different speaker starts about two seconds or more later, in one recording in label-everyone mode
+- **THEN** the two speakers' words are separate parts, each with its own label
+
 ### Requirement: A labelled transcript stays on one line
 
 A labelled transcript MUST contain no line break. Each speaker's part SHALL be written as the label, a colon, a space, and the words, and consecutive parts SHALL be separated by a single space, the separator Murmly already uses between the parts of a transcript.
@@ -199,7 +204,7 @@ A labelled transcript MUST contain no line break. Each speaker's part SHALL be w
 
 ### Requirement: Consecutive parts from one speaker share one label
 
-Within one delivered transcript, consecutive parts attributed to the same speaker MUST be joined under a single label. In label-everyone mode every delivered transcript SHALL begin with a label, including each segment of a continuous session, except a transcript this capability delivers as it would with the speaker mode off.
+Within one delivered transcript, consecutive parts attributed to the same speaker MUST be joined under a single label. In label-everyone mode every delivered transcript SHALL begin with a label, including each segment of a continuous session, except a transcript this capability delivers unlabelled and unfiltered.
 
 #### Scenario: Owner speaks twice in a row
 
@@ -228,7 +233,7 @@ Murmly SHALL keep an unknown voice's number for the whole capture session, so a 
 
 ### Requirement: A part too short to identify takes a neighbouring speaker
 
-A part of a recording or segment that is too short to identify reliably SHALL be attributed to the speaker of the nearest identifiable part in the same recording or segment, preferring the part before it. When no part of a recording or segment can be identified, Murmly MUST deliver it as it would with the speaker mode off.
+A part of a recording or segment that is too short to identify reliably SHALL be attributed to the speaker of the nearest identifiable part in the same recording or segment, preferring the part before it. When no part of a recording or segment can be identified, Murmly MUST deliver it unlabelled and unfiltered.
 
 #### Scenario: Owner answers briefly after speaking
 
@@ -243,7 +248,7 @@ A part of a recording or segment that is too short to identify reliably SHALL be
 #### Scenario: Recording too short to identify
 
 - **WHEN** a recording or segment contains only a single short word such as "yes", in either speaker mode
-- **THEN** it is delivered as it would be with the speaker mode off
+- **THEN** it is delivered unlabelled and unfiltered
 
 ### Requirement: Speaker mode applies to every delivered transcript
 
@@ -300,12 +305,12 @@ When the selected speaker mode cannot run, Murmly SHALL deliver the transcript a
 
 ### Requirement: A speaker failure never loses a transcript
 
-When attributing speakers fails while a recording or segment is being processed, Murmly MUST deliver that transcript as it would with the speaker mode off. The failure MUST NOT fail the recording, end a continuous session, or discard the text, and Murmly MUST log it without transcript text.
+When attributing speakers fails while a recording or segment is being processed, including a speaker model found unusable only after capture started, Murmly MUST deliver that transcript unlabelled and unfiltered. The failure MUST NOT fail the recording, end a continuous session, or discard the text, and Murmly MUST log it without transcript text.
 
 #### Scenario: Attribution raises an error
 
 - **WHEN** attributing speakers raises an error while a recording is being processed
-- **THEN** the transcript is delivered as it would be with the speaker mode off
+- **THEN** the transcript is delivered unlabelled and unfiltered
 - **AND** the daemon logs the failure without any transcript text
 
 ### Requirement: Voiceprints are used only with the model that made them

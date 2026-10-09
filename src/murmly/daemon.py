@@ -537,7 +537,7 @@ class _EmbedderBuild:
 
     Started when capture starts and never awaited there. Attribution waits on it
     only once the segments are ready, and a build that failed means that capture
-    is delivered as with the mode off, after the one warning logged here.
+    is delivered unlabelled and unfiltered, after the one warning logged here.
     """
 
     def __init__(self, embedder: SpeakerEmbedder) -> None:
@@ -784,7 +784,10 @@ class SpeechSession:
         and nothing else. Otherwise the decode is kept as timed parts and each is
         attributed. An empty string means mine-only dropped everything, which the
         callers already treat as a transcription that yielded no text; a failure
-        in attribution (not in the decode) returns the plain text instead.
+        in attribution (not in the decode) returns the joined timed text,
+        unlabelled and unfiltered. That is one decode: it is not repeated as
+        `transcribe_pcm16`, so it can differ from the mode off's text by a word
+        edge or a full stop.
         """
         rate = self._recorder.sample_rate_hz
         if self._config.speaker_mode == "off" or not self._speaker_ready:
@@ -797,7 +800,7 @@ class SpeechSession:
         except Exception as error:  # noqa: BLE001 - the transcript is delivered regardless
             # The class only: a message could carry a name or the words.
             logger.warning(
-                "Speaker attribution failed; delivering the transcript as with the mode off: %s",
+                "Speaker attribution failed; delivering the transcript unlabelled and unfiltered: %s",
                 type(error).__name__,
             )
             return plain

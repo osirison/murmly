@@ -106,10 +106,13 @@ murmly speakers list
 
 ## What it cannot do
 
-- **Two people in one segment.** Murmly splits what you said into segments
-  where the speech engine finds a break, then decides who spoke each one. If
-  two people speak within one segment, the whole segment goes to one of them.
-  In `mine-only` it is kept or dropped whole.
+- **Quick back-and-forth.** Murmly splits what you said into parts at breaks
+  in the speech, then decides who spoke each one. A pause of about two seconds
+  or more between speakers separates their words. If two people speak with a
+  shorter pause between them, the whole part can go to one of them. In
+  `mine-only` it is kept or dropped whole. In
+  [continuous mode](pause-to-finish.md), the silence setting also splits what
+  you said.
 - **Overlapping speech.** When two people talk at once, murmly does not
   separate them.
 - **The overlay shows everyone.** With [live transcription](words-as-you-speak.md)

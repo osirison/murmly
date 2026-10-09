@@ -592,8 +592,8 @@ def speaker_text(
 
     Returns "" when mine-only drops every part, which the daemon treats as a
     transcription that yielded no text. Returns None when the transcript is to
-    be delivered as with the mode off: no part could be identified, the mode is
-    `off`, or mine-only has no enrolled owner. None and "" mean opposite things.
+    be delivered unlabelled and unfiltered: no part could be identified, the mode
+    is `off`, or mine-only has no enrolled owner. None and "" mean opposite things.
     """
     if mode not in {"mine-only", "label-everyone"}:
         return None

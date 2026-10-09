@@ -20,6 +20,14 @@ from murmly.speakers import TimedText
 logger = logging.getLogger(__name__)
 WHISPER_SAMPLE_RATE_HZ = 16_000
 
+# A gap between two words at least this long starts a new timed part. The VAD
+# removes silences of about two seconds or more before decoding, so Whisper can
+# return two speakers' sentences as one segment; word times map those back to
+# the original audio and show the removed pause as a large gap. 1.5 s sits above
+# the largest alignment artefact measured inside speech (0.74 s) and below the
+# pauses the VAD removes.
+PART_SPLIT_GAP_S = 1.5
+
 # What CTranslate2 needs to run on CUDA, on every platform but Windows. The
 # ONNX synthesis runtime needs these and four more, so `tts.py` extends this
 # tuple rather than restating it: the provenance checks below are the point,
@@ -344,11 +352,14 @@ class FasterWhisperTranscriber:
     def transcribe_segments_pcm16(
         self, pcm_audio: bytes, sample_rate_hz: int | None = None
     ) -> list[TimedText]:
-        """The same decode as `transcribe_pcm16`, kept as Whisper's timed segments.
+        """Whisper's words, grouped into timed parts for speaker attribution.
 
         Times are seconds from the start of the audio handed in, whatever the
-        capture rate. Joining the texts with a space and stripping gives exactly
-        what `transcribe_pcm16` returns for the same decode.
+        capture rate. Decodes with word timestamps, which `transcribe_pcm16`
+        does not, and starts a new part wherever two words are `PART_SPLIT_GAP_S`
+        or more apart, so a pause between speakers that the VAD spliced out of
+        one Whisper segment still separates them. The joined text can differ
+        slightly from `transcribe_pcm16`'s for the same audio.
         """
         if not pcm_audio or not any(pcm_audio):
             return []
@@ -425,23 +436,40 @@ class FasterWhisperTranscriber:
         return " ".join(segment.text.strip() for segment in self._segments(model, audio)).strip()
 
     def _decode_timed(self, model, audio) -> list[TimedText]:
-        return [
-            TimedText(segment.start, segment.end, segment.text.strip())
-            for segment in self._segments(model, audio)
-        ]
+        parts: list[TimedText] = []
+        for segment in self._segments(model, audio, word_timestamps=True):
+            run: list = []
+            for word in getattr(segment, "words", None) or ():
+                if run and word.start - run[-1].end >= PART_SPLIT_GAP_S:
+                    self._close_part(parts, run)
+                    run = []
+                run.append(word)
+            self._close_part(parts, run)
+        return parts
 
-    def _segments(self, model, audio) -> list:
+    @staticmethod
+    def _close_part(parts: list[TimedText], words: list) -> None:
+        if words:
+            text = "".join(word.word for word in words).strip()
+            parts.append(TimedText(words[0].start, words[-1].end, text))
+
+    def _segments(self, model, audio, *, word_timestamps: bool = False) -> list:
         """The one decode both entry points share.
+
+        Word timestamps are asked for only by the timed entry point; the other
+        passes exactly the arguments it always did.
 
         Listed here, while `_model_lock` is held: faster-whisper decodes as the
         generator is iterated, so handing the generator back would let an idle
         release take the weights away part-way through.
         """
+        options = {"word_timestamps": True} if word_timestamps else {}
         segments, _info = model.transcribe(
             audio,
             language="en",
             beam_size=self._config.beam_size,
             vad_filter=self._config.vad_filter,
+            **options,
         )
         return list(segments)
 

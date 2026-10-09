@@ -152,11 +152,43 @@ Questions.
 ### Attribute speakers per Whisper segment
 
 A new `FasterWhisperTranscriber.transcribe_segments_pcm16(pcm, rate)` returns
-`list[TimedText(start_s, end_s, text)]` from the same decode the final pass runs
-today. `transcribe_pcm16` keeps its exact output, and the `off` path keeps
-calling it. For each segment, the PCM between `start` and `end` is converted to
+`list[TimedText(start_s, end_s, text)]`. It decodes with `word_timestamps=True`.
+A part is a Whisper segment, split wherever the gap between two consecutive words
+is 1.5 s or more. Its text is its words joined as Whisper wrote them, stripped.
+Its start is the first word's start and its end is the last word's end. A segment
+with no words gives no part. `transcribe_pcm16` keeps its exact output and its
+exact arguments to the model, with no word timestamps, and the `off` path keeps
+calling it. For each part, the PCM between its start and end is converted to
 mono float32 and resampled to 16 kHz with the existing `resample_float32`. The
 embedding is computed from that audio.
+
+*Why split at word gaps.* With `vad_filter=True`, faster-whisper cuts out
+silences of about 2 s or more before decoding (its default
+`min_silence_duration_ms`). Two sentences with a 4 s pause between them came back
+as one Whisper segment: the user's real recording `~/murmly-pause.wav` gave one
+segment from 1.71 s to 14.28 s. One segment would give two speakers one label.
+With word timestamps, faster-whisper maps each word back to original-audio time
+by the VAD chunk its midpoint falls in, so the removed pause shows as a gap
+between words: "dog." ends at 4.91 s and "She" starts at 10.77 s, a gap of
+5.86 s. Splitting there gives two parts, 1.71-4.91 s and 10.77-13.77 s. The user
+listened to both slices on 2026-10-09 and they matched the words.
+
+*Why 1.5 s.* The largest gap inside speech that alignment produced was 0.74 s.
+The pauses the VAD removes are about 2 s or more. 1.5 s is between the two.
+
+*Cost.* Word timestamps added 1-4% to decode time (a 16 s clip: +4 ms; a 60 s
+clip: +61 ms, noisy). The words were the same. Once a trailing full stop differed
+("past 50." against "past 50"), and segment edges can move by about 0.1 s. So
+the timed text is not guaranteed identical to `transcribe_pcm16`'s, and the
+fallback that delivers the transcript unlabelled and unfiltered uses the joined
+timed text from the one decode. It does not decode a second time. When the mode
+cannot run at capture start, `transcribe_pcm16` is called and the output is
+exactly the mode off's.
+
+*Limit.* Turns separated by less than about 2 s are not removed by the VAD, and
+word alignment smears them: on a synthetic clip with 0.5 s between turns every
+word gap was 0.00 s. Quick back-and-forth still merges into one part. Only a
+pause of about 2 s or more splits.
 
 A segment with less audio than the minimum (a placeholder of 1.0 s, set by
 measurement in task 4.7) is not embedded. It takes its neighbour's speaker, as
@@ -167,10 +199,10 @@ of 2 s by default, so most units contain one speaker's turn.
 
 Murmly builds a plain `WhisperModel`, not a batched one, and `_decode` calls
 `model.transcribe(audio, language="en", beam_size=..., vad_filter=...)` with no
-`clip_timestamps`, `without_timestamps` or `word_timestamps`. Those keep their
-defaults (`clip_timestamps="0"`, `without_timestamps=False`,
-`word_timestamps=False`). Checked in faster-whisper's source (task 1.6, source
-half):
+`clip_timestamps` or `without_timestamps`, which keep their defaults
+(`clip_timestamps="0"`, `without_timestamps=False`). The timed decode adds
+`word_timestamps=True`; the decode behind `transcribe_pcm16` leaves it at its
+default `False`. Checked in faster-whisper's source (task 1.6, source half):
 
 - `transcribe.py` lines 885-892: `if vad_filter and clip_timestamps == "0":`
   speech chunks are found with `get_speech_timestamps(audio, vad_parameters)` and
@@ -184,7 +216,9 @@ half):
 
 So `start` and `end` are seconds from the start of the original audio, rounded
 to 0.01 s. Each end is mapped separately, so a segment that spans removed
-silence includes that silence when the audio is sliced at its times.
+silence includes that silence when the audio is sliced at its times. That is why
+parts take their times from words (the first word's start, the last word's end)
+and not from the segment, and are split at word gaps of 1.5 s or more.
 `decode_audio` resamples to 16 kHz mono (`audio.py` lines 37-40), and the times
 do not depend on the capture rate.
 
@@ -192,17 +226,21 @@ Slicing the capture PCM uses these times directly. Murmly's `_write_wav` writes
 `config.channels` channels, so the PCM can be interleaved. The slice is
 downmixed to mono before `resample_float32` is called.
 
-**Still open.** The other half of task 1.6, a real recording with a known pause
-where the slice at a segment's reported times plays back as that segment's words,
-has not been done. It needs a person to record and listen.
+**Task 1.6, real-recording half: done on 2026-10-09.** The real recording
+`~/murmly-pause.wav` holds two sentences with a 4 s pause. Whisper returned them
+as one segment, 1.71-14.28 s, so slicing at the segment's times did not give one
+speaker's words. That finding led to the word-gap split above. The split parts
+(1.71-4.91 s and 10.77-13.77 s) played back as their words, and the user passed
+the listening check on 2026-10-09. The times are in original-audio seconds.
 
 *Alternatives considered.* **Full diarization** runs a segmentation model (for
 example pyannote segmentation-3.0, which sherpa-onnx ships as ONNX), clusters the
 regions, and aligns them to Whisper's times. It catches speaker changes without a
 pause and handles overlap. It costs a second model, alignment code, and in
 practice the sherpa-onnx dependency. It stays a later option. **Word timestamps**
-(`word_timestamps=True`) would give finer alignment, but they slow every final
-decode and still need a segmentation step to use them.
+were first rejected as too slow. That is superseded: measured on 2026-10-09 they
+add 1-4% to decode time, and they are used in speaker modes only, to split at
+long word gaps.
 
 ### Matching and clustering
 
@@ -639,10 +677,11 @@ Speech-session replies go through the same helper, through
   measured on real voices (task 4.7). Short parts take a neighbour's speaker.
   The manual says to enrol with the microphone used every day, and to re-enrol
   after changing it.
-- **Two speakers inside one Whisper segment are attributed as one.** That part
-  is kept, dropped, or labelled whole. → This is a documented limit. Continuous
-  mode's silence boundary reduces it, and full diarization remains a later
-  option.
+- **Two speakers inside one part are attributed as one.** Parts split at word
+  gaps of 1.5 s or more, so a pause of about 2 s or more between speakers
+  separates them. Only turns with shorter pauses merge, and that part is kept,
+  dropped, or labelled whole. → This is a documented limit. Continuous mode's
+  silence boundary also splits, and full diarization remains a later option.
 - **Overlapping speech is not separated.** → The same documented limit applies.
 - **Added latency between capture stop and delivery.** One embedding is computed
   per Whisper segment on the CPU. The limit was 500 ms per minute of speech. Task
