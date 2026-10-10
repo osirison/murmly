@@ -8,6 +8,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import shlex
 import signal
 import socket
 import subprocess
@@ -20,18 +21,21 @@ from datetime import datetime
 from murmly.audio import (
     SoundDeviceRecorder,
     SoundDevicePlayer,
+    capture_as_mono_float32,
     disable_portaudio_exit_teardown,
 )
 from murmly.config import (
     WINDOWS_PIPE_NAME,
     MurmlyConfig,
     default_config_path,
+    default_data_dir,
     is_quiet_at,
     load_config,
 )
 from murmly.daemon import (
     COMMAND_REBIND_HOTKEYS,
     COMMAND_STATUS,
+    STATE_IDLE,
     DaemonNotRespondingError,
     DaemonStartupError,
     MurmlyDaemon,
@@ -81,8 +85,22 @@ from murmly.platform import (
     TRANSCRIPTION_CAPABILITY,
 )
 from murmly.silence import SilenceDetector
+from murmly.speakers import (
+    MIN_PART_SECONDS,
+    CPU_PROVIDER as SPEAKER_CPU_PROVIDER,
+    SAMPLE_RATE_HZ as SPEAKER_SAMPLE_RATE_HZ,
+    SPEAKER_MODEL_FILENAME,
+    SPEAKER_MODEL_SHA256,
+    SpeakerEmbedder,
+    InvalidSpeakerName,
+    checksum_mismatch_message,
+    file_sha256,
+    l2_normalised,
+    validate_name,
+)
 from murmly.stt import FasterWhisperTranscriber
 from murmly.tts import COREML_PROVIDER, CUDA_PROVIDER, KokoroSynthesizer, resolve_providers
+from murmly.voiceprints import VoiceprintStore
 from murmly.win_pipe import is_pipe_name
 
 
@@ -95,6 +113,38 @@ DAEMON_POLL_INTERVAL_SECONDS = 0.1
 
 #: Subcommands whose daemon-side name differs from the one argparse takes.
 DAEMON_COMMANDS = {"toggle-session": "toggle_session"}
+
+#: How long `murmly enrol` records by default: the measured need is 5 s of
+#: speech (about 7 s recorded), and twice that is kept for other days and
+#: voice conditions (design.md, task 6.7).
+ENROL_SECONDS = 20.0
+#: The longest `--seconds` accepted. The whole recording is held in memory.
+ENROL_MAX_SECONDS = 120.0
+#: The least speech, found by the voice activity model, that enrolment accepts.
+#: Twice the 5 s that met both targets in the measurement (task 6.7).
+ENROL_MIN_SPEECH_SECONDS = 10.0
+#: The speech is embedded in windows this long and the embeddings averaged. A
+#: few seconds is what the model was trained on, and averaging several windows
+#: keeps one cough or stumble from deciding the voiceprint.
+ENROL_WINDOW_SECONDS = 3.0
+
+#: Read aloud during enrolment. Neutral, with a spread of vowels and consonants,
+#: and long enough to fill the default recording at a relaxed pace.
+ENROL_PASSAGE = (
+    "The old harbour wakes slowly each morning. Fishermen carry heavy nets down "
+    "the wet stone steps, while gulls circle above the quiet water. A bakery on "
+    "the corner opens its green door, and the smell of fresh bread drifts along "
+    "the street. Children zigzag past on bicycles, ringing their bells, and an "
+    "elderly woman waves from a window. By noon the market is crowded with "
+    "oranges, cheese, flowers and tools, and everyone seems to be talking at once."
+)
+
+#: What a busy daemon is doing, in the words the refusal uses.
+_BUSY_STATE_DESCRIPTIONS = {
+    "LISTENING": "listening",
+    "THINKING": "transcribing",
+    "SPEAKING": "speaking",
+}
 
 
 class DaemonUnavailableError(RuntimeError):
@@ -184,6 +234,27 @@ def build_parser() -> argparse.ArgumentParser:
     spike.add_argument("--paste", action="store_true", help="Also paste the transcription after copying it.")
 
     subparsers.add_parser("doctor", help="Show detected session and integration commands.")
+
+    enrol = subparsers.add_parser(
+        "enrol",
+        help="Record a voice sample and store its voiceprint under a name.",
+    )
+    enrol.add_argument("name", help="Name to enrol the voice under.")
+    enrol.add_argument(
+        "--seconds",
+        type=float,
+        default=ENROL_SECONDS,
+        help=f"How long to record (default: {ENROL_SECONDS:g}).",
+    )
+
+    speakers = subparsers.add_parser("speakers", help="List or remove enrolled voices.")
+    speakers_commands = speakers.add_subparsers(dest="speakers_command", required=True)
+    speakers_commands.add_parser("list", help="List the enrolled names, marking the owner.")
+    remove = speakers_commands.add_parser("remove", help="Remove one enrolled voice, or all of them.")
+    # Exactly one of a name and --all: neither is a typo and both is ambiguous.
+    remove_target = remove.add_mutually_exclusive_group(required=True)
+    remove_target.add_argument("name", nargs="?", default=None, help="Name of the voice to remove.")
+    remove_target.add_argument("--all", action="store_true", help="Remove every enrolled voice.")
     return parser
 
 
@@ -332,6 +403,12 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.command == "doctor":
         _run_doctor(config, profile)
         return 0
+    if args.command == "enrol":
+        return _run_enrol(config, args.name, args.seconds)
+    if args.command == "speakers":
+        if args.speakers_command == "list":
+            return _run_speakers_list(config)
+        return _run_speakers_remove(args.name, args.all)
     parser.error(f"Unsupported command: {args.command}")
     return 2
 
@@ -652,6 +729,245 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
     return 0
 
 
+def _speaker_model_path() -> Path:
+    return default_data_dir() / SPEAKER_MODEL_FILENAME
+
+
+def _command_line_name(name: str) -> str:
+    """`name` quoted for the shell a person will paste the command into."""
+    if sys.platform == "win32":
+        return subprocess.list2cmdline([name])
+    return shlex.quote(name)
+
+
+def _enrol_speech_regions(audio) -> list[tuple[int, int]]:
+    """Where there is speech in 16 kHz mono float32 audio, as sample ranges.
+
+    The Silero model `silence.py` loads, through faster-whisper's own splitter.
+    No padding, so the total is speech and not speech plus margin; a pause of
+    300 ms or more ends a region.
+    """
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    options = VadOptions(min_speech_duration_ms=250, min_silence_duration_ms=300, speech_pad_ms=0)
+    return [
+        (int(chunk["start"]), int(chunk["end"]))
+        for chunk in get_speech_timestamps(audio, options, sampling_rate=SPEAKER_SAMPLE_RATE_HZ)
+    ]
+
+
+def _capture_as_speaker_audio(clip: bytes, sample_rate_hz: int, channels: int):
+    """Interleaved 16-bit PCM at the capture rate, as 16 kHz mono float32."""
+    return capture_as_mono_float32(clip, sample_rate_hz, channels, SPEAKER_SAMPLE_RATE_HZ)
+
+
+def _voiceprint_from_speech(audio, regions, embedder):
+    """The unit-length average of the embeddings of the speech, in windows.
+
+    The speech regions are joined and cut into `ENROL_WINDOW_SECONDS` windows. A
+    last window shorter than the least the daemon will attribute is left out
+    when there is another to use.
+    """
+    import numpy as np
+
+    speech = np.concatenate([audio[start:end] for start, end in regions])
+    window = int(ENROL_WINDOW_SECONDS * SPEAKER_SAMPLE_RATE_HZ)
+    windows = [speech[start : start + window] for start in range(0, len(speech), window)]
+    if len(windows) > 1 and len(windows[-1]) < MIN_PART_SECONDS * SPEAKER_SAMPLE_RATE_HZ:
+        windows.pop()
+    embeddings = [np.asarray(embedder.embed(part), dtype=np.float64) for part in windows]
+    return l2_normalised(np.mean(embeddings, axis=0))
+
+
+def _run_enrol(
+    config: MurmlyConfig,
+    name: str,
+    seconds: float,
+    *,
+    embedder_factory: Callable[[Path], object] | None = None,
+    speech_regions: Callable[[object], list[tuple[int, int]]] | None = None,
+    send: Callable[[str, str], dict[str, object]] | None = None,
+) -> int:
+    """Record a sample in this process and store the voiceprint made from it.
+
+    Refusals come in a fixed order, each before anything is recorded: the name,
+    the length, the model, then the daemon. Nothing is stored on any of them. The
+    sample is held in memory and never written to a file.
+
+    The daemon is asked for `status` and nothing else: it is neither started nor
+    changed. `send_command_with_recovery` is not used, because it starts the
+    installed service when nothing answers, and a missing daemon is a case
+    enrolment proceeds in.
+
+    Exit handling: nothing beyond `spike`'s. PortAudio's exit teardown stays
+    registered, which is what stops its loop threads. The recorder has closed its
+    stream by then, and the audio server is running, which a command a person is
+    watching can rely on. See docs/agent-notes/portaudio-jack-exit-abort.md.
+    """
+    try:
+        name = validate_name(name)
+    except InvalidSpeakerName as error:
+        print(f"Cannot enrol that name: {error}.", file=sys.stderr)
+        return 1
+    if not (math.isfinite(seconds) and ENROL_MIN_SPEECH_SECONDS < seconds <= ENROL_MAX_SECONDS):
+        print(
+            f"--seconds must be more than {ENROL_MIN_SPEECH_SECONDS:g} and at most "
+            f"{ENROL_MAX_SECONDS:g}, because at least {ENROL_MIN_SPEECH_SECONDS:g} seconds of "
+            "speech are needed.",
+            file=sys.stderr,
+        )
+        return 1
+
+    model_path = _speaker_model_path()
+    if not model_path.is_file():
+        setup = r".\bootstrap.ps1 upgrade" if sys.platform == "win32" else "./setup.sh upgrade"
+        print(
+            f"The speaker model is missing: {model_path}\n"
+            f"Run {setup} to download it, or place the file there.",
+            file=sys.stderr,
+        )
+        return 1
+
+    status, _reason = _daemon_status(config, send, "whether it is busy")
+    state = status.get("state") if isinstance(status.get("state"), str) else None
+    if state is not None and state != STATE_IDLE:
+        doing = _BUSY_STATE_DESCRIPTIONS.get(state, f"in state {state}")
+        print(
+            f"The Murmly daemon is {doing}, so a sample would mix your voice with it. "
+            "Try again when it is idle.",
+            file=sys.stderr,
+        )
+        return 1
+
+    make_embedder = embedder_factory or SpeakerEmbedder
+    find_speech = speech_regions or _enrol_speech_regions
+    embedder = make_embedder(model_path)
+    try:
+        return _enrol_recording(config, name, seconds, model_path, embedder, find_speech)
+    finally:
+        embedder.release()
+
+
+def _enrol_recording(
+    config: MurmlyConfig,
+    name: str,
+    seconds: float,
+    model_path: Path,
+    embedder,
+    find_speech: Callable[[object], list[tuple[int, int]]],
+) -> int:
+    """The part of enrolment that holds the model: load it, record, embed, store."""
+    # Loaded before recording, so a model that will not load costs the person
+    # nothing. A short silent probe is enough to build the session.
+    try:
+        import numpy as np
+
+        embedder.embed(np.full(SPEAKER_SAMPLE_RATE_HZ, 1e-3, dtype=np.float32))
+    except Exception as error:  # noqa: BLE001 - reported with the file, not raised
+        print(f"The speaker model could not be loaded from {model_path}: {error}", file=sys.stderr)
+        return 1
+
+    store = VoiceprintStore(default_data_dir())
+    store.refresh()
+    discarded_other_model = store.needs_reenrolment
+    discarded_unreadable = store.detail is not None and not discarded_other_model
+
+    recorder = SoundDeviceRecorder(config)
+    print(f'Enrolling "{name}". Recording for {seconds:g} seconds. Read this aloud:\n')
+    print(ENROL_PASSAGE)
+    print(
+        "\nKeep reading until the recording stops. If you reach the end, start again "
+        "from the top."
+    )
+    print("\nRecording now.", flush=True)
+    try:
+        clip = recorder.record_for_seconds(seconds)
+    except KeyboardInterrupt:
+        recorder.stop()
+        print("\nEnrolment cancelled. Nothing was stored.", file=sys.stderr)
+        return 130
+    except RuntimeError as error:
+        recorder.stop()
+        print(f"Could not record: {error}", file=sys.stderr)
+        return 1
+    print("Recording finished. Checking the sample.", flush=True)
+
+    audio = _capture_as_speaker_audio(clip, recorder.sample_rate_hz, config.channels)
+    del clip
+    regions = find_speech(audio) if len(audio) else []
+    speech_seconds = sum(end - start for start, end in regions) / SPEAKER_SAMPLE_RATE_HZ
+    if speech_seconds < ENROL_MIN_SPEECH_SECONDS:
+        print(
+            f"Too little speech was heard: {speech_seconds:.1f} seconds, and at least "
+            f"{ENROL_MIN_SPEECH_SECONDS:g} are needed. Nothing was stored. Check that the "
+            "microphone is not muted, then try again and keep talking for the whole recording.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        voiceprint = _voiceprint_from_speech(audio, regions, embedder)
+        replaced = store.add_or_replace(name, voiceprint)
+    except Exception as error:  # noqa: BLE001 - nothing was stored, and the reason is the report
+        print(f"Could not make or store the voiceprint: {error}", file=sys.stderr)
+        return 1
+
+    print(f'Enrolled "{name}".')
+    if replaced:
+        print(f'Replaced the voiceprint already enrolled as "{name}".')
+    if discarded_other_model:
+        print(
+            "The earlier voiceprints were made with a different speaker model and have been "
+            "discarded. Enrol those voices again."
+        )
+    elif discarded_unreadable:
+        print("The earlier voiceprint file could not be read and has been replaced.")
+    print(f"Voiceprint stored in: {store.path}")
+    print(f"To remove this voice: murmly speakers remove {_command_line_name(name)}")
+    if not config.speaker_owner:
+        print(
+            f"\nNo owner is set. To make this voice the owner, add this to {config.config_path}:\n\n"
+            f"[speakers]\nowner = {json.dumps(name, ensure_ascii=False)}"
+        )
+    return 0
+
+
+def _run_speakers_list(config: MurmlyConfig) -> int:
+    store = VoiceprintStore(default_data_dir())
+    store.refresh()
+    owner = config.speaker_owner
+    names = store.names
+    if names:
+        print(f"Enrolled voices ({len(names)}):")
+        for name in names:
+            print(f"  {name} (owner)" if owner and name.casefold() == owner.casefold() else f"  {name}")
+    else:
+        print("No voices are enrolled. Enrol one with: murmly enrol <name>")
+    if owner and not any(name.casefold() == owner.casefold() for name in names):
+        print(f'The configured owner "{owner}" is not enrolled.')
+    if store.needs_reenrolment:
+        print(
+            "Voiceprints made with a different speaker model are ignored. "
+            "Enrol those voices again."
+        )
+    elif store.detail:
+        print(f"Voiceprint file: {store.detail}.")
+    return 0
+
+
+def _run_speakers_remove(name: str | None, remove_all: bool) -> int:
+    store = VoiceprintStore(default_data_dir())
+    if remove_all:
+        existed = store.remove_all()
+        print("Removed every enrolled voice." if existed else "No voices were enrolled.")
+        return 0
+    if name is None or not store.remove(name):
+        print(f'"{name}" is not enrolled.', file=sys.stderr)
+        return 1
+    print(f'Removed "{name}".')
+    return 0
+
+
 def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) -> None:
     # Resolved once, like `_dispatch` resolves it once for every other command
     # (task 1.3): a second `resolve_platform()` call here could in principle
@@ -666,7 +982,11 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
     # transcription is enabled, and the speech probe opens the output device;
     # residency is meant to say what the daemon held when the question was put,
     # not what this report caused on its way past.
-    (model_resident, model_resident_detail), synthesis_residency = daemon_residency(config)
+    (
+        (model_resident, model_resident_detail),
+        synthesis_residency,
+        speaker_residency,
+    ) = daemon_residency(config)
     # Asked here for the same reason and at the same moment. The speech probe
     # below opens an output device of its own, and a count taken after that
     # would still be the daemon's rather than the probe's -- but taking both
@@ -755,6 +1075,14 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             "available": False,
             "detail": f"Unable to check the microphone: {error}",
         }
+
+    # Guarded like every other probe. The residency was asked of the daemon above,
+    # before anything here could have changed it; this section reads files and
+    # builds no session.
+    try:
+        speaker_recognition = speaker_recognition_diagnostics(config, residency=speaker_residency)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not raise
+        speaker_recognition = speaker_recognition_failure(config, speaker_residency, error)
 
     # Guarded on its own, like every other probe: a speech stack that cannot be
     # inspected must not take the rest of the report with it.
@@ -863,6 +1191,7 @@ def _run_doctor(config: MurmlyConfig, profile: PlatformProfile | None = None) ->
             None if memory_returnable else system_memory_unreturnable_reason()
         ),
         "live_transcription": live_transcription_diagnostics(config),
+        "speaker_recognition": speaker_recognition,
         "delivery": delivery_diagnostics(config),
         "overlay": overlay,
         "speech_output": speech,
@@ -1282,8 +1611,15 @@ def daemon_playback(
 def daemon_residency(
     config: MurmlyConfig,
     send: Callable[[str, str], dict[str, object]] | None = None,
-) -> tuple[tuple[bool | None, str | None], tuple[bool | None, str | None]]:
+) -> tuple[
+    tuple[bool | None, str | None],
+    tuple[bool | None, str | None],
+    tuple[bool | None, str | None],
+]:
     """What the running daemon holds, as a value and a reason for each model.
+
+    The models are transcription, synthesis and speaker recognition, in that
+    order, all out of the one `status` answer.
 
     Asked of the daemon rather than answered here. `murmly doctor` runs in its
     own process and holds neither model, so its own residency is a constant
@@ -1300,6 +1636,7 @@ def daemon_residency(
 
     Three outcomes per model, in the shape this file already uses for a value it
     could not determine: True, False, or None beside a detail naming the reason.
+    A speaker model that failed to build is False beside the daemon's reason.
     Nothing is loaded to produce any of them.
     """
     response, unavailable = _daemon_status(config, send, "what it holds")
@@ -1327,14 +1664,37 @@ def daemon_residency(
             "The Murmly daemon holds no synthesis session: speech output is not "
             "enabled in the daemon that is running.",
         )
-    return transcription, synthesis
+    return transcription, synthesis, _speaker_residency_field(response)
 
 
 def _residency_unknown(
     detail: str,
-) -> tuple[tuple[None, str], tuple[None, str]]:
-    """Both models unanswered for the same reason, which is one reason each."""
-    return (None, detail), (None, detail)
+) -> tuple[tuple[None, str], tuple[None, str], tuple[None, str]]:
+    """Every model unanswered for the same reason, which is one reason each."""
+    return (None, detail), (None, detail), (None, detail)
+
+
+def _speaker_residency_field(response: dict[str, object]) -> tuple[bool | None, str | None]:
+    """The speaker model's residency out of the daemon's answer.
+
+    Unlike the other two, a False can carry the daemon's reason: a model that
+    could not be built is not held, and the daemon says why.
+    """
+    if "speaker_model_resident" not in response:
+        return None, (
+            "The running Murmly daemon does not report speaker model residency. "
+            "Restart the service to pick up a version that does."
+        )
+    value = response.get("speaker_model_resident")
+    detail = response.get("speaker_model_resident_detail")
+    if isinstance(value, bool):
+        return value, detail if isinstance(detail, str) and detail else None
+    if isinstance(detail, str) and detail:
+        return None, f"The Murmly daemon could not read speaker model residency: {detail}"
+    return None, (
+        f"The Murmly daemon reported speaker model residency as {value!r}, which is "
+        "not an answer."
+    )
 
 
 def _residency_field(
@@ -1367,6 +1727,152 @@ def _quiet_window_in_use(config: MurmlyConfig) -> str | None:
         f"{config.tts_quiet_start.strftime('%H:%M')}"
         f"-{config.tts_quiet_end.strftime('%H:%M')}"
     )
+
+
+def speaker_recognition_diagnostics(
+    config: MurmlyConfig,
+    residency: tuple[bool | None, str | None] = (None, None),
+    data_dir: Path | None = None,
+) -> dict[str, object]:
+    """The `speaker_recognition` section of `murmly doctor`.
+
+    Every key is present in every mode and on every platform, `None` where it
+    does not apply. Works in every mode: the mode restricts the daemon, not the
+    report.
+
+    The model is checked by hashing the file. No session is built and
+    `onnxruntime` is not imported, so the report loads nothing. Only names,
+    their count and the owner are reported about the voices; the store's
+    vectors are never read into the report.
+
+    Residency is passed in, taken from the daemon's `status` answer by
+    `daemon_residency`. `(None, reason)` means no daemon could say.
+    """
+    resident, resident_detail = residency
+    directory = data_dir if data_dir is not None else default_data_dir()
+    model_path = directory / SPEAKER_MODEL_FILENAME
+    model_present, checksum_matches, model_problem = _speaker_model_state(model_path)
+
+    store = VoiceprintStore(directory)
+    store.refresh()
+    names = store.names
+    owner = config.speaker_owner or None
+    owner_enrolled = (
+        None if owner is None else any(name.casefold() == owner.casefold() for name in names)
+    )
+
+    available, detail = _speaker_availability(
+        config.speaker_mode, model_problem, store, owner, owner_enrolled
+    )
+    return {
+        "mode": config.speaker_mode,
+        "mode_rejected_value": config.speaker_mode_rejected_value,
+        "match_threshold": config.speaker_match_threshold_percent,
+        "match_threshold_rejected_value": config.speaker_match_threshold_rejected_value,
+        "owner": owner,
+        "owner_enrolled": owner_enrolled,
+        "enrolled_count": len(names),
+        "enrolled_names": names,
+        "voiceprints_path": str(store.path),
+        "voiceprints_need_reenrolment": store.needs_reenrolment,
+        "model_path": str(model_path),
+        "model_present": model_present,
+        "model_checksum_matches": checksum_matches,
+        "available": available,
+        "detail": detail,
+        "provider": SPEAKER_CPU_PROVIDER,
+        "resident": resident,
+        "resident_detail": resident_detail,
+        "unload_after_idle_s": config.unload_after_idle_s,
+    }
+
+
+def speaker_recognition_failure(
+    config: MurmlyConfig,
+    residency: tuple[bool | None, str | None],
+    error: BaseException,
+) -> dict[str, object]:
+    """The section when the probe itself failed: the same keys, and why.
+
+    What the configuration says survives, as does the daemon's answer, which was
+    taken before the probe ran.
+    """
+    resident, resident_detail = residency
+    return {
+        "mode": config.speaker_mode,
+        "mode_rejected_value": config.speaker_mode_rejected_value,
+        "match_threshold": config.speaker_match_threshold_percent,
+        "match_threshold_rejected_value": config.speaker_match_threshold_rejected_value,
+        "owner": config.speaker_owner or None,
+        "owner_enrolled": None,
+        "enrolled_count": None,
+        "enrolled_names": None,
+        "voiceprints_path": None,
+        "voiceprints_need_reenrolment": None,
+        "model_path": None,
+        "model_present": None,
+        "model_checksum_matches": None,
+        "available": False,
+        "detail": f"Unable to check speaker recognition: {error}",
+        "provider": SPEAKER_CPU_PROVIDER,
+        "resident": resident,
+        "resident_detail": resident_detail,
+        "unload_after_idle_s": config.unload_after_idle_s,
+    }
+
+
+def _speaker_model_state(model_path: Path) -> tuple[bool, bool | None, str | None]:
+    """Whether the model file is there, whether it is the pinned one, and why not.
+
+    The reason is worded as the daemon words its warnings. `None` for the
+    checksum when there is no file to hash.
+    """
+    if not model_path.is_file():
+        return False, None, f"the speaker model is missing: {model_path}"
+    try:
+        checksum = file_sha256(model_path)
+    except OSError as error:
+        return True, None, f"the speaker model cannot be read: {model_path}: {error}"
+    if checksum != SPEAKER_MODEL_SHA256:
+        return True, False, checksum_mismatch_message(model_path)
+    return True, True, None
+
+
+def _speaker_availability(
+    mode: str,
+    model_problem: str | None,
+    store: VoiceprintStore,
+    owner: str | None,
+    owner_enrolled: bool | None,
+) -> tuple[bool, str | None]:
+    """Whether the daemon could use the mode, and the reason when it could not.
+
+    The same checks, in the same order and terms, as the daemon's warning at
+    capture start, the checksum included.
+    """
+    if mode == "off":
+        return False, "the speaker mode is off"
+    if model_problem is not None:
+        return False, model_problem
+    if mode == "mine-only" and not owner_enrolled:
+        if store.needs_reenrolment:
+            return False, (
+                "the enrolled voices were made with a different speaker model and "
+                "must be enrolled again"
+            )
+        if store.detail:
+            return False, f"mine-only needs an enrolled owner, and {store.detail}"
+        if owner is None:
+            return False, "mine-only needs an enrolled owner, and no owner is set"
+        return False, f'mine-only needs an enrolled owner, and "{owner}" is not enrolled'
+    if store.needs_reenrolment:
+        return True, (
+            "voices made with a different speaker model are ignored; "
+            "enrol those voices again"
+        )
+    if store.detail:
+        return True, store.detail
+    return True, None
 
 
 def speech_output_diagnostics(

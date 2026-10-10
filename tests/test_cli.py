@@ -1733,6 +1733,7 @@ class DoctorCompletenessTests(unittest.TestCase):
         "system_memory_returnable",
         "system_memory_returnable_detail",
         "live_transcription",
+        "speaker_recognition",
         "delivery",
         "overlay",
         "speech_output",
@@ -3433,6 +3434,7 @@ class StubDaemonSession:
 
     def __init__(self, *, model_resident: bool = False) -> None:
         self.model_resident = model_resident
+        self.speaker_model_resident = False
 
     def capture_delivery_target(self):
         return None
@@ -3726,7 +3728,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
                     self.fail("daemon socket was not accepting connections")
                 time.sleep(0.01)
 
-        transcription, synthesis = daemon_residency(config)
+        transcription, synthesis, speaker = daemon_residency(config)
 
         self.assertEqual((True, None), transcription)
         self.assertIsNone(synthesis[0])
@@ -3828,7 +3830,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
 
         def residency(config: MurmlyConfig, send: object = None):
             order.append("residency")
-            return (False, None), (False, None)
+            return (False, None), (False, None), (False, None)
 
         def live(config: MurmlyConfig) -> dict[str, object]:
             order.append("live transcription")
