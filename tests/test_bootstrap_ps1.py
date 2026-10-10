@@ -364,5 +364,108 @@ class BootstrapPs1SpeakerModelTests(unittest.TestCase):
         self.assertIn("FETCHES:[]", result.stdout)
 
 
+class BootstrapPs1CommandTests(unittest.TestCase):
+    """The script run as a command, which is the only way to reach its trailing
+    guard: `install` fetches the model and then hands off to `murmly`, while
+    `upgrade` fetches the model and stops, because `murmly` has no `upgrade`
+    subcommand to hand it to.
+
+    The driver calls the real script with `&` after defining `Invoke-WebRequest`,
+    `Get-FileHash` and `uv` as functions, which the script sees through
+    PowerShell's dynamic scoping and which win over the cmdlets and executable
+    of the same names. `Get-FileHash` answers the script's own pinned checksum
+    for any file, since the pinned value is set inside the script and a test
+    cannot replace it.
+    """
+
+    def setUp(self) -> None:
+        if _INTERPRETER is None:
+            self.skipTest("no PowerShell interpreter (pwsh or powershell) on PATH")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.dir = Path(temp_dir.name)
+        self.local = self.dir / "local"
+        self.model = self.local / "murmly" / "voxceleb_resnet34_LM.onnx"
+        match = re.search(r'^\$SpeakerModelSha256 = "([0-9a-f]{64})"$', BOOTSTRAP_PS1.read_text(encoding="utf-8"), re.MULTILINE)
+        assert match is not None
+        self.checksum = match.group(1)
+
+    def _run(self, command: str, *, download_fails: bool = False):
+        download = (
+            'throw "network down"'
+            if download_fails
+            else "Set-Content -LiteralPath $OutFile -Value stand-in"
+        )
+        driver = self.dir / "driver.ps1"
+        driver.write_text(
+            "function Invoke-WebRequest {\n"
+            "    param($Uri, $OutFile, [switch]$UseBasicParsing)\n"
+            "    $global:Fetches++\n"
+            f"    {download}\n"
+            "}\n"
+            f'function Get-FileHash {{ param($LiteralPath, $Algorithm) [pscustomobject]@{{ Hash = "{self.checksum}" }} }}\n'
+            "function uv { $global:UvCallArgs = $args -join \" \"; $global:LASTEXITCODE = 0 }\n"
+            f'$env:LOCALAPPDATA = "{self.local}"\n'
+            f'& "{BOOTSTRAP_PS1}" {command}\n'
+            'Write-Output "EXITCODE:[$LASTEXITCODE]"\n'
+            'Write-Output "FETCHES:[$Fetches]"\n'
+            'Write-Output "UVCALL:[$UvCallArgs]"\n',
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [_INTERPRETER, "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+    def test_upgrade_fetches_the_model_and_does_not_hand_off(self) -> None:
+        result = self._run("upgrade")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("FETCHES:[1]", result.stdout)
+        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertTrue(self.model.is_file())
+
+    def test_upgrade_with_the_model_already_there_exits_zero_without_fetching(self) -> None:
+        self.model.parent.mkdir(parents=True)
+        self.model.write_bytes(b"already here")
+
+        result = self._run("upgrade")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("FETCHES:[]", result.stdout)
+        self.assertIn("UVCALL:[]", result.stdout)
+
+    def test_upgrade_exits_one_when_the_model_could_not_be_fetched(self) -> None:
+        result = self._run("upgrade", download_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[1]", result.stdout)
+        self.assertIn("Could not fetch", result.stdout + result.stderr)
+        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertFalse(self.model.exists())
+
+    def test_install_fetches_the_model_then_hands_off(self) -> None:
+        result = self._run("install Meta+X")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("FETCHES:[1]", result.stdout)
+        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
+
+    def test_install_still_hands_off_when_the_model_could_not_be_fetched(self) -> None:
+        result = self._run("install Meta+X", download_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("Could not fetch", result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
+
+
 if __name__ == "__main__":
     unittest.main()

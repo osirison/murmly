@@ -53,6 +53,9 @@ or, if murmly is already installed:
 These are the commands from [installing murmly](install.md). Use your own
 hotkey in place of `Meta+X`. Setup
 checks the file against a known checksum and tells you if it does not match.
+On Windows, `upgrade` does only this: it downloads the model, or confirms the
+one you have, and reports a failure if the file is still missing or wrong
+afterwards. It changes nothing else.
 
 Check that the file is there:
 

@@ -8,8 +8,15 @@
 #
 #   .\bootstrap.ps1 install Meta+X
 #   .\bootstrap.ps1 sync --cuda
+#   .\bootstrap.ps1 upgrade
 #
-# Every argument is passed straight through to `murmly`, run inside this
+# `upgrade` is the one command that is not handed to `murmly`, which has no
+# such subcommand: it fetches the speaker model, or confirms the one already
+# there, and stops. It exits 0 when the model is in place and matches its
+# checksum, and 1 when it is not, because the model is all `upgrade` does. (On
+# `install` a failed fetch stays a warning: the daemon runs without it.)
+#
+# Every other argument is passed straight through to `murmly`, run inside this
 # checkout's own environment (`uv run`, which syncs it on demand -- the same
 # "no environment yet" bootstrap `setup.sh`'s own `sync_environment` performs
 # with a plain `uv sync --locked` before it can call `murmly sync` itself).
@@ -124,6 +131,17 @@ function Install-SpeakerModel {
     }
 }
 
+# What `upgrade` does: the model, and nothing else. The exit code answers
+# whether the model is now in place and verified, which `Install-SpeakerModel`
+# does not return because on `install` its failure is only a warning.
+function Invoke-Upgrade {
+    Install-SpeakerModel
+    if (Test-SpeakerModel -Path (Join-Path (Get-DataDir) $SpeakerModelFile)) {
+        return 0
+    }
+    return 1
+}
+
 function Invoke-Bootstrap {
     param([string[]]$Arguments)
 
@@ -158,9 +176,13 @@ function Invoke-Bootstrap {
 #
 # The speaker model is fetched on `install` and `upgrade`, the two commands
 # `setup.sh` fetches it on, and outside `Invoke-Bootstrap` so that a test of the
-# hand-off to `uv` never reaches the network.
+# hand-off to `uv` never reaches the network. `install` then hands off to
+# `murmly`; `upgrade` ends here, because `murmly` has no `upgrade` subcommand.
 if ($MyInvocation.InvocationName -ne '.') {
-    if ($args.Count -gt 0 -and $args[0] -in @("install", "upgrade")) {
+    if ($args.Count -gt 0 -and $args[0] -eq "upgrade") {
+        exit (Invoke-Upgrade)
+    }
+    if ($args.Count -gt 0 -and $args[0] -eq "install") {
         Install-SpeakerModel
     }
     exit (Invoke-Bootstrap -Arguments $args)
