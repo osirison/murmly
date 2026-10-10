@@ -32,10 +32,12 @@ from murmly.speakers import (
     TimedText,
     Voice,
     attribute,
+    drop_silent_parts,
     fbank_features,
     normalised_features,
     same_name,
     speaker_text,
+    speech_seconds,
     validate_name,
 )
 
@@ -903,6 +905,79 @@ class StaysPureTests(unittest.TestCase):
         )
 
         self.assertEqual("You", result[0].speaker.label)
+
+
+class SilenceCheckTests(unittest.TestCase):
+    """`drop_silent_parts` against a measure that reads the seconds off the slice."""
+
+    @staticmethod
+    def speech(seconds: float):
+        """A slice standing for this many seconds of detected speech."""
+        return seconds
+
+    def drop(self, parts, seconds, **options):
+        by_part = {id(timed): value for timed, value in zip(parts, seconds)}
+        return drop_silent_parts(
+            parts, lambda timed: by_part[id(timed)], measure=lambda value: value, **options
+        )
+
+    def test_a_part_with_no_speech_is_dropped_and_the_rest_keep_their_order(self) -> None:
+        parts = [part("Hello.", 0, 2, E0), part("Thank you.", 2, 4, E0), part("Bye.", 4, 6, E0)]
+        timed = [item for item, _ in parts]
+
+        self.assertEqual([timed[0], timed[2]], self.drop(timed, [1.8, 0.0, 0.3]))
+
+    def test_the_least_speech_kept_is_the_threshold_itself(self) -> None:
+        timed = [item for item, _ in [part("a", 0, 1, E0), part("b", 1, 2, E0)]]
+
+        kept = self.drop(timed, [0.15, 0.149], min_speech_seconds=0.15)
+
+        self.assertEqual([timed[0]], kept)
+
+    def test_every_part_dropped_is_an_empty_list(self) -> None:
+        timed = [item for item, _ in [part("Thank you.", 0, 1, E0)]]
+
+        self.assertEqual([], self.drop(timed, [0.0]))
+
+    def test_a_part_shorter_than_the_attribution_minimum_is_still_measured(self) -> None:
+        timed = [item for item, _ in [part("yes", 0, 0.4, E0), part("hm", 1, 1.1, E0)]]
+
+        self.assertEqual([timed[0]], self.drop(timed, [0.4, 0.0]))
+
+    def test_a_measure_that_raises_keeps_every_part_and_logs_only_the_class(self) -> None:
+        timed = [item for item, _ in [part("secret words", 0, 2, E0), part("more", 2, 4, E0)]]
+
+        def broken(_audio):
+            raise RuntimeError("secret words in a message")
+
+        with self.assertLogs("murmly.speakers", level="WARNING") as logs:
+            kept = drop_silent_parts(timed, lambda _timed: None, measure=broken)
+
+        self.assertEqual(timed, kept)
+        self.assertNotIn("secret", logs.output[0])
+        self.assertIn("RuntimeError", logs.output[0])
+
+
+class SpeechSecondsTests(unittest.TestCase):
+    """The real Silero model, which ships with faster-whisper."""
+
+    def setUp(self) -> None:
+        try:
+            import faster_whisper.vad  # noqa: F401
+        except ImportError:
+            self.skipTest("faster-whisper is not installed")
+
+    def test_audio_with_no_frame_in_it_has_no_speech_and_does_not_raise(self) -> None:
+        for size in (0, 1, 100, 511, 512, 513):
+            with self.subTest(size=size):
+                self.assertEqual(0.0, speech_seconds(np.zeros(size, dtype=np.float32)))
+
+    def test_silence_and_faint_noise_have_no_speech(self) -> None:
+        rng = np.random.default_rng(1)
+        noise = (rng.standard_normal(32_000) * 10 ** (-45 / 20)).astype(np.float32)
+
+        self.assertEqual(0.0, speech_seconds(np.zeros(32_000, dtype=np.float32)))
+        self.assertEqual(0.0, speech_seconds(noise))
 
 
 if __name__ == "__main__":

@@ -147,6 +147,7 @@ description: Track verification, implementation and validation of voice enrolmen
 
   Done when the suite passes with `--no-sync`.
 - [x] 7.7 Split timed parts at word gaps of 1.5 s or more, using word timestamps in speaker modes only. Done when a fake-model test splits a two-sentence segment at a long word gap and leaves mode off's decode unchanged, and ~/murmly-pause.wav yields two parts through the real code path.
+- [x] 7.8 In label-everyone, decode with `vad_filter=False` and `condition_on_previous_text=False` and drop every part with less than 0.15 s of Silero speech before attribution; mine-only keeps the configured filter. Done when tests cover the decode flags by mode (off and mine-only unchanged), the check dropping a near-silent part and keeping a quiet one, and a recording of only invented text delivering nothing, and `round-d.wav` through the real code path labels "Yes, go ahead." as Sam while the noise recordings deliver nothing. The measured threshold is recorded in `design.md`.
 
 ## 8. Residency and status
 

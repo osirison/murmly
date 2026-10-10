@@ -65,6 +65,13 @@ MODEL_INPUT_NAME = "feats"
 #: on real recordings, and at 0.5 s they were not (design.md, task 4.7).
 MIN_PART_SECONDS = 1.0
 
+#: A part with less speech than this, by Silero, is not delivered by
+#: label-everyone. Decoded without the VAD, Whisper writes stock phrases over
+#: silence and room noise; Silero found none in any of those (0.00 s) and at
+#: least 0.28 s in every spoken part measured, quiet second speaker included
+#: (design.md, task 7.8).
+MIN_SPEECH_SECONDS = 0.15
+
 #: The longest name an enrolled voice may have, and the labels Murmly reserves.
 MAX_NAME_LENGTH = 32
 OWNER_LABEL = "You"
@@ -621,3 +628,51 @@ def speaker_text(
         )
         return kept
     return format_label_everyone(attributed)
+
+
+def speech_seconds(samples) -> float:
+    """Seconds of speech Silero finds in 16 kHz mono float32 audio.
+
+    The model `silence.py` loads, through faster-whisper's own splitter with its
+    default options. Audio too short to hold one frame has none. Raises when the
+    model cannot be loaded or run.
+    """
+    import numpy as np
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    audio = np.asarray(samples, dtype=np.float32)
+    if audio.size == 0:
+        return 0.0
+    regions = get_speech_timestamps(audio, VadOptions(), sampling_rate=SAMPLE_RATE_HZ)
+    return sum(region["end"] - region["start"] for region in regions) / SAMPLE_RATE_HZ
+
+
+def drop_silent_parts(
+    parts: Sequence[TimedText],
+    audio_for: Callable[[TimedText], object],
+    *,
+    measure: Callable[[object], float] = speech_seconds,
+    min_speech_seconds: float = MIN_SPEECH_SECONDS,
+) -> list[TimedText]:
+    """The parts whose own audio holds speech, in order.
+
+    Whisper decoded without its VAD writes text over silence; a part with less
+    than `min_speech_seconds` of speech is that text and is dropped. Unlike
+    `attribute`, this looks at every part however short. When `measure` raises
+    the model is unusable, so every part is kept: the text is then delivered as
+    it would be with the check absent, and nothing but the exception's class is
+    logged.
+    """
+    kept = []
+    try:
+        for part in parts:
+            if measure(audio_for(part)) >= min_speech_seconds:
+                kept.append(part)
+    except Exception as error:  # noqa: BLE001 - the transcript is delivered regardless
+        logger.warning(
+            "Silence check unavailable; delivering every part: %s", type(error).__name__
+        )
+        return list(parts)
+    if len(kept) < len(parts):
+        logger.info("silence check kept %d of %d parts", len(kept), len(parts))
+    return kept

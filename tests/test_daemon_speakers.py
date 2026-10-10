@@ -142,6 +142,7 @@ class FakeTranscriber:
         self.scripts: dict[bytes, list[TimedText]] = {}
         self.plain_calls = 0
         self.timed_calls = 0
+        self.timed_options: list[dict] = []
         self.released = 0
         self.resident = True
         self.partials_available = False
@@ -160,8 +161,11 @@ class FakeTranscriber:
         self.plain_calls += 1
         return " ".join(part.text for part in self.scripts[pcm_audio]).strip()
 
-    def transcribe_segments_pcm16(self, pcm_audio: bytes, sample_rate_hz: int | None = None):
+    def transcribe_segments_pcm16(
+        self, pcm_audio: bytes, sample_rate_hz: int | None = None, **options
+    ):
         self.timed_calls += 1
+        self.timed_options.append(options)
         return list(self.scripts[pcm_audio])
 
 
@@ -231,6 +235,16 @@ class SpeakerDaemonCase(unittest.TestCase):
         patcher = patch.object(SpeechSession, "_create_silence_detector", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Silero on a constant block means nothing; a silent block (voice 0) is
+        # the one with no speech in it, any other has all of its seconds.
+        self.measure = Mock(side_effect=self.fake_speech_seconds)
+        patcher = patch("murmly.daemon.speech_seconds", self.measure)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def fake_speech_seconds(samples) -> float:
+        return float(len(samples)) / 16_000 if np.any(samples) else 0.0
 
     def build(self, mode: str, **overrides: object):
         config = MurmlyConfig(
@@ -498,6 +512,151 @@ class LabelEveryoneTests(SpeakerDaemonCase):
 
         self.assertEqual(["yes"], self.paster.pasted)
         self.assertEqual("yes", response["text"])
+
+
+class SilenceCheckTests(SpeakerDaemonCase):
+    """Label-everyone decodes without the VAD and drops what Whisper wrote over silence."""
+
+    SILENT = 0
+
+    def test_the_decode_flag_follows_the_mode(self) -> None:
+        for mode, options in (
+            ("off", None),
+            ("mine-only", {}),
+            ("label-everyone", {"quiet_speakers": True}),
+        ):
+            with self.subTest(mode=mode):
+                daemon = self.build(mode)
+                self.recorder.finals.append(self.audio((ME, "hello there", 2.0)))
+
+                daemon.handle_command("toggle")
+                daemon.handle_command("toggle")
+
+                if options is None:
+                    self.assertEqual((1, 0), (self.transcriber.plain_calls, self.transcriber.timed_calls))
+                else:
+                    self.assertEqual([options], self.transcriber.timed_options)
+
+    def test_a_silent_part_is_dropped_before_attribution_and_a_quiet_one_kept(self) -> None:
+        daemon = self.build("label-everyone")
+        self.recorder.finals.append(
+            self.audio(
+                (ME, "Shall we start?", 2.0),
+                (self.SILENT, "Thank you.", 1.5),
+                (STRANGER_A, "Yes, go ahead.", 1.0),
+                (self.SILENT, "Thank you.", 1.5),
+            )
+        )
+
+        daemon.handle_command("toggle")
+        response = daemon.handle_command("toggle")
+
+        expected = "You: Shall we start? Speaker 1: Yes, go ahead."
+        self.assertEqual([expected], self.paster.pasted)
+        self.assertEqual(expected, response["text"])
+        self.assertEqual(2, self.embedder.embeds)
+
+    def test_a_recording_of_only_invented_text_delivers_nothing_and_signals_no_failure(self) -> None:
+        daemon = self.build("label-everyone")
+        self.recorder.finals.append(
+            self.audio((self.SILENT, "Thank you.", 1.5), (self.SILENT, "Thank you.", 1.5))
+        )
+
+        daemon.handle_command("toggle")
+        response = daemon.handle_command("toggle")
+
+        self.assertEqual("", response["text"])
+        self.assertFalse(response["delivered"])
+        self.assertNotIn("detail", response)
+        self.assertEqual([], self.paster.pasted)
+        self.assertEqual([], self.paster.copied)
+        self.assertNotIn("error", [event[0] for event in self.overlay.events])
+        self.assertEqual(0, self.embedder.embeds)
+
+    def test_a_continuous_segment_of_only_invented_text_keeps_listening(self) -> None:
+        daemon = self.build("label-everyone", auto_transcribe="continuous")
+        self.recorder.segments.append(self.audio((ME, "kept segment", 2.0)))
+        self.recorder.segments.append(self.audio((self.SILENT, "Thank you.", 2.0)))
+        self.recorder.finals.append(self.audio((STRANGER_A, "closing words", 2.0)))
+
+        daemon.handle_command("toggle")
+        daemon._on_silence()
+        self.settle(daemon)
+        daemon._on_silence()
+        self.settle(daemon)
+
+        self.assertEqual("LISTENING", daemon.state)
+        self.assertEqual(["You: kept segment"], self.paster.pasted)
+        self.assertNotIn(("error", 2_000), self.overlay.events)
+
+        response = daemon.handle_command("toggle")
+
+        self.assertEqual("You: kept segment Speaker 1: closing words", response["text"])
+        self.assertEqual(2, response["segments"])
+        self.assertTrue(response["delivered"])
+
+    def test_a_session_bound_reply_of_only_invented_text_is_not_delivered(self) -> None:
+        self.build("label-everyone")
+        pcm = self.audio((self.SILENT, "Thank you.", 2.0))
+        delivered: list[str] = []
+
+        self.session.start_recording()
+        result = self.session.process_for_session(pcm, lambda text: delivered.append(text) or True)
+
+        self.assertEqual([], delivered)
+        self.assertEqual("", result.text)
+        self.assertFalse(result.delivered)
+
+    def test_the_check_applies_when_the_speaker_model_cannot_be_built(self) -> None:
+        daemon = self.build("label-everyone")
+        self.embedder.load_error = RuntimeError("cannot open the model")
+        self.recorder.finals.append(
+            self.audio((ME, "all of it", 2.0), (self.SILENT, "Thank you.", 1.5))
+        )
+
+        with self.assertLogs("murmly.daemon", level=logging.WARNING):
+            daemon.handle_command("toggle")
+            response = daemon.handle_command("toggle")
+
+        self.assertEqual("all of it", response["text"])
+
+    def test_the_check_applies_to_the_unlabelled_text_of_a_recording_too_short_to_identify(self) -> None:
+        daemon = self.build("label-everyone")
+        self.recorder.finals.append(
+            self.audio((ME, "yes", 0.5), (self.SILENT, "Thank you.", 0.5))
+        )
+
+        daemon.handle_command("toggle")
+        response = daemon.handle_command("toggle")
+
+        self.assertEqual("yes", response["text"])
+
+    def test_a_check_that_cannot_run_delivers_every_part(self) -> None:
+        daemon = self.build("label-everyone")
+        self.measure.side_effect = RuntimeError("no vad model")
+        self.recorder.finals.append(
+            self.audio((ME, "Shall we start?", 2.0), (self.SILENT, "Thank you.", 1.5))
+        )
+
+        with self.assertLogs("murmly.speakers", level=logging.WARNING):
+            daemon.handle_command("toggle")
+            response = daemon.handle_command("toggle")
+
+        # The silent block is no voice the fake embedder knows, so attribution
+        # fails on it and the unlabelled text comes back: what matters is that
+        # the part the check would have dropped is still there.
+        self.assertEqual("Shall we start? Thank you.", response["text"])
+
+    def test_mine_only_and_off_never_run_the_check(self) -> None:
+        for mode in ("off", "mine-only"):
+            with self.subTest(mode=mode):
+                daemon = self.build(mode)
+                self.recorder.finals.append(self.audio((ME, "hello there", 2.0)))
+
+                daemon.handle_command("toggle")
+                daemon.handle_command("toggle")
+
+                self.measure.assert_not_called()
 
 
 class SpeechSessionBoundTests(SpeakerDaemonCase):

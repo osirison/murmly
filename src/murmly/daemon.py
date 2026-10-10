@@ -48,8 +48,10 @@ from murmly.speakers import (
     SpeakerEmbedder,
     SpeakerState,
     Voice,
+    drop_silent_parts,
     find_voice,
     speaker_text,
+    speech_seconds,
 )
 from murmly.speech import (
     EVENT_INTERRUPTED,
@@ -788,11 +790,28 @@ class SpeechSession:
         unlabelled and unfiltered. That is one decode: it is not repeated as
         `transcribe_pcm16`, so it can differ from the mode off's text by a word
         edge or a full stop.
+
+        Label-everyone decodes without the VAD, which would otherwise drop a
+        quiet second speaker, and then drops the parts with no speech in them:
+        Whisper writes stock phrases over silence. That happens before anything
+        else, so no fallback below can deliver those words, and a recording with
+        nothing left is an empty transcript. Mine-only keeps the configured VAD.
         """
         rate = self._recorder.sample_rate_hz
-        if self._config.speaker_mode == "off" or not self._speaker_ready:
+        mode = self._config.speaker_mode
+        if mode == "off" or not self._speaker_ready:
             return self._transcriber.transcribe_pcm16(pcm_audio, rate)
-        parts = self._transcriber.transcribe_segments_pcm16(pcm_audio, rate)
+        if mode == "label-everyone":
+            parts = self._transcriber.transcribe_segments_pcm16(
+                pcm_audio, rate, quiet_speakers=True
+            )
+            parts = drop_silent_parts(
+                parts, self._part_audio(pcm_audio, rate), measure=speech_seconds
+            )
+            if not parts:
+                return ""
+        else:
+            parts = self._transcriber.transcribe_segments_pcm16(pcm_audio, rate)
         plain = " ".join(part.text for part in parts).strip()
         try:
             with self._attribution_lock:
@@ -811,6 +830,19 @@ class SpeechSession:
         build = self._speaker_build
         if build is not None and not build.succeeded():
             return None
+        return speaker_text(
+            parts,
+            self._part_audio(pcm_audio, rate),
+            mode=self._config.speaker_mode,
+            voices=self._speaker_voices,
+            owner=self._config.speaker_owner,
+            embedder=self._speaker_embedder,
+            state=self._speaker_state,
+            threshold_percent=self._config.speaker_match_threshold_percent,
+        )
+
+    def _part_audio(self, pcm_audio: bytes, rate: int) -> Callable:
+        """Cuts a part's audio from the capture as 16 kHz mono float32."""
         channels = max(self._config.channels, 1)
         frame_bytes = 2 * channels
         frames = len(pcm_audio) // frame_bytes
@@ -825,16 +857,7 @@ class SpeechSession:
                 SPEAKER_SAMPLE_RATE_HZ,
             )
 
-        return speaker_text(
-            parts,
-            audio_for,
-            mode=self._config.speaker_mode,
-            voices=self._speaker_voices,
-            owner=self._config.speaker_owner,
-            embedder=self._speaker_embedder,
-            state=self._speaker_state,
-            threshold_percent=self._config.speaker_match_threshold_percent,
-        )
+        return audio_for
 
     def _prepare_speakers(self) -> None:
         """Get a capture session ready for its speaker mode. Never raises.

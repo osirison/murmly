@@ -258,7 +258,7 @@ Dictate as you always do. Nothing changes in how you start or stop.
 **With the hotkey.** Press the hotkey, speak, press it again. Murmly types the
 result of the whole recording: in `mine-only` only your words, in
 `label-everyone` the labelled line. Telling voices apart adds a short wait
-before the text arrives, [about 1.3 seconds for each minute of
+before the text arrives, [about 1.3 to 1.7 seconds for each minute of
 speech](#what-it-costs). If `mine-only` finds none of your voice in a
 recording, nothing is typed.
 
@@ -380,6 +380,9 @@ For anything else, see [when something goes wrong](troubleshooting.md).
   "yes" or "three", is too short to check, so it takes the speaker of the part
   next to it. If someone else spoke just before, your "yes" counts as theirs and
   `mine-only` leaves it out. Said on its own, the same word is kept.
+- **Quieter voices.** `label-everyone` picks up a quieter voice, such as
+  someone further from the microphone, that earlier versions could miss.
+  `mine-only` works as before.
 - **One person can get two numbers.** In `label-everyone`, if someone you have
   not enrolled says something very short, murmly may not recognise them and
   start a new `Speaker` number for it. The same person then appears as two
@@ -393,9 +396,16 @@ For anything else, see [when something goes wrong](troubleshooting.md).
 ## What it costs { #what-it-costs }
 
 Telling voices apart adds a wait between the end of the recording and the
-text arriving. Measured on a fast machine, it is about 1.3 seconds for each
-minute of speech, so a 10-second dictation waits about 0.2 seconds longer.
-Your machine may be slower. With the mode `off`, nothing is added.
+text arriving. Measured on a fast machine, `mine-only` adds about 1.3 seconds
+for each minute of speech, so a 10-second dictation waits about 0.2 seconds
+longer. `label-everyone` adds about 1.7 seconds for each minute, so a 10-second
+dictation waits about 0.3 seconds longer. Your machine may be slower. With the
+mode `off`, nothing is added.
+
+`label-everyone` does not skip the pauses before it transcribes, which is how it
+hears quieter voices, and it then discards any part with no speech in it. That
+costs the extra time, and the text of a recording can occasionally start without
+capital letters or full stops. `mine-only` is not affected.
 
 The speaker model runs on the CPU. It is loaded when you first record in a
 speaker mode and released with the transcription model after the idle period.

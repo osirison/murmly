@@ -665,6 +665,35 @@ Speech-session replies go through the same helper, through
 `process_for_session`. In label-everyone mode, the agent therefore receives
 `You: …`-prefixed text.
 
+### Label-everyone decodes without the VAD and drops silent parts
+
+A live label-everyone recording lost its quiet second speaker. Sam spoke at
+about -28 dBFS, 12 dB below the owner. The Silero VAD found Sam, but Whisper's
+decode of the chunks that faster-whisper stitches from the VAD's regions wrote
+only the loud owner's words. Mine-only is not affected: it keeps only the owner.
+
+Decision: label-everyone decodes the timed path with `vad_filter=False` and
+`condition_on_previous_text=False`. Whisper then writes text over silence, so label-everyone also drops every part whose own
+audio holds less than 0.15 s of speech by Silero, before attribution. A recording
+with no part left is an empty transcript: nothing is delivered, and a continuous
+session keeps listening. The check fails open: when Silero cannot run, every part
+is delivered. It runs before any fallback, so the unlabelled text delivered when
+attribution fails or the speaker model cannot be built has the same parts dropped.
+Mine-only and off keep the configured filter and Whisper's default of carrying
+text over, and have no check; the check would only drop parts mine-only drops
+anyway.
+
+Without the VAD, Whisper's default of carrying each segment's text into the next
+(`condition_on_previous_text=True`) made some recordings lowercase and
+unpunctuated and appended invented "Thank you." parts. It is turned off for this
+decode only. The two settings are one switch, `quiet_speakers`, on the timed
+decode, so no caller can have one without the other.
+
+Silero is the model `silence.py` loads. Its default options are used, because
+those are what was measured. The model keeps no state between calls, so the check
+can run while the silence detector reads the next segment. Measurements are under
+"Task 7.8" below.
+
 ## Risks / Trade-offs
 
 - **Failing open in mine-only types other people's words.** The user finds out
@@ -689,10 +718,12 @@ Speech-session replies go through the same helper, through
 - **Overlapping speech is not separated.** → The same documented limit applies.
 - **Added latency between capture stop and delivery.** One embedding is computed
   per Whisper segment on the CPU. The limit was 500 ms per minute of speech. Task
-  7.5 measured it and no variant met it, so the limit is now 1500 ms per minute
-  of speech, and the figure that is shipped is about 1.3 s. → The user accepted
-  the cost. Speaker modes are opt-in and mode `off` is unaffected. A 10 s
-  dictation takes about 0.2 s longer.
+  7.5 measured it and no variant met it. The limit is now stated per mode.
+  Mine-only: 1500 ms per minute of speech, shipped at about 1.3 s, so a 10 s
+  dictation takes about 0.2 s longer. Label-everyone: about 1.7 s per minute
+  (embeddings 1.3 s, silence check 0.2 s, decode between 13% faster and 20%
+  slower, task 7.8), so a 10 s dictation takes about 0.3 s longer. → The user
+  accepted the cost. Speaker modes are opt-in and mode `off` is unaffected.
 
   How it was measured (2026-10-09), by a script and not the daemon:
   - Config: the user's own. `[stt]` `device = "cuda"`, `model_profile =
@@ -867,6 +898,81 @@ Measured minimum: 5 s of speech, about 7 s of recording at that ratio. Decision:
 keep the enrolment at 20 s of recording and 10 s of minimum speech, twice the
 measured need. One session cannot show how the owner's voice changes between
 days or with a cold, and a longer sample costs the user only a few seconds.
+
+### Task 7.8: quiet speakers and invented text
+
+Same recordings as above, plus `round-d.wav` (the owner, Sam at about -28 dBFS
+and a television, 29 s) and white noise at -60 and -45 dBFS. Decode settings
+tried on the label-everyone path, with the 1.5 s word-gap split:
+
+| Decode | Sam's "Yes, go ahead." | Other recordings | Invented text |
+| --- | --- | --- | --- |
+| Configured VAD (today) | lost, television lost | baseline | none |
+| VAD threshold 0.35, 0.2 or 0.1; shorter minimum silence | lost | words lost on turns | none |
+| VAD padding 100 or 200 ms | words returned | owner and Sam merged under one label | none |
+| `vad_filter=False` | labelled Sam; television separated | same words | "Thank you." on noise; "Okay. Let's go. Thank you." four times at the end of `turns.wav`; a stray "Thanks." in `round-d.wav` |
+
+Decode time, warm, median of three: 1.49 s to 1.77 s on `turns.wav` (59 s of
+audio) and 1.19 s to 1.57 s on `owner-dictation.wav` (67 s), 19 to 32% more.
+
+The gate was chosen on every part of those recordings (86 parts with text, two of them from a clip of 5 s of speech followed by 10 s of
+noise), measured on the part's own audio as the daemon cuts it:
+
+- Level fails. The invented parts measure -27.6 to -35.7 dBFS RMS, and
+  -23.9 to -33.1 dBFS at the loudest 30 ms. Sam's real lines measure -27.9 to
+  -30.2 RMS and -20.7 to -24.5 at the loudest 30 ms. The ranges overlap. The
+  stray "Thanks." is 0.12 s at -13 dBFS, louder than any real part.
+- Silero speech time separates. Every invented part measured 0.00 s (noise at
+  both levels, six parts at the end of `turns.wav`, the tail of
+  `owner-enrol.wav`, the stray "Thanks."). The shortest real parts measured
+  0.28 s ("so"), 0.36 s ("Three.") and 0.44 s (Sam's "Okay."). With the default
+  options a region under 250 ms is not reported, so the figure is 0 or at
+  least 0.25 s, and the speech fraction is near 1.0 on short real parts because
+  the region is padded to the slice.
+- Threshold: 0.15 s, which leaves 0.13 s to the shortest real part and 0.15 s to
+  the invented ones. Lowering the minimum speech to 100 ms changed nothing.
+
+Cost of the check: 0.13 s over the 22 parts of `turns.wav`, 0.16 s over the
+7 parts of `owner-dictation.wav`, 0.37 s over the 19 parts of the 120 s
+`tv-alone.wav`.
+
+Punctuation. With `vad_filter=False` alone, the owner's dictation came back with
+no punctuation or capitals at all. Variants on label-everyone's decode, two runs
+each (identical):
+
+| Decode | `owner-dictation.wav` sentences punctuated | `turns.wav` | `round-d.wav` | TV opening line |
+| --- | --- | --- | --- | --- |
+| Configured VAD | 15 of 15 | no invented tail | Sam lost | lost |
+| `vad_filter=False` | 0 of 15 | invented "Thank you." x4 | Sam kept | lost |
+| plus `condition_on_previous_text=False` | 9 of 15 (first three sentences lowercase) | no invented tail | Sam kept | lost |
+| plus a punctuation `initial_prompt` | 15 of 15 | merged turns (an 11.6 s part); invented text in noise | Sam kept | lost |
+
+The prompt changed a word in the dictation ("sir" to "Sarah"), so it was
+rejected. No variant recovers the television's opening line.
+
+Decision (user, 2026-10-10): keep `vad_filter=False` and add
+`condition_on_previous_text=False` to label-everyone's decode only.
+
+Latency of label-everyone, per minute of speech, warm: embeddings about 1.3 s
+(task 7.5), the silence check about 0.2 s, and the decode between 13% faster and
+20% slower than with the VAD: `turns.wav` 1.34 s against 1.54 s, `owner-dictation.wav`
+1.42 s against 1.18 s. That is about 1.7 s per minute and about 0.3 s on a 10 s
+dictation, and it is the new limit for label-everyone. Mine-only keeps about
+1.3 s and its limit of 1500 ms; off is unchanged.
+
+Costs that remain. The first sentences of a recording can still come back
+lowercase or without full stops in label-everyone. The television's opening line
+in `owner-with-tv.wav` is not decoded without the VAD, which the configured VAD
+did decode.
+
+Limits. Whisper's text over silence changes from run to run (the tail of
+`owner-enrol.wav` gave different words in two runs); the speech time was 0.00 s
+in both. A real word spoken so briefly that Silero finds no speech in it would
+be dropped. Speech after a 5 s clip followed by 10 s of noise did not produce
+invented text in the test file made for it, so the end-of-turn case rests on
+`turns.wav` and `owner-enrol.wav`. Without the VAD, the television's opening
+line in `owner-with-tv.wav` was not decoded at all, which the configured VAD did
+decode.
 
 ## Open Questions
 

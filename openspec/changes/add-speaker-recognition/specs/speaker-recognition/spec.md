@@ -167,7 +167,7 @@ In mine-only mode Murmly SHALL deliver only the parts of a transcript attributed
 
 ### Requirement: Label-everyone labels each speaker's part
 
-In label-everyone mode Murmly SHALL deliver every part of a transcript, each preceded by its speaker's label: You for the owner, the enrolled name for any other enrolled person, and Speaker followed by a number for an unknown voice. Unknown voices MUST be numbered from 1 in the order in which they are first heard. Labels are omitted only where this capability delivers a transcript unlabelled and unfiltered.
+In label-everyone mode Murmly SHALL deliver every part of a transcript that holds speech, each preceded by its speaker's label: You for the owner, the enrolled name for any other enrolled person, and Speaker followed by a number for an unknown voice. Unknown voices MUST be numbered from 1 in the order in which they are first heard. Labels are omitted only where this capability delivers a transcript unlabelled and unfiltered.
 
 #### Scenario: Owner and an enrolled person
 
@@ -191,6 +191,31 @@ In label-everyone mode Murmly SHALL deliver every part of a transcript, each pre
 
 - **WHEN** one speaker finishes and a different speaker starts about two seconds or more later, in one recording in label-everyone mode
 - **THEN** the two speakers' words are separate parts, each with its own label
+
+### Requirement: Label-everyone includes quiet speakers and delivers no text from near-silence
+
+In label-everyone mode Murmly SHALL decode without the voice-activity filter, so a quiet second speaker is not lost, and SHALL NOT deliver a part whose own audio holds less than 0.15 seconds of speech, because the decoder invents text over silence. Mine-only and off MUST keep the configured filter and be unchanged.
+
+#### Scenario: A quiet second speaker
+
+- **GIVEN** the owner speaks at a normal level and another enrolled person answers about 12 dB quieter
+- **WHEN** the recording is processed in label-everyone mode
+- **THEN** the quiet answer is delivered, labelled with that person's name
+
+#### Scenario: Silence after the speech
+
+- **WHEN** a recording in label-everyone mode ends in a second or more of silence or room noise
+- **THEN** no words the decoder invented for that stretch are delivered
+
+#### Scenario: Only silence
+
+- **WHEN** a recording or continuous segment in label-everyone mode holds no speech
+- **THEN** it is treated as a transcription that yielded no text: nothing is delivered, no failure is signalled, and a continuous session keeps listening
+
+#### Scenario: The check cannot run
+
+- **WHEN** the speech check cannot be loaded or run
+- **THEN** every part is delivered as it would be without the check
 
 ### Requirement: A labelled transcript stays on one line
 

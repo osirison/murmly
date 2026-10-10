@@ -820,6 +820,37 @@ class TimedSegmentTests(unittest.TestCase):
         self.assertNotIn("word_timestamps", off_kwargs)
         self.assertEqual({**off_kwargs, "word_timestamps": True}, timed_kwargs)
 
+    def test_quiet_speakers_turns_the_vad_and_carrying_text_over_off(self) -> None:
+        audio = b"\x01\x00" * 16_000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = self._transcriber(temp_dir)
+            configured = transcriber.vad_filter
+            seen: dict[str, dict] = {}
+            for name, call in (
+                ("off", lambda: transcriber.transcribe_pcm16(audio, 16_000)),
+                ("timed", lambda: transcriber.transcribe_segments_pcm16(audio, 16_000)),
+                (
+                    "quiet",
+                    lambda: transcriber.transcribe_segments_pcm16(
+                        audio, 16_000, quiet_speakers=True
+                    ),
+                ),
+            ):
+                model = self._timed_model([(0.0, 1.0, " x")])
+                with patch.object(transcriber, "_load_model", return_value=model):
+                    call()
+                seen[name] = model.transcribe.call_args.kwargs
+
+        self.assertTrue(configured)
+        for name in ("off", "timed"):
+            self.assertEqual(configured, seen[name]["vad_filter"], name)
+            self.assertNotIn("condition_on_previous_text", seen[name], name)
+        self.assertNotIn("word_timestamps", seen["off"])
+        self.assertTrue(seen["timed"]["word_timestamps"])
+        self.assertFalse(seen["quiet"]["vad_filter"])
+        self.assertFalse(seen["quiet"]["condition_on_previous_text"])
+        self.assertTrue(seen["quiet"]["word_timestamps"])
+
     def test_silence_and_nothing_give_no_parts_without_decoding(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             transcriber = self._transcriber(temp_dir)
