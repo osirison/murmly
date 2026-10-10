@@ -83,6 +83,8 @@ MIN_LIVE_TICK_SECONDS = 0.05
 SILENCE_TICK_SECONDS = 0.25
 MAX_SILENCE_TICK_SECONDS = 1.0
 MAX_TICK_FAILURES = 5
+# Longest attribution waits for the speaker model's build before failing open.
+EMBEDDER_BUILD_WAIT_SECONDS = 30.0
 
 COMMAND_SPEECH_SESSION = "speech_session"
 COMMAND_TOGGLE = "toggle"
@@ -540,19 +542,41 @@ class _EmbedderBuild:
     Started when capture starts and never awaited there. Attribution waits on it
     only once the segments are ready, and a build that failed means that capture
     is delivered unlabelled and unfiltered, after the one warning logged here.
+    A build that has not finished `EMBEDDER_BUILD_WAIT_SECONDS` after attribution starts
+    to wait counts as failed, so a stuck build cannot hold a transcript back. Its
+    thread is left to finish on its own, and holds no lock of the session's.
     """
 
     def __init__(self, embedder: SpeakerEmbedder) -> None:
         self._embedder = embedder
         self._failed = False
+        self._abandoned = False
         self._thread = threading.Thread(target=self._run, name="murmly-speaker-build", daemon=True)
 
     def start(self) -> None:
         self._thread.start()
 
+    @property
+    def running(self) -> bool:
+        return self._thread.is_alive()
+
     def succeeded(self) -> bool:
-        """Wait for the build, and report whether the model is there to use."""
-        self._thread.join()
+        """Wait for the build, up to the limit, and report whether the model is there to use.
+
+        Once the wait has run out, later calls do not wait again or warn again: a
+        segment finds the model if the build has finished by then, and is
+        delivered unlabelled if not.
+        """
+        self._thread.join(timeout=0 if self._abandoned else EMBEDDER_BUILD_WAIT_SECONDS)
+        if self._thread.is_alive():
+            if not self._abandoned:
+                self._abandoned = True
+                logger.warning(
+                    "Speaker recognition disabled for this capture: "
+                    "the speaker model did not finish loading within %g s",
+                    EMBEDDER_BUILD_WAIT_SECONDS,
+                )
+            return False
         return not self._failed
 
     def _run(self) -> None:
@@ -560,6 +584,8 @@ class _EmbedderBuild:
             self._embedder.load()
         except Exception as error:  # noqa: BLE001 - a failed build is a warning, not a failed capture
             self._failed = True
+            if self._abandoned:
+                return
             logger.warning(
                 "Speaker recognition disabled for this capture: the speaker model could not be loaded: %s",
                 error,
@@ -707,6 +733,13 @@ class SpeechSession:
         """Release the speaker model with the transcription model, after any attribution."""
         embedder = self._speaker_embedder
         if embedder is None:
+            return
+        # A build still running holds the embedder's load lock, which release
+        # would wait on while holding the attribution lock, and the next
+        # attribution would wait behind both. The model it leaves is released by
+        # a later release.
+        build = self._speaker_build
+        if build is not None and build.running:
             return
         with self._attribution_lock:
             embedder.release()

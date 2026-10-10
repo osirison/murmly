@@ -947,6 +947,82 @@ class BackgroundBuildTests(SpeakerDaemonCase):
 
         self.assertEqual(["You: waiting for the model"], results)
 
+    def test_a_build_still_running_after_the_limit_fails_open_with_one_warning(self) -> None:
+        self.build("label-everyone")
+        self.embedder.load_gate = threading.Event()
+        self.addCleanup(self.embedder.load_gate.set)
+        pcm = self.audio((ME, "stuck behind the model", 2.0), (STRANGER_A, "and more", 2.0))
+        self.session.start_recording()
+        results: list = []
+        worker = threading.Thread(
+            target=lambda: results.append(self.session.process_recording(pcm)), daemon=True
+        )
+
+        with patch("murmly.daemon.EMBEDDER_BUILD_WAIT_SECONDS", 0.1), self.assertLogs(
+            "murmly.daemon", level=logging.WARNING
+        ) as logs:
+            worker.start()
+            worker.join(GATE_TIMEOUT_SECONDS)
+
+        self.assertFalse(worker.is_alive(), "attribution waited past the limit")
+        self.assertEqual("stuck behind the model and more", results[0].text)
+        self.assertEqual(["stuck behind the model and more"], self.paster.pasted)
+        self.assertEqual(1, len(logs.records))
+        message = logs.records[0].getMessage()
+        self.assertIn("did not finish loading", message)
+        self.assertNotIn("stuck behind", message)
+        self.assertEqual(0, self.embedder.embeds)
+        # Neither the status nor the attribution lock waits on the stuck thread.
+        self.assertTrue(self.session._attribution_lock.acquire(timeout=GATE_TIMEOUT_SECONDS))
+        self.session._attribution_lock.release()
+        self.assertIs(False, self.daemon.handle_command("status")["speaker_model_resident"])
+
+    def test_a_build_that_finishes_late_leaves_the_next_capture_able_to_attribute(self) -> None:
+        self.build("label-everyone")
+        self.embedder.load_gate = threading.Event()
+        self.addCleanup(self.embedder.load_gate.set)
+        first = self.audio((ME, "too early", 2.0))
+        second = self.audio((ME, "later", 2.0))
+        self.session.start_recording()
+        build = self.session._speaker_build
+        with patch("murmly.daemon.EMBEDDER_BUILD_WAIT_SECONDS", 0.1), self.assertLogs(
+            "murmly.daemon", level=logging.WARNING
+        ):
+            self.assertEqual("too early", self.session.process_recording(first).text)
+
+        self.embedder.load_gate.set()
+        build._thread.join(GATE_TIMEOUT_SECONDS)
+        self.session.start_recording()
+        with patch("murmly.daemon.EMBEDDER_BUILD_WAIT_SECONDS", 0.1):
+            result = self.session.process_recording(second)
+
+        self.assertEqual("You: later", result.text)
+
+    def test_a_build_that_finishes_within_the_limit_still_attributes(self) -> None:
+        self.build("label-everyone")
+        self.embedder.load_gate = threading.Event()
+        pcm = self.audio((ME, "in time", 2.0))
+        self.session.start_recording()
+        self.assertTrue(self.embedder.load_started.wait(GATE_TIMEOUT_SECONDS))
+        threading.Timer(BLOCKED_SECONDS, self.embedder.load_gate.set).start()
+        self.addCleanup(self.embedder.load_gate.set)
+
+        with patch("murmly.daemon.EMBEDDER_BUILD_WAIT_SECONDS", GATE_TIMEOUT_SECONDS):
+            result = self.session.process_recording(pcm)
+
+        self.assertEqual("You: in time", result.text)
+
+    def test_a_release_does_not_wait_on_a_build_that_is_still_running(self) -> None:
+        self.build("label-everyone")
+        self.embedder.load_gate = threading.Event()
+        self.addCleanup(self.embedder.load_gate.set)
+        self.session.start_recording()
+
+        self.session.release_model()
+
+        self.assertEqual(0, self.embedder.releases)
+        self.assertFalse(self.embedder.release_ran.is_set())
+
     def test_the_embedder_is_built_once_and_reused_while_resident(self) -> None:
         daemon = self.build("label-everyone")
         for _ in range(2):

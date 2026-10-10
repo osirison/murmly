@@ -344,8 +344,12 @@ model this small gains nothing from a GPU.
 capture starts and the mode is not `off`, a background build begins, in the same
 way the transcription model's warm-up overlaps capture. Capture never waits for
 it. If the build has not finished when the segments are ready, attribution waits
-for it. If the build fails, attribution does not run for that recording, the
-transcript is delivered as with `off`, and a warning is logged.
+for it, for at most 30 s. If the build fails, or has not finished 30 s after
+attribution began to wait, attribution does not run for that recording, the
+transcript is delivered as with `off`, and a warning is logged. The limit is
+there because a build stuck in the runtime or on a stalled disk would otherwise
+hold the transcript back indefinitely; in mine-only, other voices may be typed
+for that one recording, which is the fail-open rule applied as usual.
 
 **When it is released.** It is released by the transcription model's
 `IdleRelease` callback, so it follows `stt.unload_after_idle_s`, including 0

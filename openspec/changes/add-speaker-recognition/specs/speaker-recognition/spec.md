@@ -330,13 +330,20 @@ When the selected speaker mode cannot run, Murmly SHALL deliver the transcript a
 
 ### Requirement: A speaker failure never loses a transcript
 
-When attributing speakers fails while a recording or segment is being processed, including a speaker model found unusable only after capture started, Murmly MUST deliver that transcript unlabelled and unfiltered. The failure MUST NOT fail the recording, end a continuous session, or discard the text, and Murmly MUST log it without transcript text.
+When attributing speakers fails while a recording or segment is being processed, including a speaker model found unusable only after capture started or one that does not finish loading, Murmly MUST deliver that transcript unlabelled and unfiltered. The failure MUST NOT fail the recording, end a continuous session, or discard the text, and Murmly MUST log it without transcript text.
 
 #### Scenario: Attribution raises an error
 
 - **WHEN** attributing speakers raises an error while a recording is being processed
 - **THEN** the transcript is delivered unlabelled and unfiltered
 - **AND** the daemon logs the failure without any transcript text
+
+#### Scenario: The speaker model does not finish loading
+
+- **GIVEN** a speaker mode is selected and the speaker model has not finished loading 30 seconds after attribution began to wait for it
+- **WHEN** a recording is processed
+- **THEN** the transcript is delivered unlabelled and unfiltered
+- **AND** the daemon logs one warning that the model did not finish loading, without any transcript text
 
 ### Requirement: Voiceprints are used only with the model that made them
 
