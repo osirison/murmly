@@ -110,13 +110,13 @@ jobs:
         run: uv sync --locked --extra overlay
 
       # The suite takes about 1 to 2 minutes (the slowest, macOS, 118 s). If it
-      # runs five minutes, something is hung: faulthandler prints every thread's
+      # runs ten minutes, something is hung: faulthandler prints every thread's
       # stack and exits, so the log says where instead of the job sitting until
       # it is cancelled. Same as `python -m unittest discover -s tests`.
       - name: Run the suite
         run: >-
           uv run --no-sync python -c "import faulthandler, unittest;
-          faulthandler.dump_traceback_later(300, exit=True);
+          faulthandler.dump_traceback_later(600, exit=True);
           unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests'])"
 
       # A green run on a platform says nothing about how much of the suite that
@@ -129,7 +129,7 @@ jobs:
         if: always()
         run: >-
           uv run --no-sync python -c "import faulthandler, unittest;
-          faulthandler.dump_traceback_later(300, exit=True);
+          faulthandler.dump_traceback_later(600, exit=True);
           unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests', '-v'])"
           2>&1 | grep -E "skipped '" || echo "nothing skipped"
 

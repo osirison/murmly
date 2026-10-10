@@ -32,7 +32,7 @@ named. `uv run` syncs before it runs anything, and the CPU build of `onnxruntime
 arrives as a dependency of `faster-whisper`, so any sync reinstalls it over the GPU
 build on a machine that has had the swap applied. The suite still passes, and every
 synthesis measurement taken afterwards silently reports a CPU session. CI runs
-this same command inside a five-minute `faulthandler` watchdog that prints every
+this same command inside a ten-minute `faulthandler` watchdog that prints every
 thread's stack and fails the job if the suite hangs. See `docs/agent-notes/onnxruntime-gpu-cuda-version.md`.
 
 ## Dependencies
