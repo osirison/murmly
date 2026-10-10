@@ -13,6 +13,15 @@ edit `config.toml` and restart `murmly.service` (or the Windows scheduled task) 
 hand. The installer already knows how to install, restart and remove the service on
 both platforms.
 
+Speaker recognition (`add-speaker-recognition`, which this change builds on) adds a
+`[speakers]` table, `murmly enrol` — which records its sample in the command's own
+process and refuses while the daemon is busy — `murmly speakers list` and
+`remove`, voiceprints in `<data dir>/voiceprints.json`, and a
+`speaker_recognition` section in `murmly doctor`. When a mode cannot run it fails
+open: everything is typed, one warning is logged, and only `murmly doctor` says
+why. Its spec forbids speaker names in delivery signals and logs, but exempts the
+toggle response, which carries the labelled transcript.
+
 The visual design is on the canvas linked from proposal.md. It uses the Proton Sync
 design system — Instrument Sans for anything a person reads, IBM Plex Mono for
 anything the machine owns (keys, paths, config names, raw `doctor` values), and
@@ -45,7 +54,10 @@ colour that carries meaning only:
   memory.
 - Replacing the command line. Every task the app performs stays possible from the
   terminal.
-- Changing what the overlay looks like, beyond the delivered confirmation.
+- Changing what the overlay looks like, beyond the delivered confirmation and the
+  not-your-voice presentation.
+- Changing how speaker recognition decides who spoke. The app only configures it,
+  enrols voices and reports its state.
 
 ## Decisions
 
@@ -132,6 +144,41 @@ followed by the existing hide after at most 1.5 s. Each renderer (X11, Wayland, 
 draws a check and the word "Typed"; under reduced motion it appears without
 animation. Continuous sessions never send it for a segment, as the spec requires.
 
+### Enrolment runs in the app's process, through the enrolment command's code
+
+The speaker spec has enrolment record "in the command's own process", not the
+daemon's. The app calls the same enrolment function `murmly enrol` uses, from its
+own process, so the sample length, minimum speech, name rules, busy refusal and
+storage are the same code rather than a second copy of the rules. The app adds
+only the screens around it: the passage to read, a live count of speech heard, and
+the consent confirmation for anyone who is not the owner. The busy check is the
+same `status` request the command makes.
+
+### Voices-not-checked comes from the doctor report, not from `status`
+
+Whether speaker recognition can run is reported in `murmly doctor`'s
+`speaker_recognition` section (`available`, `detail`). The app reads that section
+when Home or Voices opens, after any change to voices or the `[speakers]` table,
+and after a restart. It does not poll it every 500 ms: availability changes only
+when the person changes something. The `detail` string is shown verbatim, following
+the design system's rule never to paraphrase a daemon error.
+
+### Last words keep the labelled parts
+
+When a transcript is labelled, the daemon's last-words slot keeps its parts with
+their labels as well as the delivered line, so the app can lay out who said what
+without parsing the line (a colon in someone's words would make parsing
+ambiguous). The slot is answered over the owner-only command socket, under the same
+exemption the speaker spec gives the toggle response.
+
+### Not-your-voice in the overlay
+
+When mine-only leaves a recording with nothing to type, the daemon sends the
+overlay a "not-your-voice" state carrying no name and no text, then hides it after
+at most 1.5 s, as with the delivered confirmation. Continuous sessions never send
+it for a segment. The outcome is still not a refused delivery, as the speaker spec
+requires: nothing is pasted and no failure is signalled.
+
 ## Risks / Trade-offs
 
 - [The app could take focus and turn a good delivery into a refused one] → The app
@@ -149,12 +196,24 @@ animation. Continuous sessions never send it for a segment, as the spec requires
   the measured machine), so the cost falls while the person is speaking.
 - [The last words could linger on a shared machine] → They live only in daemon
   memory, readable only by the owning account, and can be cleared from the app.
+- [Enrolment needs the microphone while the daemon might want it] → The app checks
+  `status` before recording and refuses while the daemon is busy, as the command
+  does; a press of the dictation key during enrolment is answered by the daemon as
+  usual, and the app discards the sample.
+- [Consent is only as good as the person confirming it] → The app cannot verify
+  agreement; it makes the question explicit, says the voiceprint can be removed, and
+  keeps removal one click away.
+- [`add-speaker-recognition` changes before it is archived] → The Voices
+  requirements reference its behaviour, not its code; re-check them against its
+  final spec when archiving it.
 
 ## Migration Plan
 
 Nothing to migrate. The command line, the configuration file format and the
 service are unchanged; the app is additive and opt-in. Removing the `gui` extra
-removes the app and nothing else.
+removes the app and nothing else. Voices enrolled with `murmly enrol` appear in the
+app as they are, and voices enrolled in the app are listed by
+`murmly speakers list`.
 
 ## Open Questions
 

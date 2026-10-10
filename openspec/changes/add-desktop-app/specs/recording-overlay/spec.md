@@ -30,3 +30,25 @@ Murmly SHALL replace the listening presentation with a visually distinct process
 - **WHEN** a segment is transcribed and delivered while microphone capture is still running
 - **THEN** the overlay keeps the listening presentation with live audio-level feedback
 - **AND** the overlay does not show the processing presentation or the delivered confirmation for that segment
+
+## ADDED Requirements
+
+### Requirement: A recording left empty by mine-only is acknowledged
+
+When mine-only leaves out every part of a recording, Murmly SHALL show a neutral presentation saying that the voice heard was not the owner's, for no more than 1.5 seconds, before hiding the overlay. It MUST differ from both the error presentation and the delivered confirmation, and MUST carry no speaker name and no transcript text.
+
+#### Scenario: Only other voices were heard
+
+- **WHEN** a recording in mine-only mode ends and every part of it was left out
+- **THEN** the overlay shows the not-your-voice presentation
+- **AND** hides no more than 1.5 seconds later
+
+#### Scenario: A continuous segment with only other voices
+
+- **WHEN** a segment of a continuous session in mine-only mode is left out entirely while capture continues
+- **THEN** the overlay keeps the listening presentation and does not show the not-your-voice presentation
+
+#### Scenario: Nothing identifying is shown
+
+- **WHEN** the not-your-voice presentation is shown
+- **THEN** it displays no speaker name and no words from the recording

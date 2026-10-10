@@ -50,7 +50,19 @@ skip themselves when none is available.
 
 - [ ] 9.1 Add a confirmation naming what will be removed, run the same removal as `murmly uninstall`, with purge as a separate explicit choice, and record the app shortcut as installed so uninstall removes it; verify tests that removal without purge keeps settings and models and that the shortcut is gone afterwards
 
-## 10. Integration
+## 10. Voices
 
-- [ ] 10.1 Write `manual/using-the-app.md` and add it to the `mkdocs.yml` navigation; verify `mkdocs build --strict` passes
-- [ ] 10.2 Run the app end to end on KDE Plasma X11 and on Windows: dictate with the app open behind the target window, change a setting while recording, refuse a delivery by switching windows, and remove Murmly; record the results in the change before archiving
+- [ ] 10.1 Confirm `add-speaker-recognition` is archived and `openspec/specs/speaker-recognition/spec.md` exists; re-check this change's Voices requirements against that final spec and run `openspec validate --all --strict`
+- [ ] 10.2 Build the Voices section from the canvas: mode, owner and match threshold written through the Settings writer, the enrolled-voices list with the owner marked, remove one, and remove all behind a second confirmation; verify tests that each control writes `speakers.mode`, `speakers.owner` or `speakers.match_threshold`, that removal deletes only the named voiceprint, and that remove-all deletes nothing until confirmed twice
+- [ ] 10.3 Build in-app enrolment around the code `murmly enrol` runs (factor it into one function both call, if it is not one already): passage, live speech count, the busy refusal, and the replaced-voiceprint message; verify tests with a fake recorder that a short sample stores nothing and reports the speech heard, a busy daemon is refused with its state, and no audio file is written
+- [ ] 10.4 Require consent before enrolling anyone not marked as the owner; verify a test that recording cannot start until it is confirmed
+- [ ] 10.5 Read `speaker_recognition` from the doctor report on opening Home or Voices, after voice or `[speakers]` changes, and after a restart, and show the voices-not-checked notice on Home, the tray panel and Voices with `detail` verbatim; verify tests over recorded reports that the notice appears for each `detail` the manual lists, disappears when `available` is true, and that Health lists the same problem
+- [ ] 10.6 Keep labelled parts in the last-words slot and show them by speaker in the app; verify tests that a labelled transcript is shown part by part and that Copy again copies the delivered line byte for byte
+- [ ] 10.7 Send a not-your-voice overlay state when mine-only leaves a recording empty, never for a continuous segment, and draw it in the X11, Wayland and Qt renderers with no name or text; verify daemon tests for both cases and renderer tests where the platform allows
+- [ ] 10.8 Add the optional voice step to first run; verify a test that skipping it leaves no voiceprint and finishing it stores one marked as the owner
+- [ ] 10.9 Add the app's route to `manual/typing-only-your-own-voice.md` next to each command, and describe the not-your-voice state in `manual/using-murmly.md`; verify `mkdocs build --strict` passes
+
+## 11. Integration
+
+- [ ] 11.1 Write `manual/using-the-app.md` and add it to the `mkdocs.yml` navigation; verify `mkdocs build --strict` passes
+- [ ] 11.2 Run the app end to end on KDE Plasma X11 and on Windows: dictate with the app open behind the target window, change a setting while recording, refuse a delivery by switching windows, enrol a voice and switch to "only my voice", remove the owner's voice and see the voices-not-checked notice, and remove Murmly; record the results in the change before archiving
