@@ -1599,6 +1599,11 @@ class LivePlaybackTests(unittest.TestCase):
 
     TONE_SECONDS = 2.0
     RATE_HZ = 24_000
+    # Far past any stall the timing assertion is there to catch. Only the
+    # device's own callback moves `pending_frames`, so a device that stops
+    # asking for audio altogether would otherwise hold the suite until CI
+    # cancels it, with nothing in the log to say where.
+    GIVE_UP_SECONDS = 30.0
 
     def _player(self) -> SoundDevicePlayer:
         try:
@@ -1620,6 +1625,16 @@ class LivePlaybackTests(unittest.TestCase):
         self.addCleanup(player.stop)
         return player
 
+    def _drain_to(self, player: SoundDevicePlayer, frames: int, deadline: float) -> None:
+        """Wait until no more than `frames` are left unplayed, or fail at `deadline`."""
+        while player.pending_frames > frames:
+            if time.monotonic() > deadline:
+                self.fail(
+                    f"{player.pending_frames} frames still unplayed after "
+                    f"{self.GIVE_UP_SECONDS:.0f} s: the device stopped asking for audio"
+                )
+            time.sleep(0.02)
+
     @staticmethod
     def _silence(seconds: float, rate_hz: int) -> list[float]:
         return [0.0] * int(seconds * rate_hz)
@@ -1635,12 +1650,11 @@ class LivePlaybackTests(unittest.TestCase):
         chunk = self._silence(self.TONE_SECONDS, self.RATE_HZ)
 
         started = time.monotonic()
+        deadline = started + self.GIVE_UP_SECONDS
         for _ in range(2):
-            while player.pending_frames > int(3.0 * player.sample_rate_hz):
-                time.sleep(0.02)
+            self._drain_to(player, int(3.0 * player.sample_rate_hz), deadline)
             player.write(chunk, self.RATE_HZ)
-        while player.pending_frames > 0:
-            time.sleep(0.02)
+        self._drain_to(player, 0, deadline)
         elapsed = time.monotonic() - started
 
         audio_seconds = 2 * self.TONE_SECONDS
