@@ -758,10 +758,14 @@ class SpeechSession:
         self,
         pcm_audio: bytes,
         target: WindowIdentity | None = None,
+        separator: str = "",
     ) -> ProcessingResult:
         text = self._transcribe_final(pcm_audio)
         if not text:
             return ProcessingResult(text=text, state="DONE")
+        # What is pasted, and what the clipboard keeps when it is not; the
+        # result still reports the bare transcript.
+        delivered_text = separator + text
         # Held across delivery because clipboard restoration runs inside
         # copy_and_paste: without it a restore could overwrite the next
         # segment's transcript before that segment is pasted.
@@ -770,13 +774,13 @@ class SpeechSession:
             if allowed:
                 # A session that cannot inject a paste is a refusal, not an error:
                 # the transcript stays on the clipboard and the caller is told.
-                outcome = self._ensure_paster().copy_and_paste(text)
+                outcome = self._ensure_paster().copy_and_paste(delivered_text)
                 if outcome.injected:
                     return ProcessingResult(text=text, state="DONE", delivered=True)
                 logger.warning("Transcript delivery could not inject a paste: %s", outcome.reason)
             else:
                 logger.warning("Transcript delivery refused: %s", reason)
-                self._ensure_paster().copy(text)
+                self._ensure_paster().copy(delivered_text)
         return ProcessingResult(
             text=text,
             state="DONE",
@@ -788,6 +792,7 @@ class SpeechSession:
         self,
         pcm_audio: bytes,
         deliver: Callable[[str], bool],
+        separator: str = "",
     ) -> ProcessingResult:
         """Transcribe, and hand the text to the speech session that asked for it.
 
@@ -799,10 +804,11 @@ class SpeechSession:
         text = self._transcribe_final(pcm_audio)
         if not text:
             return ProcessingResult(text=text, state="DONE")
-        if deliver(text):
+        delivered_text = separator + text
+        if deliver(delivered_text):
             return ProcessingResult(text=text, state="DONE", delivered=True)
         with self._delivery_lock:
-            self._ensure_paster().copy(text)
+            self._ensure_paster().copy(delivered_text)
         logger.warning("A transcript had no speech session to be delivered to.")
         return ProcessingResult(
             text=text,
@@ -2648,10 +2654,23 @@ class MurmlyDaemon:
         self,
         pcm_audio: bytes,
         target: WindowIdentity | None,
+        separator: str = "",
     ) -> ProcessingResult:
         if self._capture_destination == DESTINATION_SESSION:
-            return self._session.process_for_session(pcm_audio, self._deliver_to_session)
-        return self._session.process_recording(pcm_audio, target)
+            return self._session.process_for_session(
+                pcm_audio, self._deliver_to_session, separator=separator
+            )
+        return self._session.process_recording(pcm_audio, target, separator=separator)
+
+    def _segment_separator(self) -> str:
+        """A space when an earlier segment of this continuous session produced text.
+
+        Read while the unit lock is held, so no segment can be appended between
+        this and the delivery. `_segments` is empty at the start of every capture
+        and for a recording that is one transcript, so those get nothing.
+        """
+        with self._lock:
+            return " " if self._segments else ""
 
     def _deliver_to_session(self, text: str) -> bool:
         """Deliver to the session this capture was started for, or to nobody.
@@ -2672,7 +2691,7 @@ class MurmlyDaemon:
     def _finish_toggle(self, pcm_audio: bytes, target: WindowIdentity | None) -> dict[str, object]:
 
         try:
-            result = self._process_recording(pcm_audio, target)
+            result = self._process_recording(pcm_audio, target, self._segment_separator())
             if result.detail is None:
                 self._publish_state(OverlayState.IDLE)
             else:
@@ -2820,7 +2839,7 @@ class MurmlyDaemon:
             segment = self._session.take_segment()
             target = self._delivery_target()
             try:
-                result = self._process_recording(segment, target)
+                result = self._process_recording(segment, target, self._segment_separator())
             except Exception as error:
                 logger.warning("Segment transcription failed: %s", error)
                 self._end_continuous_session()

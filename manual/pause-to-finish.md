@@ -18,7 +18,11 @@ values:
   to idle.
 - `continuous` — silence closes a segment, which is transcribed and delivered
   while capture keeps running for your next sentence. The session ends when
-  you toggle, when a delivery is refused, or on error.
+  you toggle, when a delivery is refused, or on error. Each segment after the
+  first is typed with a space in front of it, so segments do not run together.
+  The first segment, and a recording ended by the hotkey or by `stop`, are typed
+  as they are. If you move the cursor during a session, for example to a new
+  line, the next segment still starts with a space.
 
 In `continuous` mode, a refused delivery ends the session rather than
 continuing to record speech murmly has just shown it cannot deliver — see

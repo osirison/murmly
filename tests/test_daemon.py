@@ -66,6 +66,8 @@ class DummySession:
         self.speaker_model_resident_detail = None
         self.targets_captured = 0
         self.received_targets: list[WindowIdentity | None] = []
+        # What the daemon asked to put in front of each transcript.
+        self.separators: list[str] = []
         self.target = WindowIdentity(window_id=1, pid=10, window_class="editor")
         self.start_error = start_error
         self.stop_error = stop_error
@@ -97,9 +99,11 @@ class DummySession:
         self,
         pcm_audio: bytes,
         target: WindowIdentity | None = None,
+        separator: str = "",
     ) -> ProcessingResult:
         self.processed += 1
         self.received_targets.append(target)
+        self.separators.append(separator)
         if pcm_audio != b"recording":
             raise RuntimeError("unexpected recording")
         if self.process_error is not None:
@@ -117,10 +121,11 @@ class BlockingSession(DummySession):
         self,
         pcm_audio: bytes,
         target: WindowIdentity | None = None,
+        separator: str = "",
     ) -> ProcessingResult:
         self.processing.set()
         self.release.wait(timeout=5)
-        return super().process_recording(pcm_audio, target)
+        return super().process_recording(pcm_audio, target, separator)
 
 
 class FakeOverlay:
@@ -596,9 +601,9 @@ class DeliveryTargetTests(unittest.TestCase):
                 order.append("capture_target")
                 return super().capture_delivery_target()
 
-            def process_recording(inner, pcm_audio, target=None):
+            def process_recording(inner, pcm_audio, target=None, separator=""):
                 order.append("process")
-                return super().process_recording(pcm_audio, target)
+                return super().process_recording(pcm_audio, target, separator)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             session = OrderedSession()
@@ -630,7 +635,7 @@ class DeliveryTargetTests(unittest.TestCase):
 
     def test_refused_delivery_copies_without_pasting_and_publishes_error(self) -> None:
         class RefusingSession(DummySession):
-            def process_recording(inner, pcm_audio, target=None):
+            def process_recording(inner, pcm_audio, target=None, separator=""):
                 inner.processed += 1
                 return ProcessingResult(
                     text="hello world",
@@ -710,12 +715,12 @@ class TranscriptDeliveryTests(unittest.TestCase):
         def active_window(self):
             return self._window
 
-    def _run(self, session: SpeechSession, target, text: str = "hello world"):
+    def _run(self, session: SpeechSession, target, text: str = "hello world", **keywords):
         paster = self.RecordingPaster()
         session._paster = paster
         session._transcriber.transcribe_pcm16.return_value = text
         session._recorder.sample_rate_hz = 16_000
-        return session.process_recording(b"pcm", target), paster
+        return session.process_recording(b"pcm", target, **keywords), paster
 
     def test_unchanged_focus_pastes(self) -> None:
         target = WindowIdentity(1, 10, "editor")
@@ -781,6 +786,108 @@ class TranscriptDeliveryTests(unittest.TestCase):
         self.assertTrue(result.delivered)
         self.assertEqual(["hello world"], paster.pasted)
 
+    def test_a_separator_goes_in_front_of_the_pasted_text_but_not_the_result(self) -> None:
+        target = WindowIdentity(1, 10, "editor")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(target))
+            result, paster = self._run(session, target, separator=" ")
+
+        self.assertTrue(result.delivered)
+        self.assertEqual([" hello world"], paster.pasted)
+        self.assertEqual("hello world", result.text)
+
+    def test_a_refused_segment_keeps_its_separator_on_the_clipboard(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(WindowIdentity(2, 20, "browser")))
+            result, paster = self._run(session, WindowIdentity(1, 10, "editor"), separator=" ")
+
+        self.assertFalse(result.delivered)
+        self.assertEqual([" hello world"], paster.copied)
+        self.assertEqual([], paster.pasted)
+        self.assertEqual("hello world", result.text)
+
+    def test_a_segment_that_cannot_be_injected_keeps_its_separator_on_the_clipboard(self) -> None:
+        target = WindowIdentity(1, 10, "editor")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(target))
+            paster = self.RecordingPaster(injection_reason="No Wayland paste injector is installed.")
+            session._paster = paster
+            session._transcriber.transcribe_pcm16.return_value = "hello world"
+            session._recorder.sample_rate_hz = 16_000
+            result = session.process_recording(b"pcm", target, separator=" ")
+
+        self.assertFalse(result.delivered)
+        self.assertEqual([" hello world"], paster.copied)
+        self.assertEqual("hello world", result.text)
+
+    def test_no_separator_leaves_the_text_byte_identical(self) -> None:
+        target = WindowIdentity(1, 10, "editor")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(target))
+            _result, paster = self._run(session, target)
+
+        self.assertEqual(["hello world"], paster.pasted)
+
+    def test_a_separator_is_not_pasted_for_a_transcript_with_no_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(WindowIdentity(1, 10, "editor")))
+            _result, paster = self._run(session, WindowIdentity(1, 10, "editor"), text="", separator=" ")
+
+        self.assertEqual([], paster.pasted)
+        self.assertEqual([], paster.copied)
+
+    def _run_for_session(self, session: SpeechSession, deliver, text: str = "hello world", **keywords):
+        paster = self.RecordingPaster()
+        session._paster = paster
+        session._transcriber.transcribe_pcm16.return_value = text
+        session._recorder.sample_rate_hz = 16_000
+        return session.process_for_session(b"pcm", deliver, **keywords), paster
+
+    def test_a_session_frame_carries_the_separator_but_the_result_does_not(self) -> None:
+        sent: list[str] = []
+
+        def deliver(text: str) -> bool:
+            sent.append(text)
+            return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(None))
+            result, paster = self._run_for_session(session, deliver, separator=" ")
+
+        self.assertTrue(result.delivered)
+        self.assertEqual([" hello world"], sent)
+        self.assertEqual("hello world", result.text)
+        self.assertEqual([], paster.copied)
+
+    def test_a_session_that_has_gone_leaves_the_separator_on_the_clipboard(self) -> None:
+        sent: list[str] = []
+
+        def deliver(text: str) -> bool:
+            sent.append(text)
+            return False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(None))
+            result, paster = self._run_for_session(session, deliver, separator=" ")
+
+        self.assertFalse(result.delivered)
+        self.assertEqual([" hello world"], sent)
+        self.assertEqual([" hello world"], paster.copied)
+        self.assertEqual("hello world", result.text)
+
+    def test_a_session_frame_without_a_separator_is_unchanged(self) -> None:
+        sent: list[str] = []
+
+        def deliver(text: str) -> bool:
+            sent.append(text)
+            return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = self._session(temp_dir, self.Observer(None))
+            self._run_for_session(session, deliver)
+
+        self.assertEqual(["hello world"], sent)
+
     def test_empty_transcript_touches_the_clipboard_at_all(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             session = self._session(temp_dir, self.Observer(WindowIdentity(2, 20, "browser")))
@@ -813,6 +920,8 @@ class SegmentSession(DummySession):
         self.delivered = delivered or []
         self.segments_taken = 0
         self.processed_audio: list[bytes] = []
+        # The text each segment would have been delivered as: separator and transcript.
+        self.delivered_texts: list[str] = []
 
     def take_segment(self) -> bytes:
         self.segments_taken += 1
@@ -822,15 +931,18 @@ class SegmentSession(DummySession):
         self,
         pcm_audio: bytes,
         target: WindowIdentity | None = None,
+        separator: str = "",
     ) -> ProcessingResult:
         self.processed += 1
         self.processed_audio.append(pcm_audio)
         self.received_targets.append(target)
+        self.separators.append(separator)
         index = self.processed - 1
         text = self.texts[index] if index < len(self.texts) else ""
         delivered = self.delivered[index] if index < len(self.delivered) else True
         if not text:
             return ProcessingResult(text="", state="DONE")
+        self.delivered_texts.append(separator + text)
         if delivered:
             return ProcessingResult(text=text, state="DONE", delivered=True)
         return ProcessingResult(
@@ -970,6 +1082,64 @@ class AutoTranscribeTests(unittest.TestCase):
         self.assertTrue(response["delivered"])
         self.assertEqual(3, response["segments"])
         self.assertEqual("IDLE", daemon.state)
+
+    def test_later_segments_are_delivered_with_one_space_before_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["first segment", "second segment", "final segment"])
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+            daemon._on_silence()
+            self._settle(daemon)
+            daemon._on_silence()
+            self._settle(daemon)
+
+            response = daemon.handle_command("toggle")
+
+        # Including the final segment, which the toggle delivers.
+        self.assertEqual(
+            ["first segment", " second segment", " final segment"], session.delivered_texts
+        )
+        self.assertEqual(["", " ", " "], session.separators)
+        self.assertEqual("first segment second segment final segment", response["text"])
+        self.assertNotIn("  ", response["text"])
+
+    def test_segments_that_yield_no_text_add_no_space(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = SegmentSession(texts=["", "one", "", "two", "three"])
+            daemon = self._daemon(temp_dir, session, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+            for _ in range(4):
+                daemon._on_silence()
+                self._settle(daemon)
+
+            response = daemon.handle_command("toggle")
+
+        # The first segment that produced text has nothing before it, and the one
+        # after the empty segment still gets exactly one space.
+        self.assertEqual(["one", " two", " three"], session.delivered_texts)
+        self.assertEqual("one two three", response["text"])
+
+    def test_a_toggle_recording_passes_no_separator_even_after_another(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session)
+            for _ in range(2):
+                daemon.handle_command("toggle")
+                daemon.handle_command("toggle")
+
+        self.assertEqual(["", ""], session.separators)
+
+    def test_a_stop_mode_recording_passes_no_separator_even_after_another(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = DummySession()
+            daemon = self._daemon(temp_dir, session, auto_transcribe="stop")
+            for _ in range(2):
+                daemon.handle_command("toggle")
+                daemon._on_silence()
+                self._settle(daemon)
+                self._wait_for_state(daemon, "IDLE")
+
+        self.assertEqual(["", ""], session.separators)
 
     def test_each_segment_records_its_own_delivery_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1202,10 +1372,10 @@ class LiveWorkerCadenceTests(unittest.TestCase):
                 self.delivering = threading.Event()
                 self.release = threading.Event()
 
-            def process_recording(self, pcm_audio, target=None):
+            def process_recording(self, pcm_audio, target=None, separator=""):
                 self.delivering.set()
                 self.release.wait(timeout=5)
-                return super().process_recording(pcm_audio, target)
+                return super().process_recording(pcm_audio, target, separator)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             session = BlockingSegmentSession()
@@ -1331,12 +1501,12 @@ class SegmentToggleConcurrencyTests(unittest.TestCase):
                 self.release = threading.Event()
                 self.order: list[str] = []
 
-            def process_recording(self, pcm_audio, target=None):
+            def process_recording(self, pcm_audio, target=None, separator=""):
                 self.order.append("enter")
                 if not self.entered.is_set():
                     self.entered.set()
                     self.release.wait(timeout=5)
-                result = super().process_recording(pcm_audio, target)
+                result = super().process_recording(pcm_audio, target, separator)
                 self.order.append("exit")
                 return result
 
@@ -1377,11 +1547,11 @@ class SegmentToggleConcurrencyTests(unittest.TestCase):
                 self.entered = threading.Event()
                 self.release = threading.Event()
 
-            def process_recording(self, pcm_audio, target=None):
+            def process_recording(self, pcm_audio, target=None, separator=""):
                 if not self.entered.is_set():
                     self.entered.set()
                     self.release.wait(timeout=5)
-                return super().process_recording(pcm_audio, target)
+                return super().process_recording(pcm_audio, target, separator)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             session = RefusingSlowSession()

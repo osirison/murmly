@@ -278,7 +278,8 @@ pause and types it while it keeps listening. Each segment is checked on its
 own. In `mine-only`, a segment that held only other voices types nothing, and
 the session keeps listening for your next sentence. In `label-everyone`, the
 `Speaker` numbers stay the same until you press the hotkey to end the session.
-See [finishing a recording by pausing](pause-to-finish.md).
+In every mode, segments are typed with a space between them, for example
+`Speaker 1: that's right You: Yeah, maybe`. See [finishing a recording by pausing](pause-to-finish.md).
 
 ## Add other people { #other-people }
 
