@@ -38,6 +38,12 @@ or, if murmly is already installed:
 ./setup.sh upgrade
 ```
 
+If you installed murmly on Linux before speaker recognition existed, run
+`./setup.sh upgrade` a second time. The first run updates murmly but still runs
+the old setup steps, so it does not fetch the model. The second run does.
+`murmly doctor` (below) shows whether the model is there. Windows is not
+affected.
+
 On Windows, in PowerShell, from the murmly folder:
 
 ```powershell
