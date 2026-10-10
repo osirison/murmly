@@ -427,6 +427,134 @@ class InstallSpeakerModelTests(SetupShTestCase):
                 self.assertTrue(record.exists())
 
 
+class UpgradeRestartsAfterPullTests(SetupShTestCase):
+    """`git pull` replaces setup.sh, but the bash process keeps running the copy
+    it already read, so a step added by the pull never ran on that upgrade.
+    `command_upgrade` now starts the new script when the pull moved HEAD.
+
+    Real `git` and a real `exec` throughout: an origin repository, a clone
+    holding the script under test, and a second commit on the origin whose
+    setup.sh is a stand-in that prints what it was started with.
+    """
+
+    def git(self, directory: Path, *arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *arguments],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout.strip()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.origin = self.repo / "origin"
+        self.clone = self.repo / "clone"
+        self.origin.mkdir()
+        self.git(self.origin, "init", "-q", "-b", "main")
+        shutil.copy(SETUP_SH, self.origin / "setup.sh")
+        self.git(self.origin, "add", "setup.sh")
+        self.git(self.origin, "commit", "-q", "-m", "first")
+        self.git(self.repo, "clone", "-q", str(self.origin), str(self.clone))
+        self.record = self.repo / "calls.txt"
+
+    def publish_new_setup_sh(self) -> None:
+        """A newer setup.sh on the origin that records how it was started."""
+        (self.origin / "setup.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'restarted:%s pulled:%s\\n\' "$*" "${{MURMLY_SETUP_PULLED:-}}" >> "{self.record}"\n'
+        )
+        self.git(self.origin, "commit", "-q", "-am", "second")
+
+    def run_upgrade(self, *, arguments: str = "upgrade --yes --no-cuda", before: str = "") -> subprocess.CompletedProcess[str]:
+        return run_bash(
+            "source ./setup.sh\n"
+            "require_uv() { :; }\n"
+            "sync_environment() { echo SYNCED; }\n"
+            "install_speaker_model() { :; }\n"
+            "recorded_hotkeys() { :; }\n"
+            "restart_service() { :; }\n"
+            "report_state() { :; }\n"
+            f"ORIGINAL_ARGS=({arguments})\n"
+            f"{before}"
+            "command_upgrade\n"
+            "echo FINISHED",
+            cwd=self.clone,
+        )
+
+    def test_a_pull_that_moves_head_starts_the_new_script_with_the_original_arguments(self) -> None:
+        self.publish_new_setup_sh()
+
+        result = self.run_upgrade()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("restarted:upgrade --yes --no-cuda pulled:1", self.record.read_text().strip())
+        # The old script handed over: it did not carry on with its own steps.
+        self.assertNotIn("SYNCED", result.stdout)
+        self.assertNotIn("FINISHED", result.stdout)
+        self.assertEqual(self.git(self.origin, "rev-parse", "HEAD"), self.git(self.clone, "rev-parse", "HEAD"))
+
+    def test_the_restart_does_not_pull_again(self) -> None:
+        self.publish_new_setup_sh()
+        git_record = self.repo / "git-calls.txt"
+        bin_dir = self.repo / "fake-bin"
+        bin_dir.mkdir()
+        real_git = shutil.which("git")
+        wrapper = bin_dir / "git"
+        wrapper.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{git_record}"\nexec "{real_git}" "$@"\n')
+        wrapper.chmod(0o755)
+
+        self.run_upgrade(before=f'PATH="{bin_dir}:$PATH"\n')
+
+        pulls = [line for line in git_record.read_text().splitlines() if " pull" in line]
+        self.assertEqual(1, len(pulls))
+        # What ran second is the stand-in, which never calls git; had it been
+        # the real script it would take the marker branch below, not pull.
+        self.assertEqual(1, len(self.record.read_text().splitlines()))
+
+    def test_an_unchanged_head_carries_on_without_restarting(self) -> None:
+        result = self.run_upgrade()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("SYNCED", result.stdout)
+        self.assertIn("FINISHED", result.stdout)
+        self.assertNotIn("Restarting", result.stdout)
+        self.assertFalse(self.record.exists())
+
+    def test_the_marker_skips_the_pull_says_so_and_carries_on(self) -> None:
+        self.publish_new_setup_sh()
+        head = self.git(self.clone, "rev-parse", "HEAD")
+
+        result = self.run_upgrade(before="export MURMLY_SETUP_PULLED=1\n")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Already pulled", result.stdout)
+        self.assertIn("SYNCED", result.stdout)
+        self.assertIn("FINISHED", result.stdout)
+        # Not pulled, and not restarted even though the origin is ahead.
+        self.assertEqual(head, self.git(self.clone, "rev-parse", "HEAD"))
+        self.assertFalse(self.record.exists())
+
+    def test_started_from_the_command_line_either_way_it_restarts_with_its_arguments(self) -> None:
+        # Nothing but `uv` has to exist: the old script hands over right after
+        # the pull, before any step that would need more. The script is run the
+        # two ways a person runs it.
+        bin_dir = self.fake_command("uv", self.repo / "uv-calls.txt")
+        first = self.git(self.clone, "rev-parse", "HEAD")
+        self.publish_new_setup_sh()
+        for invocation in ("./setup.sh", "bash setup.sh"):
+            with self.subTest(invocation=invocation):
+                self.git(self.clone, "reset", "-q", "--hard", first)
+                self.record.unlink(missing_ok=True)
+
+                result = run_bash(f'PATH="{bin_dir}:$PATH"\n{invocation} upgrade --yes', cwd=self.clone)
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("restarted:upgrade --yes pulled:1", self.record.read_text().strip())
+
+
 class ConfirmDeclinesWithoutATerminalTests(SetupShTestCase):
     """Task 16.6, at the bash layer: `setup.sh`'s own `confirm()` (unchanged
     by this task, and exercised here for the first time)."""

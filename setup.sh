@@ -44,6 +44,10 @@ WANT_TTS=auto
 WANT_HOOKS=auto
 PURGE=0
 
+# The arguments exactly as given, kept before `main` parses and shifts them, so
+# `command_upgrade` can start this script again with the same ones.
+ORIGINAL_ARGS=("$@")
+
 # ---------------------------------------------------------------- output ----
 
 if [ -t 1 ]; then
@@ -668,14 +672,31 @@ command_install() {
 command_upgrade() {
     require_uv
 
+    # Set by the run that pulled and then restarted itself, below. Read once and
+    # cleared so it neither loops this run nor reaches anything it starts.
+    local already_pulled="${MURMLY_SETUP_PULLED:-}"
+    unset MURMLY_SETUP_PULLED
+
     step "Source"
-    if [ ! -d "$REPO/.git" ]; then
+    if [ -n "$already_pulled" ]; then
+        note "Already pulled by the run that restarted this script."
+    elif [ ! -d "$REPO/.git" ]; then
         note "Not a git checkout, so there is nothing to pull."
     elif [ -n "$(git -C "$REPO" status --porcelain)" ]; then
         warn "The working tree has uncommitted changes. Leaving the source alone."
     else
         info "Pulling into $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+        local before after
+        before="$(git -C "$REPO" rev-parse HEAD)"
         git -C "$REPO" pull --ff-only
+        after="$(git -C "$REPO" rev-parse HEAD)"
+        if [ "$before" != "$after" ]; then
+            # Git replaced this file, but bash is still running the copy it
+            # already read, so any step the new version added would not run
+            # until the next upgrade. Start the new one with the same arguments.
+            note "The source changed. Restarting setup.sh so the new steps run."
+            MURMLY_SETUP_PULLED=1 exec "$BASH" "$REPO/setup.sh" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
+        fi
     fi
 
     sync_environment
