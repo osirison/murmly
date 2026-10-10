@@ -8,7 +8,17 @@ Defines the public site that introduces Murmly to someone who has never seen it 
 
 ### Requirement: The project page is published at a stable public address
 
-Murmly SHALL publish a site at `https://osirison.github.io/murmly/`, whose root address serves the landing page and which additionally serves the documentation pages at stable addresses beneath that prefix. Publication MUST run automatically when the default branch changes any input that determines the published bytes — the documentation's Markdown sources, the generator's configuration and its pinned versions, the site's templates, styles and assets, and the publishing workflow itself — and MUST also be startable on demand. A proposed change that has not reached the default branch MUST NOT replace the published site. A documentation page's address SHALL NOT change when unrelated pages are added.
+Murmly SHALL publish a site at `https://osirison.github.io/murmly/`, whose root address serves the landing page and which additionally serves the documentation pages at stable addresses beneath that prefix. A documentation page's address SHALL NOT change when unrelated pages are added.
+
+#### Scenario: A documentation page address is quoted elsewhere
+
+- **GIVEN** a documentation page address that has been published
+- **WHEN** further documentation pages are added and the site is republished
+- **THEN** that address still resolves to the same page
+
+### Requirement: Publication runs from the default branch and never from a proposed change
+
+Publication MUST run automatically when the default branch changes any input that determines the published bytes — the documentation's Markdown sources, the generator's configuration and its pinned versions, the site's templates, styles and assets, and the publishing workflow itself — and MUST also be startable on demand. A proposed change that has not reached the default branch MUST NOT replace the published site.
 
 #### Scenario: A site change reaches the default branch
 
@@ -37,20 +47,18 @@ Murmly SHALL publish a site at `https://osirison.github.io/murmly/`, whose root 
 - **THEN** it neither runs nor waits on Murmly's Python test matrix
 - **AND** a failure in that matrix does not prevent a page correction from publishing
 
-#### Scenario: A documentation page address is quoted elsewhere
-
-- **GIVEN** a documentation page address that has been published
-- **WHEN** further documentation pages are added and the site is republished
-- **THEN** that address still resolves to the same page
-
 ### Requirement: The first screen says what Murmly is and what using it looks like
 
-The site's landing page — the page served at the site's root address — SHALL, without scrolling on a 1280×800 viewport, present Murmly's name, a single sentence describing what it does in the user's own terms, a visual depiction of the press-speak-press loop, and a link to installation. That first screen MUST NOT open with an explanation of Wayland, compositors, hotkey protocols, or any other implementation subject. This requirement governs the landing page only; a documentation page is not required to open this way.
+The site's landing page — the page served at the site's root address — SHALL, without scrolling on a 1280×800 viewport, present Murmly's name, a single sentence describing what it does in the user's own terms, a visual depiction of the press-speak-press loop, and a link to installation. This requirement governs the landing page only; a documentation page is not required to open this way.
 
 #### Scenario: A first-time visitor opens the page
 
 - **WHEN** the site's root address is loaded at a 1280×800 viewport and nothing is scrolled
 - **THEN** the project name, a one-sentence description, a depiction of the record-transcribe-paste loop, and a link to installation are all visible
+
+### Requirement: The first screen opens without implementation detail
+
+The landing page's first screen, which is what is visible without scrolling on a 1280×800 viewport, MUST NOT open with an explanation of Wayland, compositors, hotkey protocols, or any other implementation subject. This requirement governs the landing page only; a documentation page is not required to open this way.
 
 #### Scenario: The opening text is checked for implementation detail
 
@@ -65,14 +73,6 @@ systems Murmly runs on, that Python 3.12 or newer is required, that installation
 run from a terminal, which permissions the visitor's platform will ask them to
 grant, and which parts of Murmly are not automatic on their platform — for each
 platform, whether the hotkey registers itself and whether the overlay is presented.
-Presenting Murmly as broadly consumer-ready MUST NOT come at the cost of omitting
-any of these on any page that invites an install.
-
-Where a capability has been verified end to end on some platforms and not others,
-the page MUST say which, and MUST NOT let a verified platform's status stand for an
-unverified one. A visitor MUST be able to determine, from that page alone and
-without installing anything, what will and will not work on the machine they are
-reading it on.
 
 #### Scenario: A visitor reads the install section
 
@@ -81,6 +81,33 @@ reading it on.
   requirement, the permissions each platform asks for, and the per-platform hotkey
   and overlay status are each stated on that same page
 
+#### Scenario: An install command appears on a documentation page
+
+- **WHEN** a documentation page shows an install command
+- **THEN** those same disclosures appear on that page as well, not only on the
+  landing page
+
+### Requirement: Presenting Murmly as consumer-ready does not displace the disclosures
+
+Presenting Murmly as broadly consumer-ready MUST NOT come at the cost of omitting
+any disclosure that "The page discloses what Murmly requires before it asks for an
+install" requires, on any page that invites an install.
+
+#### Scenario: A page presents Murmly as broadly consumer-ready
+
+- **WHEN** a page that invites an install presents Murmly as broadly consumer-ready
+- **THEN** the supported operating systems, the Python version floor, the terminal
+  requirement, the permissions each platform asks for, and the per-platform hotkey
+  and overlay status are each still stated on that page
+
+### Requirement: The page says where a capability is verified and what will work on the visitor's machine
+
+Where a capability has been verified end to end on some platforms and not others, a
+page that invites an install MUST say which, and MUST NOT let a verified platform's
+status stand for an unverified one. A visitor MUST be able to determine, from that
+page alone and without installing anything, what will and will not work on the
+machine they are reading it on.
+
 #### Scenario: A visitor on an unsupported desktop
 
 - **WHEN** someone running a desktop on which Murmly cannot register a hotkey reads
@@ -88,12 +115,6 @@ reading it on.
 - **THEN** they can determine from that page alone that the hotkey will not register
   itself on their desktop
 - **AND** that the rest of Murmly still installs and works
-
-#### Scenario: An install command appears on a documentation page
-
-- **WHEN** a documentation page shows an install command
-- **THEN** those same disclosures appear on that page as well, not only on the
-  landing page
 
 #### Scenario: A visitor checks whether their platform is verified
 
@@ -104,7 +125,7 @@ reading it on.
 
 ### Requirement: Every capability claim on the page is traceable to this repository
 
-No page of the site SHALL make a factual claim about Murmly's behavior, performance, or resource use that is not traceable to this repository's specifications under `openspec/specs/`, to a measurement recorded in this repository, or to the source itself. A documentation page MUST NOT be accepted as the source for its own claim, because the documentation now lives on the site and a figure invented there would otherwise trace to itself. Measured figures MUST be reproduced with the same qualification they carry at their source, including the hardware they were measured on. No page MAY present a comparison against a named competitor, a benchmark that exists nowhere else, a testimonial, a user count, or a rating.
+No page of the site SHALL make a factual claim about Murmly's behavior, performance, or resource use that is not traceable to this repository's specifications under `openspec/specs/`, to a measurement recorded in this repository, or to the source itself. A documentation page MUST NOT be accepted as the source for its own claim, because the documentation now lives on the site and a figure invented there would otherwise trace to itself.
 
 #### Scenario: A performance figure appears on the page
 
@@ -117,6 +138,21 @@ No page of the site SHALL make a factual claim about Murmly's behavior, performa
 - **WHEN** a proposed claim on any page cannot be traced outside the documentation itself
 - **THEN** it is not published
 
+### Requirement: Measured figures keep their qualification and no comparisons or social proof are presented
+
+Measured figures MUST be reproduced with the same qualification they carry at their source, including the hardware they were measured on. No page MAY present a comparison against a named competitor, a benchmark that exists nowhere else, a testimonial, a user count, or a rating.
+
+#### Scenario: A measured figure is reproduced
+
+- **WHEN** a page of the site reproduces a measured figure
+- **THEN** the figure carries the same qualification it carries at its source
+- **AND** that includes the hardware it was measured on
+
+#### Scenario: A competitor comparison or a benchmark that exists nowhere else is proposed
+
+- **WHEN** a comparison against a named competitor, or a benchmark that exists nowhere else, is proposed for any page of the site
+- **THEN** it is not published
+
 #### Scenario: Social proof is proposed
 
 - **WHEN** a testimonial, install count, star count, star-history chart, or rating is proposed for any page of the site
@@ -124,18 +160,12 @@ No page of the site SHALL make a factual claim about Murmly's behavior, performa
 
 ### Requirement: The page loads entirely from its own origin
 
-Every page of the site SHALL request no resource from any host other than the one serving it. Fonts, stylesheets, images, icons, search indexes, and any script MUST be served from the site itself or embedded in the document. No page MAY load analytics, tracking pixels, embedded third-party media, or an external font service, and no page MAY set a cookie or write to persistent browser storage. This constrains the generator's output and anything a theme or a plugin contributes to it, not only hand-written markup — a theme feature that persists a preference, or a header widget that queries a code-hosting API at view time, is forbidden by this requirement however convenient it is.
+Every page of the site SHALL request no resource from any host other than the one serving it. Fonts, stylesheets, images, icons, search indexes, and any script MUST be served from the site itself or embedded in the document. No page MAY load analytics, tracking pixels, embedded third-party media, or an external font service, and no page MAY set a cookie or write to persistent browser storage.
 
 #### Scenario: The page is loaded with network requests recorded
 
 - **WHEN** every page of the site and every asset any of them references are loaded
 - **THEN** every request goes to the origin serving the site
-
-#### Scenario: The generator's output is checked before the generator is adopted
-
-- **WHEN** the site is built with a candidate generator and theme and the output is searched for references to an external host
-- **THEN** no output file names a host other than the one serving the site
-- **AND** a theme that emits one is rejected, or its emission removed, before that generator is adopted
 
 #### Scenario: The page is loaded offline after a first visit
 
@@ -147,6 +177,16 @@ Every page of the site SHALL request no resource from any host other than the on
 
 - **WHEN** browser storage is inspected after loading the landing page and after exercising every interactive control on a documentation page
 - **THEN** neither has set a cookie nor written a persistent entry
+
+### Requirement: What the generator, a theme, or a plugin contributes is held to the same origin rules
+
+Every rule in the requirement "The page loads entirely from its own origin" SHALL bind the generator's output and anything a theme or a plugin contributes to it, not only hand-written markup. A theme feature that persists a preference, or a header widget that queries a code-hosting API at view time, is forbidden by those rules however convenient it is.
+
+#### Scenario: The generator's output is checked before the generator is adopted
+
+- **WHEN** the site is built with a candidate generator and theme and the output is searched for references to an external host
+- **THEN** no output file names a host other than the one serving the site
+- **AND** a theme that emits one is rejected, or its emission removed, before that generator is adopted
 
 ### Requirement: The page resolves correctly under a project path prefix
 
@@ -169,9 +209,7 @@ The published site is served from a path prefix rather than a domain root. Every
 
 ### Requirement: The page is complete without JavaScript and legible on a phone
 
-All of every page's content SHALL be present and readable with JavaScript disabled. Any script is enhancement only, and its absence MUST NOT remove content, navigation, an install command, or the ability to reach any documentation page from any other. Navigation between pages SHALL be plain links that work with scripting disabled. Search is the one feature that MAY require a script; where it does, its control MUST NOT remain visible when it cannot function, so a reader is never offered a search box that does nothing.
-
-Every page SHALL remain readable from a 360 px viewport upward, with no horizontal scrolling of the document body, and navigation MUST remain usable at that width without a script. Content wider than the viewport MUST scroll within its own region, and that MUST hold with scripting disabled as well as enabled — a scroll container created by a script is not sufficient.
+All of every page's content SHALL be present and readable with JavaScript disabled. Any script is enhancement only, and its absence MUST NOT remove content, navigation, an install command, or the ability to reach any documentation page from any other. Navigation between pages SHALL be plain links that work with scripting disabled.
 
 #### Scenario: JavaScript is disabled
 
@@ -183,10 +221,18 @@ Every page SHALL remain readable from a 360 px viewport upward, with no horizont
 - **WHEN** a visitor with scripting disabled starts at the landing page
 - **THEN** they can reach every documentation page by following links alone
 
+### Requirement: A control for a feature that needs a script is not shown without one
+
+Search is the one feature that MAY require a script; where it does, its control MUST NOT remain visible when it cannot function, so a reader is never offered a search box that does nothing.
+
 #### Scenario: A feature that needs a script is unavailable
 
 - **WHEN** a page is loaded with scripting disabled
 - **THEN** no control is shown for a feature that cannot function without a script
+
+### Requirement: Every page is legible on a phone, with or without a script
+
+Every page SHALL remain readable from a 360 px viewport upward, with no horizontal scrolling of the document body, and navigation MUST remain usable at that width without a script. Content wider than the viewport MUST scroll within its own region, and that MUST hold with scripting disabled as well as enabled — a scroll container created by a script is not sufficient.
 
 #### Scenario: The page is opened on a narrow viewport
 
@@ -216,7 +262,25 @@ On every page of the site, images presented as screenshots SHALL be captures of 
 
 ### Requirement: The project mark is original and carried by the repository
 
-The site's logo, wordmark, favicon, and social-preview image SHALL be authored in this repository and distributable under its license. No page MAY use a third-party mark, stock illustration, or icon set that the repository does not carry and cannot relicense, and this applies to anything a generator theme contributes as much as to hand-written markup: an icon set that arrives with a theme is carried by the site as surely as one committed by hand, and either the repository carries its license or the icons do not ship. The mark SHALL be legible at 16 px and SHALL render on both a light and a dark background. Every page SHALL carry the project's own mark and favicon, and no page MAY present the generator's or the theme's default mark as Murmly's.
+The site's logo, wordmark, favicon, and social-preview image SHALL be authored in this repository and distributable under its license. No page MAY use a third-party mark, stock illustration, or icon set that the repository does not carry and cannot relicense.
+
+#### Scenario: The page is shared as a link
+
+- **WHEN** the address of the landing page or of any documentation page is pasted into a service that renders link previews
+- **THEN** the preview shows the project's own image, title, and description, served from this origin
+
+### Requirement: What a theme contributes is held to the same mark and icon rules
+
+The rule against a third-party mark, stock illustration, or icon set that the repository does not carry and cannot relicense SHALL apply to anything a generator theme contributes as much as to hand-written markup: an icon set that arrives with a theme is carried by the site as surely as one committed by hand, and either the repository carries its license or the icons do not ship.
+
+#### Scenario: A theme contributes an icon set
+
+- **WHEN** the built output is inspected for images, icons, and fonts, including those embedded in stylesheets
+- **THEN** every one is authored in this repository, or is carried by the repository under a license permitting redistribution with that license text committed alongside it
+
+### Requirement: The mark is legible at 16 px and on light and dark backgrounds
+
+The mark SHALL be legible at 16 px and SHALL render on both a light and a dark background.
 
 #### Scenario: The mark is rendered small
 
@@ -228,15 +292,9 @@ The site's logo, wordmark, favicon, and social-preview image SHALL be authored i
 - **WHEN** any page of the site is viewed under a light colour scheme and under a dark one
 - **THEN** the logo and wordmark are legible in both
 
-#### Scenario: The page is shared as a link
+### Requirement: Every page carries the project's own mark and favicon
 
-- **WHEN** the address of the landing page or of any documentation page is pasted into a service that renders link previews
-- **THEN** the preview shows the project's own image, title, and description, served from this origin
-
-#### Scenario: A theme contributes an icon set
-
-- **WHEN** the built output is inspected for images, icons, and fonts, including those embedded in stylesheets
-- **THEN** every one is authored in this repository, or is carried by the repository under a license permitting redistribution with that license text committed alongside it
+Every page SHALL carry the project's own mark and favicon, and no page MAY present the generator's or the theme's default mark as Murmly's.
 
 #### Scenario: A theme ships its own favicon
 
@@ -245,7 +303,7 @@ The site's logo, wordmark, favicon, and social-preview image SHALL be authored i
 
 ### Requirement: The page is usable without sight, without a mouse, and without motion
 
-On every page of the site, every image SHALL carry a text alternative that conveys what the image shows, or be marked as decorative when it carries no information. Text SHALL meet a contrast ratio of at least 4.5:1 against its background, and at least 3:1 for text at 24 px or larger, under both colour schemes and including any syntax highlighting the generator applies. Every interactive element, including every navigation control the generator or its theme emits, SHALL be reachable by keyboard and SHALL show a visible focus indicator. Every page SHALL expose a heading structure a screen reader can navigate by. Any animation SHALL be suppressed when the visitor has asked for reduced motion.
+On every page of the site, every image SHALL carry a text alternative that conveys what the image shows, or be marked as decorative when it carries no information. Every page SHALL expose a heading structure a screen reader can navigate by.
 
 #### Scenario: The page is read by a screen reader
 
@@ -254,15 +312,27 @@ On every page of the site, every image SHALL carry a text alternative that conve
 - **AND** decorative images are skipped rather than announced
 - **AND** the page's headings form a structure that can be navigated by heading level
 
-#### Scenario: The page is navigated by keyboard
+### Requirement: Text meets a minimum contrast under both colour schemes
 
-- **WHEN** focus is advanced through any page with the keyboard alone
-- **THEN** every link and control, including every generated navigation control, receives focus in reading order with a visible indicator
+On every page of the site, text SHALL meet a contrast ratio of at least 4.5:1 against its background, and at least 3:1 for text at 24 px or larger, under both colour schemes and including any syntax highlighting the generator applies.
 
 #### Scenario: Contrast is measured under both colour schemes
 
 - **WHEN** the text on any page is measured against its background under a light colour scheme and under a dark one
 - **THEN** every measurement meets the ratio required for its size, including code and its syntax highlighting
+
+### Requirement: Every interactive element is reachable by keyboard with a visible focus indicator
+
+On every page of the site, every interactive element, including every navigation control the generator or its theme emits, SHALL be reachable by keyboard and SHALL show a visible focus indicator.
+
+#### Scenario: The page is navigated by keyboard
+
+- **WHEN** focus is advanced through any page with the keyboard alone
+- **THEN** every link and control, including every generated navigation control, receives focus in reading order with a visible indicator
+
+### Requirement: Animation is suppressed when the visitor has asked for reduced motion
+
+On every page of the site, any animation SHALL be suppressed when the visitor has asked for reduced motion.
 
 #### Scenario: The visitor has asked for reduced motion
 
@@ -271,7 +341,7 @@ On every page of the site, every image SHALL carry a text alternative that conve
 
 ### Requirement: The page routes to installation rather than replacing the documentation
 
-The landing page SHALL show the command that installs Murmly and SHALL link to the site's own documentation pages for everything beyond a first install. Reference material — the configuration reference, the speech-session protocol, hotkey management, transcript delivery, the recording overlay, and troubleshooting — SHALL exist in exactly one place, the site's documentation pages built from this repository's Markdown sources. The landing page MUST NOT restate that material, because a second copy drifts from the first. A link to reference material, wherever it is written, SHALL address a documentation page on this site rather than a heading anchor in `README.md`.
+The landing page SHALL show the command that installs Murmly and SHALL link to the site's own documentation pages for everything beyond a first install. It MUST NOT restate reference material, which exists only on those pages, because a second copy drifts from the first.
 
 #### Scenario: A visitor decides to install
 
@@ -284,11 +354,19 @@ The landing page SHALL show the command that installs Murmly and SHALL link to t
 - **WHEN** the landing page is searched for a configuration reference
 - **THEN** it links to the site's configuration documentation instead of reproducing it
 
+### Requirement: Reference material exists in exactly one place
+
+Reference material — the configuration reference, the speech-session protocol, hotkey management, transcript delivery, the recording overlay, and troubleshooting — SHALL exist in exactly one place, the site's documentation pages built from this repository's Markdown sources.
+
 #### Scenario: Reference material is checked for a second copy
 
 - **WHEN** the configuration reference, the speech-session protocol, and the troubleshooting steps are searched for across `README.md`, the landing page, and the documentation pages
 - **THEN** each appears in full on exactly one documentation page
 - **AND** neither `README.md` nor the landing page reproduces it
+
+### Requirement: A link to reference material addresses a documentation page, not a README.md anchor
+
+A link to reference material, wherever it is written, SHALL address a documentation page on this site rather than a heading anchor in `README.md`.
 
 #### Scenario: A documentation link is written
 
@@ -298,11 +376,7 @@ The landing page SHALL show the command that installs Murmly and SHALL link to t
 
 ### Requirement: Murmly's reference documentation is published as pages of this site
 
-The site SHALL publish, as pages of its own, every piece of reference material a person needs after a first install: what Murmly requires and how to install it, first use and the recording overlay, changing or removing a hotkey, where a transcript goes and what happens to the clipboard, live transcription, ending a recording on silence, speech output, announcing a finished agent turn, the configuration reference, what Murmly holds in memory and how fast it is, troubleshooting, and the speech-session protocol together with the command socket's permission rules. Each page SHALL be authored as Markdown held in this repository and SHALL reach the published site through the generator rather than by hand-editing generated output.
-
-No reference material `README.md` carries before this change SHALL be lost in the move. For each subject above the published site MUST state at least what `README.md` stated, and every measured figure, table, exact command, configuration key, default, documented range, diagnostic field name, refusal code, and protocol frame MUST survive with its meaning unchanged. Text a reader is expected to copy — an instruction to place in their own file, a udev rule, a pinned version — MUST be reproduced exactly rather than paraphrased.
-
-Editing a published documentation page MUST be done by editing its Markdown source. Generated output MUST NOT be hand-edited, because an edit made there is overwritten by the next build without warning.
+The site SHALL publish, as pages of its own, every piece of reference material a person needs after a first install.
 
 #### Scenario: The published site is examined after the move
 
@@ -310,20 +384,14 @@ Editing a published documentation page MUST be done by editing its Markdown sour
 - **THEN** a page exists for each of installation and requirements, first use, hotkey management, transcript delivery, live transcription, ending a recording on silence, speech output, agent-turn announcements, the configuration reference, memory and speed, troubleshooting, and the developer reference
 - **AND** each is reachable from the site's documentation index
 
-#### Scenario: A configuration key is looked up
+#### Scenario: Every subject of reference material has pages of its own
 
-- **WHEN** a configuration key that `README.md` documented before the move is looked up on the published site
-- **THEN** it is documented there with its meaning, its default, and its documented range
+- **WHEN** the published site is examined for each subject a person needs after a first install: what Murmly requires and how to install it, first use and the recording overlay, changing or removing a hotkey, where a transcript goes and what happens to the clipboard, live transcription, ending a recording on silence, speech output, announcing a finished agent turn, the configuration reference, what Murmly holds in memory and how fast it is, troubleshooting, and the speech-session protocol together with the command socket's permission rules
+- **THEN** each is published as pages of the site itself
 
-#### Scenario: Text the reader must copy
+### Requirement: Documentation pages are authored as Markdown and never hand-edited as output
 
-- **WHEN** the exact instruction text a person must place in their own file for an agent that cannot be told automatically is looked for
-- **THEN** it appears in full on a documentation page and can be copied from it unaltered
-
-#### Scenario: A measured figure is carried across
-
-- **WHEN** a documentation page states a figure that `README.md` stated before the move
-- **THEN** the figure is unchanged and carries the same qualification, including the machine it was measured on
+Each documentation page SHALL be authored as Markdown held in this repository and SHALL reach the published site through the generator rather than by hand-editing generated output. Editing a published documentation page MUST be done by editing its Markdown source. Generated output MUST NOT be hand-edited, because an edit made there is overwritten by the next build without warning.
 
 #### Scenario: A documentation page is changed
 
@@ -336,13 +404,32 @@ Editing a published documentation page MUST be done by editing its Markdown sour
 - **WHEN** the generator's output directory is inspected in version control
 - **THEN** it is absent from version control
 
+### Requirement: Nothing README.md stated is lost in the move to the site
+
+No reference material `README.md` carries before this change SHALL be lost in the move. For each subject of reference material named under "Murmly's reference documentation is published as pages of this site", the published site MUST state at least what `README.md` stated, and every measured figure, table, exact command, configuration key, default, documented range, diagnostic field name, refusal code, and protocol frame MUST survive with its meaning unchanged.
+
+#### Scenario: A configuration key is looked up
+
+- **WHEN** a configuration key that `README.md` documented before the move is looked up on the published site
+- **THEN** it is documented there with its meaning, its default, and its documented range
+
+#### Scenario: A measured figure is carried across
+
+- **WHEN** a documentation page states a figure that `README.md` stated before the move
+- **THEN** the figure is unchanged and carries the same qualification, including the machine it was measured on
+
+### Requirement: Text a reader is expected to copy is reproduced exactly in the move to the site
+
+When reference material moves from `README.md` to the site, text a reader is expected to copy — an instruction to place in their own file, a udev rule, a pinned version — MUST be reproduced exactly rather than paraphrased.
+
+#### Scenario: Text the reader must copy
+
+- **WHEN** the exact instruction text a person must place in their own file for an agent that cannot be told automatically is looked for
+- **THEN** it appears in full on a documentation page and can be copied from it unaltered
+
 ### Requirement: A reader who does not know the vocabulary can find the page they need
 
 Every documentation page SHALL be reachable from the landing page by following visible links, without the reader knowing a URL, a filename, or Murmly's internal vocabulary. Every documentation page SHALL show a persistent, visible index of the documentation, SHALL indicate which page the reader is on, and SHALL link back to the landing page. No documentation page SHALL be a dead end.
-
-Navigation entries and page titles SHALL be phrased in terms of what the reader wants to do rather than in terms of Murmly's internal components, so that a reader who has never heard the words "daemon", "compositor", or "session protocol" can still choose correctly. The documentation SHALL be ordered so that installing and first use come before the configuration reference and troubleshooting, and the developer reference comes last.
-
-The index SHALL state, for each heading that `README.md` carried before this change and no longer carries, which page now holds that subject, so a reader arriving from a link to a heading that no longer exists can find where it went.
 
 #### Scenario: A visitor looks for how to change the recording key
 
@@ -355,11 +442,25 @@ The index SHALL state, for each heading that `README.md` carried before this cha
 - **WHEN** any documentation page is loaded
 - **THEN** it shows an index of the documentation, marks the current page within that index, and links to the landing page
 
+#### Scenario: A reader arrives on a documentation page from a search engine
+
+- **GIVEN** a reader who followed a link to a documentation page directly rather than through the landing page
+- **WHEN** that page is loaded
+- **THEN** they can determine from the page alone what Murmly is, and reach the landing page and the documentation index from it
+
+### Requirement: Navigation entries and page titles are phrased in what the reader wants to do
+
+Navigation entries and page titles SHALL be phrased in terms of what the reader wants to do rather than in terms of Murmly's internal components, so that a reader who has never heard the words "daemon", "compositor", or "session protocol" can still choose correctly.
+
 #### Scenario: The navigation entries are read
 
 - **WHEN** the navigation entries are read
 - **THEN** each names a task or a subject a user would recognise
 - **AND** none is titled only with an internal component name
+
+### Requirement: The documentation is ordered from installing to the developer reference
+
+The documentation SHALL be ordered so that installing and first use come before the configuration reference and troubleshooting, and the developer reference comes last.
 
 #### Scenario: The documentation index is read from the top
 
@@ -367,11 +468,9 @@ The index SHALL state, for each heading that `README.md` carried before this cha
 - **THEN** installation and first use precede the configuration reference and troubleshooting
 - **AND** the developer reference comes last
 
-#### Scenario: A reader arrives on a documentation page from a search engine
+### Requirement: The index states where each heading removed from README.md went
 
-- **GIVEN** a reader who followed a link to a documentation page directly rather than through the landing page
-- **WHEN** that page is loaded
-- **THEN** they can determine from the page alone what Murmly is, and reach the landing page and the documentation index from it
+The index SHALL state, for each heading that `README.md` carried before this change and no longer carries, which page now holds that subject, so a reader arriving from a link to a heading that no longer exists can find where it went.
 
 #### Scenario: A link to a heading that no longer exists is followed
 
@@ -386,20 +485,38 @@ reader must meet before installing — including which operating systems Murmly 
 on, which machines it cannot run on and why, and which platforms each capability is
 verified end to end on — give the command that installs it, show what using it
 looks like, and link to the published site as the place all further documentation
-lives. The link to the site SHALL appear near the top and SHALL address the
-published site rather than a file path in the repository.
-
-`README.md` MUST NOT carry the configuration reference, the speech-session protocol,
-the command socket's permission rules, troubleshooting steps, or any other reference
-material the documentation pages hold, because a second copy drifts from the first.
-It SHALL nonetheless remain complete enough that a reader who never leaves the
-repository can install Murmly and produce one transcript.
+lives.
 
 #### Scenario: README.md is read from top to bottom
 
 - **WHEN** `README.md` is read from top to bottom
 - **THEN** it states what Murmly is, states the requirements, gives the install
   command, shows a first use, and links to the published site
+
+#### Scenario: README.md is measured after the move
+
+- **WHEN** `README.md` is measured after the move
+- **THEN** it is a small fraction of the 966 lines it held before
+- **AND** no section of reference material that moved to the site remains duplicated
+  in it
+
+### Requirement: The link from README.md to the site is near the top and addresses the published site
+
+The link from `README.md` to the published site SHALL appear near the top and SHALL
+address the published site rather than a file path in the repository.
+
+#### Scenario: The link to the site is followed
+
+- **WHEN** the link to the site in `README.md` is followed
+- **THEN** it resolves to `https://osirison.github.io/murmly/`
+
+### Requirement: README.md carries no reference material yet remains complete enough to install
+
+`README.md` MUST NOT carry the configuration reference, the speech-session protocol,
+the command socket's permission rules, troubleshooting steps, or any other reference
+material the documentation pages hold, because a second copy drifts from the first.
+It SHALL nonetheless remain complete enough that a reader who never leaves the
+repository can install Murmly and produce one transcript.
 
 #### Scenario: README.md is searched for reference material
 
@@ -413,23 +530,9 @@ repository can install Murmly and produce one transcript.
 - **WHEN** they follow it to the end
 - **THEN** they have installed Murmly and produced one transcript
 
-#### Scenario: README.md is measured after the move
-
-- **WHEN** `README.md` is measured after the move
-- **THEN** it is a small fraction of the 966 lines it held before
-- **AND** no section of reference material that moved to the site remains duplicated
-  in it
-
-#### Scenario: The link to the site is followed
-
-- **WHEN** the link to the site in `README.md` is followed
-- **THEN** it resolves to `https://osirison.github.io/murmly/`
-
 ### Requirement: Internal notes are excluded from everything the site publishes
 
-`docs/agent-notes/` holds internal operational notes and SHALL NOT be published. The set of sources the generator reads SHALL be defined so that `docs/agent-notes/` lies outside it, and that exclusion SHALL be explicit in the generator's configuration rather than incidental to it — a note added later MUST NOT become published merely because it was placed in a directory the generator happened to be pointed at.
-
-No file under `docs/agent-notes/` SHALL appear in the generator's output, in a search index, in a sitemap, or in any other artifact uploaded for publication, and no text SHALL be reproduced from one verbatim. A maintainer MAY write up, in their own words on a documentation page, a fix they learned from an internal note; what is forbidden is publishing the note.
+`docs/agent-notes/` holds internal operational notes and SHALL NOT be published. No file under `docs/agent-notes/` SHALL appear in the generator's output, in a search index, in a sitemap, or in any other artifact uploaded for publication, and no text SHALL be reproduced from one verbatim. A maintainer MAY write up, in their own words on a documentation page, a fix they learned from an internal note; what is forbidden is publishing the note.
 
 #### Scenario: The built output is listed
 
@@ -440,6 +543,15 @@ No file under `docs/agent-notes/` SHALL appear in the generator's output, in a s
 
 - **WHEN** the published site is searched for text that appears only in a file under `docs/agent-notes/`
 - **THEN** nothing is found, including in any search index the site serves
+
+#### Scenario: A documentation page carries a fix learned from an internal note
+
+- **WHEN** a documentation page describes a fix that an internal note also describes
+- **THEN** it is written in the documentation's own words rather than reproduced from the note
+
+### Requirement: The generator's source set explicitly excludes the internal notes
+
+The set of sources the generator reads SHALL be defined so that `docs/agent-notes/` lies outside it, and that exclusion SHALL be explicit in the generator's configuration rather than incidental to it — a note added later MUST NOT become published merely because it was placed in a directory the generator happened to be pointed at.
 
 #### Scenario: A new internal note is added
 
@@ -452,18 +564,9 @@ No file under `docs/agent-notes/` SHALL appear in the generator's output, in a s
 - **WHEN** the generator's configuration is read
 - **THEN** the boundary of its source set is stated explicitly and `docs/agent-notes/` lies outside it
 
-#### Scenario: A documentation page carries a fix learned from an internal note
-
-- **WHEN** a documentation page describes a fix that an internal note also describes
-- **THEN** it is written in the documentation's own words rather than reproduced from the note
-
 ### Requirement: The build between the sources and the published bytes is pinned and fails closed
 
 The published site is generated rather than committed byte-for-byte, so what a reviewer approves is the Markdown sources, the templates, and the generator's configuration rather than the bytes that reach the visitor. The generator, its theme, and every plugin the build depends on SHALL be pinned to exact versions recorded in a file committed to this repository, so the same sources produce the same site until a version is deliberately changed.
-
-Every byte the site publishes SHALL derive either from a committed source in this repository or from that pinned toolchain. No published page MAY contain content fetched from a third-party host at build time or at view time. Every file in the published artifact that lies outside the generated documentation tree SHALL be byte-identical to its committed source, and that identity SHALL be asserted by the publishing process rather than assumed.
-
-A build that fails SHALL leave the published site as it was: a failed build MUST NOT publish a partial or empty site. The build SHALL be runnable on a change before it reaches the default branch, so a reviewer can see the generated pages without publishing them. Publication SHALL continue to neither run nor wait on Murmly's Python test matrix, and a failure in that matrix MUST NOT prevent a documentation correction from publishing.
 
 #### Scenario: The pinned toolchain is inspected
 
@@ -476,11 +579,19 @@ A build that fails SHALL leave the published site as it was: a failed build MUST
 - **WHEN** the site is built twice from them
 - **THEN** the two outputs are the same
 
+### Requirement: Every published byte derives from a committed source or the pinned toolchain
+
+Every byte the site publishes SHALL derive either from a committed source in this repository or from the pinned toolchain. No published page MAY contain content fetched from a third-party host at build time or at view time.
+
 #### Scenario: A published page is traced to its source
 
 - **WHEN** any published page is traced back
 - **THEN** every part of it derives from a committed source in this repository or from the pinned toolchain
 - **AND** no part was fetched from a third-party host
+
+### Requirement: Files outside the generated documentation tree are asserted identical to their sources
+
+Every file in the published artifact that lies outside the generated documentation tree SHALL be byte-identical to its committed source, and that identity SHALL be asserted by the publishing process rather than assumed.
 
 #### Scenario: The artifact is assembled
 
@@ -488,17 +599,29 @@ A build that fails SHALL leave the published site as it was: a failed build MUST
 - **THEN** every file it carries outside the generated documentation tree is byte-identical to its committed source
 - **AND** a difference stops publication rather than being published
 
+### Requirement: A failed build leaves the published site as it was
+
+A build that fails SHALL leave the published site as it was: a failed build MUST NOT publish a partial or empty site.
+
 #### Scenario: A commit breaks the build
 
 - **GIVEN** a published site
 - **WHEN** a commit reaches the default branch whose sources cause the build to fail
 - **THEN** publication does not replace the published site and the previously published pages continue to serve
 
+### Requirement: The build can be run on a change before it reaches the default branch
+
+The build SHALL be runnable on a change before it reaches the default branch, so a reviewer can see the generated pages without publishing them.
+
 #### Scenario: A pull request changes a documentation source
 
 - **WHEN** a pull request changes a documentation source
 - **THEN** the site can be built from that pull request and the result inspected
 - **AND** the published site is unchanged until the change reaches the default branch
+
+### Requirement: Publication stays independent of the test suite
+
+Publication SHALL continue to neither run nor wait on Murmly's Python test matrix, and a failure in that matrix MUST NOT prevent a documentation correction from publishing.
 
 #### Scenario: Publication remains independent of the test suite
 

@@ -48,7 +48,7 @@ jobs:
             name: macOS
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # sounddevice loads libportaudio at import. Without it, the tests that
       # exercise the real module skip themselves rather than fail -- including
@@ -65,7 +65,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y libportaudio2
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -109,8 +109,15 @@ jobs:
         if: "runner.os == 'Windows' && matrix.python-version == '3.12'"
         run: uv sync --locked --extra overlay
 
+      # The suite takes about 1 to 2 minutes (the slowest, macOS, 118 s). If it
+      # runs ten minutes, something is hung: faulthandler prints every thread's
+      # stack and exits, so the log says where instead of the job sitting until
+      # it is cancelled. Same as `python -m unittest discover -s tests`.
       - name: Run the suite
-        run: uv run --no-sync python -m unittest discover -s tests
+        run: >-
+          uv run --no-sync python -c "import faulthandler, unittest;
+          faulthandler.dump_traceback_later(600, exit=True);
+          unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests'])"
 
       # A green run on a platform says nothing about how much of the suite that
       # platform actually ran: a test that skips itself is not a test that
@@ -120,7 +127,11 @@ jobs:
       # prints it, per platform, in the log of the run that produced it.
       - name: List what this platform skipped
         if: always()
-        run: uv run --no-sync python -m unittest discover -s tests -v 2>&1 | grep -E "skipped '" || echo "nothing skipped"
+        run: >-
+          uv run --no-sync python -c "import faulthandler, unittest;
+          faulthandler.dump_traceback_later(600, exit=True);
+          unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests', '-v'])"
+          2>&1 | grep -E "skipped '" || echo "nothing skipped"
 
   docs:
     name: docs
@@ -128,10 +139,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: "3.12"
@@ -155,10 +166,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -168,7 +179,7 @@ jobs:
       # Move the pin on purpose, with the specs brought into line in the same
       # change.
       - name: Install the OpenSpec CLI
-        run: npm install -g @fission-ai/openspec@1.14.0
+        run: npm install -g @fission-ai/openspec@1.14.1
 
       # Behavioral changes are planned as OpenSpec changes, so a delta spec that
       # does not parse -- a scenario written with three hashes, a requirement

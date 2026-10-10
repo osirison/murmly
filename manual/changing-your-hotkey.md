@@ -56,8 +56,9 @@ If you move the project directory or rebuild its environment, the recorded
 path goes stale. Run `murmly install <hotkey>` again from the new location to
 repair it; `murmly doctor` shows the path currently recorded. On Linux,
 `./setup.sh upgrade` does this for you, rebinding the keys it reads back
-rather than asking for them again; Windows has no equivalent upgrade command
-yet, so repeat the install command by hand.
+rather than asking for them again; on Windows, `.\bootstrap.ps1 upgrade` only
+fetches the speaker model and does not repair the path, so repeat the install
+command by hand.
 
 See [choosing a hotkey](install.md#choosing-a-hotkey) for what makes a hotkey
 valid, and [making murmly speak](making-murmly-speak.md) for what the second

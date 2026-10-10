@@ -73,8 +73,9 @@ theme:
 #   repo_url
 #       Material's repository widget fetches api.github.com at view time for
 #       star and fork counts. That is an off-origin request on every page load,
-#       and a star count is social proof, which the claims requirement forbids
-#       outright.
+#       and a star count is social proof, which the "Measured figures keep their
+#       qualification and no comparisons or social proof are presented"
+#       requirement forbids outright.
 #
 #   theme.palette with any toggle: entry
 #       The light/dark switch writes __palette to localStorage. No page may
@@ -139,6 +140,7 @@ nav:
   - Everyday use:
       - Changing your hotkey: changing-your-hotkey.md
       - Where your words go: where-your-words-go.md
+      - Typing only your own voice: typing-only-your-own-voice.md
       - Seeing your words as you speak: words-as-you-speak.md
       - Finishing a recording by pausing: pause-to-finish.md
   - When murmly speaks:

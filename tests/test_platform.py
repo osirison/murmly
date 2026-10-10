@@ -329,7 +329,9 @@ class BackendRegistryTests(unittest.TestCase):
 
     def test_command_channel_selects_the_unix_socket_on_macos(self) -> None:
         """Task 13.1: macOS keeps the UNIX socket exactly as Linux has it,
-        including the whole path-privacy analysis in `command-interface`."""
+        including the whole path-privacy analysis in `command-interface` ("A
+        configured socket path another account could take control of is
+        refused at daemon startup" and the three requirements after it)."""
         choice = BACKEND_REGISTRIES["command_channel"].select(macos())
 
         self.assertEqual("unix-socket", choice.mechanism)
@@ -777,7 +779,8 @@ class WindowsMicrophonePermissionTests(unittest.TestCase):
         """A person can flip the master "Microphone access" toggle off without
         touching the `NonPackaged` desktop-apps toggle at all -- checking only
         the per-app key would read that as no denial and report `GRANTED`,
-        which is exactly what the `platform-support` spec forbids."""
+        which is exactly what the `platform-support` spec's "A denied
+        permission is reported as denied" forbids."""
 
         def read(key_path: str, _name: str) -> str | None:
             return "Deny" if not key_path.endswith("NonPackaged") else None

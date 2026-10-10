@@ -1733,6 +1733,7 @@ class DoctorCompletenessTests(unittest.TestCase):
         "system_memory_returnable",
         "system_memory_returnable_detail",
         "live_transcription",
+        "speaker_recognition",
         "delivery",
         "overlay",
         "speech_output",
@@ -3433,6 +3434,7 @@ class StubDaemonSession:
 
     def __init__(self, *, model_resident: bool = False) -> None:
         self.model_resident = model_resident
+        self.speaker_model_resident = False
 
     def capture_delivery_target(self):
         return None
@@ -3726,7 +3728,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
                     self.fail("daemon socket was not accepting connections")
                 time.sleep(0.01)
 
-        transcription, synthesis = daemon_residency(config)
+        transcription, synthesis, speaker = daemon_residency(config)
 
         self.assertEqual((True, None), transcription)
         self.assertIsNone(synthesis[0])
@@ -3811,7 +3813,8 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
         speech = report["speech_output"]
         self.assertIn("the probe exploded", speech["detail"])
         # A section that drops these reads as one the report never asked about,
-        # which is the distinction the residency requirement exists to preserve.
+        # which is the distinction "Diagnostics report unknown residency when no
+        # daemon can be asked" exists to preserve.
         # The daemon's answer was taken before the probe ran, and the probe
         # failing does not make it less true.
         self.assertEqual(900, speech["unload_after_idle_s"])
@@ -3827,7 +3830,7 @@ class ModelResidencyDiagnosticsTests(unittest.TestCase):
 
         def residency(config: MurmlyConfig, send: object = None):
             order.append("residency")
-            return (False, None), (False, None)
+            return (False, None), (False, None), (False, None)
 
         def live(config: MurmlyConfig) -> dict[str, object]:
             order.append("live transcription")

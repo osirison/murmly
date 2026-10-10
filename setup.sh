@@ -30,11 +30,23 @@ readonly KOKORO_RELEASE="https://github.com/thewh1teagle/kokoro-onnx/releases/do
 readonly MODEL_FILE="kokoro-v1.0.onnx"
 readonly VOICES_FILE="voices-v1.0.bin"
 
+# The speaker-embedding model. These three values are the same ones as in
+# `src/murmly/speakers.py` and `bootstrap.ps1`; `tests/test_speakers_model_pin.py`
+# fails when they differ. The URL is pinned to one commit of the publisher's
+# repository.
+readonly SPEAKER_MODEL_URL="https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/f0c48c298fd835726c27956a5d617bad7115627e/voxceleb_resnet34_LM.onnx"
+readonly SPEAKER_MODEL_FILE="voxceleb_resnet34_LM.onnx"
+readonly SPEAKER_MODEL_SHA256="7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068"
+
 ASSUME_YES=0
 WANT_CUDA=auto
 WANT_TTS=auto
 WANT_HOOKS=auto
 PURGE=0
+
+# The arguments exactly as given, kept before `main` parses and shifts them, so
+# `command_upgrade` can start this script again with the same ones.
+ORIGINAL_ARGS=("$@")
 
 # ---------------------------------------------------------------- output ----
 
@@ -273,6 +285,64 @@ install_models() {
             warn "Could not fetch $file. Place it in $directory by hand."
         fi
     done
+}
+
+#: Whether `$1` is a file whose SHA-256 is `$SPEAKER_MODEL_SHA256`.
+speaker_model_verified() {
+    local file="$1" actual
+    [ -s "$file" ] || return 1
+    # macOS ships `shasum` and no `sha256sum`.
+    if have sha256sum; then
+        actual="$(sha256sum -- "$file" | cut -d' ' -f1)"
+    else
+        actual="$(shasum -a 256 -- "$file" | cut -d' ' -f1)"
+    fi
+    [ "$actual" = "$SPEAKER_MODEL_SHA256" ]
+}
+
+#: The speaker-embedding model is fetched for everyone, whether or not a speaker
+#: mode is ever selected, so that enrolling a voice and switching a mode on never
+#: wait on a download. A file already there is kept only when its checksum
+#: matches: a corrupted or replaced one is fetched again. A failure warns and
+#: leaves the rest of the install alone, because speaker recognition is an
+#: option and the daemon runs without it.
+install_speaker_model() {
+    step "Speaker model"
+    local directory target temporary
+    directory="$(data_dir)"
+    target="$directory/$SPEAKER_MODEL_FILE"
+    temporary="$directory/.$SPEAKER_MODEL_FILE.part"
+
+    if speaker_model_verified "$target"; then
+        info "Already in $directory."
+        return 0
+    fi
+    if [ -e "$target" ]; then
+        warn "$SPEAKER_MODEL_FILE in $directory does not match its checksum. Fetching it again."
+        rm -f -- "$target"
+    fi
+
+    if ! have curl; then
+        warn "curl is not installed, so the speaker model was not fetched. Place $SPEAKER_MODEL_FILE in $directory."
+        return 0
+    fi
+
+    mkdir -p "$directory"
+    info "Fetching $SPEAKER_MODEL_FILE into $directory"
+    info "From $SPEAKER_MODEL_URL"
+    # Downloaded beside the target and moved into place only once it checks out,
+    # so an interrupted or altered fetch never leaves a file that looks installed.
+    if ! curl --fail --location --progress-bar --output "$temporary" "$SPEAKER_MODEL_URL"; then
+        rm -f -- "$temporary"
+        warn "Could not fetch $SPEAKER_MODEL_FILE. Speaker recognition stays unavailable until it is in $directory."
+        return 0
+    fi
+    if ! speaker_model_verified "$temporary"; then
+        rm -f -- "$temporary"
+        warn "$SPEAKER_MODEL_FILE did not match its checksum and was deleted. Speaker recognition stays unavailable until it is in $directory."
+        return 0
+    fi
+    mv -- "$temporary" "$target"
 }
 
 # ------------------------------------------------- agent announcements ------
@@ -590,6 +660,7 @@ command_hooks() {
 command_install() {
     require_uv
     sync_environment
+    install_speaker_model
     bind_hotkeys "${1:-}" "${2:-}"
     restart_service
     offer_announce_hook
@@ -601,17 +672,35 @@ command_install() {
 command_upgrade() {
     require_uv
 
+    # Set by the run that pulled and then restarted itself, below. Read once and
+    # cleared so it neither loops this run nor reaches anything it starts.
+    local already_pulled="${MURMLY_SETUP_PULLED:-}"
+    unset MURMLY_SETUP_PULLED
+
     step "Source"
-    if [ ! -d "$REPO/.git" ]; then
+    if [ -n "$already_pulled" ]; then
+        note "Already pulled by the run that restarted this script."
+    elif [ ! -d "$REPO/.git" ]; then
         note "Not a git checkout, so there is nothing to pull."
     elif [ -n "$(git -C "$REPO" status --porcelain)" ]; then
         warn "The working tree has uncommitted changes. Leaving the source alone."
     else
         info "Pulling into $(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+        local before after
+        before="$(git -C "$REPO" rev-parse HEAD)"
         git -C "$REPO" pull --ff-only
+        after="$(git -C "$REPO" rev-parse HEAD)"
+        if [ "$before" != "$after" ]; then
+            # Git replaced this file, but bash is still running the copy it
+            # already read, so any step the new version added would not run
+            # until the next upgrade. Start the new one with the same arguments.
+            note "The source changed. Restarting setup.sh so the new steps run."
+            MURMLY_SETUP_PULLED=1 exec "$BASH" "$REPO/setup.sh" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
+        fi
     fi
 
     sync_environment
+    install_speaker_model
 
     # Rebound rather than left alone: the entrypoint Murmly recorded goes stale
     # when the environment is rebuilt, and the unit file changes between versions.

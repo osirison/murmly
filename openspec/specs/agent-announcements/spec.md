@@ -43,26 +43,30 @@ to its opening sentences. The limits that exist to bound an extract MUST NOT be
 applied to it, because those limits exist to stop where an extract is no longer
 informative, and a passage that was authored to be heard has no such point.
 
-A marked passage SHALL still be subject to an upper bound of its own, materially
-larger than the bound applied to an extract, so that a passage of unbounded length
-cannot hold the speech session against the person. When a passage exceeds that bound,
-Murmly SHALL announce it up to a sentence boundary rather than stopping mid-word.
-
-Markup inside a marked passage SHALL be removed before it is spoken, on the same
-terms as everywhere else. An agent is asked for prose, and removal is what makes a
-path or an identifier it slipped in anyway audible rather than punctuation read aloud.
-
 #### Scenario: A passage longer than an extract is announced in full
 
 - **WHEN** a marked passage is longer than the limit that bounds an extract
 - **AND** it is within its own upper bound
 - **THEN** all of it is announced
 
+### Requirement: A marked passage has an upper bound of its own
+
+A marked passage SHALL be subject to an upper bound of its own, materially larger
+than the bound applied to an extract, so that a passage of unbounded length cannot
+hold the speech session against the person. When a passage exceeds that bound, Murmly
+SHALL announce it up to a sentence boundary rather than stopping mid-word.
+
 #### Scenario: A passage beyond its own bound stops at a sentence
 
 - **WHEN** a marked passage exceeds its upper bound
 - **THEN** the announcement ends at a sentence boundary at or before that bound
 - **AND** no word is cut in half
+
+### Requirement: Markup inside a marked passage is removed before it is spoken
+
+Markup inside a marked passage SHALL be removed before it is spoken, on the same
+terms as everywhere else. An agent is asked for prose, and removal is what makes a
+path or an identifier it slipped in anyway audible rather than punctuation read aloud.
 
 #### Scenario: Markup inside a marked passage
 
@@ -106,10 +110,6 @@ there in preference to any record written alongside the conversation, because su
 record is not guaranteed to contain the finished turn's message at the moment that
 turn ends.
 
-Where no message is handed over, Murmly SHALL fall back to that record. The fallback
-is what keeps an agent that supplies no message announced at all, and it is the only
-circumstance in which an announcement may be of whatever the record last holds.
-
 #### Scenario: The record lags behind the turn
 
 - **WHEN** the announcement is made and the conversation's record does not yet contain
@@ -129,6 +129,13 @@ circumstance in which an announcement may be of whatever the record last holds.
   holds any agent message at all
 - **THEN** that turn's message is announced
 - **AND** the announcement is not skipped for want of anything to say
+
+### Requirement: Murmly falls back to the conversation's record when no message is handed over
+
+Where the agent hands Murmly no message along with the announcement, Murmly SHALL
+fall back to the record written alongside the conversation. The fallback is what
+keeps an agent that supplies no message announced at all, and it is the only
+circumstance in which an announcement may be of whatever the record last holds.
 
 #### Scenario: No message is handed over
 
@@ -163,10 +170,6 @@ installation MUST NOT write into any file that holds the person's own instructio
 their agent. Unregistering SHALL remove it, and registering more than once SHALL
 leave exactly one of it, on the same terms as the announcement itself.
 
-An agent that offers no way to be told automatically SHALL still be announced. Only
-the instruction is left to the person, and the documentation MUST give them the exact
-text to place and say where it goes.
-
 #### Scenario: Registering installs the instruction
 
 - **WHEN** the announcement is registered for an agent that can be told automatically
@@ -184,6 +187,12 @@ text to place and say where it goes.
 - **THEN** the instruction registration is removed alongside it
 - **AND** configuration belonging to anything other than Murmly is left as it was
 
+### Requirement: An agent that cannot be told automatically is still announced
+
+An agent that offers no way to be told automatically SHALL still be announced. Only
+the instruction that tells it to write a marked passage is left to the person, and
+the documentation MUST give them the exact text to place and say where it goes.
+
 #### Scenario: An agent that cannot be told automatically
 
 - **GIVEN** an agent with no facility for being given instructions by an installer
@@ -198,15 +207,6 @@ Every hook Murmly registers with an agent SHALL exit successfully whatever it
 encounters. This holds for reading a message it cannot parse, for a marked passage
 that is malformed, and for every reason the announcement stays silent.
 
-The announcement SHALL NOT hold up the turn it announces.
-
-Whatever tells the agent the convention SHALL run before the session it instructs
-begins, because there is no later point at which it can be in that session's
-context. It MUST therefore cost no more than emitting a fixed piece of text: it
-opens no connection, reads no configuration, and starts no subprocess. That is the
-whole of what may delay anything, and it is bounded by construction rather than by
-hope.
-
 #### Scenario: A message that cannot be read
 
 - **WHEN** the announcement runs against a message it cannot parse
@@ -218,6 +218,15 @@ hope.
 - **WHEN** whatever tells the agent the convention fails for any reason
 - **THEN** the agent's session starts normally
 - **AND** the failure is not reported as an error to the person
+
+### Requirement: Only the instruction may delay anything
+
+The announcement SHALL NOT hold up the turn it announces. Whatever tells the agent
+the convention SHALL run before the session it instructs begins, because there is no
+later point at which it can be in that session's context. It MUST therefore cost no
+more than emitting a fixed piece of text: it opens no connection, reads no
+configuration, and starts no subprocess. That is the whole of what may delay
+anything, and it is bounded by construction rather than by hope.
 
 #### Scenario: The turn is not held up
 
@@ -232,11 +241,7 @@ hope.
 
 ### Requirement: An announcement that is not spoken makes no sound
 
-An announcement SHALL make no sound at all when it is not going to be spoken. Any sound that precedes the words — a signal that an announcement is arriving — MUST NOT be produced unless Murmly has undertaken to speak. Every reason an announcement stays silent is covered by this, whether the reason is that speech output is disabled or unavailable, that another caller holds the session, that the microphone is open, or that the agent marked nothing to be heard.
-
-A sound announcing words that never arrive is worse than silence. It tells a person who is not looking at the terminal to stop and listen, spends their attention, and returns nothing for it. Repeated once per turn it trains them to ignore the signal, which costs the announcements that do work.
-
-The undertaking to speak MUST be established before the signal is produced rather than after, and it MUST reflect what Murmly can do at that moment rather than what it could do earlier.
+An announcement SHALL make no sound at all when it is not going to be spoken. Every reason an announcement stays silent is covered by this, whether the reason is that speech output is disabled or unavailable, that another caller holds the session, that the microphone is open, or that the agent marked nothing to be heard.
 
 #### Scenario: Speech output cannot run
 
@@ -254,17 +259,31 @@ The undertaking to speak MUST be established before the signal is produced rathe
 - **WHEN** a turn ends with an announcement suppressed by the agent
 - **THEN** no sound of any kind is produced for that turn
 
-#### Scenario: An announcement that will be spoken
-
-- **WHEN** a turn ends and Murmly has undertaken to speak the announcement
-- **THEN** the signal is produced and the announcement follows it
-
 #### Scenario: Speech becomes unavailable between turns
 
 - **GIVEN** a daemon that has been announcing turns aloud
 - **WHEN** speech output stops being able to run and a further turn ends
 - **THEN** that turn produces no sound of any kind
 - **AND** the reason is available in the daemon's diagnostics
+
+### Requirement: No signal precedes words that Murmly has not undertaken to speak
+
+Any sound that precedes the words — a signal that an announcement is arriving — MUST NOT be produced unless Murmly has undertaken to speak. A sound announcing words that never arrive is worse than silence. It tells a person who is not looking at the terminal to stop and listen, spends their attention, and returns nothing for it. Repeated once per turn it trains them to ignore the signal, which costs the announcements that do work.
+
+#### Scenario: An announcement that will be spoken
+
+- **WHEN** a turn ends and Murmly has undertaken to speak the announcement
+- **THEN** the signal is produced and the announcement follows it
+
+### Requirement: The undertaking to speak is established before the signal and reflects the moment
+
+The undertaking to speak that permits the signal preceding the words MUST be established before the signal is produced rather than after, and it MUST reflect what Murmly can do at that moment rather than what it could do earlier.
+
+#### Scenario: The undertaking is established at the moment of the signal
+
+- **WHEN** a turn ends and a signal would precede the announcement
+- **THEN** whether Murmly has undertaken to speak is established before the signal is produced
+- **AND** it reflects what Murmly can do at that moment rather than what it could do earlier
 
 ### Requirement: The diagnostic record says which announcement was made
 

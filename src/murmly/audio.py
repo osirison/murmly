@@ -412,6 +412,23 @@ def resample_float32(samples, from_rate_hz: int, to_rate_hz: int):
     return np.interp(target, source, audio).astype(np.float32)
 
 
+def capture_as_mono_float32(pcm_audio: bytes, sample_rate_hz: int, channels: int, to_rate_hz: int):
+    """Interleaved 16-bit PCM at the capture rate, as mono float32 at `to_rate_hz`.
+
+    Shared by enrolment and by the daemon's speaker attribution, so a voice is
+    prepared the same way when it is enrolled and when it is recognised. A
+    trailing partial frame is dropped.
+    """
+    import numpy as np
+
+    channels = max(channels, 1)
+    usable = len(pcm_audio) - (len(pcm_audio) % (2 * channels))
+    samples = np.frombuffer(pcm_audio[:usable], dtype="<i2").astype(np.float32) / 32_768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return resample_float32(samples, sample_rate_hz, to_rate_hz)
+
+
 class SoundDevicePlayer:
     """Plays synthesized audio, and stops playing it on demand.
 
@@ -438,8 +455,9 @@ class SoundDevicePlayer:
         self._frames_written = 0
         self._frames_played = 0
         # Counted for the life of the process, not the life of a stream. The
-        # spec asks how many dropouts there have been since the daemon started,
-        # and a session suspended for capture and resumed afterwards reopens the
+        # spec's "Diagnostics report playback dropouts as two separate counts"
+        # asks how many dropouts there have been since the daemon started, and
+        # a session suspended for capture and resumed afterwards reopens the
         # device -- so resetting these in `start()` would zero the count every
         # time the person dictated, which is exactly when they are investigating.
         self._underruns = 0

@@ -19,7 +19,8 @@ Outcomes, one per attempt:
                   pass: the connection was owed an answer and got one.
   no response     the connection closed without a response, reported as a
                   message. No traceback, so the desktop-integration rule holds,
-                  but "An accepted connection is answered" does not.
+                  but "A response is sent when a request cannot be served" does
+                  not.
   traceback       the failure this whole change exists to remove.
   raced           the transcription finished before the restart landed, so the
                   scenario never happened. Retried, not counted.

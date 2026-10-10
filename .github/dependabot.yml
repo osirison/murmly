@@ -1,0 +1,102 @@
+# Dependabot version updates. A release is picked up a few days after it is
+# published, and .github/workflows/dependabot-auto-merge.yml merges the pull
+# request once the checks the ruleset requires have passed.
+#
+# Read before editing:
+#
+#  1. An invalid file is ignored as a whole, not partly applied. Check a change
+#     under Insights > Dependency graph > Dependabot after it merges. Two ways
+#     to make it invalid:
+#       - `semver-major-days`, `semver-minor-days` and `semver-patch-days`
+#         under `github-actions`, which accepts `default-days` alone;
+#       - an unquoted `time: 09:00`, which YAML reads as a number.
+#  2. Do not add `labels:` before the labels exist in the repository.
+#     Dependabot drops a label it cannot find and says nothing. With none set
+#     it creates its own `dependencies` label on demand.
+#  3. `cooldown` delays version updates only. A security update is not held
+#     back by it.
+#  4. Only the dependencies named in pyproject.toml are offered. A package that
+#     arrives through another one, such as the ctranslate2 or onnxruntime that
+#     faster-whisper brings, moves only when uv.lock is refreshed for a package
+#     that needs it, or for a security update.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    # Daily rather than weekly: the cooldown below already holds a release back,
+    # so a weekly schedule would add up to another week on top of it. Dependabot
+    # skips weekends.
+    schedule:
+      interval: "daily"
+    # Counts every open pull request, including one waiting for a person (the
+    # cuda group) or one failing CI, which is why it is above the default of 5.
+    open-pull-requests-limit: 10
+    # Leave a requirement alone when it already allows the new release, so most
+    # updates change uv.lock only and the floors and comments in pyproject.toml
+    # stay as written. The exceptions are the exact pin on pywin32, which moves
+    # to the new version, and a requirement with an upper bound that a new
+    # release crosses, which the `ignore` list below stops for the capped
+    # packages.
+    versioning-strategy: "increase-if-necessary"
+    # Three days for minor and patch releases, seven for majors. A release that
+    # is withdrawn within that time never reaches a pull request.
+    cooldown:
+      default-days: 3
+      semver-major-days: 7
+    commit-message:
+      prefix: "deps"
+    # A dependency joins the first group that matches it, so cuda has to come
+    # first. Every other minor or patch update shares one pull request; a major
+    # update gets a pull request of its own.
+    groups:
+      # CI installs no CUDA wheels (tests.yml names no extras but overlay), so a
+      # green run says nothing about these. The auto-merge workflow leaves their
+      # pull request for a person, and grouping them means that wait costs one
+      # open pull request, not six.
+      cuda:
+        patterns:
+          - "nvidia-*"
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # An upper bound in pyproject.toml is a decision someone wrote down: the
+      # mkdocs caps are explained next to the docs group, and the nvidia-* caps
+      # hold the CUDA 12 line that CTranslate2 needs. Left alone, Dependabot
+      # raises a cap to take the new major, and auto-merge would ship it as soon
+      # as CI is green. Crossing a cap should be an edit to pyproject.toml made
+      # on purpose.
+      #
+      # Majors only, and only for version updates: `update-types` does not hold
+      # back a security update that needs the new major.
+      - dependency-name: "mkdocs"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "mkdocs-material"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "PySide6"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "nvidia-*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # `default-days` only: the semver-*-days keys are invalid for this ecosystem.
+    cooldown:
+      default-days: 3
+    commit-message:
+      prefix: "CI"
+    # The workflows pin major tags, so nearly every update is a major one and a
+    # minor-and-patch group would almost never match. One group puts them in a
+    # single pull request, which is the one a person has to merge: it edits
+    # files under .github/workflows/, and the auto-merge workflow does not arm
+    # those.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

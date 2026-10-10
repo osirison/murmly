@@ -20,6 +20,8 @@ from murmly.config import (
     DEFAULT_OVERLAY_TEXT_SIZE_PX,
     DEFAULT_RESTORE_DELAY_MS,
     DEFAULT_SILENCE_MS,
+    DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT,
+    DEFAULT_SPEAKER_MODE,
     DEFAULT_STT_UNLOAD_AFTER_IDLE_S,
     DEFAULT_TTS_DEVICE,
     DEFAULT_TTS_UNLOAD_AFTER_IDLE_S,
@@ -28,13 +30,17 @@ from murmly.config import (
     MAX_OVERLAY_TEXT_SIZE_PX,
     MAX_RESTORE_DELAY_MS,
     MAX_SILENCE_MS,
+    MAX_SPEAKER_MATCH_THRESHOLD_PERCENT,
     MAX_UNLOAD_AFTER_IDLE_S,
     MIN_LIVE_INTERVAL_MS,
     MIN_OVERLAY_TEXT_SIZE_PX,
     MIN_SILENCE_MS,
+    MIN_SPEAKER_MATCH_THRESHOLD_PERCENT,
     MIN_UNLOAD_AFTER_IDLE_S,
+    VALID_SPEAKER_MODES,
     WINDOWS_PIPE_NAME,
     default_config_path,
+    default_data_dir,
     default_runtime_dir,
     default_socket_path,
     default_tts_model_dir,
@@ -744,6 +750,7 @@ class LinuxPathsAreUnmovedTests(unittest.TestCase):
                 with self.subTest(config_home=config_home, data_home=data_home, runtime_dir=runtime_dir):
                     self.assertEqual(expected_config_path, default_config_path(env))
                     self.assertEqual(expected_data_dir, default_tts_model_dir(env))
+                    self.assertEqual(expected_data_dir, default_data_dir(env))
                     self.assertEqual(expected_runtime_dir, default_runtime_dir(env))
                     self.assertEqual(expected_socket_path, default_socket_path(env))
 
@@ -776,6 +783,10 @@ class WindowsAndMacOSPathTests(unittest.TestCase):
                 Path(r"C:\Users\a\AppData\Local") / "murmly",
                 default_tts_model_dir(env),
             )
+            self.assertEqual(
+                Path(r"C:\Users\a\AppData\Local") / "murmly",
+                default_data_dir(env),
+            )
             self.assertIsNone(default_runtime_dir(env))
             self.assertEqual(Path(WINDOWS_PIPE_NAME), default_socket_path(env))
 
@@ -797,11 +808,119 @@ class WindowsAndMacOSPathTests(unittest.TestCase):
                 home / "Library" / "Application Support" / "murmly",
                 default_tts_model_dir({}),
             )
+            self.assertEqual(
+                home / "Library" / "Application Support" / "murmly",
+                default_data_dir({}),
+            )
             self.assertEqual(home / "Library" / "Caches" / "murmly", default_runtime_dir({}))
             self.assertEqual(
                 home / "Library" / "Caches" / "murmly" / "murmly.sock",
                 default_socket_path({}),
             )
+
+
+class SpeakerSettingsTests(unittest.TestCase):
+    """Task 3.1 and 3.4: the `[speakers]` table and its fallbacks."""
+
+    def _load(self, body: str | None) -> murmly.config.MurmlyConfig:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            if body is not None:
+                config_path.write_text(textwrap.dedent(body), encoding="utf-8")
+            return load_config(config_path, {})
+
+    def test_defaults_when_the_table_is_absent(self) -> None:
+        config = self._load(None)
+
+        self.assertEqual("off", DEFAULT_SPEAKER_MODE)
+        self.assertEqual("off", config.speaker_mode)
+        self.assertIsNone(config.speaker_mode_rejected_value)
+        self.assertEqual("", config.speaker_owner)
+        self.assertEqual(DEFAULT_SPEAKER_MATCH_THRESHOLD_PERCENT, config.speaker_match_threshold_percent)
+        self.assertEqual(30, config.speaker_match_threshold_percent)
+        self.assertIsNone(config.speaker_match_threshold_rejected_value)
+
+    def test_the_valid_modes_are_exactly_the_three(self) -> None:
+        self.assertEqual({"off", "mine-only", "label-everyone"}, VALID_SPEAKER_MODES)
+
+    def test_each_valid_mode_is_read_without_a_rejected_value(self) -> None:
+        for mode in sorted(VALID_SPEAKER_MODES):
+            with self.subTest(mode=mode):
+                config = self._load(f'[speakers]\nmode = "{mode}"\n')
+                self.assertEqual(mode, config.speaker_mode)
+                self.assertIsNone(config.speaker_mode_rejected_value)
+
+    def test_an_unrecognized_mode_falls_back_to_off_and_is_reported(self) -> None:
+        config = self._load('[speakers]\nmode = "only-me"\n')
+
+        self.assertEqual("off", config.speaker_mode)
+        self.assertEqual("only-me", config.speaker_mode_rejected_value)
+
+    def test_a_non_string_mode_falls_back_without_raising(self) -> None:
+        config = self._load("[speakers]\nmode = 3\n")
+
+        self.assertEqual("off", config.speaker_mode)
+        self.assertEqual("3", config.speaker_mode_rejected_value)
+
+    def test_the_owner_is_read_as_a_string(self) -> None:
+        self.assertEqual("Milo", self._load('[speakers]\nowner = "Milo"\n').speaker_owner)
+
+    def test_an_absent_or_empty_owner_means_no_owner(self) -> None:
+        self.assertEqual("", self._load("[speakers]\nmode = \"off\"\n").speaker_owner)
+        self.assertEqual("", self._load('[speakers]\nowner = ""\n').speaker_owner)
+        self.assertEqual("", self._load('[speakers]\nowner = "   "\n').speaker_owner)
+
+    def test_a_threshold_within_bounds_is_used(self) -> None:
+        for percent in (
+            MIN_SPEAKER_MATCH_THRESHOLD_PERCENT,
+            55,
+            MAX_SPEAKER_MATCH_THRESHOLD_PERCENT,
+        ):
+            with self.subTest(percent=percent):
+                config = self._load(f"[speakers]\nmatch_threshold = {percent}\n")
+                self.assertEqual(percent, config.speaker_match_threshold_percent)
+                self.assertIsNone(config.speaker_match_threshold_rejected_value)
+
+    def test_a_threshold_out_of_bounds_falls_back_and_is_reported(self) -> None:
+        for percent in (
+            MIN_SPEAKER_MATCH_THRESHOLD_PERCENT - 1,
+            MAX_SPEAKER_MATCH_THRESHOLD_PERCENT + 1,
+            0,
+            -5,
+        ):
+            with self.subTest(percent=percent):
+                config = self._load(f"[speakers]\nmatch_threshold = {percent}\n")
+                self.assertEqual(30, config.speaker_match_threshold_percent)
+                self.assertEqual(percent, config.speaker_match_threshold_rejected_value)
+
+    def test_a_fractional_threshold_is_rejected_and_reported_not_truncated(self) -> None:
+        config = self._load("[speakers]\nmatch_threshold = 0.55\n")
+
+        self.assertEqual(30, config.speaker_match_threshold_percent)
+        self.assertEqual(0.55, config.speaker_match_threshold_rejected_value)
+
+    def test_a_non_numeric_threshold_never_raises(self) -> None:
+        config = self._load('[speakers]\nmatch_threshold = "high"\n')
+
+        self.assertEqual(30, config.speaker_match_threshold_percent)
+        self.assertEqual("high", config.speaker_match_threshold_rejected_value)
+
+    def test_a_speakers_entry_that_is_not_a_table_is_ignored(self) -> None:
+        config = self._load('speakers = "mine-only"\n')
+
+        self.assertEqual("off", config.speaker_mode)
+        self.assertEqual("", config.speaker_owner)
+
+    def test_the_tts_model_dir_default_is_the_data_dir(self) -> None:
+        """Task 3.2: the data directory is the one place both models live."""
+        for platform_name, env in (
+            ("linux", {"XDG_DATA_HOME": "/data"}),
+            ("linux", {}),
+            ("win32", {"LOCALAPPDATA": r"C:\Users\a\AppData\Local"}),
+            ("darwin", {}),
+        ):
+            with self.subTest(platform=platform_name, env=env), patch("sys.platform", platform_name):
+                self.assertEqual(default_data_dir(env), default_tts_model_dir(env))
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -846,7 +965,7 @@ class ExampleConfigTests(unittest.TestCase):
         source = Path(murmly.config.__file__).read_text(encoding="utf-8")
         read_keys = set(
             re.findall(
-                r"\b(daemon|audio|stt|clipboard|overlay|tts)\.get\(\s*\"(\w+)\"",
+                r"\b(daemon|audio|stt|clipboard|overlay|tts|speakers)\.get\(\s*\"(\w+)\"",
                 source,
             )
         )

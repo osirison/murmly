@@ -14,7 +14,9 @@ it), and what task 16.5 asks to keep working (every subcommand and flag).
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -281,6 +283,281 @@ class SyncEnvironmentDelegationTests(SetupShTestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertFalse(models_record.exists())
+
+
+class InstallSpeakerModelTests(SetupShTestCase):
+    """The speaker model is fetched for everyone, checked against a pinned
+    SHA-256, and fetched again only when the file there does not match.
+
+    `curl` is a script on `PATH` that copies a local file to the `--output`
+    path and records that it ran, so nothing here reaches the network. The
+    pinned checksum is `readonly` in `setup.sh`, so the copy under test has it
+    swapped for the checksum of the stand-in file: what is under test is the
+    check, not the real model's bytes.
+    """
+
+    GOOD = b"a stand-in for the model file"
+
+    def setUp(self) -> None:
+        super().setUp()
+        pinned = re.compile(r'^readonly SPEAKER_MODEL_SHA256=".*"$', re.MULTILINE)
+        script = self.repo / "setup.sh"
+        text = script.read_text()
+        self.assertRegex(text, pinned)
+        script.write_text(
+            pinned.sub(
+                f'readonly SPEAKER_MODEL_SHA256="{hashlib.sha256(self.GOOD).hexdigest()}"',
+                text,
+            )
+        )
+        self.data_home = self.repo / "data"
+        self.model = self.data_home / "murmly" / "voxceleb_resnet34_LM.onnx"
+        self.curl_record = self.repo / "curl-calls.txt"
+        self.served = self.repo / "served.bin"
+        self.served.write_bytes(self.GOOD)
+
+    def _fake_curl(self, *, exit_code: int = 0) -> Path:
+        bin_dir = self.repo / "fake-bin"
+        bin_dir.mkdir(exist_ok=True)
+        curl = bin_dir / "curl"
+        curl.write_text(
+            "#!/bin/sh\n"
+            'printf \'%s\\n\' "$*" >> "' + str(self.curl_record) + '"\n'
+            "while [ $# -gt 0 ]; do\n"
+            '    if [ "$1" = "--output" ]; then output="$2"; fi\n'
+            "    shift\n"
+            "done\n"
+            f'if [ {exit_code} -eq 0 ]; then cp "{self.served}" "$output"; fi\n'
+            f"exit {exit_code}\n"
+        )
+        curl.chmod(0o755)
+        return bin_dir
+
+    def _run(self, bin_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
+        path = f'PATH="{bin_dir}:$PATH"\n' if bin_dir is not None else ""
+        return run_bash(
+            f'export XDG_DATA_HOME="{self.data_home}"\n{path}source ./setup.sh\ninstall_speaker_model',
+            cwd=self.repo,
+        )
+
+    def test_fetches_the_model_into_the_data_directory_when_absent(self) -> None:
+        result = self._run(self._fake_curl())
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(self.GOOD, self.model.read_bytes())
+        self.assertEqual(1, len(self.curl_record.read_text().splitlines()))
+        call = self.curl_record.read_text()
+        self.assertIn("--fail", call)
+        self.assertIn("--location", call)
+        self.assertIn("voxceleb_resnet34_LM.onnx", call)
+        self.assertEqual([], list(self.model.parent.glob(".*.part")))
+
+    def test_a_corrupted_file_is_replaced(self) -> None:
+        self.model.parent.mkdir(parents=True)
+        self.model.write_bytes(b"truncated")
+
+        result = self._run(self._fake_curl())
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("does not match its checksum", result.stderr)
+        self.assertEqual(self.GOOD, self.model.read_bytes())
+        self.assertEqual(1, len(self.curl_record.read_text().splitlines()))
+
+    def test_a_verified_file_is_not_downloaded_again(self) -> None:
+        bin_dir = self._fake_curl()
+
+        first = self._run(bin_dir)
+        second = self._run(bin_dir)
+
+        self.assertEqual(0, first.returncode, first.stderr)
+        self.assertEqual(0, second.returncode, second.stderr)
+        self.assertEqual(1, len(self.curl_record.read_text().splitlines()))
+        self.assertIn("Already in", second.stdout)
+
+    def test_a_download_that_fails_the_checksum_is_deleted_and_warned_about(self) -> None:
+        self.served.write_bytes(b"something else entirely")
+
+        result = self._run(self._fake_curl())
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("did not match its checksum", result.stderr)
+        self.assertFalse(self.model.exists())
+        self.assertEqual([], list(self.model.parent.glob(".*.part")))
+
+    def test_a_failed_download_warns_and_does_not_stop_the_install(self) -> None:
+        result = self._run(self._fake_curl(exit_code=22))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Could not fetch", result.stderr)
+        self.assertFalse(self.model.exists())
+        self.assertEqual([], list(self.model.parent.glob(".*.part")))
+
+    def test_a_missing_curl_warns_and_does_not_stop_the_install(self) -> None:
+        # An empty directory first on `PATH` is not enough to hide the real
+        # curl, so `have` is replaced, the seam the rest of the suite uses.
+        result = run_bash(
+            f'export XDG_DATA_HOME="{self.data_home}"\n'
+            "source ./setup.sh\n"
+            "have() { return 1; }\n"
+            "install_speaker_model",
+            cwd=self.repo,
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("curl is not installed", result.stderr)
+
+    def test_install_and_upgrade_both_fetch_it_without_being_asked(self) -> None:
+        for command in ("install", "upgrade"):
+            record = self.repo / f"{command}-calls.txt"
+            result = run_bash(
+                "source ./setup.sh\n"
+                "require_uv() { :; }\n"
+                "sync_environment() { :; }\n"
+                "bind_hotkeys() { :; }\n"
+                "restart_service() { :; }\n"
+                "offer_announce_hook() { :; }\n"
+                "report_state() { :; }\n"
+                "recorded_hotkeys() { :; }\n"
+                f'install_speaker_model() {{ echo ran >> "{record}"; }}\n'
+                f"command_{command}",
+                cwd=self.repo,
+            )
+            with self.subTest(command=command):
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertTrue(record.exists())
+
+
+class UpgradeRestartsAfterPullTests(SetupShTestCase):
+    """`git pull` replaces setup.sh, but the bash process keeps running the copy
+    it already read, so a step added by the pull never ran on that upgrade.
+    `command_upgrade` now starts the new script when the pull moved HEAD.
+
+    Real `git` and a real `exec` throughout: an origin repository, a clone
+    holding the script under test, and a second commit on the origin whose
+    setup.sh is a stand-in that prints what it was started with.
+    """
+
+    def git(self, directory: Path, *arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *arguments],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        return result.stdout.strip()
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.origin = self.repo / "origin"
+        self.clone = self.repo / "clone"
+        self.origin.mkdir()
+        self.git(self.origin, "init", "-q", "-b", "main")
+        shutil.copy(SETUP_SH, self.origin / "setup.sh")
+        self.git(self.origin, "add", "setup.sh")
+        self.git(self.origin, "commit", "-q", "-m", "first")
+        self.git(self.repo, "clone", "-q", str(self.origin), str(self.clone))
+        self.record = self.repo / "calls.txt"
+
+    def publish_new_setup_sh(self) -> None:
+        """A newer setup.sh on the origin that records how it was started."""
+        (self.origin / "setup.sh").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'restarted:%s pulled:%s\\n\' "$*" "${{MURMLY_SETUP_PULLED:-}}" >> "{self.record}"\n'
+        )
+        self.git(self.origin, "commit", "-q", "-am", "second")
+
+    def run_upgrade(self, *, arguments: str = "upgrade --yes --no-cuda", before: str = "") -> subprocess.CompletedProcess[str]:
+        return run_bash(
+            "source ./setup.sh\n"
+            "require_uv() { :; }\n"
+            "sync_environment() { echo SYNCED; }\n"
+            "install_speaker_model() { :; }\n"
+            "recorded_hotkeys() { :; }\n"
+            "restart_service() { :; }\n"
+            "report_state() { :; }\n"
+            f"ORIGINAL_ARGS=({arguments})\n"
+            f"{before}"
+            "command_upgrade\n"
+            "echo FINISHED",
+            cwd=self.clone,
+        )
+
+    def test_a_pull_that_moves_head_starts_the_new_script_with_the_original_arguments(self) -> None:
+        self.publish_new_setup_sh()
+
+        result = self.run_upgrade()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("restarted:upgrade --yes --no-cuda pulled:1", self.record.read_text().strip())
+        # The old script handed over: it did not carry on with its own steps.
+        self.assertNotIn("SYNCED", result.stdout)
+        self.assertNotIn("FINISHED", result.stdout)
+        self.assertEqual(self.git(self.origin, "rev-parse", "HEAD"), self.git(self.clone, "rev-parse", "HEAD"))
+
+    def test_the_restart_does_not_pull_again(self) -> None:
+        self.publish_new_setup_sh()
+        git_record = self.repo / "git-calls.txt"
+        bin_dir = self.repo / "fake-bin"
+        bin_dir.mkdir()
+        real_git = shutil.which("git")
+        wrapper = bin_dir / "git"
+        wrapper.write_text(f'#!/bin/sh\nprintf \'%s\\n\' "$*" >> "{git_record}"\nexec "{real_git}" "$@"\n')
+        wrapper.chmod(0o755)
+
+        self.run_upgrade(before=f'PATH="{bin_dir}:$PATH"\n')
+
+        pulls = [line for line in git_record.read_text().splitlines() if " pull" in line]
+        self.assertEqual(1, len(pulls))
+        # What ran second is the stand-in, which never calls git; had it been
+        # the real script it would take the marker branch below, not pull.
+        self.assertEqual(1, len(self.record.read_text().splitlines()))
+
+    def test_an_unchanged_head_carries_on_without_restarting(self) -> None:
+        result = self.run_upgrade()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("SYNCED", result.stdout)
+        self.assertIn("FINISHED", result.stdout)
+        self.assertNotIn("Restarting", result.stdout)
+        self.assertFalse(self.record.exists())
+
+    def test_the_marker_skips_the_pull_says_so_and_carries_on(self) -> None:
+        self.publish_new_setup_sh()
+        head = self.git(self.clone, "rev-parse", "HEAD")
+
+        result = self.run_upgrade(before="export MURMLY_SETUP_PULLED=1\n")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Already pulled", result.stdout)
+        self.assertIn("SYNCED", result.stdout)
+        self.assertIn("FINISHED", result.stdout)
+        # Not pulled, and not restarted even though the origin is ahead.
+        self.assertEqual(head, self.git(self.clone, "rev-parse", "HEAD"))
+        self.assertFalse(self.record.exists())
+
+    def test_started_from_the_command_line_either_way_it_restarts_with_its_arguments(self) -> None:
+        # Nothing but `uv` has to exist: the old script hands over right after
+        # the pull, before any step that would need more. The script is run the
+        # two ways a person runs it.
+        bin_dir = self.fake_command("uv", self.repo / "uv-calls.txt")
+        # `main` refuses on Darwin before anything else; a fake `uname` on
+        # `PATH` keeps this test independent of the host, as above.
+        uname = bin_dir / "uname"
+        uname.write_text("#!/bin/sh\necho Linux\n")
+        uname.chmod(0o755)
+        first = self.git(self.clone, "rev-parse", "HEAD")
+        self.publish_new_setup_sh()
+        for invocation in ("./setup.sh", "bash setup.sh"):
+            with self.subTest(invocation=invocation):
+                self.git(self.clone, "reset", "-q", "--hard", first)
+                self.record.unlink(missing_ok=True)
+
+                result = run_bash(f'PATH="{bin_dir}:$PATH"\n{invocation} upgrade --yes', cwd=self.clone)
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertEqual("restarted:upgrade --yes pulled:1", self.record.read_text().strip())
 
 
 class ConfirmDeclinesWithoutATerminalTests(SetupShTestCase):

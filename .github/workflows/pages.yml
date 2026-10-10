@@ -11,6 +11,13 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/pages.yml"
+  # A Dependabot update merged by .github/workflows/dependabot-auto-merge.yml
+  # starts no push run (GitHub does not create runs for events caused by
+  # GITHUB_TOKEN), so a new mkdocs or mkdocs-material would never be built into
+  # the published manual. This weekly rebuild picks it up. The environment
+  # allows main only, and a scheduled run is on the default branch.
+  schedule:
+    - cron: "17 5 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -35,13 +42,13 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: "3.12"
@@ -249,10 +256,10 @@ jobs:
           PY
 
       - name: Upload the artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: _pages/
 
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

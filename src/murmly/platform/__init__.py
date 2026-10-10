@@ -271,14 +271,15 @@ class BackendChoice:
     decides them.
 
     `remedy` is the data that carries the distinction the `platform-support`
-    spec requires between a mechanism that does not exist on this platform and
-    one that exists here but could not be used: empty means "the platform
-    offers none" and the report must not name something to install, while a
-    non-empty tuple names exactly what to install, enable, or grant to make the
-    existing mechanism usable. A reader (or a future registry) decides which
-    case it is by testing `remedy`, never by pattern-matching `reason`'s
-    wording -- `reason` is prose for a person, `remedy` is the structured
-    answer for code.
+    spec's "The report names each mechanism specifically and tells an absent
+    one from an unusable one" requires between a mechanism that does not exist
+    on this platform and one that exists here but could not be used: empty
+    means "the platform offers none" and the report must not name something to
+    install, while a non-empty tuple names exactly what to install, enable, or
+    grant to make the existing mechanism usable. A reader (or a future
+    registry) decides which case it is by testing `remedy`, never by
+    pattern-matching `reason`'s wording -- `reason` is prose for a person,
+    `remedy` is the structured answer for code.
     """
 
     #: What a selected mechanism cannot do, where that is worth saying even
@@ -571,7 +572,9 @@ COMMAND_CHANNEL = BackendRegistry(
     candidates=(
         # macOS shares Linux's candidate rather than getting its own: task
         # 13.1 keeps the UNIX socket exactly as it is there, including the
-        # whole path-privacy analysis in `command-interface` -- both
+        # whole path-privacy analysis in `command-interface` ("A configured
+        # socket path another account could take control of is refused at
+        # daemon startup" and the three requirements after it) -- both
         # platforms genuinely have `AF_UNIX` and load the same family from
         # the same running interpreter's own `socket` module.
         BackendCandidate("unix-socket", lambda profile: _is_linux(profile) or _is_macos(profile), _load_unix_socket_family),
@@ -900,10 +903,10 @@ class Permission:
 #: desktop apps to access your microphone" toggle at its `NonPackaged`
 #: subkey. Checking only the second is the bug a person who flipped the
 #: *master* toggle off would fall through -- read as no denial there, and
-#: reported `GRANTED`, which is exactly what the `platform-support` spec
-#: forbids. Read from Microsoft's own documentation of the consent store's
-#: shape, not confirmed on a Windows machine; see
-#: `_windows_microphone_permission_check`.
+#: reported `GRANTED`, which is exactly what the `platform-support` spec's "A
+#: denied permission is reported as denied" forbids. Read from Microsoft's own
+#: documentation of the consent store's shape, not confirmed on a Windows
+#: machine; see `_windows_microphone_permission_check`.
 _WINDOWS_MICROPHONE_CONSENT_KEYS = (
     r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion"
     r"\CapabilityAccessManager\ConsentStore\microphone",

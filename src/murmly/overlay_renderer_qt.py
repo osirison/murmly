@@ -32,8 +32,9 @@ Task 10.5: the result is read back with `GetWindowLongPtr`, not assumed --
 "the previous value already was 0" -- and `missing_property_for_exstyle`
 decides from that readback whether the window actually has every property
 the `recording-overlay` spec's "Non-disruptive placement on every platform"
-requirement demands. Where it does not, the overlay is not shown at all and
-the missing property is what gets reported, the same choice
+requirement demands. Where it does not, the overlay is not shown at all (the
+same spec's "A platform that cannot provide a required property gets no
+overlay") and the missing property is what gets reported, the same choice
 `OverlayApplication._fail_visual` already makes in the GTK4 renderer.
 
 Unverified on real Windows -- everything past argument parsing and the pure

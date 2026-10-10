@@ -91,6 +91,11 @@ Murmly can read a coding assistant's output aloud and tell you when it has
 finished a turn. It is off by default:
 [making murmly speak](https://osirison.github.io/murmly/manual/making-murmly-speak/).
 
+## It can tell voices apart
+
+Murmly can type only your voice, or label who spoke. It is off by default:
+[typing only your own voice](https://osirison.github.io/murmly/manual/typing-only-your-own-voice/).
+
 ## Documentation
 
 Every setting, changing your hotkey, where transcripts go, speech output and

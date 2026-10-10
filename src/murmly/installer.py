@@ -1915,15 +1915,15 @@ class Installer:
         register in Murmly's own process").
 
         Installation therefore starts the daemon *before* reporting a hotkey
-        bound (the `desktop-integration` spec's "Hotkey takes effect in the
-        running session"): the record is written, the service is installed
-        and started, and only a daemon that reports the requested purposes
-        actually held (`COMMAND_STATUS`'s `hotkeys_held`, task 8.6) is
-        reported as a successful bind. A refusal the platform itself raises
-        (task 8.4 -- `WindowsHotkeyRegistrar.rebind` surfacing
-        `RegisterHotKey`'s own collision) leaves no registration behind: the
-        record reverts and the daemon is told to pick the previous bindings
-        back up, mirroring the desktop-launcher flow's own rollback.
+        bound (the `desktop-integration` spec's "A hotkey held by the daemon's
+        own process depends on the running daemon"): the record is written,
+        the service is installed and started, and only a daemon that reports
+        the requested purposes actually held (`COMMAND_STATUS`'s
+        `hotkeys_held`, task 8.6) is reported as a successful bind. A refusal
+        the platform itself raises (task 8.4 -- `WindowsHotkeyRegistrar.rebind`
+        surfacing `RegisterHotKey`'s own collision) leaves no registration
+        behind: the record reverts and the daemon is told to pick the previous
+        bindings back up, mirroring the desktop-launcher flow's own rollback.
         """
         from murmly.daemon import COMMAND_REBIND_HOTKEYS, COMMAND_STATUS
 
