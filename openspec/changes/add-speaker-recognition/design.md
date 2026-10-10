@@ -536,8 +536,11 @@ The download is 26.5 MB. `bootstrap.ps1` has never fetched anything before, so
 this is its first download, made with `Invoke-WebRequest` and checked with
 `Get-FileHash`. `setup.sh` refuses macOS, so on macOS the model is not fetched by
 either script. The Linux download was repeated on a second fetch and gave the
-same size and SHA-256 as recorded (task 1.9, Linux half). The Windows half is
-open.
+same size and SHA-256 as recorded (task 1.9, Linux half). The Windows half was
+skipped by the user's decision on 2026-10-10 and is still open. The pin test
+checks that `bootstrap.ps1` carries the same URL and SHA-256, and its
+PowerShell tests run on the Windows CI runner, but no real Windows download
+has been compared.
 
 ### Voiceprint store
 
@@ -552,8 +555,9 @@ The voiceprints are stored in `<data dir>/voiceprints.json`:
   `os.replace`. On POSIX the file is created through `os.open(..., 0o600)`, and a
   directory Murmly creates gets mode `0o700`. On Windows the file inherits the
   per-user ACL of `%LOCALAPPDATA%`. **Task 1.7 is still open.** It needs
-  `icacls %LOCALAPPDATA%\murmly` on a Windows machine, and nothing has been
-  run. This design keeps the assumption that the inherited ACL excludes other
+  `icacls %LOCALAPPDATA%\murmly` on a Windows machine. The user skipped it on
+  2026-10-10 and merged without it, so nothing has been run. This design keeps
+  the assumption that the inherited ACL excludes other
   standard accounts, and the Windows part of task 5.2 depends on the result.
 - **No audio is written.** `murmly enrol` computes the embedding from the PCM it
   holds in memory. No WAV is ever written, which is stronger than deleting one.
