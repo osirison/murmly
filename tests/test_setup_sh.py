@@ -542,6 +542,11 @@ class UpgradeRestartsAfterPullTests(SetupShTestCase):
         # the pull, before any step that would need more. The script is run the
         # two ways a person runs it.
         bin_dir = self.fake_command("uv", self.repo / "uv-calls.txt")
+        # `main` refuses on Darwin before anything else; a fake `uname` on
+        # `PATH` keeps this test independent of the host, as above.
+        uname = bin_dir / "uname"
+        uname.write_text("#!/bin/sh\necho Linux\n")
+        uname.chmod(0o755)
         first = self.git(self.clone, "rev-parse", "HEAD")
         self.publish_new_setup_sh()
         for invocation in ("./setup.sh", "bash setup.sh"):
