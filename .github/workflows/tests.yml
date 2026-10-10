@@ -109,8 +109,15 @@ jobs:
         if: "runner.os == 'Windows' && matrix.python-version == '3.12'"
         run: uv sync --locked --extra overlay
 
+      # The suite takes about 1 to 2 minutes (the slowest, macOS, 118 s). If it
+      # runs five minutes, something is hung: faulthandler prints every thread's
+      # stack and exits, so the log says where instead of the job sitting until
+      # it is cancelled. Same as `python -m unittest discover -s tests`.
       - name: Run the suite
-        run: uv run --no-sync python -m unittest discover -s tests
+        run: >-
+          uv run --no-sync python -c "import faulthandler, unittest;
+          faulthandler.dump_traceback_later(300, exit=True);
+          unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests'])"
 
       # A green run on a platform says nothing about how much of the suite that
       # platform actually ran: a test that skips itself is not a test that
@@ -120,7 +127,11 @@ jobs:
       # prints it, per platform, in the log of the run that produced it.
       - name: List what this platform skipped
         if: always()
-        run: uv run --no-sync python -m unittest discover -s tests -v 2>&1 | grep -E "skipped '" || echo "nothing skipped"
+        run: >-
+          uv run --no-sync python -c "import faulthandler, unittest;
+          faulthandler.dump_traceback_later(300, exit=True);
+          unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests', '-v'])"
+          2>&1 | grep -E "skipped '" || echo "nothing skipped"
 
   docs:
     name: docs
