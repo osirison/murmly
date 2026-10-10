@@ -114,6 +114,38 @@ set:
 verify_target = false
 ```
 
+## Voiceprints { #voiceprints }
+
+If you use [speaker recognition](typing-only-your-own-voice.md), murmly keeps
+a voiceprint for each voice you enrol. A voiceprint is a list of numbers that
+describes how a voice sounds. Murmly stores the voiceprint and never the audio:
+the recording you read aloud is held in memory while murmly makes the
+voiceprint, and is never written to a file or a log.
+
+| Platform | Where voiceprints are stored |
+| --- | --- |
+| Linux | `~/.local/share/murmly/voiceprints.json` |
+| Windows | `%LOCALAPPDATA%\murmly\voiceprints.json` |
+
+`murmly doctor` names the exact path under `speaker_recognition`.
+
+- **Only you can read the file.** On Linux the file is readable and writable
+  only by your account (mode `0600`), in a folder only you can open. On Windows
+  the file sits in your per-user folder and takes that folder's permissions.
+  Murmly has not yet checked on a Windows machine that those permissions keep
+  other accounts out.
+- **It stays on your machine.** Murmly does not send a voiceprint or an
+  enrolment sample anywhere.
+- **You can see and remove voices.** `murmly speakers list` shows the enrolled
+  names and marks the owner. `murmly speakers remove <name>` deletes one voice.
+  `murmly speakers remove --all` deletes every voice and the file with them.
+- **Uninstalling does not remove them.** `murmly uninstall` removes the service
+  and the hotkeys, and leaves the voiceprints in place. Remove them first with
+  `murmly speakers remove --all`, or delete the folder yourself. On Linux,
+  `./setup.sh uninstall --purge` deletes that folder too, after asking.
+- **Ask before you enrol someone else.** A voiceprint identifies a person. Enrol
+  another person's voice only if they agree, and remove it if they ask.
+
 ---
 
 If murmly still is not pasting the way you expect, see

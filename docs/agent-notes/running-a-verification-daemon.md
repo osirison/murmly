@@ -1,7 +1,7 @@
 ---
 title: Running a second murmly daemon by hand, to verify something against a live one
 description: Its socket must go under /run/user/<uid>, because a session scratchpad path exceeds the 108-byte AF_UNIX limit and the failure is reported as an unrelated-looking probe error; and starting it with an empty PATH is what keeps a verification capture off the clipboard and out of the focused window
-trigger: murmly daemon, murmly --config, murmly doctor, murmly toggle, verify against a real daemon, setsid murmly daemon
+trigger: murmly daemon, murmly --config, murmly doctor, doctor scratch config, XDG_RUNTIME_DIR, murmly toggle, verify against a real daemon, setsid murmly daemon
 
 depends_on: src/murmly/daemon.py, src/murmly/cli.py, src/murmly/integrations.py
 recorded: 2026-08-28
@@ -70,3 +70,13 @@ appears on the user's desktop for the length of the capture.
 daemon"` then remove the socket file. Check `nvidia-smi
 --query-compute-apps` after: the process is gone from `ps` a moment before its
 GPU memory is returned, so a reading taken immediately still lists it.
+
+## Running `murmly doctor` alone against a scratch config
+
+No daemon is needed to run `doctor` from a worktree. Pass
+`--config <scratch>/config.toml` with a short `[daemon] socket_path` (the 108-byte
+limit above applies), set `XDG_DATA_HOME` to a scratch directory so the model and
+voiceprints it looks at are the scratch ones, and leave the real `XDG_RUNTIME_DIR`
+alone. Pointing `XDG_RUNTIME_DIR` at a scratch directory made `doctor` hang for
+minutes; the cause was not isolated (probably the session bus or audio). A full run
+takes about 10 to 20 seconds. The real daemon is not touched.

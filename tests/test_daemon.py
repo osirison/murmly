@@ -61,6 +61,9 @@ class DummySession:
         # cannot ask as null beside a reason, and a stand-in without the
         # property would send every status query down that path.
         self.model_resident = False
+        # Never created unless a speaker mode is selected, so not held.
+        self.speaker_model_resident = False
+        self.speaker_model_resident_detail = None
         self.targets_captured = 0
         self.received_targets: list[WindowIdentity | None] = []
         self.target = WindowIdentity(window_id=1, pid=10, window_class="editor")
@@ -166,6 +169,7 @@ IDLE_STATUS = {
     "ok": True,
     "state": "IDLE",
     "model_resident": False,
+    "speaker_model_resident": False,
     "playback_dropouts": 0,
     "playback_starvations": 0,
     "hotkeys_held": [],
@@ -3615,6 +3619,8 @@ class UnaskableTranscriber:
         self.started = 0
         self.stopped = 0
         self.released = 0
+        self.speaker_model_resident = False
+        self.speaker_model_resident_detail = None
 
     @property
     def model_resident(self) -> bool:
@@ -3675,6 +3681,7 @@ class StatusResidencyTests(ServedDaemonTests):
                 "ok": True,
                 "state": "IDLE",
                 "model_resident": True,
+                "speaker_model_resident": False,
                 "synthesis_resident": True,
                 "playback_dropouts": 0,
                 "playback_starvations": 0,

@@ -412,6 +412,23 @@ def resample_float32(samples, from_rate_hz: int, to_rate_hz: int):
     return np.interp(target, source, audio).astype(np.float32)
 
 
+def capture_as_mono_float32(pcm_audio: bytes, sample_rate_hz: int, channels: int, to_rate_hz: int):
+    """Interleaved 16-bit PCM at the capture rate, as mono float32 at `to_rate_hz`.
+
+    Shared by enrolment and by the daemon's speaker attribution, so a voice is
+    prepared the same way when it is enrolled and when it is recognised. A
+    trailing partial frame is dropped.
+    """
+    import numpy as np
+
+    channels = max(channels, 1)
+    usable = len(pcm_audio) - (len(pcm_audio) % (2 * channels))
+    samples = np.frombuffer(pcm_audio[:usable], dtype="<i2").astype(np.float32) / 32_768.0
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return resample_float32(samples, sample_rate_hz, to_rate_hz)
+
+
 class SoundDevicePlayer:
     """Plays synthesized audio, and stops playing it on demand.
 

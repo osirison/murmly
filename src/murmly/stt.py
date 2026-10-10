@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import ctypes
+import functools
 from importlib.metadata import PackageNotFoundError, distribution
 import logging
 import os
@@ -14,10 +15,19 @@ import wave
 from murmly.config import MurmlyConfig
 from murmly.idle import return_free_heap
 from murmly.platform import OperatingSystem, PlatformProfile, resolve_platform
+from murmly.speakers import TimedText
 
 
 logger = logging.getLogger(__name__)
 WHISPER_SAMPLE_RATE_HZ = 16_000
+
+# A gap between two words at least this long starts a new timed part. The VAD
+# removes silences of about two seconds or more before decoding, so Whisper can
+# return two speakers' sentences as one segment; word times map those back to
+# the original audio and show the removed pause as a large gap. 1.5 s sits above
+# the largest alignment artefact measured inside speech (0.74 s) and below the
+# pauses the VAD removes.
+PART_SPLIT_GAP_S = 1.5
 
 # What CTranslate2 needs to run on CUDA, on every platform but Windows. The
 # ONNX synthesis runtime needs these and four more, so `tts.py` extends this
@@ -340,6 +350,33 @@ class FasterWhisperTranscriber:
             return ""
         return self._transcribe(pcm_audio, sample_rate_hz)
 
+    def transcribe_segments_pcm16(
+        self,
+        pcm_audio: bytes,
+        sample_rate_hz: int | None = None,
+        *,
+        quiet_speakers: bool = False,
+    ) -> list[TimedText]:
+        """Whisper's words, grouped into timed parts for speaker attribution.
+
+        Times are seconds from the start of the audio handed in, whatever the
+        capture rate. Decodes with word timestamps, which `transcribe_pcm16`
+        does not, and starts a new part wherever two words are `PART_SPLIT_GAP_S`
+        or more apart, so a pause between speakers that the VAD spliced out of
+        one Whisper segment still separates them. The joined text can differ
+        slightly from `transcribe_pcm16`'s for the same audio.
+
+        `quiet_speakers` is label-everyone's decode. The VAD's chunks can make
+        Whisper drop a quiet second speaker, so the VAD is off for this decode
+        whatever is configured; Whisper then writes text over silence, which the
+        caller must drop. Without the VAD, carrying each segment's text into the
+        next also leaves recordings lowercase and unpunctuated and appends an
+        invented "Thank you.", so that is off too (design.md, task 7.8).
+        """
+        if not pcm_audio or not any(pcm_audio):
+            return []
+        return self._transcribe(pcm_audio, sample_rate_hz, timed=True, quiet_speakers=quiet_speakers)
+
     def transcribe_partial(self, pcm_audio: bytes, sample_rate_hz: int | None = None) -> str | None:
         """Transcribe captured audio for display only.
 
@@ -375,8 +412,13 @@ class FasterWhisperTranscriber:
         sample_rate_hz: int | None,
         *,
         allow_array: bool = False,
-    ) -> str:
+        timed: bool = False,
+        quiet_speakers: bool = False,
+    ) -> str | list[TimedText]:
         model = self._load_model()
+        decode = self._decode_timed if timed else self._decode
+        if quiet_speakers:
+            decode = functools.partial(decode, quiet_speakers=True)
         rate = sample_rate_hz or self._config.sample_rate_hz
         # Mono 16 kHz only: the array path has no de-interleaving, and handing
         # Whisper interleaved stereo would show nonsense in the panel while the
@@ -390,7 +432,7 @@ class FasterWhisperTranscriber:
         if audio is not None:
             with self._model_lock:
                 self._ensure_resident_locked(model)
-                return self._decode(model, audio)
+                return decode(model, audio)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
             wav_path = Path(handle.name)
@@ -401,18 +443,62 @@ class FasterWhisperTranscriber:
                 # that skipped it would fail inside CTranslate2 on an evicted
                 # model, and only for the audio shape that reaches that site.
                 self._ensure_resident_locked(model)
-                return self._decode(model, str(wav_path))
+                return decode(model, str(wav_path))
         finally:
             wav_path.unlink(missing_ok=True)
 
-    def _decode(self, model, audio) -> str:
+    def _decode(self, model, audio, *, quiet_speakers: bool = False) -> str:
+        return " ".join(
+            segment.text.strip()
+            for segment in self._segments(model, audio, quiet_speakers=quiet_speakers)
+        ).strip()
+
+    def _decode_timed(self, model, audio, *, quiet_speakers: bool = False) -> list[TimedText]:
+        parts: list[TimedText] = []
+        segments = self._segments(
+            model, audio, word_timestamps=True, quiet_speakers=quiet_speakers
+        )
+        for segment in segments:
+            run: list = []
+            for word in getattr(segment, "words", None) or ():
+                if run and word.start - run[-1].end >= PART_SPLIT_GAP_S:
+                    self._close_part(parts, run)
+                    run = []
+                run.append(word)
+            self._close_part(parts, run)
+        return parts
+
+    @staticmethod
+    def _close_part(parts: list[TimedText], words: list) -> None:
+        if words:
+            text = "".join(word.word for word in words).strip()
+            parts.append(TimedText(words[0].start, words[-1].end, text))
+
+    def _segments(
+        self, model, audio, *, word_timestamps: bool = False, quiet_speakers: bool = False
+    ) -> list:
+        """The one decode both entry points share.
+
+        Word timestamps are asked for only by the timed entry point; the other
+        passes exactly the arguments it always did.
+
+        Listed here, while `_model_lock` is held: faster-whisper decodes as the
+        generator is iterated, so handing the generator back would let an idle
+        release take the weights away part-way through.
+        """
+        options = {"word_timestamps": True} if word_timestamps else {}
+        vad_filter = self._config.vad_filter
+        if quiet_speakers:
+            vad_filter = False
+            options["condition_on_previous_text"] = False
         segments, _info = model.transcribe(
             audio,
             language="en",
             beam_size=self._config.beam_size,
-            vad_filter=self._config.vad_filter,
+            vad_filter=vad_filter,
+            **options,
         )
-        return " ".join(segment.text.strip() for segment in segments).strip()
+        return list(segments)
 
     @staticmethod
     def _as_array(pcm_audio: bytes):

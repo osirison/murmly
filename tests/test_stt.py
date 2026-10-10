@@ -17,6 +17,7 @@ from module_stubs import injected_module
 
 from murmly.config import MurmlyConfig
 from murmly.platform import OperatingSystem, PlatformProfile
+from murmly.speakers import TimedText
 from murmly.stt import (
     CTRANSLATE2_CUDA_DLL_DIRECTORIES,
     FasterWhisperTranscriber,
@@ -665,6 +666,223 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
                 self.assertEqual(48_000, wav_handle.getframerate())
                 self.assertEqual(1, wav_handle.getnchannels())
                 self.assertEqual(2, wav_handle.getsampwidth())
+
+class TimedSegmentTests(unittest.TestCase):
+    """`transcribe_pcm16` is untouched; `transcribe_segments_pcm16` splits at word gaps."""
+
+    # Whisper's own whitespace habits and the edge cases of the join: a segment
+    # that strips to nothing is kept, so the join has a doubled space there.
+    TEXTS = (
+        [" hello there "],
+        [" a ", "", " b"],
+        ["a", "   ", "b", "  "],
+        ["", ""],
+        [],
+        ["   "],
+        [" one\ttwo ", "three\n"],
+    )
+
+    def _transcriber(self, temp_dir: str) -> FasterWhisperTranscriber:
+        return FasterWhisperTranscriber(
+            MurmlyConfig(
+                socket_path=Path(temp_dir) / "murmly.sock",
+                config_path=Path(temp_dir) / "config.toml",
+            )
+        )
+
+    @staticmethod
+    def _model(texts: list[str]) -> Mock:
+        model = Mock()
+        model.transcribe.return_value = (
+            iter(
+                SimpleNamespace(text=text, start=index * 2.0, end=index * 2.0 + 1.5)
+                for index, text in enumerate(texts)
+            ),
+            object(),
+        )
+        return model
+
+    def test_the_string_is_byte_identical_to_the_join_it_always_was(self) -> None:
+        for texts in self.TEXTS:
+            with self.subTest(texts=texts), tempfile.TemporaryDirectory() as temp_dir:
+                transcriber = self._transcriber(temp_dir)
+                with patch.object(transcriber, "_load_model", return_value=self._model(texts)):
+                    text = transcriber.transcribe_pcm16(b"\x01\x00" * 16_000, 16_000)
+
+                # The expression `_decode` held before this change.
+                self.assertEqual(" ".join(item.strip() for item in texts).strip(), text)
+
+    @staticmethod
+    def _timed_model(*segments: list[tuple[float, float, str]]) -> Mock:
+        """A model whose segments carry words, as (start, end, word) triples."""
+        model = Mock()
+        model.transcribe.return_value = (
+            iter(
+                SimpleNamespace(
+                    text="".join(word for _, _, word in words),
+                    start=words[0][0] if words else 0.0,
+                    end=words[-1][1] if words else 0.0,
+                    words=[SimpleNamespace(start=s, end=e, word=w) for s, e, w in words],
+                )
+                for words in segments
+            ),
+            object(),
+        )
+        return model
+
+    def _timed_parts(self, *segments: list[tuple[float, float, str]]) -> list[TimedText]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = self._transcriber(temp_dir)
+            with patch.object(
+                transcriber, "_load_model", return_value=self._timed_model(*segments)
+            ):
+                return transcriber.transcribe_segments_pcm16(b"\x01\x00" * 16_000, 16_000)
+
+    def test_a_long_gap_between_words_splits_one_segment_into_two_parts(self) -> None:
+        parts = self._timed_parts(
+            [
+                (1.7, 2.0, " The"),
+                (2.0, 4.9, " dog."),
+                (10.8, 11.2, " She"),
+                (11.2, 11.5, " sells"),
+                (11.5, 12.0, " shells."),
+            ]
+        )
+
+        self.assertEqual(
+            [TimedText(1.7, 4.9, "The dog."), TimedText(10.8, 12.0, "She sells shells.")],
+            parts,
+        )
+
+    def test_the_split_is_at_the_gap_not_before_it(self) -> None:
+        parts = self._timed_parts(
+            [(0.0, 1.0, " a"), (2.5, 3.0, " b"), (4.4, 5.0, " c")]
+        )
+
+        # 1.5 s splits; 1.4 s does not.
+        self.assertEqual([TimedText(0.0, 1.0, "a"), TimedText(2.5, 5.0, "b c")], parts)
+
+    def test_gaps_below_the_threshold_leave_one_part(self) -> None:
+        parts = self._timed_parts(
+            [(0.0, 1.0, " one"), (1.74, 2.0, " two"), (2.0, 3.0, " three")]
+        )
+
+        self.assertEqual([TimedText(0.0, 3.0, "one two three")], parts)
+
+    def test_each_segment_starts_its_own_part_and_text_is_the_words_joined(self) -> None:
+        segments = (
+            [(0.0, 0.5, " Hello"), (0.5, 1.0, " there,"), (1.0, 1.5, " Bob.")],
+            [(2.0, 2.5, " Hi"), (2.5, 3.0, "!")],
+        )
+        parts = self._timed_parts(*segments)
+
+        self.assertEqual(
+            [TimedText(0.0, 1.5, "Hello there, Bob."), TimedText(2.0, 3.0, "Hi!")], parts
+        )
+        for part, words in zip(parts, segments):
+            self.assertEqual("".join(word for _, _, word in words).strip(), part.text)
+
+    def test_segments_without_words_are_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = self._transcriber(temp_dir)
+            model = Mock()
+            model.transcribe.return_value = (
+                iter(
+                    [
+                        SimpleNamespace(text="", start=0.0, end=1.0, words=[]),
+                        SimpleNamespace(text="x", start=1.0, end=2.0, words=None),
+                        SimpleNamespace(
+                            text=" ok",
+                            start=2.0,
+                            end=3.0,
+                            words=[SimpleNamespace(start=2.0, end=3.0, word=" ok")],
+                        ),
+                    ]
+                ),
+                object(),
+            )
+            with patch.object(transcriber, "_load_model", return_value=model):
+                parts = transcriber.transcribe_segments_pcm16(b"\x01\x00" * 16_000, 16_000)
+
+        self.assertEqual([TimedText(2.0, 3.0, "ok")], parts)
+
+    def test_the_timed_decode_adds_only_word_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = self._transcriber(temp_dir)
+            string_model, timed_model = self._model(["x"]), self._timed_model([(0.0, 1.0, " x")])
+            with patch.object(transcriber, "_load_model", return_value=string_model):
+                transcriber.transcribe_pcm16(b"\x01\x00" * 16_000, 16_000)
+            with patch.object(transcriber, "_load_model", return_value=timed_model):
+                transcriber.transcribe_segments_pcm16(b"\x01\x00" * 16_000, 16_000)
+
+        off_kwargs = string_model.transcribe.call_args.kwargs
+        timed_kwargs = timed_model.transcribe.call_args.kwargs
+        self.assertNotIn("word_timestamps", off_kwargs)
+        self.assertEqual({**off_kwargs, "word_timestamps": True}, timed_kwargs)
+
+    def test_quiet_speakers_turns_the_vad_and_carrying_text_over_off(self) -> None:
+        audio = b"\x01\x00" * 16_000
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = self._transcriber(temp_dir)
+            configured = transcriber.vad_filter
+            seen: dict[str, dict] = {}
+            for name, call in (
+                ("off", lambda: transcriber.transcribe_pcm16(audio, 16_000)),
+                ("timed", lambda: transcriber.transcribe_segments_pcm16(audio, 16_000)),
+                (
+                    "quiet",
+                    lambda: transcriber.transcribe_segments_pcm16(
+                        audio, 16_000, quiet_speakers=True
+                    ),
+                ),
+            ):
+                model = self._timed_model([(0.0, 1.0, " x")])
+                with patch.object(transcriber, "_load_model", return_value=model):
+                    call()
+                seen[name] = model.transcribe.call_args.kwargs
+
+        self.assertTrue(configured)
+        for name in ("off", "timed"):
+            self.assertEqual(configured, seen[name]["vad_filter"], name)
+            self.assertNotIn("condition_on_previous_text", seen[name], name)
+        self.assertNotIn("word_timestamps", seen["off"])
+        self.assertTrue(seen["timed"]["word_timestamps"])
+        self.assertFalse(seen["quiet"]["vad_filter"])
+        self.assertFalse(seen["quiet"]["condition_on_previous_text"])
+        self.assertTrue(seen["quiet"]["word_timestamps"])
+
+    def test_silence_and_nothing_give_no_parts_without_decoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = self._transcriber(temp_dir)
+            model = self._model(["never"])
+            with patch.object(transcriber, "_load_model", return_value=model):
+                self.assertEqual([], transcriber.transcribe_segments_pcm16(b""))
+                self.assertEqual([], transcriber.transcribe_segments_pcm16(b"\x00\x00" * 100))
+
+        model.transcribe.assert_not_called()
+
+    def test_the_segments_are_consumed_while_the_model_lock_is_held(self) -> None:
+        """A lazy generator iterated outside the lock could outlive an idle release."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcriber = self._transcriber(temp_dir)
+            held: list[bool] = []
+
+            def lazy():
+                held.append(transcriber._model_lock.locked())
+                yield SimpleNamespace(
+                    text="x",
+                    start=0.0,
+                    end=1.0,
+                    words=[SimpleNamespace(start=0.0, end=1.0, word=" x")],
+                )
+
+            model = Mock()
+            model.transcribe.return_value = (lazy(), object())
+            with patch.object(transcriber, "_load_model", return_value=model):
+                transcriber.transcribe_segments_pcm16(b"\x01\x00" * 16_000, 16_000)
+
+        self.assertEqual([True], held)
+
 
 class TranscriberConcurrencyTests(unittest.TestCase):
     def _transcriber(self) -> FasterWhisperTranscriber:

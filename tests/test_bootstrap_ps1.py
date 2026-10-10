@@ -23,6 +23,7 @@ reaches the network or a real checkout, the same guarantee
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -251,6 +252,219 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("CALLARGS:[]", result.stdout)
+
+
+class BootstrapPs1SpeakerModelTests(unittest.TestCase):
+    """`Install-SpeakerModel`: fetched for everyone, checked against a pinned
+    SHA-256, fetched again only when the file there does not match.
+
+    `Invoke-WebRequest` is a function that copies a local file to `-OutFile`
+    and counts the call, so nothing here reaches the network -- a function
+    wins over the cmdlet of the same name in PowerShell's command resolution,
+    the same fact the `uv` stubs above rely on. The pinned checksum is a plain
+    variable, so each scenario sets it to the stand-in file's checksum: what is
+    under test is the check, not the real model's bytes.
+    """
+
+    GOOD = b"a stand-in for the model file"
+
+    def setUp(self) -> None:
+        if _INTERPRETER is None:
+            self.skipTest("no PowerShell interpreter (pwsh or powershell) on PATH")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.dir = Path(temp_dir.name)
+        self.local = self.dir / "local"
+        self.model = self.local / "murmly" / "voxceleb_resnet34_LM.onnx"
+        self.served = self.dir / "served.bin"
+        self.served.write_bytes(self.GOOD)
+
+    def _run(self, body: str, *, served_throws: bool = False):
+        checksum = hashlib.sha256(self.GOOD).hexdigest()
+        download = (
+            'Set-Content -LiteralPath $OutFile -Value partial; throw "network down"'
+            if served_throws
+            else f'Copy-Item -LiteralPath "{self.served}" -Destination $OutFile'
+        )
+        driver = self.dir / "driver.ps1"
+        driver.write_text(
+            "function Invoke-WebRequest {\n"
+            "    param($Uri, $OutFile, [switch]$UseBasicParsing)\n"
+            "    $global:Fetches++\n"
+            f"    {download}\n"
+            "}\n"
+            f'. "{BOOTSTRAP_PS1}"\n'
+            f'$SpeakerModelSha256 = "{checksum}"\n'
+            f'$env:LOCALAPPDATA = "{self.local}"\n' + body,
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [_INTERPRETER, "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+    def test_fetches_it_into_the_data_directory_when_absent(self) -> None:
+        result = self._run('Install-SpeakerModel\nWrite-Output "FETCHES:[$Fetches]"\n')
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("FETCHES:[1]", result.stdout)
+        self.assertEqual(self.GOOD, self.model.read_bytes())
+        self.assertEqual([], list(self.model.parent.glob(".*.part")))
+
+    def test_a_verified_file_is_not_downloaded_again(self) -> None:
+        result = self._run(
+            "Install-SpeakerModel\n"
+            "Install-SpeakerModel\n"
+            'Write-Output "FETCHES:[$Fetches]"\n'
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("FETCHES:[1]", result.stdout)
+        self.assertIn("Already in", result.stdout)
+
+    def test_a_corrupted_file_is_replaced(self) -> None:
+        self.model.parent.mkdir(parents=True)
+        self.model.write_bytes(b"truncated")
+
+        result = self._run('Install-SpeakerModel\nWrite-Output "FETCHES:[$Fetches]"\n')
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("FETCHES:[1]", result.stdout)
+        self.assertIn("does not match its checksum", result.stdout + result.stderr)
+        self.assertEqual(self.GOOD, self.model.read_bytes())
+
+    def test_a_download_that_fails_the_checksum_is_deleted_and_warned_about(self) -> None:
+        self.served.write_bytes(b"something else entirely")
+
+        result = self._run('Install-SpeakerModel\nWrite-Output "DONE"\n')
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("DONE", result.stdout)
+        self.assertIn("did not match its checksum", result.stdout + result.stderr)
+        self.assertFalse(self.model.exists())
+        self.assertEqual([], list(self.model.parent.glob(".*.part")))
+
+    def test_a_failed_download_warns_and_does_not_throw(self) -> None:
+        result = self._run('Install-SpeakerModel\nWrite-Output "DONE"\n', served_throws=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("DONE", result.stdout)
+        self.assertIn("Could not fetch", result.stdout + result.stderr)
+        self.assertFalse(self.model.exists())
+        self.assertEqual([], list(self.model.parent.glob(".*.part")))
+
+    def test_dot_sourcing_does_not_fetch(self) -> None:
+        result = self._run('Write-Output "FETCHES:[$Fetches]"\n')
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("FETCHES:[]", result.stdout)
+
+
+class BootstrapPs1CommandTests(unittest.TestCase):
+    """The script run as a command, which is the only way to reach its trailing
+    guard: `install` fetches the model and then hands off to `murmly`, while
+    `upgrade` fetches the model and stops, because `murmly` has no `upgrade`
+    subcommand to hand it to.
+
+    The driver calls the real script with `&` after defining `Invoke-WebRequest`,
+    `Get-FileHash` and `uv` as functions, which the script sees through
+    PowerShell's dynamic scoping and which win over the cmdlets and executable
+    of the same names. `Get-FileHash` answers the script's own pinned checksum
+    for any file, since the pinned value is set inside the script and a test
+    cannot replace it.
+    """
+
+    def setUp(self) -> None:
+        if _INTERPRETER is None:
+            self.skipTest("no PowerShell interpreter (pwsh or powershell) on PATH")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.dir = Path(temp_dir.name)
+        self.local = self.dir / "local"
+        self.model = self.local / "murmly" / "voxceleb_resnet34_LM.onnx"
+        match = re.search(r'^\$SpeakerModelSha256 = "([0-9a-f]{64})"$', BOOTSTRAP_PS1.read_text(encoding="utf-8"), re.MULTILINE)
+        assert match is not None
+        self.checksum = match.group(1)
+
+    def _run(self, command: str, *, download_fails: bool = False):
+        download = (
+            'throw "network down"'
+            if download_fails
+            else "Set-Content -LiteralPath $OutFile -Value stand-in"
+        )
+        driver = self.dir / "driver.ps1"
+        driver.write_text(
+            "function Invoke-WebRequest {\n"
+            "    param($Uri, $OutFile, [switch]$UseBasicParsing)\n"
+            "    $global:Fetches++\n"
+            f"    {download}\n"
+            "}\n"
+            f'function Get-FileHash {{ param($LiteralPath, $Algorithm) [pscustomobject]@{{ Hash = "{self.checksum}" }} }}\n'
+            "function uv { $global:UvCallArgs = $args -join \" \"; $global:LASTEXITCODE = 0 }\n"
+            f'$env:LOCALAPPDATA = "{self.local}"\n'
+            f'& "{BOOTSTRAP_PS1}" {command}\n'
+            'Write-Output "EXITCODE:[$LASTEXITCODE]"\n'
+            'Write-Output "FETCHES:[$Fetches]"\n'
+            'Write-Output "UVCALL:[$UvCallArgs]"\n',
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [_INTERPRETER, "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+    def test_upgrade_fetches_the_model_and_does_not_hand_off(self) -> None:
+        result = self._run("upgrade")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("FETCHES:[1]", result.stdout)
+        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertTrue(self.model.is_file())
+
+    def test_upgrade_with_the_model_already_there_exits_zero_without_fetching(self) -> None:
+        self.model.parent.mkdir(parents=True)
+        self.model.write_bytes(b"already here")
+
+        result = self._run("upgrade")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("FETCHES:[]", result.stdout)
+        self.assertIn("UVCALL:[]", result.stdout)
+
+    def test_upgrade_exits_one_when_the_model_could_not_be_fetched(self) -> None:
+        result = self._run("upgrade", download_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[1]", result.stdout)
+        self.assertIn("Could not fetch", result.stdout + result.stderr)
+        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertFalse(self.model.exists())
+
+    def test_install_fetches_the_model_then_hands_off(self) -> None:
+        result = self._run("install Meta+X")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("FETCHES:[1]", result.stdout)
+        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
+
+    def test_install_still_hands_off_when_the_model_could_not_be_fetched(self) -> None:
+        result = self._run("install Meta+X", download_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[0]", result.stdout)
+        self.assertIn("Could not fetch", result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
 
 
 if __name__ == "__main__":
