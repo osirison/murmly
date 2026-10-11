@@ -121,9 +121,10 @@ SESSION_WRITER_JOIN_SECONDS = 1.0
 STATE_IDLE = "IDLE"
 STATE_LISTENING = "LISTENING"
 STATE_THINKING = "THINKING"
-# The fourth state. `OverlayState` deliberately keeps its three: speech has no
+# The fourth state. `OverlayState` has no counterpart for it: speech has no
 # visual indicator in this change, and `recording-overlay` forbids one outside
-# the capture lifecycle.
+# the capture lifecycle. (`OverlayState.DELIVERED` is a confirmation that ends
+# a capture, not a daemon state.)
 STATE_SPEAKING = "SPEAKING"
 
 DESTINATION_WINDOW = "window"
@@ -2692,10 +2693,7 @@ class MurmlyDaemon:
 
         try:
             result = self._process_recording(pcm_audio, target, self._segment_separator())
-            if result.detail is None:
-                self._publish_state(OverlayState.IDLE)
-            else:
-                self._publish_error()
+            self._publish_outcome(result)
             return self._session_response(result)
         except Exception as error:
             self._publish_error()
@@ -2793,10 +2791,7 @@ class MurmlyDaemon:
             self._publish_state(OverlayState.THINKING)
             target = self._delivery_target()
             result = self._process_recording(pcm_audio, target)
-            if result.detail is None:
-                self._publish_state(OverlayState.IDLE)
-            else:
-                self._publish_error()
+            self._publish_outcome(result)
         except Exception as error:
             logger.warning("Auto-transcribe stop failed: %s", error)
             self._publish_error()
@@ -2929,6 +2924,29 @@ class MurmlyDaemon:
             self._overlay.publish_state(state)
         except Exception as error:
             logger.warning("Overlay state update failed: %s", error)
+
+    def _publish_outcome(self, result: ProcessingResult) -> None:
+        """Show how a recording that has stopped capturing ended.
+
+        A refusal is the error presentation. A delivery is confirmed, which the
+        renderer hides on its own. Nothing typed is nothing to confirm, so the
+        overlay simply hides: that is a capture bound for a speech session, which
+        pastes nothing, and a recording with no words in it. The one exception
+        is the final stop of a continuous session that had already delivered
+        segments, whose last stretch held no words. Never called for a segment
+        delivered while capture continues: the listening presentation still
+        represents live input there.
+        """
+        if result.detail is not None:
+            self._publish_error()
+            return
+        with self._lock:
+            earlier_segments_typed = bool(self._segments) and self._session_delivered
+        typed = result.delivered or (not result.text and earlier_segments_typed)
+        if typed and self._capture_destination != DESTINATION_SESSION:
+            self._publish_state(OverlayState.DELIVERED)
+        else:
+            self._publish_state(OverlayState.IDLE)
 
     def _publish_level(self, level: float) -> None:
         try:

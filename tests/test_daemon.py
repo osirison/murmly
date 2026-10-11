@@ -283,7 +283,7 @@ class DaemonTests(unittest.TestCase):
             [
                 ("state", OverlayState.LISTENING),
                 ("state", OverlayState.THINKING),
-                ("state", OverlayState.IDLE),
+                ("state", OverlayState.DELIVERED),
             ],
             overlay.events,
         )
@@ -657,6 +657,7 @@ class DeliveryTargetTests(unittest.TestCase):
         self.assertEqual("hello world", response["text"])
         self.assertIn(("error", 2_000), overlay.events)
         self.assertNotIn(("state", OverlayState.IDLE), overlay.events)
+        self.assertNotIn(("state", OverlayState.DELIVERED), overlay.events)
 
     def test_delivered_transcript_reports_delivery_and_returns_to_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -668,7 +669,206 @@ class DeliveryTargetTests(unittest.TestCase):
 
         self.assertTrue(response["delivered"])
         self.assertNotIn("detail", response)
-        self.assertIn(("state", OverlayState.IDLE), overlay.events)
+        self.assertEqual("IDLE", daemon.state)
+        self.assertIn(("state", OverlayState.DELIVERED), overlay.events)
+
+
+class DeliveredConfirmationTests(unittest.TestCase):
+    """`recording-overlay`'s delivered confirmation, as the daemon publishes it.
+
+    The daemon only announces DELIVERED. The renderer hides it after
+    `DELIVERED_DURATION_MS` on its own timer, so there is no daemon-side timer
+    to hold, and nothing the daemon sends later that a stale timer could
+    misapply to a capture that began in the meantime.
+    """
+
+    def _daemon(self, temp_dir: str, session: DummySession, overlay: FakeOverlay, **overrides) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            **overrides,
+        )
+        return MurmlyDaemon(
+            config,
+            session=session,
+            overlay=overlay,
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
+
+    def _states(self, overlay: FakeOverlay) -> list[OverlayState]:
+        return [value for kind, value in overlay.events if kind == "state"]
+
+    def test_a_successful_stop_publishes_the_confirmation_and_nothing_hides_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            daemon = self._daemon(temp_dir, DummySession(), overlay)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+        self.assertEqual(
+            [OverlayState.LISTENING, OverlayState.THINKING, OverlayState.DELIVERED],
+            self._states(overlay),
+        )
+
+    def test_the_confirmation_names_no_transcript_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            daemon = self._daemon(temp_dir, DummySession(), overlay)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+        self.assertEqual([], [event for event in overlay.events if event[0] == "partial"])
+        self.assertNotIn("hello world", repr(overlay.events))
+
+    def test_a_refused_delivery_shows_the_error_and_no_confirmation(self) -> None:
+        class RefusingSession(DummySession):
+            def process_recording(self, pcm_audio, target=None, separator=""):
+                return ProcessingResult(
+                    text="hello world",
+                    state="DONE",
+                    delivered=False,
+                    detail="Transcript copied to the clipboard but not pasted.",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            daemon = self._daemon(temp_dir, RefusingSession(), overlay)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+        self.assertEqual(("error", 2_000), overlay.events[-1])
+        self.assertNotIn(OverlayState.DELIVERED, self._states(overlay))
+
+    def test_a_recording_with_no_words_is_not_confirmed(self) -> None:
+        class SilentSession(DummySession):
+            def process_recording(self, pcm_audio, target=None, separator=""):
+                return ProcessingResult(text="", state="DONE")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            daemon = self._daemon(temp_dir, SilentSession(), overlay)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+        self.assertEqual(
+            [OverlayState.LISTENING, OverlayState.THINKING, OverlayState.IDLE],
+            self._states(overlay),
+        )
+
+    def test_a_capture_for_a_speech_session_types_nothing_and_is_not_confirmed(self) -> None:
+        class SessionBoundSession(DummySession):
+            def process_for_session(self, pcm_audio, deliver, separator=""):
+                return ProcessingResult(text="hello world", state="DONE", delivered=True)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            daemon = self._daemon(temp_dir, SessionBoundSession(), overlay)
+
+            daemon.handle_command("toggle_session")
+            daemon.handle_command("toggle_session")
+
+        self.assertEqual(
+            [OverlayState.LISTENING, OverlayState.THINKING, OverlayState.IDLE],
+            self._states(overlay),
+        )
+
+    def test_a_capture_starting_during_the_confirmation_goes_straight_to_listening(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            daemon = self._daemon(temp_dir, DummySession(), overlay)
+
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+        # No hide between the confirmation and the new capture for a late timer
+        # to be mistaken for: the next thing the renderer is told is LISTENING.
+        self.assertEqual(
+            [
+                OverlayState.LISTENING,
+                OverlayState.THINKING,
+                OverlayState.DELIVERED,
+                OverlayState.LISTENING,
+            ],
+            self._states(overlay),
+        )
+
+    def test_a_segment_delivered_while_capture_continues_keeps_the_listening_presentation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            session = SegmentSession(texts=["first segment", "second segment", "final segment"])
+            daemon = self._daemon(temp_dir, session, overlay, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            for _segment in range(2):
+                daemon._on_silence()
+                thread = daemon._segment_thread
+                if thread is not None:
+                    thread.join(timeout=5)
+
+            self.assertEqual([OverlayState.LISTENING], self._states(overlay))
+            self.assertEqual(2, session.processed)
+
+            daemon.handle_command("toggle")
+
+        # Only the recording's end is confirmed, once, after capture stopped.
+        self.assertEqual(
+            [OverlayState.LISTENING, OverlayState.THINKING, OverlayState.DELIVERED],
+            self._states(overlay),
+        )
+
+    def test_the_end_of_a_continuous_session_with_nothing_left_to_type_is_still_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            session = SegmentSession(texts=["only segment", ""])
+            daemon = self._daemon(temp_dir, session, overlay, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+            daemon._on_silence()
+            thread = daemon._segment_thread
+            if thread is not None:
+                thread.join(timeout=5)
+
+            daemon.handle_command("toggle")
+
+        self.assertEqual(OverlayState.DELIVERED, self._states(overlay)[-1])
+
+    def test_a_refused_segment_ends_the_session_with_the_error_and_no_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            session = SegmentSession(texts=["refused text"], delivered=[False])
+            daemon = self._daemon(temp_dir, session, overlay, auto_transcribe="continuous")
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+            thread = daemon._segment_thread
+            if thread is not None:
+                thread.join(timeout=5)
+            deadline = time.time() + 3
+            while daemon.state != "IDLE" and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(("error", 2_000), overlay.events[-1])
+        self.assertNotIn(OverlayState.DELIVERED, self._states(overlay))
+
+    def test_an_automatic_stop_publishes_the_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            overlay = FakeOverlay()
+            daemon = self._daemon(temp_dir, DummySession(), overlay, auto_transcribe="stop")
+            daemon.handle_command("toggle")
+
+            daemon._on_silence()
+            deadline = time.time() + 3
+            while daemon.state != "IDLE" and time.time() < deadline:
+                time.sleep(0.01)
+
+        self.assertEqual(
+            [OverlayState.LISTENING, OverlayState.THINKING, OverlayState.DELIVERED],
+            self._states(overlay),
+        )
 
 
 class TranscriptDeliveryTests(unittest.TestCase):

@@ -37,6 +37,12 @@ from murmly.overlay_shared import (
     BAR_START_X,
     BAR_WIDTH,
     CORNER_RADIUS_PX,
+    DELIVERED_CHECK_POINTS,
+    DELIVERED_DURATION_MS,
+    DELIVERED_LINE_WIDTH,
+    DELIVERED_TEXT,
+    DELIVERED_TEXT_SIZE_PX,
+    DELIVERED_TEXT_X,
     ERROR_CIRCLE_CENTER_Y,
     ERROR_CIRCLE_RADIUS,
     ERROR_DOT_RADIUS,
@@ -661,6 +667,12 @@ class OverlayApplication:
                 self._hide_error,
                 generation,
             )
+        elif self._view.state == RendererVisualState.DELIVERED and message["type"] == "state":
+            self._GLib.timeout_add(
+                DELIVERED_DURATION_MS,
+                self._hide_delivered,
+                self._view.delivered_generation,
+            )
         self._sync_visibility()
         if self._drawing_area is not None:
             self._drawing_area.queue_draw()
@@ -889,6 +901,14 @@ class OverlayApplication:
             self._sync_visibility()
         return False
 
+    def _hide_delivered(self, generation: int) -> bool:
+        # The state check is what keeps a timer that outlived its confirmation
+        # from hiding the listening presentation that replaced it.
+        if self._view.state == RendererVisualState.DELIVERED and self._view.delivered_generation == generation:
+            self._view.state = RendererVisualState.IDLE
+            self._sync_visibility()
+        return False
+
     def _animate(self) -> bool:
         if self._view.state == RendererVisualState.THINKING and not self._reduced_motion:
             self._phase = (self._phase + THINKING_PHASE_STEP) % (2 * math.pi)
@@ -907,6 +927,9 @@ class OverlayApplication:
 
         if self._view.state == RendererVisualState.ERROR:
             self._draw_error(context)
+            return
+        if self._view.state == RendererVisualState.DELIVERED:
+            self._draw_delivered(context)
             return
         self._draw_microphone(context, active=self._view.state == RendererVisualState.LISTENING)
         if self._view.state == RendererVisualState.THINKING and self._reduced_motion:
@@ -969,6 +992,22 @@ class OverlayApplication:
         context.stroke()
         context.arc(WINDOW_WIDTH / 2.0, ERROR_DOT_Y, ERROR_DOT_RADIUS, 0.0, 2 * math.pi)
         context.fill()
+
+    def _draw_delivered(self, context: Any) -> None:
+        context.set_source_rgb(*FOREGROUND_RGB)
+        context.set_line_width(DELIVERED_LINE_WIDTH)
+        context.set_line_cap(self._cairo.LINE_CAP_ROUND)
+        context.set_line_join(self._cairo.LINE_JOIN_ROUND)
+        first, *rest = DELIVERED_CHECK_POINTS
+        context.move_to(*first)
+        for point in rest:
+            context.line_to(*point)
+        context.stroke()
+        context.select_font_face("sans-serif", self._cairo.FONT_SLANT_NORMAL, self._cairo.FONT_WEIGHT_NORMAL)
+        context.set_font_size(DELIVERED_TEXT_SIZE_PX)
+        extents = context.font_extents()
+        context.move_to(DELIVERED_TEXT_X, (WINDOW_HEIGHT + extents[0] - extents[1]) / 2.0)
+        context.show_text(DELIVERED_TEXT)
 
     @staticmethod
     def _rounded_rectangle(context: Any, x: float, y: float, width: float, height: float, radius: float) -> None:

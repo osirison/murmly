@@ -14,7 +14,7 @@ desktop actually delivers the key — so press it once after installing.
 ## The window that appears while you speak
 
 While you use murmly, a small panel appears at the bottom of the screen
-showing what murmly is doing. It moves through three states as you record.
+showing what murmly is doing. It moves through four states as you record.
 
 ![The murmly overlay while recording, showing a row of bars rising and falling with the speaker's voice.](assets/overlay-listening.png)
 
@@ -32,6 +32,17 @@ see [Seeing your words as you speak](words-as-you-speak.md).
 Press the hotkey a second time and the panel changes to show murmly working on
 the recording, between you finishing speaking and the transcript landing.
 
+![The murmly overlay confirming a delivery, showing a check mark and the word Typed.](assets/overlay-delivered.png)
+
+When the transcript has been pasted, the panel shows a check mark and the word
+"Typed" for a moment, then disappears. It never shows your words, only that they
+arrived. It does not appear when nothing was typed: when murmly could only
+copy the transcript to the clipboard, you see the error mark instead; when you
+recorded for a speech session, the words go to that session rather than into a
+window; and while a continuous recording keeps listening, each pasted segment
+leaves the panel showing the live bars. If you start recording again while
+"Typed" is showing, the panel switches to the bars at once.
+
 On Linux, the overlay works on KDE Plasma, under both X11 and Wayland — no
 other Linux desktop presents it. Under X11 it is built from two window-system
 features called X11 EWMH window state and the X Shape extension; under Wayland
@@ -46,7 +57,8 @@ If you have more than one display connected, murmly shows the overlay on the
 display containing the desktop origin, and keeps it on that display for the
 whole recording. With reduced motion turned on, the overlay swaps continuous
 animation for stable symbols that show its state, and level feedback that
-steps rather than moves smoothly.
+steps rather than moves smoothly. "Typed" is the same either way: it never
+moves.
 
 ## Turning the overlay off
 

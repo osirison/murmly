@@ -107,6 +107,12 @@ from murmly.overlay_shared import (
     BAR_START_X,
     BAR_WIDTH,
     CORNER_RADIUS_PX,
+    DELIVERED_CHECK_POINTS,
+    DELIVERED_DURATION_MS,
+    DELIVERED_LINE_WIDTH,
+    DELIVERED_TEXT,
+    DELIVERED_TEXT_SIZE_PX,
+    DELIVERED_TEXT_X,
     ERROR_CIRCLE_CENTER_Y,
     ERROR_CIRCLE_RADIUS,
     ERROR_DOT_RADIUS,
@@ -536,6 +542,12 @@ class OverlayApplication:
                 int(message["duration_ms"]),
                 lambda: self._hide_error(generation),
             )
+        elif self._view.state == RendererVisualState.DELIVERED and message["type"] == "state":
+            delivered_generation = self._view.delivered_generation
+            self._QTimer.singleShot(
+                DELIVERED_DURATION_MS,
+                lambda: self._hide_delivered(delivered_generation),
+            )
         self._sync_visibility()
         self._window.update()
         if message["type"] != "level" and self._panel_window is not None:
@@ -543,6 +555,14 @@ class OverlayApplication:
 
     def _hide_error(self, generation: int) -> None:
         if self._view.state == RendererVisualState.ERROR and self._view.error_generation == generation:
+            self._view.state = RendererVisualState.IDLE
+            self._sync_visibility()
+            self._window.update()
+
+    def _hide_delivered(self, generation: int) -> None:
+        # The state check is what keeps a timer that outlived its confirmation
+        # from hiding the listening presentation that replaced it.
+        if self._view.state == RendererVisualState.DELIVERED and self._view.delivered_generation == generation:
             self._view.state = RendererVisualState.IDLE
             self._sync_visibility()
             self._window.update()
@@ -755,6 +775,9 @@ def _paint_indicator(painter: Any, painter_path_cls: Any, view: RendererViewStat
     if view.state == RendererVisualState.ERROR:
         _paint_error(painter)
         return
+    if view.state == RendererVisualState.DELIVERED:
+        _paint_delivered(painter)
+        return
     _paint_microphone(painter, active=view.state == RendererVisualState.LISTENING)
     if view.state == RendererVisualState.THINKING and reduced_motion:
         _paint_static_processing(painter)
@@ -873,6 +896,30 @@ def _paint_error(painter: Any) -> None:
     painter.setBrush(QColor(*channels))
     painter.drawEllipse(
         QRectF(center_x - ERROR_DOT_RADIUS, ERROR_DOT_Y - ERROR_DOT_RADIUS, ERROR_DOT_RADIUS * 2, ERROR_DOT_RADIUS * 2)
+    )
+
+
+def _paint_delivered(painter: Any) -> None:
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import QColor, QFont, QPen
+
+    channels = [round(component * 255) for component in FOREGROUND_RGB]
+    pen = QPen(QColor(*channels))
+    pen.setWidthF(DELIVERED_LINE_WIDTH)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt_NoBrush())
+    painter.drawPolyline([QPointF(x, y) for x, y in DELIVERED_CHECK_POINTS])
+
+    font = QFont(painter.font())
+    font.setPixelSize(round(DELIVERED_TEXT_SIZE_PX))
+    painter.setFont(font)
+    painter.setPen(QColor(*channels))
+    painter.drawText(
+        QRectF(DELIVERED_TEXT_X, 0, WINDOW_WIDTH - DELIVERED_TEXT_X, WINDOW_HEIGHT),
+        int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+        DELIVERED_TEXT,
     )
 
 

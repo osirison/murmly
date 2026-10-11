@@ -53,6 +53,10 @@ MAX_MESSAGE_BYTES = 1_024
 MIN_ERROR_DURATION_MS = 100
 MAX_ERROR_DURATION_MS = 10_000
 MAX_PARTIAL_CHARS = 200
+#: How long a renderer shows DELIVERED before hiding itself. The
+#: `recording-overlay` spec allows at most 1.5 s; the margin is for the time
+#: between a renderer starting its timer and the compositor showing the frame.
+DELIVERED_DURATION_MS = 1_200
 
 # --------------------------------------------------------------------------
 # Dimensions (task 10.4: "the dimensions")
@@ -179,7 +183,7 @@ def truncate_to_width(text: str, measure, available_px: float) -> str:
 class RendererVisualState(StrEnum):
     """Every state a renderer can be asked to present.
 
-    A superset of `overlay.OverlayState` (IDLE/LISTENING/THINKING): ERROR is
+    A superset of `overlay.OverlayState` (IDLE/LISTENING/THINKING/DELIVERED): ERROR is
     not a state the daemon ever announces over the wire -- it announces an
     "error" *message*, timed to revert on its own -- but it is a state a
     renderer must draw, so it belongs in the renderer's own enumeration
@@ -189,6 +193,7 @@ class RendererVisualState(StrEnum):
     IDLE = "IDLE"
     LISTENING = "LISTENING"
     THINKING = "THINKING"
+    DELIVERED = "DELIVERED"
     ERROR = "ERROR"
 
 
@@ -283,6 +288,7 @@ class RendererViewState:
     level: float = 0.0
     partial: str = ""
     error_generation: int = 0
+    delivered_generation: int = 0
 
     @property
     def visible(self) -> bool:
@@ -292,6 +298,8 @@ class RendererViewState:
         message_type = message["type"]
         if message_type == "state":
             self.state = RendererVisualState(str(message["value"]))
+            if self.state == RendererVisualState.DELIVERED:
+                self.delivered_generation += 1
             if self.state != RendererVisualState.LISTENING:
                 # Partial text describes audio still being captured. Dropping
                 # it here, rather than at each call site, is what keeps it out
@@ -366,6 +374,15 @@ STATIC_PROCESSING_DOT_START_X = 76.0
 STATIC_PROCESSING_DOT_Y = 24.0
 REDUCED_MOTION_LEVEL_INTERVAL_S = 0.25
 REDUCED_MOTION_QUANTUM_STEPS = 3.0
+
+# The delivered confirmation: a check mark and the word "Typed", left to right
+# at the indicator's vertical centre. Colour is the foreground's, so the
+# confirmation reads as neutral next to the error's red and the listening red.
+DELIVERED_TEXT = "Typed"
+DELIVERED_LINE_WIDTH = 1.6
+DELIVERED_CHECK_POINTS = ((19.5, 24.4), (22.6, 27.3), (28.5, 20.9))
+DELIVERED_TEXT_X = 42.0
+DELIVERED_TEXT_SIZE_PX = 12.5
 
 # The error glyph.
 ERROR_LINE_WIDTH = 3.0
