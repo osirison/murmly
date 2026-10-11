@@ -1037,6 +1037,63 @@ class WindowsServiceLifecycleTests(unittest.TestCase):
         self.assertNotEqual(SERVICE_NAME, WINDOWS_TASK_NAME)
 
 
+class ServiceRestartTests(unittest.TestCase):
+    """`restart` is what applying a setting runs: it must replace a running
+    daemon, which `start` alone does not do on systemd or Task Scheduler."""
+
+    def test_systemd_restarts_the_unit_in_one_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            systemctl = FakeSystemctl()
+            service = UserService(run_command=systemctl, unit_dir=Path(tmp))
+
+            self.assertTrue(service.restart())
+
+            self.assertEqual([["systemctl", "--user", "restart", SERVICE_NAME]], systemctl.calls)
+
+    def test_systemd_reports_a_failed_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            service = UserService(
+                run_command=FakeSystemctl(failures={"restart": 1}), unit_dir=Path(tmp)
+            )
+
+            self.assertFalse(service.restart())
+
+    def test_windows_ends_the_running_task_then_runs_it_again(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+        schtasks.calls.clear()
+
+        self.assertTrue(service.restart())
+
+        self.assertEqual(["/end", "/run"], [call[1] for call in schtasks.calls])
+        self.assertTrue(service.is_active())
+
+    def test_windows_starts_a_task_that_was_not_running(self) -> None:
+        schtasks = FakeSchtasks()
+        service = WindowsUserService(run_command=schtasks)
+        service.install(Path("C:/murmly/murmly.exe"))
+        service.stop()
+
+        self.assertTrue(service.restart())
+
+        self.assertTrue(service.is_active())
+
+    def test_launchd_kicks_the_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            launchctl = FakeLaunchctl()
+            service = LaunchdUserService(
+                run_command=launchctl, agents_dir=Path(tmp) / "LaunchAgents", uid=501
+            )
+            service.install(Path("/opt/murmly/murmly"))
+            launchctl.calls.clear()
+
+            self.assertTrue(service.restart())
+
+            self.assertEqual("kickstart", launchctl.calls[0][1])
+            self.assertIn("-k", launchctl.calls[0])
+
+
 class FakeWindowsService:
     """`WindowsUserService`'s duck-typed surface, with `active` settable
     independently of `is_installed` -- unlike `FakeService` (systemd), a

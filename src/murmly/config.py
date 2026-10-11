@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import time
 from pathlib import Path
@@ -506,12 +507,20 @@ def _get_table(data: dict[str, object], key: str) -> dict[str, object]:
     return {}
 
 
-def _bounded_int(value: object, default: int, *, minimum: int, maximum: int) -> int:
+def _parse_bounded_int(value: object, *, minimum: int, maximum: int) -> int | None:
+    """The integer `value` reads as when it is within the bounds, else None."""
+    if value is None:
+        return None
     try:
-        parsed = int(value) if value is not None else default
+        parsed = int(value)
     except (TypeError, ValueError):
-        return default
-    return parsed if minimum <= parsed <= maximum else default
+        return None
+    return parsed if minimum <= parsed <= maximum else None
+
+
+def _bounded_int(value: object, default: int, *, minimum: int, maximum: int) -> int:
+    parsed = _parse_bounded_int(value, minimum=minimum, maximum=maximum)
+    return default if parsed is None else parsed
 
 
 def _idle_period(value: object, default: int) -> int:
@@ -527,6 +536,12 @@ def _idle_period(value: object, default: int) -> int:
     the bounds falls back to this setting's own default. `_bounded_int` keeps
     its meaning for its many other callers.
     """
+    parsed = _parse_idle_period(value)
+    return default if parsed is None else parsed
+
+
+def _parse_idle_period(value: object) -> int | None:
+    """The idle period `value` reads as, or None when it is not one."""
     if value is not None:
         try:
             # Compared, not truncated. `int(value)` reads 0.5 and -0.9 as zero,
@@ -538,9 +553,8 @@ def _idle_period(value: object, default: int) -> int:
                 return 0
         except (TypeError, ValueError):
             pass
-    return _bounded_int(
+    return _parse_bounded_int(
         value,
-        default,
         minimum=MIN_UNLOAD_AFTER_IDLE_S,
         maximum=MAX_UNLOAD_AFTER_IDLE_S,
     )
@@ -611,3 +625,123 @@ def _quiet_window(value: object) -> tuple[time | None, time | None, str | None]:
 
 def _boolean(value: object, default: bool) -> bool:
     return value if isinstance(value, bool) else default
+
+
+@dataclass(frozen=True, slots=True)
+class SettingRule:
+    """What one configuration key accepts, as a test and as a sentence.
+
+    Built from the constants and helpers `load_config` reads with, so a value
+    the writer accepts is one the reader honours and a value the reader would
+    set aside is one the writer refuses. The sentence is what a person is told
+    when their value is refused.
+    """
+
+    expectation: str
+    accepts: Callable[[object], bool]
+
+
+class SettingValueError(ValueError):
+    """A value a key does not accept; the message says what it does."""
+
+
+def _is_whole_number(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _choice_rule(choices: "set[str] | dict[str, object]") -> SettingRule:
+    names = sorted(choices)
+    return SettingRule(
+        f"one of {', '.join(names)}",
+        lambda value: isinstance(value, str) and value in choices,
+    )
+
+
+def _range_rule(minimum: int, maximum: int, unit: str = "") -> SettingRule:
+    return SettingRule(
+        f"a whole number from {minimum} to {maximum}{unit}",
+        lambda value: (
+            _is_whole_number(value)
+            and _parse_bounded_int(value, minimum=minimum, maximum=maximum) is not None
+        ),
+    )
+
+
+def _idle_rule() -> SettingRule:
+    return SettingRule(
+        f"0 (never) or a whole number of seconds from {MIN_UNLOAD_AFTER_IDLE_S} "
+        f"to {MAX_UNLOAD_AFTER_IDLE_S}",
+        lambda value: _is_whole_number(value) and _parse_idle_period(value) is not None,
+    )
+
+
+def _flag_rule() -> SettingRule:
+    return SettingRule("true or false", lambda value: isinstance(value, bool))
+
+
+def _text_rule(meaning: str) -> SettingRule:
+    return SettingRule(meaning, lambda value: isinstance(value, str))
+
+
+def _quiet_hours_rule() -> SettingRule:
+    # Empty is accepted because it is how the window is switched off.
+    return SettingRule(
+        'a window written as "HH:MM-HH:MM" in local time with different start and '
+        'end, for example "22:00-07:00", or empty for none',
+        lambda value: isinstance(value, str) and _quiet_window(value)[2] is None,
+    )
+
+
+#: Every key the app may write, by dotted name. Keys `load_config` reads that are
+#: not here (`daemon.socket_path`, `audio.*`) have no documented range and are
+#: not edited by the app.
+SETTING_RULES: dict[str, SettingRule] = {
+    "stt.model_profile": _choice_rule(MODEL_PROFILES),
+    "stt.device": _choice_rule(VALID_DEVICES),
+    "stt.compute_type": _choice_rule(VALID_COMPUTE_TYPES),
+    "stt.beam_size": _range_rule(1, 10),
+    "stt.vad_filter": _flag_rule(),
+    "stt.lazy_load_model": _flag_rule(),
+    "stt.unload_after_idle_s": _idle_rule(),
+    "stt.live_transcribe": _flag_rule(),
+    "stt.live_interval_ms": _range_rule(MIN_LIVE_INTERVAL_MS, MAX_LIVE_INTERVAL_MS, " milliseconds"),
+    "stt.live_window_seconds": _range_rule(
+        MIN_LIVE_WINDOW_SECONDS, MAX_LIVE_WINDOW_SECONDS, " seconds"
+    ),
+    "stt.auto_transcribe": _choice_rule(VALID_AUTO_TRANSCRIBE_MODES),
+    "stt.auto_transcribe_silence_ms": _range_rule(MIN_SILENCE_MS, MAX_SILENCE_MS, " milliseconds"),
+    "stt.auto_transcribe_min_speech_ms": _range_rule(
+        MIN_MIN_SPEECH_MS, MAX_MIN_SPEECH_MS, " milliseconds"
+    ),
+    "clipboard.restore": _flag_rule(),
+    "clipboard.restore_delay_ms": _range_rule(0, MAX_RESTORE_DELAY_MS, " milliseconds"),
+    "clipboard.verify_target": _flag_rule(),
+    "overlay.enabled": _flag_rule(),
+    "overlay.bottom_margin_px": _range_rule(0, 512, " pixels"),
+    "overlay.reduced_motion": _flag_rule(),
+    "overlay.text_size_px": _range_rule(
+        MIN_OVERLAY_TEXT_SIZE_PX, MAX_OVERLAY_TEXT_SIZE_PX, " pixels"
+    ),
+    "tts.enabled": _flag_rule(),
+    "tts.voice": _choice_rule(VALID_TTS_VOICES),
+    "tts.rate": _range_rule(MIN_TTS_RATE_PERCENT, MAX_TTS_RATE_PERCENT, " percent"),
+    "tts.device": _choice_rule(VALID_DEVICES),
+    "tts.unload_after_idle_s": _idle_rule(),
+    "tts.output_device": _text_rule("text naming an output device, or empty for the default"),
+    "tts.model_dir": _text_rule("text giving a directory"),
+    "tts.quiet_hours": _quiet_hours_rule(),
+    "speakers.mode": _choice_rule(VALID_SPEAKER_MODES),
+    "speakers.owner": _text_rule("text naming an enrolled voice, or empty for none"),
+    "speakers.match_threshold": _range_rule(
+        MIN_SPEAKER_MATCH_THRESHOLD_PERCENT, MAX_SPEAKER_MATCH_THRESHOLD_PERCENT, " percent"
+    ),
+}
+
+
+def validate_setting(key: str, value: object) -> None:
+    """Raise `SettingValueError` unless `load_config` would honour `value` for `key`."""
+    rule = SETTING_RULES.get(key)
+    if rule is None:
+        raise SettingValueError(f"{key} is not a setting Murmly reads.")
+    if not rule.accepts(value):
+        raise SettingValueError(f"{key} must be {rule.expectation}, not {value!r}.")

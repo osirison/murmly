@@ -367,6 +367,10 @@ class UserService:
     def start(self) -> bool:
         return self._systemctl("start", SERVICE_NAME).returncode == 0
 
+    def restart(self) -> bool:
+        """Stop and start the unit, or start it when it is not running."""
+        return self._systemctl("restart", SERVICE_NAME).returncode == 0
+
     def is_active(self) -> bool:
         result = self._systemctl("is-active", SERVICE_NAME)
         return result.returncode == 0 and (result.stdout or "").strip() == "active"
@@ -655,6 +659,11 @@ class LaunchdUserService:
     def stop(self) -> bool:
         return self._launchctl("bootout", self._service_target).returncode == 0
 
+    def restart(self) -> bool:
+        # `kickstart -k` kills a running job before starting it, so `start`
+        # already is a restart here.
+        return self.start()
+
     def is_active(self) -> bool:
         result = self._launchctl("print", self._service_target)
         if result.returncode != 0:
@@ -802,6 +811,16 @@ class WindowsUserService:
 
     def stop(self) -> bool:
         return self._schtasks("/end", "/tn", self._task_name).returncode == 0
+
+    def restart(self) -> bool:
+        """End the task if it is running, then run it.
+
+        `/run` on a task that is already running does nothing, so a restart
+        needs the `/end` first. Its result is not read: a task that was not
+        running has nothing to end.
+        """
+        self.stop()
+        return self.start()
 
     def enable(self) -> bool:
         return self._schtasks("/change", "/tn", self._task_name, "/enable").returncode == 0
