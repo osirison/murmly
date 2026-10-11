@@ -66,6 +66,12 @@ Murmly sends these without being asked:
 | `{"event": "failed", "name": "m4", "error": "..."}` | `m4` could not be produced; the session continues. `name` is null when the failure is the output device itself rather than a named piece of text |
 | `{"event": "shutting_down"}` | Murmly is stopping |
 
+With [`auto_transcribe = "continuous"`](settings.md#stt-auto-transcribe), each
+segment of the capture arrives as its own `transcript` frame. Every frame after
+the first one that carried text begins with a single space, so frames joined as
+they arrive read as one text. A sender that shows each frame on its own can
+strip that space. A segment with no text sends no frame.
+
 ## Four things a sender should know
 
 - **Wait for the acknowledgement.** The declaration is read by the same path

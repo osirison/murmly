@@ -378,9 +378,25 @@ class MineOnlyTests(SpeakerDaemonCase):
         self.settle(daemon)
         response = daemon.handle_command("toggle")
 
-        self.assertEqual(["first thing", "last thing"], self.paster.pasted)
+        self.assertEqual(["first thing", " last thing"], self.paster.pasted)
         self.assertEqual("first thing last thing", response["text"])
         self.assertEqual(2, response["segments"])
+
+    def test_a_dropped_segment_between_two_kept_ones_leaves_exactly_one_space(self) -> None:
+        daemon = self.build("mine-only", auto_transcribe="continuous")
+        self.recorder.segments.append(self.audio((ME, "first thing", 2.0)))
+        self.recorder.segments.append(self.audio((STRANGER_A, "only others here", 2.0)))
+        self.recorder.finals.append(self.audio((ME, "closing words", 2.0)))
+
+        daemon.handle_command("toggle")
+        daemon._on_silence()
+        self.settle(daemon)
+        daemon._on_silence()
+        self.settle(daemon)
+        response = daemon.handle_command("toggle")
+
+        self.assertEqual(["first thing", " closing words"], self.paster.pasted)
+        self.assertEqual("first thing closing words", response["text"])
 
     def test_a_dropped_continuous_segment_keeps_listening_and_is_not_counted(self) -> None:
         daemon = self.build("mine-only", auto_transcribe="continuous")
@@ -474,11 +490,24 @@ class LabelEveryoneTests(SpeakerDaemonCase):
         self.assertEqual(
             [
                 "Speaker 1: first stranger You: owner here",
-                "Speaker 2: second stranger Speaker 1: first again",
-                "Speaker 1: still first",
+                " Speaker 2: second stranger Speaker 1: first again",
+                " Speaker 1: still first",
             ],
             self.paster.pasted,
         )
+
+    def test_the_second_segment_is_pasted_after_a_space_and_its_label(self) -> None:
+        daemon = self.build("label-everyone", auto_transcribe="continuous")
+        self.recorder.segments.append(self.audio((STRANGER_A, "that is right", 2.0)))
+        self.recorder.finals.append(self.audio((ME, "yeah maybe", 2.0)))
+
+        daemon.handle_command("toggle")
+        daemon._on_silence()
+        self.settle(daemon)
+        response = daemon.handle_command("toggle")
+
+        self.assertEqual(["Speaker 1: that is right", " You: yeah maybe"], self.paster.pasted)
+        self.assertEqual("Speaker 1: that is right You: yeah maybe", response["text"])
 
     def test_numbering_starts_again_in_the_next_capture_session(self) -> None:
         daemon = self.build("label-everyone")
@@ -808,7 +837,7 @@ class FailingOpenTests(SpeakerDaemonCase):
         self.assertEqual("LISTENING", daemon.state)
         response = daemon.handle_command("toggle")
 
-        self.assertEqual(["first words", "second words", "last words"], self.paster.pasted)
+        self.assertEqual(["first words", " second words", " last words"], self.paster.pasted)
         self.assertTrue(response["delivered"])
         self.assertEqual(3, response["segments"])
         self.assertNotIn("error", [event[0] for event in self.overlay.events])

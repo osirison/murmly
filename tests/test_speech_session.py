@@ -44,7 +44,7 @@ from test_speech import RecordingPlayer
 class DummyCaptureSession:
     """The capture session the daemon drives, with no microphone behind it."""
 
-    def __init__(self, text: str = "hello world") -> None:
+    def __init__(self, text: str = "hello world", texts: list[str] | None = None) -> None:
         self.started = 0
         self.stopped = 0
         self.targets_captured = 0
@@ -52,6 +52,8 @@ class DummyCaptureSession:
         self.delivered_to_session: list[str] = []
         self.copied: list[str] = []
         self.text = text
+        self.texts = texts
+        self.processed_for_session = 0
         self.target = WindowIdentity(window_id=1, pid=10, window_class="editor")
 
     def capture_delivery_target(self) -> WindowIdentity | None:
@@ -68,19 +70,33 @@ class DummyCaptureSession:
     def take_segment(self) -> bytes:
         return b"recording"
 
-    def process_recording(self, pcm_audio: bytes, target: WindowIdentity | None = None):
+    def process_recording(
+        self,
+        pcm_audio: bytes,
+        target: WindowIdentity | None = None,
+        separator: str = "",
+    ):
         self.received_targets.append(target)
         return ProcessingResult(text=self.text, state="DONE", delivered=True)
 
-    def process_for_session(self, pcm_audio: bytes, deliver):
-        if not self.text:
+    def process_for_session(self, pcm_audio: bytes, deliver, separator: str = ""):
+        # One text per segment when `texts` is set, the single `text` otherwise.
+        if self.texts is None:
+            text = self.text
+        elif self.processed_for_session < len(self.texts):
+            text = self.texts[self.processed_for_session]
+        else:
+            text = ""
+        self.processed_for_session += 1
+        if not text:
             return ProcessingResult(text="", state="DONE")
-        if deliver(self.text):
-            self.delivered_to_session.append(self.text)
-            return ProcessingResult(text=self.text, state="DONE", delivered=True)
-        self.copied.append(self.text)
+        delivered_text = separator + text
+        if deliver(delivered_text):
+            self.delivered_to_session.append(delivered_text)
+            return ProcessingResult(text=text, state="DONE", delivered=True)
+        self.copied.append(delivered_text)
         return ProcessingResult(
-            text=self.text,
+            text=text,
             state="DONE",
             delivered=False,
             detail="No speech session to deliver to. Transcript copied to the clipboard.",
@@ -721,6 +737,66 @@ class BargeInTests(SpeechSessionHarness):
 
         self.assertEqual({"ok": True, "state": "LISTENING"}, response)
         self.assertEqual(1, capture.started)
+
+
+class ContinuousSessionSegmentTests(SpeechSessionHarness):
+    """Continuous capture bound for a speech session, one frame per segment."""
+
+    def run_session(self, texts: list[str], silences: int):
+        capture = DummyCaptureSession(texts=texts)
+        daemon, socket_path, _engine, _player, capture = self.serve(
+            session=capture, auto_transcribe="continuous"
+        )
+        client = self.client(socket_path)
+        client.declare()
+        send_command(str(socket_path), "toggle_session")
+        for _ in range(silences):
+            daemon._on_silence()
+            thread = daemon._segment_thread
+            if thread is not None:
+                thread.join(timeout=5)
+        response = send_command(str(socket_path), "toggle_session")
+        return client, response, capture
+
+    def test_later_frames_begin_with_one_space_and_the_first_with_none(self) -> None:
+        client, _response, _capture = self.run_session(
+            ["first segment", "second segment", "final segment"], silences=2
+        )
+
+        frames = [client.read_until(EVENT_TRANSCRIPT)["text"] for _ in range(3)]
+
+        self.assertEqual(["first segment", " second segment", " final segment"], frames)
+
+    def test_a_segment_with_no_text_sends_no_frame_and_adds_no_space(self) -> None:
+        client, _response, _capture = self.run_session(["", "one", "", "two"], silences=3)
+
+        frames = [frame["text"] for frame in client.drain() if frame.get("event") == EVENT_TRANSCRIPT]
+
+        self.assertEqual(["one", " two"], frames)
+
+    def test_the_response_still_carries_no_transcript(self) -> None:
+        _client, response, _capture = self.run_session(["one", "two"], silences=1)
+
+        self.assertEqual("", response["text"])
+
+    def test_a_session_that_closes_leaves_the_spaced_text_on_the_clipboard(self) -> None:
+        capture = DummyCaptureSession(texts=["one", "two"])
+        daemon, socket_path, _engine, _player, capture = self.serve(
+            session=capture, auto_transcribe="continuous"
+        )
+        client = SessionClient(socket_path)
+        client.declare()
+        self.wait_for(lambda: daemon._speech_session is not None, message="the session")
+        send_command(str(socket_path), "toggle_session")
+        daemon._on_silence()
+        daemon._segment_thread.join(timeout=5)
+        client.close()
+        self.wait_for(lambda: daemon._speech_session is None, message="the session to close")
+
+        send_command(str(socket_path), "toggle_session")
+
+        self.assertEqual(["one"], capture.delivered_to_session)
+        self.assertEqual([" two"], capture.copied)
 
 
 class TranscriptRoutingTests(SpeechSessionHarness):
