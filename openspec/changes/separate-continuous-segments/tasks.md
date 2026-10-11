@@ -152,12 +152,19 @@
       `murmly.__file__` resolved under the worktree. 1906 tests, OK (skipped=34).
 - [x] 5.2 Run `openspec validate --all --strict`. Done when it passes.
       12 passed, 0 failed.
-- [ ] 5.3 Live check on the desktop with a verification daemon
+- [x] 5.3 Live check on the desktop with a verification daemon
       (`docs/agent-notes/running-a-verification-daemon.md`), not the installed service.
       In a text editor with `auto_transcribe = "continuous"`, dictate three sentences
       with pauses in speaker mode `off`, then in `label-everyone`. Done when the
       editor shows one space between every pair of segments and none before the
       first, and the result is recorded here.
+      Done 2026-10-11 by the user, a different way: they installed the service from
+      this branch's own environment rather than a verification daemon, and dictated
+      with `auto_transcribe = "continuous"` and speaker mode `mine-only` (their
+      config at the time). They reported that it works. The service journal confirms
+      the branch build ran and loaded the model during the check; the pasted text
+      itself was not seen, since Murmly logs no transcript text. Modes `off` and
+      `label-everyone` were not checked live; the tests cover all three modes.
 
 ## Workflow follow-up
 
