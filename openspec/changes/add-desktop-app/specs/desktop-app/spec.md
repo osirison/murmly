@@ -159,6 +159,98 @@ The app's Health section SHALL present every section `murmly doctor` reports, ea
 - **WHEN** the person copies the full report after dictating
 - **THEN** the copied text contains every section of the report and no transcript text
 
+#### Scenario: Speaker recognition cannot run
+
+- **WHEN** a speaker mode is set and the diagnostics report that speaker recognition cannot run
+- **THEN** Health lists speaker recognition as a problem, with the diagnostics' reason shown exactly as reported
+
+### Requirement: The Voices section manages speaker recognition
+
+The app SHALL let the person choose the speaker mode, which enrolled voice is the owner, and the match threshold, writing each as Settings writes any setting. It SHALL list the enrolled voices with the owner marked, and let the person remove one voice, or all of them after a second, explicit confirmation.
+
+#### Scenario: Choosing a mode
+
+- **WHEN** the person chooses "only my voice"
+- **THEN** `speakers.mode` is written as `mine-only` and takes effect as any other setting does
+
+#### Scenario: Choosing who is the owner
+
+- **WHEN** the person marks an enrolled voice as theirs
+- **THEN** `speakers.owner` is written as that voice's enrolled name
+
+#### Scenario: Removing one voice
+
+- **WHEN** the person removes an enrolled voice
+- **THEN** that voiceprint no longer exists and the other voices are unchanged
+
+#### Scenario: Removing every voice
+
+- **WHEN** the person asks to remove all voices
+- **THEN** nothing is removed until they confirm a second time
+- **AND** after confirming, no voiceprint remains
+
+### Requirement: Enrolment in the app follows the enrolment command's rules
+
+The app SHALL enrol a voice under the same rules as the enrolment command: the same sample length, the same minimum of speech, the same name rules, refusal while the daemon is listening, transcribing or speaking, and storing only the voiceprint. Re-enrolling a name MUST say that it replaced the earlier voiceprint.
+
+#### Scenario: A successful enrolment
+
+- **WHEN** the person enrols a valid name while the daemon is idle and speaks for the whole sample
+- **THEN** a voiceprint is stored under that name
+- **AND** no audio from the sample is kept
+
+#### Scenario: Too little speech
+
+- **WHEN** the sample holds less speech than the enrolment command requires
+- **THEN** the app says how much speech was heard and how much is needed
+- **AND** nothing is stored
+
+#### Scenario: The daemon is busy
+
+- **WHEN** the person starts enrolment while the daemon is listening, transcribing or speaking
+- **THEN** the app refuses and says which of those the daemon is doing
+
+#### Scenario: Offered during first run
+
+- **WHEN** the person reaches the voice step of first run
+- **THEN** they can enrol their own voice there, or skip the step
+
+### Requirement: Enrolling someone else needs their agreement
+
+Before recording a sample for anyone other than the person using the app, the app MUST ask that person to confirm that the one being enrolled has agreed and knows they can ask for their voiceprint to be removed. Recording MUST NOT start until they confirm.
+
+#### Scenario: Enrolling another person
+
+- **WHEN** the person enrols a voice that they have not marked as their own
+- **THEN** the app asks them to confirm that person's agreement
+- **AND** recording cannot start until they do
+
+### Requirement: A speaker mode that cannot run is shown
+
+While a speaker mode is set but speaker recognition cannot run, Home, the tray panel and the Voices section SHALL say that every voice is being typed, and SHALL show the diagnostics' reason exactly as reported. The notice MUST disappear once speaker recognition can run.
+
+#### Scenario: The owner is not enrolled
+
+- **WHEN** the mode is "only my voice" and the owner named in the settings is not enrolled
+- **THEN** Home, the tray panel and Voices say that every voice is being typed
+- **AND** each shows the diagnostics' reason unaltered
+- **AND** each offers to enrol the owner's voice
+
+#### Scenario: Fixed by enrolling
+
+- **WHEN** the owner's voice is then enrolled and diagnostics report that speaker recognition can run
+- **THEN** the notice disappears from Home, the tray panel and Voices
+
+### Requirement: Last words show who spoke
+
+When the last transcript was labelled by speaker, the app SHALL show each speaker's part under its label. Copying it again MUST copy exactly the single line that was delivered.
+
+#### Scenario: A labelled transcript
+
+- **WHEN** the last transcript was delivered with "everyone labelled" and holds parts from the owner and an unknown speaker
+- **THEN** the app shows the owner's part labelled "You" and the other part labelled "Speaker 1"
+- **AND** copying it again copies the delivered line unchanged
+
 ### Requirement: First run sets up the dictation key
 
 On first run the app SHALL let the person choose the dictation key by pressing it, SHALL check it with the same rules `murmly install` applies, and MUST refuse a key another application already holds, naming that application where the platform can.
