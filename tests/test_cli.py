@@ -4345,6 +4345,14 @@ class AppCommandTests(unittest.TestCase):
         errors = StringIO()
         with (
             injected_module("PySide6", None),
+            # `main` refuses an unsupported host before it dispatches anything,
+            # so a macOS runner would never reach the command under test.
+            patch(
+                "murmly.cli.resolve_platform",
+                return_value=PlatformProfile(
+                    operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                ),
+            ),
             patch("murmly.cli.load_config", return_value=Mock()),
             redirect_stderr(errors),
         ):
@@ -4360,6 +4368,14 @@ class AppCommandTests(unittest.TestCase):
         errors = StringIO()
         with (
             patch("murmly.app.run", side_effect=ModuleNotFoundError(name="somethingelse")),
+            # `main` refuses an unsupported host before it dispatches anything,
+            # so a macOS runner would never reach the command under test.
+            patch(
+                "murmly.cli.resolve_platform",
+                return_value=PlatformProfile(
+                    operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                ),
+            ),
             patch("murmly.cli.load_config", return_value=Mock()),
             redirect_stderr(errors),
         ):
