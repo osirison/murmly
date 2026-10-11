@@ -105,9 +105,13 @@ jobs:
       # This is what makes `overlay_renderer_qt.py` (tasks 10.1/10.3/10.5) run
       # for the first time anywhere in this project's history, instead of only
       # ever being import-checked on a machine with no PySide6 at all.
+      #
+      # The `gui` extra is installed alongside it so the desktop app's Qt tests
+      # (fonts, theme, window frame) run here too. Both extras name the same
+      # PySide6, so this adds no second wheel.
       - name: Sync the environment with the overlay extra
         if: "runner.os == 'Windows' && matrix.python-version == '3.12'"
-        run: uv sync --locked --extra overlay
+        run: uv sync --locked --extra overlay --extra gui
 
       # The suite takes about 1 to 2 minutes (the slowest, macOS, 118 s). If it
       # runs ten minutes, something is hung: faulthandler prints every thread's

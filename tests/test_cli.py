@@ -19,7 +19,7 @@ from types import ModuleType
 from unittest.mock import Mock, patch
 
 from channel_helpers import command_channel_address
-from module_stubs import injected_module, removed_module
+from module_stubs import injected_module, package_unavailable, removed_module
 
 from murmly.cli import (
     _measurement_clip,
@@ -4332,8 +4332,9 @@ class AppCommandTests(unittest.TestCase):
     def test_help_prints_usage_without_importing_the_toolkit(self) -> None:
         output = StringIO()
         # `None` in `sys.modules` makes any import of PySide6 fail, whether or
-        # not the extra is installed here.
-        with injected_module("PySide6", None), redirect_stdout(output):
+        # not the extra is installed here, and even when an earlier test has
+        # already imported one of its submodules.
+        with package_unavailable("PySide6"), redirect_stdout(output):
             with self.assertRaises(SystemExit) as raised:
                 main(["app", "--help"])
 
@@ -4344,7 +4345,7 @@ class AppCommandTests(unittest.TestCase):
     def test_a_missing_extra_exits_non_zero_naming_the_extra(self) -> None:
         errors = StringIO()
         with (
-            injected_module("PySide6", None),
+            package_unavailable("PySide6"),
             # `main` refuses an unsupported host before it dispatches anything,
             # so a macOS runner would never reach the command under test.
             patch(
@@ -4385,5 +4386,5 @@ class AppCommandTests(unittest.TestCase):
         self.assertNotIn("gui extra", errors.getvalue())
 
     def test_importing_the_app_package_does_not_import_the_toolkit(self) -> None:
-        with injected_module("PySide6", None), removed_module("murmly.app"):
+        with package_unavailable("PySide6"), removed_module("murmly.app"):
             import murmly.app  # noqa: F401

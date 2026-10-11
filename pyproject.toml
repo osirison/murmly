@@ -143,3 +143,18 @@ murmly = "murmly.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The desktop app's fonts and Qt Quick files are data inside the package, and
+# are loaded from there at run time. The fonts' licences travel with them: the
+# SIL Open Font License requires its text to accompany every redistribution.
+# Naming `license-files` replaces setuptools' default patterns, so the
+# project's own licence is named again here.
+[tool.setuptools.package-data]
+"murmly.app" = ["fonts/*.ttf", "qml/*.qml"]
+
+[tool.setuptools]
+license-files = [
+    "LICENSE*",
+    "licenses/instrument-sans-ofl.txt",
+    "licenses/ibm-plex-mono-ofl.txt",
+]

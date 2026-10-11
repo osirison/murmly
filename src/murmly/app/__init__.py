@@ -10,18 +10,6 @@ from __future__ import annotations
 
 APP_TITLE = "Murmly"
 
-_WINDOW_QML = f"""
-import QtQuick
-import QtQuick.Window
-
-Window {{
-    title: "{APP_TITLE}"
-    width: 960
-    height: 640
-    visible: true
-}}
-""".encode()
-
 
 def run() -> int:
     """Show the app window and return its exit status.
@@ -32,12 +20,15 @@ def run() -> int:
     import sys
 
     from PySide6.QtGui import QGuiApplication
-    from PySide6.QtQml import QQmlApplicationEngine
+
+    from murmly.app import qt
 
     application = QGuiApplication(sys.argv[:1])
     application.setApplicationName(APP_TITLE)
-    engine = QQmlApplicationEngine()
-    engine.loadData(_WINDOW_QML)
+    for path in qt.prepare_application():
+        print(f"murmly: the bundled font {path.name} could not be loaded.", file=sys.stderr)
+    # Both stay referenced until the event loop ends; QML holds only weak ties.
+    engine, theme = qt.create_engine()
     if not engine.rootObjects():
         print("murmly: the app window could not be created.", file=sys.stderr)
         return 1

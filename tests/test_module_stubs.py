@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 
-from module_stubs import injected_module, removed_module
+from module_stubs import injected_module, package_unavailable, removed_module
 
 
 class InjectedModuleTests(unittest.TestCase):
@@ -119,6 +119,32 @@ class TheSuiteDoesNotPatchSysModulesDirectly(unittest.TestCase):
             "patch.dict restores the whole of sys.modules and evicts anything "
             "imported inside the block. See issue #28.",
         )
+
+
+class PackageUnavailableTests(unittest.TestCase):
+    def test_a_loaded_submodule_is_blocked_too_and_then_put_back(self) -> None:
+        package, sub = "murmly_test_pkg", "murmly_test_pkg.sub"
+        loaded = ModuleType(sub)
+        self.addCleanup(sys.modules.pop, package, None)
+        self.addCleanup(sys.modules.pop, sub, None)
+        sys.modules[package] = ModuleType(package)
+        sys.modules[sub] = loaded
+
+        with package_unavailable(package):
+            with self.assertRaises(ImportError):
+                __import__(sub)
+            with self.assertRaises(ImportError):
+                __import__(package)
+
+        self.assertIs(loaded, sys.modules[sub])
+
+    def test_a_package_that_was_never_loaded_is_absent_again_afterwards(self) -> None:
+        package = "murmly_test_never_loaded"
+
+        with package_unavailable(package):
+            self.assertIsNone(sys.modules[package])
+
+        self.assertNotIn(package, sys.modules)
 
 
 if __name__ == "__main__":

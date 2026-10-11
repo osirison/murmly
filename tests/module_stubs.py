@@ -51,3 +51,26 @@ def removed_module(name: str) -> Iterator[None]:
     finally:
         if previous is not _MISSING:
             sys.modules[name] = previous
+
+
+@contextmanager
+def package_unavailable(name: str) -> Iterator[None]:
+    """Make importing `name` fail, even from a submodule that is already loaded.
+
+    `injected_module(name, None)` alone is not enough for a package: once any
+    test has imported `name.sub`, `from name.sub import x` is answered by
+    `sys.modules` without ever looking at the package. So every loaded
+    submodule is blocked too, and put back afterwards.
+    """
+    blocked = [name, *(loaded for loaded in sys.modules if loaded.startswith(f"{name}."))]
+    previous = {key: sys.modules.get(key, _MISSING) for key in blocked}
+    for key in blocked:
+        sys.modules[key] = None
+    try:
+        yield
+    finally:
+        for key, module in previous.items():
+            if module is _MISSING:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = module
