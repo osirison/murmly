@@ -548,11 +548,12 @@ class DeliveredPaintTests(unittest.TestCase):
             self.skipTest("PySide6 is not installed. Run `uv sync --extra overlay`.")
 
     def _painted(self, state: RendererVisualState, reduced_motion: bool):
-        from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPainterPath
+        from PySide6.QtGui import QImage, QPainter, QPainterPath
+        from PySide6.QtWidgets import QApplication
 
         from murmly.overlay_renderer_qt import _paint_indicator
 
-        QGuiApplication.instance() or QGuiApplication([sys.argv[0]])
+        QApplication.instance() or QApplication([sys.argv[0]])
         image = QImage(WINDOW_WIDTH, WINDOW_HEIGHT, QImage.Format.Format_ARGB32)
         image.fill(0)
         painter = QPainter(image)
