@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import stat
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -173,6 +175,7 @@ class FakeOverlay:
 IDLE_STATUS = {
     "ok": True,
     "state": "IDLE",
+    "restart_ready": True,
     "model_resident": False,
     "speaker_model_resident": False,
     "playback_dropouts": 0,
@@ -4050,6 +4053,7 @@ class StatusResidencyTests(ServedDaemonTests):
             {
                 "ok": True,
                 "state": "IDLE",
+                "restart_ready": True,
                 "model_resident": True,
                 "speaker_model_resident": False,
                 "synthesis_resident": True,
@@ -4170,3 +4174,346 @@ class StatusResidencyTests(ServedDaemonTests):
         # The transcription is still parked. Anything approaching its length
         # would mean the answer waited for it.
         self.assertLess(elapsed, 1.0)
+
+
+REFUSAL_DETAIL = "Transcript copied to the clipboard but not pasted."
+
+
+class TextSession(DummySession):
+    """A session double whose transcript, delivery and detail a test chooses."""
+
+    def __init__(
+        self,
+        texts: list[str],
+        *,
+        delivered: bool = True,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.texts = list(texts)
+        self.delivered = delivered
+        self.detail = detail
+
+    def take_segment(self) -> bytes:
+        return b"recording"
+
+    def process_recording(
+        self,
+        pcm_audio: bytes,
+        target: WindowIdentity | None = None,
+        separator: str = "",
+    ) -> ProcessingResult:
+        self.processed += 1
+        text = self.texts.pop(0)
+        return ProcessingResult(
+            text=text, state="DONE", delivered=self.delivered, detail=self.detail
+        )
+
+    def process_for_session(self, pcm_audio, deliver, separator: str = "") -> ProcessingResult:
+        self.processed += 1
+        text = self.texts.pop(0)
+        return ProcessingResult(text=text, state="DONE", delivered=False)
+
+
+class LastWordsTests(unittest.TestCase):
+    """The daemon's one in-memory slot for the last transcript."""
+
+    CLOCK = datetime(2026, 10, 12, 9, 30, 15)
+
+    def _daemon(self, temp_dir: str, session, **overrides: object) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+            **overrides,
+        )
+        return MurmlyDaemon(
+            config,
+            session=session,
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+            now=lambda: self.CLOCK,
+        )
+
+    def _dictate(self, daemon: MurmlyDaemon, command: str = "toggle") -> dict[str, object]:
+        daemon.handle_command(command)
+        return daemon.handle_command(command)
+
+    def _settle(self, daemon: MurmlyDaemon) -> None:
+        thread = daemon._segment_thread
+        if thread is not None:
+            thread.join(timeout=5)
+
+    def test_a_fresh_daemon_holds_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, TextSession(["one"]))
+
+            response = daemon.handle_command("last_words")
+
+        self.assertEqual({"ok": True, "last_words": None}, response)
+
+    def test_read_returns_the_text_the_time_and_the_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, TextSession(["hello there"]))
+            self._dictate(daemon)
+
+            response = daemon.handle_command("last_words")
+
+        self.assertTrue(response["ok"])
+        record = response["last_words"]
+        self.assertEqual("hello there", record["text"])
+        self.assertTrue(record["delivered"])
+        self.assertNotIn("detail", record)
+        self.assertEqual(self.CLOCK.astimezone(), datetime.fromisoformat(record["produced_at"]))
+
+    def test_the_next_transcript_overwrites_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, TextSession(["first words", "second words"]))
+            self._dictate(daemon)
+            self._dictate(daemon)
+
+            record = daemon.handle_command("last_words")["last_words"]
+
+        self.assertEqual("second words", record["text"])
+
+    def test_a_recording_with_no_text_keeps_the_words_before_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, TextSession(["kept", ""]))
+            self._dictate(daemon)
+            self._dictate(daemon)
+
+            record = daemon.handle_command("last_words")["last_words"]
+
+        self.assertEqual("kept", record["text"])
+
+    def test_a_restarted_daemon_holds_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first = self._daemon(temp_dir, TextSession(["before the restart"]))
+            self._dictate(first)
+            self.assertIsNotNone(first.handle_command("last_words")["last_words"])
+
+            second = self._daemon(temp_dir, TextSession(["unused"]))
+
+            self.assertIsNone(second.handle_command("last_words")["last_words"])
+
+    def test_clear_empties_the_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, TextSession(["to be cleared"]))
+            self._dictate(daemon)
+
+            cleared = daemon.handle_command("clear_last_words")
+            after = daemon.handle_command("last_words")
+
+        self.assertEqual({"ok": True}, cleared)
+        self.assertIsNone(after["last_words"])
+
+    def test_a_refused_delivery_carries_the_detail_string_unchanged(self) -> None:
+        detail = "Window changed (editor -> browser): copied, not pasted.  Odd  spacing \u2013 kept"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(
+                temp_dir, TextSession(["refused words"], delivered=False, detail=detail)
+            )
+            toggled = self._dictate(daemon)
+
+            record = daemon.handle_command("last_words")["last_words"]
+
+        self.assertFalse(record["delivered"])
+        self.assertEqual("refused words", record["text"])
+        self.assertEqual(detail, record["detail"])
+        self.assertEqual(toggled["detail"], record["detail"])
+
+    def test_a_stop_mode_transcript_is_kept_though_no_toggle_response_carries_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(
+                temp_dir,
+                TextSession(["said on silence"], delivered=False, detail=REFUSAL_DETAIL),
+                auto_transcribe="stop",
+            )
+            daemon.handle_command("toggle")
+            daemon._on_silence()
+            deadline = time.time() + 3
+            while daemon.state != "IDLE" and time.time() < deadline:
+                time.sleep(0.01)
+
+            record = daemon.handle_command("last_words")["last_words"]
+
+        self.assertEqual("said on silence", record["text"])
+        self.assertFalse(record["delivered"])
+        self.assertEqual(REFUSAL_DETAIL, record["detail"])
+
+    def test_a_continuous_session_is_one_transcript_of_all_its_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(
+                temp_dir, TextSession(["first", "second", "third"]), auto_transcribe="continuous"
+            )
+            daemon.handle_command("toggle")
+            daemon._on_silence()
+            self._settle(daemon)
+            midway = daemon.handle_command("last_words")["last_words"]
+            daemon._on_silence()
+            self._settle(daemon)
+            toggled = daemon.handle_command("toggle")
+
+            record = daemon.handle_command("last_words")["last_words"]
+
+        self.assertEqual("first", midway["text"])
+        self.assertEqual("first second third", toggled["text"])
+        self.assertEqual("first second third", record["text"])
+        self.assertTrue(record["delivered"])
+
+    def test_a_refused_continuous_segment_leaves_the_session_so_far_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(
+                temp_dir,
+                TextSession(["lost words"], delivered=False, detail=REFUSAL_DETAIL),
+                auto_transcribe="continuous",
+            )
+            daemon.handle_command("toggle")
+            daemon._on_silence()
+            self._settle(daemon)
+            deadline = time.time() + 3
+            while daemon.state != "IDLE" and time.time() < deadline:
+                time.sleep(0.01)
+
+            record = daemon.handle_command("last_words")["last_words"]
+
+        self.assertEqual("lost words", record["text"])
+        self.assertFalse(record["delivered"])
+        self.assertEqual(REFUSAL_DETAIL, record["detail"])
+
+    def test_a_transcript_for_a_speech_session_is_not_held(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, TextSession(["spoken to a session"]))
+
+            toggled = self._dictate(daemon, "toggle_session")
+            record = daemon.handle_command("last_words")["last_words"]
+
+        self.assertEqual("", toggled["text"])
+        self.assertIsNone(record)
+
+    def test_no_log_record_contains_the_transcript(self) -> None:
+        text = "zebra quartz marmalade transcript"
+
+        class Collector(logging.Handler):
+            def __init__(self) -> None:
+                super().__init__(logging.DEBUG)
+                self.rendered: list[str] = []
+
+            def emit(self, record: logging.LogRecord) -> None:
+                self.rendered.append(self.format(record))
+                self.rendered.append(record.getMessage())
+                self.rendered.append(repr(record.args))
+
+        collector = Collector()
+        root = logging.getLogger()
+        previous_level = root.level
+        root.addHandler(collector)
+        root.setLevel(logging.DEBUG)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                daemon = self._daemon(temp_dir, TextSession([text]))
+                self._dictate(daemon)
+                self.assertEqual(text, daemon.handle_command("last_words")["last_words"]["text"])
+                daemon.handle_command("clear_last_words")
+        finally:
+            root.removeHandler(collector)
+            root.setLevel(previous_level)
+
+        for rendered in collector.rendered:
+            self.assertNotIn("zebra", rendered)
+            self.assertNotIn(text, rendered)
+
+    def test_the_log_check_would_notice_a_record_that_carried_the_text(self) -> None:
+        """The collector above must see records at all, or its silence proves nothing."""
+        seen: list[str] = []
+
+        class Collector(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                seen.append(record.getMessage())
+
+        collector = Collector(logging.DEBUG)
+        root = logging.getLogger()
+        previous_level = root.level
+        root.addHandler(collector)
+        root.setLevel(logging.DEBUG)
+        try:
+            logging.getLogger("murmly.daemon").debug("probe %s", "zebra")
+        finally:
+            root.removeHandler(collector)
+            root.setLevel(previous_level)
+
+        self.assertEqual(["probe zebra"], seen)
+
+
+class RestartReadyStatusTests(unittest.TestCase):
+    """`status` says whether a restart would cut anything off."""
+
+    def _daemon(self, temp_dir: str, session, speech=None) -> MurmlyDaemon:
+        config = MurmlyConfig(
+            socket_path=Path(temp_dir) / "murmly.sock",
+            config_path=Path(temp_dir) / "config.toml",
+            overlay_enabled=False,
+        )
+        return MurmlyDaemon(
+            config,
+            session=session,
+            speech=speech,
+            profile=PlatformProfile(operating_system=OperatingSystem.LINUX, architecture="x86_64"),
+        )
+
+    def test_an_idle_daemon_is_ready_to_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, DummySession())
+
+            response = daemon.handle_command("status")
+
+        self.assertEqual("IDLE", response["state"])
+        self.assertIs(True, response["restart_ready"])
+
+    def test_a_daemon_that_has_finished_a_recording_is_ready_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, DummySession())
+            daemon.handle_command("toggle")
+            daemon.handle_command("toggle")
+
+            response = daemon.handle_command("status")
+
+        self.assertIs(True, response["restart_ready"])
+
+    def test_a_capturing_daemon_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            daemon = self._daemon(temp_dir, DummySession())
+            daemon.handle_command("toggle")
+
+            response = daemon.handle_command("status")
+
+        self.assertEqual("LISTENING", response["state"])
+        self.assertIs(False, response["restart_ready"])
+
+    def test_a_transcribing_daemon_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = BlockingSession()
+            daemon = self._daemon(temp_dir, session)
+            daemon.handle_command("toggle")
+            worker = threading.Thread(target=daemon.handle_command, args=("toggle",))
+            worker.start()
+            try:
+                self.assertTrue(session.processing.wait(timeout=5))
+
+                response = daemon.handle_command("status")
+            finally:
+                session.release.set()
+                worker.join(timeout=5)
+
+        self.assertEqual("THINKING", response["state"])
+        self.assertIs(False, response["restart_ready"])
+
+    def test_a_speaking_daemon_is_not_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            speech = StubSpeechEngine()
+            speech.speaking = True
+            daemon = self._daemon(temp_dir, DummySession(), speech=speech)
+
+            response = daemon.handle_command("status")
+
+        self.assertEqual("SPEAKING", response["state"])
+        self.assertIs(False, response["restart_ready"])

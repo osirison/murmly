@@ -6,14 +6,14 @@ skip themselves when none is available.
 
 ## 1. Scaffolding
 
-- [ ] 1.1 Add the `gui` optional extra (PySide6 on Linux and Windows) and `tomlkit` to `pyproject.toml`, re-lock, and add a `murmly app` command that exits with a clear message when the extra is missing; verify the suite passes without the extra and `uv run --no-sync --extra gui murmly app --help` prints usage
+- [x] 1.1 Add the `gui` optional extra (PySide6 on Linux and Windows) and `tomlkit` to `pyproject.toml`, re-lock, and add a `murmly app` command that exits with a clear message when the extra is missing; verify the suite passes without the extra and `uv run --no-sync --extra gui murmly app --help` prints usage
 - [ ] 1.2 Bundle Instrument Sans and IBM Plex Mono (latin subsets) with their SIL OFL licences in `licenses/`; verify the app renders in those fonts with the network disabled
 - [ ] 1.3 Port the canvas's dark and light colour, type, spacing and radius tokens into one Qt Quick theme; verify a test that every colour token has both a dark and a light value
 
 ## 2. Daemon support
 
-- [ ] 2.1 Hold the last transcript in a single in-memory slot (text, time, delivery outcome) with socket requests to read and clear it; verify tests that the slot is overwritten by the next transcript, empty after a daemon restart, cleared on request, and that no log record contains its text
-- [ ] 2.2 Report in `status` whether the daemon is idle enough to restart (no capture, transcription or speech); verify tests for each busy state and for idle
+- [x] 2.1 Hold the last transcript in a single in-memory slot (text, time, delivery outcome) with socket requests to read and clear it; verify tests that the slot is overwritten by the next transcript, empty after a daemon restart, cleared on request, and that no log record contains its text
+- [x] 2.2 Report in `status` whether the daemon is idle enough to restart (no capture, transcription or speech); verify tests for each busy state and for idle
 
 ## 3. Home and the refused-delivery screen
 

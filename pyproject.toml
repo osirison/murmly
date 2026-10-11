@@ -25,6 +25,11 @@ dependencies = [
     # whose DACL grants only the creating user's SID. Markered so no other
     # platform resolves or installs it.
     "pywin32==312 ; sys_platform == 'win32'",
+    # The desktop app's settings writer edits `config.toml` with it, keeping
+    # comments and key order. Core rather than part of the `gui` extra because
+    # CI installs no extras: in an extra, its tests would never run on Linux or
+    # macOS. A small pure-Python wheel, so the default install barely notices.
+    "tomlkit>=0.13",
 ]
 
 [project.optional-dependencies]
@@ -66,6 +71,17 @@ cuda = [
 # with `uv sync --extra overlay` on Windows or macOS.
 overlay = [
     "PySide6>=6.7,<7 ; sys_platform == 'win32' or sys_platform == 'darwin'",
+]
+
+# The desktop app's toolkit (`murmly app`). An extra for the same reason
+# `overlay` is: PySide6 is a large wheel, and nothing about starting Murmly or
+# serving a command needs it, so a default dependency would put it in every
+# install and CI run whether or not the app is wanted. Separate from `overlay`,
+# which keeps its meaning (the Windows and macOS overlay renderers); `gui` is
+# marked for Linux and Windows, the platforms the app supports. Installed with
+# `uv sync --extra gui`.
+gui = [
+    "PySide6>=6.7,<7 ; sys_platform == 'linux' or sys_platform == 'win32'",
 ]
 
 # Speech output on the CPU. Also needs espeak-ng from the distribution, and the
