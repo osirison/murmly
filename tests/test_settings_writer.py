@@ -7,8 +7,15 @@ import textwrap
 import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from murmly.config import SETTING_RULES, SettingValueError, load_config, validate_setting
+from murmly.config import (
+    SETTING_RULES,
+    SettingValueError,
+    default_config_path,
+    load_config,
+    validate_setting,
+)
 from murmly.settings_writer import ConfigParseError, SettingsFileError, SettingsWriter
 
 COMMENTED = textwrap.dedent(
@@ -95,11 +102,23 @@ class RoundTripTests(WriterTestCase):
         self.assertFalse(load_config(self.path).overlay_enabled)
 
     def test_the_default_location_is_the_one_config_reads(self) -> None:
+        # Whatever this platform resolves to, the writer's default is the reader's.
+        env = {
+            "XDG_CONFIG_HOME": str(self.directory / "xdg"),
+            "APPDATA": str(self.directory / "appdata"),
+            "HOME": str(self.directory),
+        }
+
+        self.assertEqual(default_config_path(env), SettingsWriter(env=env).path)
+        self.assertEqual(default_config_path(env), load_config(env=env).config_path)
+
+    def test_the_default_location_on_linux_follows_xdg(self) -> None:
         env = {"XDG_CONFIG_HOME": str(self.directory / "xdg"), "HOME": str(self.directory)}
 
-        writer = SettingsWriter(env=env)
+        with patch("sys.platform", "linux"):
+            path = SettingsWriter(env=env).path
 
-        self.assertEqual(self.directory / "xdg" / "murmly" / "config.toml", writer.path)
+        self.assertEqual(self.directory / "xdg" / "murmly" / "config.toml", path)
 
     def test_windows_line_endings_are_kept(self) -> None:
         crlf = COMMENTED.replace("\n", "\r\n")
@@ -250,8 +269,6 @@ class AtomicWriteTests(WriterTestCase):
 
     def test_a_failed_replace_leaves_the_file_and_no_temporary(self) -> None:
         self.write_file(COMMENTED)
-        from unittest.mock import patch
-
         with patch("murmly.settings_writer.os.replace", side_effect=OSError("disk gone")):
             with self.assertRaises(SettingsFileError):
                 SettingsWriter(self.path).set("stt.model_profile", "accurate")
