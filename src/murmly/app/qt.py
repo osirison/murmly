@@ -124,22 +124,28 @@ def prepare_application() -> list[Path]:
 
 def create_engine(
     home: controller.HomeController | None = None,
+    health: controller.HealthController | None = None,
 ) -> tuple[QQmlApplicationEngine, Theme]:
     """Load the window. The caller keeps both returned objects alive.
 
-    `home` is the controller QML reads as `home`; by default one that polls the
-    real daemon. A test passes one with a fake behind it, so no test asks the
-    machine's own daemon anything.
+    `home` and `health` are the controllers QML reads as `home` and `health`; by
+    default ones that poll the real daemon and run the real `murmly doctor`. A
+    test passes ones with a fake behind them, so no test asks the machine's own
+    daemon anything or runs doctor.
     """
     engine = QQmlApplicationEngine()
     theme_object = Theme(engine)
     if home is None:
         home = controller.HomeController(controller.default_model())
-    # The engine owns it from here, so QML never outlives what it reads.
+    if health is None:
+        health = controller.HealthController(controller.default_health_model())
+    # The engine owns them from here, so QML never outlives what it reads.
     home.setParent(engine)
+    health.setParent(engine)
     context = engine.rootContext()
     context.setContextProperty("theme", theme_object)
     context.setContextProperty("home", home)
+    context.setContextProperty("health", health)
     context.setContextProperty("sections", list(shell.SECTIONS))
     engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
     return engine, theme_object

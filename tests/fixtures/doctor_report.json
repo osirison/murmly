@@ -1,0 +1,210 @@
+{
+  "config_path": "/home/person/.config/murmly/config.toml",
+  "socket_path": "/run/user/1000/murmly.sock",
+  "command_socket": {
+    "path": "/run/user/1000/murmly.sock",
+    "peer_identity_supported": true,
+    "path_private": true
+  },
+  "platform": {
+    "operating_system": "linux",
+    "supported": true,
+    "architecture": "x86_64",
+    "libc": "glibc",
+    "desktop": "plasma",
+    "concerns": {
+      "command_channel": {
+        "mechanism": "unix-socket",
+        "available": true,
+        "limitations": []
+      },
+      "service_management": {
+        "mechanism": "systemd",
+        "available": true,
+        "limitations": []
+      },
+      "hotkey_registration": {
+        "mechanism": "plasma",
+        "available": true,
+        "limitations": []
+      },
+      "clipboard": {
+        "mechanism": "wayland",
+        "available": true,
+        "limitations": []
+      },
+      "paste_injection": {
+        "mechanism": "wayland",
+        "available": true,
+        "limitations": []
+      },
+      "focus_observation": {
+        "mechanism": null,
+        "available": false,
+        "reason": "Delivery target verification requires an X11 session.",
+        "remedy": [],
+        "limitations": []
+      },
+      "overlay": {
+        "mechanism": "gtk4",
+        "available": true,
+        "limitations": []
+      },
+      "speech_synthesis": {
+        "mechanism": "kokoro",
+        "available": true,
+        "limitations": []
+      }
+    },
+    "permissions": {},
+    "environment": {}
+  },
+  "session": "wayland",
+  "session_detail": null,
+  "clipboard_command": [
+    "wl-copy"
+  ],
+  "paste_injection": {
+    "available": true,
+    "method": "xdotool",
+    "command": [
+      "xdotool",
+      "key",
+      "--clearmodifiers",
+      "ctrl+v"
+    ],
+    "confirms_delivery": false
+  },
+  "model_profile": "balanced",
+  "model_name": "large-v3-turbo",
+  "model_cache_path": "/home/person/.cache/huggingface/hub",
+  "model_cache_detail": null,
+  "device": "cuda",
+  "compute_type": "auto",
+  "runtime_device": "cuda",
+  "runtime_detail": null,
+  "runtime_compute_type": "float16",
+  "beam_size": 5,
+  "vad_filter": true,
+  "model_resident": false,
+  "model_resident_detail": null,
+  "unload_after_idle_s": 300,
+  "system_memory_returnable": true,
+  "system_memory_returnable_detail": null,
+  "live_transcription": {
+    "live_transcribe": true,
+    "live_interval_ms": 1000,
+    "live_window_seconds": 15,
+    "auto_transcribe": "continuous",
+    "auto_transcribe_silence_ms": 2000,
+    "auto_transcribe_min_speech_ms": 300,
+    "overlay_text_size_px": 15,
+    "configured_sample_rate_hz": 16000,
+    "negotiated_sample_rate_hz": 16000,
+    "silence_detection_available": true,
+    "partial_pass_ceiling_ms": 199,
+    "partial_pass_loaded_model": true,
+    "partial_pass_keeps_pace": true,
+    "partial_pass_detail": "Worst case: a full window of speech. Real partials are usually faster because the voice activity filter trims silence. Measuring this loaded the transcription model in this process; the residency reported above was read from the daemon before it ran."
+  },
+  "speaker_recognition": {
+    "mode": "mine-only",
+    "mode_rejected_value": null,
+    "match_threshold": 30,
+    "match_threshold_rejected_value": null,
+    "owner": "milo",
+    "owner_enrolled": true,
+    "enrolled_count": 2,
+    "enrolled_names": [
+      "milo",
+      "sam"
+    ],
+    "voiceprints_path": "/home/person/.local/share/murmly/voiceprints.json",
+    "voiceprints_need_reenrolment": false,
+    "model_path": "/home/person/.local/share/murmly/voxceleb_resnet34_LM.onnx",
+    "model_present": true,
+    "model_checksum_matches": true,
+    "available": true,
+    "detail": null,
+    "provider": "CPUExecutionProvider",
+    "resident": false,
+    "resident_detail": null,
+    "unload_after_idle_s": 300
+  },
+  "delivery": {
+    "verification_supported": false,
+    "verification_enabled": true,
+    "restore_clipboard": true,
+    "restore_delay_ms": 500,
+    "detail": "Delivery target verification requires an X11 session."
+  },
+  "overlay": {
+    "enabled": true,
+    "desktop": "KDE",
+    "session": "wayland",
+    "backend": "wayland",
+    "supported_session": true,
+    "system_python": "/usr/bin/python3",
+    "pygobject": true,
+    "gtk4": "4.22.5",
+    "gdk_x11": false,
+    "native_x11": false,
+    "gtk4_layer_shell": true,
+    "pyside6": false,
+    "qt_version": null,
+    "available": true
+  },
+  "speech_output": {
+    "enabled": true,
+    "voice": "af_heart",
+    "rate_percent": 100,
+    "device": "cpu",
+    "model_dir": "/home/person/.local/share/murmly",
+    "output_device": null,
+    "unload_after_idle_s": 0,
+    "resident": false,
+    "playback_dropouts": 0,
+    "playback_starvations": 0,
+    "quiet_hours": null,
+    "quiet_hours_in_force": false,
+    "available": true,
+    "providers": [
+      "CPUExecutionProvider"
+    ],
+    "device_in_use": "cpu",
+    "negotiated_output_rate_hz": 24000,
+    "negotiated_output_buffer_ms": 200.0,
+    "output_device_in_use": "default"
+  },
+  "microphone": {
+    "device_present": true,
+    "permission": null,
+    "available": true
+  },
+  "installation": {
+    "installed": true,
+    "service_active": true,
+    "entrypoint": "/home/person/.local/bin/murmly",
+    "hotkey": "Meta+X",
+    "hotkey_held": true,
+    "detail": "The Murmly service is installed and running.",
+    "hotkeys": [
+      {
+        "purpose": "window",
+        "description": "dictate into the focused window",
+        "command": "toggle",
+        "hotkey": "Meta+X",
+        "held": true,
+        "detail": null
+      },
+      {
+        "purpose": "session",
+        "description": "dictate into the open speech session",
+        "command": "toggle-session",
+        "hotkey": null,
+        "held": false,
+        "detail": "No hotkey is bound to dictate into the open speech session."
+      }
+    ]
+  }
+}
