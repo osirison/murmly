@@ -8,6 +8,7 @@ machine's own.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -143,6 +144,101 @@ class RemovalWithPurgeTests(RemovalCase):
         self.assertTrue((self.data_dir / "kokoro.onnx").is_file())
 
 
+class PurgeTargetsFollowTheGivenEnvironmentTests(unittest.TestCase):
+    """Only resolves paths: nothing here deletes, and every answer must be inside the temporary home."""
+
+    def setUp(self) -> None:
+        if os.name != "posix":
+            self.skipTest("builds POSIX-shaped environments")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name)
+        patcher = unittest.mock.patch("pathlib.Path.home", side_effect=AssertionError("the real home was read"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def assert_inside_home(self, targets) -> None:
+        for target in targets:
+            self.assertTrue(target.path.is_relative_to(self.home), f"{target.path} is outside {self.home}")
+
+    def test_a_given_home_is_the_only_home(self) -> None:
+        with unittest.mock.patch("sys.platform", "linux"):
+            targets = removal.purge_targets({"HOME": str(self.home)})
+
+        self.assert_inside_home(targets)
+        self.assertEqual(
+            [self.home / ".config" / "murmly", self.home / ".local" / "share" / "murmly"],
+            [target.path for target in targets],
+        )
+
+    def test_a_relative_xdg_value_is_not_followed(self) -> None:
+        env = {"HOME": str(self.home), "XDG_CONFIG_HOME": ".", "XDG_DATA_HOME": "relative"}
+        with unittest.mock.patch("sys.platform", "linux"), contextlib.chdir(self.home):
+            targets = removal.purge_targets(env)
+
+        self.assert_inside_home(targets)
+        self.assertEqual(
+            [self.home / ".config" / "murmly", self.home / ".local" / "share" / "murmly"],
+            [target.path for target in targets],
+        )
+
+    def test_an_environment_without_a_home_raises(self) -> None:
+        with unittest.mock.patch("sys.platform", "linux"):
+            with self.assertRaises(RuntimeError):
+                removal.purge_targets({})
+
+
+class RemovalFailureTests(RemovalCase):
+    def failing_installer(self):
+        def refuse() -> bool:
+            raise InstallError("systemctl could not stop the service")
+
+        self.service.remove = refuse
+        return self.installer
+
+    def test_a_clean_removal_did_not_fail(self) -> None:
+        result = removal.remove_murmly(self.installer, purge_user_files=True)
+
+        self.assertFalse(result.failed)
+        self.assertEqual((), result.outcome.problems)
+
+    def test_a_service_that_would_not_stop_is_a_failure(self) -> None:
+        result = removal.remove_murmly(self.failing_installer())
+
+        self.assertTrue(result.failed)
+        self.assertTrue(result.outcome.service_removal_failed)
+        self.assertIn("systemctl could not stop the service", result.outcome.problems)
+
+    def test_nothing_is_purged_while_the_service_may_still_be_running(self) -> None:
+        result = removal.remove_murmly(self.failing_installer(), purge_user_files=True)
+
+        self.assertIsNone(result.purged)
+        self.assertTrue(result.failed)
+        self.assertTrue((self.config_dir / "config.toml").is_file())
+        self.assertTrue((self.data_dir / "kokoro.onnx").is_file())
+        self.assertIn(removal.PURGE_SKIPPED, result.messages)
+        self.assertIn("systemctl could not stop the service", result.messages)
+
+    def test_no_note_about_kept_files_when_no_purge_was_asked(self) -> None:
+        result = removal.remove_murmly(self.failing_installer())
+
+        self.assertNotIn(removal.PURGE_SKIPPED, result.messages)
+
+    def test_a_purge_that_could_not_delete_everything_is_a_failure(self) -> None:
+        with unittest.mock.patch.object(removal, "purge", return_value=removal.PurgeResult(problems=("Could not delete x: in use",))):
+            result = removal.remove_murmly(self.installer, purge_user_files=True)
+
+        self.assertTrue(result.failed)
+
+    def test_a_hotkey_or_menu_entry_that_would_not_go_is_a_failure(self) -> None:
+        self.launcher.unregister = unittest.mock.Mock(side_effect=InstallError("gsettings said no"))
+
+        result = removal.remove_murmly(self.installer)
+
+        self.assertTrue(result.failed)
+        self.assertFalse(result.outcome.service_removal_failed)
+
+
 class PurgeTests(RemovalCase):
     def test_targets_are_the_settings_folder_and_the_data_folder(self) -> None:
         targets = removal.purge_targets()
@@ -186,6 +282,81 @@ class PurgeTests(RemovalCase):
 
         self.assertTrue((real / "keep.txt").is_file())
         self.assertIn("link", result.problems[0])
+
+    def test_a_junction_is_refused_and_its_target_untouched(self) -> None:
+        real = self.data_dir.parent / "elsewhere"
+        real.mkdir()
+        (real / "keep.txt").write_text("x", encoding="utf-8")
+        junction_parent = self.data_dir.parent / "joined"
+        junction_parent.mkdir()
+        junction = junction_parent / "murmly"
+        junction.mkdir()
+        (junction / "inside.txt").write_text("x", encoding="utf-8")
+
+        with unittest.mock.patch.object(
+            Path, "is_junction", lambda self: self == junction, create=True
+        ):
+            result = removal.purge((removal.PurgeTarget("Joined", junction),))
+
+        self.assertTrue((junction / "inside.txt").is_file())
+        self.assertTrue((real / "keep.txt").is_file())
+        self.assertIn("link", result.problems[0])
+
+    @unittest.skipUnless(os.name == "nt", "a real junction needs Windows")
+    def test_a_real_windows_junction_is_refused(self) -> None:
+        import _winapi
+
+        real = self.data_dir.parent / "elsewhere"
+        real.mkdir()
+        (real / "keep.txt").write_text("x", encoding="utf-8")
+        junction_parent = self.data_dir.parent / "joined"
+        junction_parent.mkdir()
+        junction = junction_parent / "murmly"
+        _winapi.CreateJunction(str(real), str(junction))
+
+        result = removal.purge((removal.PurgeTarget("Joined", junction),))
+
+        self.assertTrue((real / "keep.txt").is_file())
+        self.assertIn("link", result.problems[0])
+
+    def test_a_relative_path_is_refused(self) -> None:
+        with contextlib.chdir(self.data_dir.parent):
+            (self.data_dir.parent / "relative" / "murmly").mkdir(parents=True)
+            result = removal.purge((removal.PurgeTarget("Relative", Path("relative") / "murmly"),))
+
+        self.assertTrue((self.data_dir.parent / "relative" / "murmly").is_dir())
+        self.assertIn("not an absolute path", result.problems[0])
+
+    def test_the_home_folder_is_refused_even_when_it_is_named_murmly(self) -> None:
+        home = self.data_dir.parent / "home" / "murmly"
+        home.mkdir(parents=True)
+        (home / "photo.jpg").write_bytes(b"x")
+
+        with unittest.mock.patch.object(Path, "home", return_value=home):
+            result = removal.purge((removal.PurgeTarget("Home", home),))
+
+        self.assertTrue((home / "photo.jpg").is_file())
+        self.assertIn("home folder", result.problems[0])
+
+    def test_a_filesystem_or_drive_root_is_refused(self) -> None:
+        # Asked of the rule alone: purging a root, even to prove it is refused, is not a test.
+        root = Path(Path.cwd().anchor)
+
+        self.assertIn("root", removal.refusal(root))
+
+    def test_a_folder_that_passes_every_rule_is_not_refused(self) -> None:
+        self.assertIsNone(removal.refusal(self.data_dir))
+
+    def test_a_refused_folder_is_a_problem_and_nothing_is_deleted(self) -> None:
+        other = self.data_dir.parent / "photos"
+        other.mkdir()
+        deleted: list[Path] = []
+
+        result = removal.purge((removal.PurgeTarget("Bad", other),), rmtree=deleted.append)
+
+        self.assertEqual([], deleted)
+        self.assertEqual((), result.removed)
+        self.assertEqual(1, len(result.problems))
 
     def test_a_folder_that_is_already_gone_is_not_a_problem(self) -> None:
         missing = self.data_dir.parent / "gone" / "murmly"

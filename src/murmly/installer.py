@@ -34,6 +34,7 @@ import sys
 import time
 from typing import TYPE_CHECKING
 
+from murmly.config import absolute_setting, home_directory
 from murmly.desktop import DesktopQueryError, PlasmaShortcuts
 from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
 from murmly.hotkey import (
@@ -230,15 +231,13 @@ def write_atomically(path: Path, content: str, mode: int = 0o644) -> None:
 
 def default_unit_dir(env: dict[str, str] | None = None) -> Path:
     environment = env if env is not None else os.environ
-    config_home = environment.get("XDG_CONFIG_HOME")
-    base = Path(config_home) if config_home else Path.home() / ".config"
+    base = absolute_setting(environment, "XDG_CONFIG_HOME") or home_directory(env) / ".config"
     return base / "systemd" / "user"
 
 
 def default_applications_dir(env: dict[str, str] | None = None) -> Path:
     environment = env if env is not None else os.environ
-    data_home = environment.get("XDG_DATA_HOME")
-    base = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    base = absolute_setting(environment, "XDG_DATA_HOME") or home_directory(env) / ".local" / "share"
     return base / "applications"
 
 
@@ -249,16 +248,12 @@ def default_launch_agents_dir(env: dict[str, str] | None = None) -> Path:
     `default_unit_dir`'s `XDG_CONFIG_HOME` precedent, the same way
     `Path.home()` is `default_unit_dir`'s own fallback when nothing is set.
     """
-    environment = env if env is not None else os.environ
-    home = environment.get("HOME")
-    base = Path(home) if home else Path.home()
-    return base / "Library" / "LaunchAgents"
+    return home_directory(env) / "Library" / "LaunchAgents"
 
 
 def default_shortcut_config_path(env: dict[str, str] | None = None) -> Path:
     environment = env if env is not None else os.environ
-    config_home = environment.get("XDG_CONFIG_HOME")
-    base = Path(config_home) if config_home else Path.home() / ".config"
+    base = absolute_setting(environment, "XDG_CONFIG_HOME") or home_directory(env) / ".config"
     return base / "kglobalshortcutsrc"
 
 
@@ -1223,6 +1218,10 @@ class InstallOutcome:
     # working: an installation that binds one hotkey is still an installation.
     session_hotkey: Hotkey | None = None
     session_hotkey_registered: bool = False
+    # What an uninstall could not remove, and whether the service was among it. The
+    # same lines are in `messages`; these let a caller tell success from a partial one.
+    problems: tuple[str, ...] = ()
+    service_removal_failed: bool = False
 
 
 def default_service(profile: PlatformProfile | None = None) -> object:
@@ -1895,10 +1894,12 @@ class Installer:
                 hotkey_removed = True
                 problems.append(str(error))
 
+        service_failed = False
         try:
             service_removed = self._service.remove()
         except InstallError as error:
             service_removed = False
+            service_failed = True
             problems.append(str(error))
 
         try:
@@ -1941,6 +1942,8 @@ class Installer:
             session_verified=True,
             user_override=None,
             messages=tuple(messages),
+            problems=tuple(problems),
+            service_removal_failed=service_failed,
         )
 
     def installed_items(self) -> tuple[InstalledItem, ...]:
@@ -2322,10 +2325,12 @@ class Installer:
         # unreachable one here is not a problem to report.
         self._best_effort_rebind(self._socket_path())
 
+        service_failed = False
         try:
             service_removed = self._service.remove()
         except InstallError as error:
             service_removed = False
+            service_failed = True
             problems.append(str(error))
 
         if service_removed:
@@ -2348,6 +2353,8 @@ class Installer:
             session_verified=True,
             user_override=None,
             messages=tuple(messages),
+            problems=tuple(problems),
+            service_removal_failed=service_failed,
         )
 
     def _held_purposes_from_daemon(self) -> frozenset[str] | None:

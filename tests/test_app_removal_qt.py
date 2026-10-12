@@ -6,6 +6,7 @@ on, so no test reads or removes what is installed on the machine it runs on."""
 
 from __future__ import annotations
 
+import dataclasses
 import tempfile
 import threading
 import time
@@ -41,6 +42,7 @@ class RecordingRemoval:
         self.remove_calls: list[bool] = []
         self.remove_threads: list[int] = []
         self.failure: Exception | None = None
+        self.partial = False
         self.items = ITEMS
 
     def plan(self) -> plain.RemovalPlan:
@@ -53,6 +55,10 @@ class RecordingRemoval:
         if self.failure is not None:
             raise self.failure
         messages = ["Removed the Murmly service.", "Released the Murmly hotkey."]
+        if self.partial:
+            problem = "Could not clear the hotkey record: in use"
+            partial = dataclasses.replace(outcome(*messages, problem), problems=(problem,))
+            return plain.RemovalResult(partial)
         purged = None
         if purge:
             purged = plain.PurgeResult(removed=(Path("/home/a/.config/murmly"),))
@@ -285,7 +291,10 @@ class ConfirmationTests(RemovalQtCase):
 class RemovingTests(RemovalQtCase):
     def confirm(self) -> None:
         self.child("remove-confirm").click()
-        self.wait_for(lambda: self.removal.view["step"] in ("done", "failed"), message="the removal to finish")
+        self.wait_for(
+            lambda: self.removal.view["step"] in ("done", "partial", "failed"),
+            message="the removal to finish",
+        )
 
     def test_confirming_runs_the_removal_once_off_the_gui_thread_without_purge(self) -> None:
         self.build()
@@ -305,6 +314,22 @@ class RemovingTests(RemovalQtCase):
         self.assertEqual("Murmly was removed", self.child("remove-title").property("text"))
         lines = [item.property("text") for item in self.items_named("remove-report-line")]
         self.assertCountEqual(["Removed the Murmly service.", "Released the Murmly hotkey."], lines)
+        self.assertEqual(0, self.quits)
+
+    def test_a_partial_removal_says_so_lists_what_happened_and_keeps_the_app_open(self) -> None:
+        self.build()
+        self.fake.partial = True
+        self.ask()
+
+        self.confirm()
+
+        self.assertEqual(removal.TITLE_PARTIAL, self.child("remove-title").property("text"))
+        lines = [item.property("text") for item in self.items_named("remove-report-line")]
+        self.assertIn("Could not clear the hotkey record: in use", lines)
+        self.assertEqual(removal.PARTIAL_NOTE, self.child("remove-done-note").property("text"))
+        self.assertEqual("Close", self.child("remove-close").property("text"))
+        self.child("remove-close").click()
+        self.wait_for(lambda: self.removal.view["step"] == "idle", message="the dialog to close")
         self.assertEqual(0, self.quits)
 
     def test_the_close_button_quits_the_app(self) -> None:

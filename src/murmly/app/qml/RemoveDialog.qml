@@ -25,7 +25,8 @@ Popup {
     padding: theme.space.space24
     modal: true
     focus: true
-    closePolicy: step === "confirming" || step === "failed" ? Popup.CloseOnEscape : Popup.NoAutoClose
+    closePolicy: step === "confirming" || step === "partial" || step === "failed"
+        ? Popup.CloseOnEscape : Popup.NoAutoClose
 
     // The controller decides when it is open; Escape asks it to cancel.
     onWantedChanged: {
@@ -39,7 +40,7 @@ Popup {
             open()
     }
     onClosed: {
-        if (wanted && (step === "confirming" || step === "failed"))
+        if (wanted && (step === "confirming" || step === "partial" || step === "failed"))
             removal.cancel()
     }
 
@@ -267,9 +268,10 @@ Popup {
             Layout.fillWidth: true
         }
 
-        // Done: what was removed.
+        // Done: what was removed. Partial: the same list, with what went wrong in it;
+        // the app stays open, and its button only closes the dialog.
         ColumnLayout {
-            visible: dialog.step === "done"
+            visible: dialog.step === "done" || dialog.step === "partial"
             spacing: theme.space.space12
             Layout.fillWidth: true
 
@@ -302,8 +304,8 @@ Popup {
                     objectName: "remove-close"
                     kind: "primary"
                     text: dialog.view.doneLabel !== undefined ? dialog.view.doneLabel : ""
-                    focus: dialog.step === "done"
-                    onClicked: removal.finish()
+                    focus: dialog.step === "done" || dialog.step === "partial"
+                    onClicked: dialog.step === "partial" ? removal.cancel() : removal.finish()
                 }
             }
         }

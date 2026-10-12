@@ -1153,6 +1153,45 @@ class UninstallPurgeCommandTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertFalse(self.config_dir.exists())
 
+    def failed_outcome(self, service: bool):
+        import dataclasses
+
+        return dataclasses.replace(
+            self.outcome,
+            messages=("Released the Murmly hotkey.", "systemctl could not stop the service"),
+            problems=("systemctl could not stop the service",),
+            service_removal_failed=service,
+        )
+
+    def test_a_step_that_failed_exits_non_zero_with_the_whole_report(self) -> None:
+        self.outcome = self.failed_outcome(service=False)
+
+        exit_code, output, _installer = self.run_command(purge=False)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("Released the Murmly hotkey.", output)
+        self.assertIn("systemctl could not stop the service", output)
+
+    def test_a_service_that_would_not_stop_keeps_the_files_and_exits_non_zero(self) -> None:
+        self.outcome = self.failed_outcome(service=True)
+
+        exit_code, output, _installer = self.run_command(purge=True, answer=True)
+
+        self.assertEqual(1, exit_code)
+        self.assertTrue((self.config_dir / "file.txt").is_file())
+        self.assertTrue((self.data_dir / "file.txt").is_file())
+        self.assertIn("were kept", output)
+
+    def test_a_purge_that_could_not_delete_everything_exits_non_zero(self) -> None:
+        from murmly import removal
+
+        problem = removal.PurgeResult(problems=("Could not delete x: in use",))
+        with patch("murmly.removal.purge", return_value=problem):
+            exit_code, output, _installer = self.run_command(purge=True, answer=True)
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("Could not delete x: in use", output)
+
     def test_the_flags_are_parsed(self) -> None:
         from murmly.cli import build_parser
 

@@ -27,11 +27,13 @@ PLANNING = "planning"
 CONFIRMING = "confirming"
 REMOVING = "removing"
 DONE = "done"
+PARTIAL = "partial"
 FAILED = "failed"
 
 TITLE_CONFIRM = "Remove murmly from this computer?"
 TITLE_REMOVING = "Removing murmly…"
 TITLE_DONE = "Murmly was removed"
+TITLE_PARTIAL = "Murmly was only partly removed"
 TITLE_FAILED = "Murmly could not be removed"
 
 INTRO_ITEMS = "This stops murmly and removes the following from this computer."
@@ -47,6 +49,7 @@ CONFIRM_LABEL = "Remove murmly"
 CONFIRM_PURGE_LABEL = "Remove murmly and delete my data"
 DONE_NOTE = "The app was using what was just removed, so it has to close."
 DONE_LABEL = "Close murmly"
+PARTIAL_NOTE = "Some parts were not removed, so the app stays open. What went wrong is listed above."
 FAILED_LABEL = "Close"
 
 Plan = Callable[[], RemovalPlan]
@@ -79,7 +82,7 @@ class RemovalState:
 
     def request(self) -> bool:
         """The person asked to remove murmly. True when a plan should be read."""
-        if self.step not in (IDLE, FAILED, DONE):
+        if self.step not in (IDLE, FAILED, DONE, PARTIAL):
             return False
         self.step = PLANNING
         self.plan = None
@@ -104,10 +107,11 @@ class RemovalState:
             self.purge = bool(purge)
 
     def cancel(self) -> None:
-        if self.step in (PLANNING, CONFIRMING, FAILED):
+        if self.step in (PLANNING, CONFIRMING, FAILED, PARTIAL):
             self.step = IDLE
             self.plan = None
             self.purge = False
+            self.report = ()
             self.error = ""
 
     def confirm(self) -> bool:
@@ -121,7 +125,7 @@ class RemovalState:
         if self.step != REMOVING:
             return
         self.report = tuple(result.messages)
-        self.step = DONE
+        self.step = PARTIAL if result.failed else DONE
 
     def failed(self, error: str) -> None:
         if self.step != REMOVING:
@@ -141,7 +145,7 @@ def confirm_lines(plan: RemovalPlan) -> list[dict[str, str]]:
 
 def removal_view(state: RemovalState) -> dict:
     """Everything the dialog shows, as strings and flags."""
-    open_ = state.step in (CONFIRMING, REMOVING, DONE, FAILED)
+    open_ = state.step in (CONFIRMING, REMOVING, DONE, PARTIAL, FAILED)
     view: dict = {
         "step": state.step,
         "open": open_,
@@ -181,6 +185,11 @@ def removal_view(state: RemovalState) -> dict:
         view["title"] = TITLE_DONE
         view["report"] = list(state.report)
         view["doneNote"] = DONE_NOTE
+    elif state.step == PARTIAL:
+        view["title"] = TITLE_PARTIAL
+        view["report"] = list(state.report)
+        view["doneNote"] = PARTIAL_NOTE
+        view["doneLabel"] = FAILED_LABEL
     elif state.step == FAILED:
         view["title"] = TITLE_FAILED
         view["error"] = state.error

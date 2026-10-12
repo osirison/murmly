@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import os
 import re
 import tomllib
@@ -178,6 +178,38 @@ QUIET_HOURS_PATTERN = re.compile(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})
 WINDOWS_PIPE_NAME = r"\\.\pipe\murmly"
 
 
+def absolute_setting(
+    environment: Mapping[str, str], name: str, windows: bool = False
+) -> Path | None:
+    """The folder `name` sets, or None when it is unset, empty or not an absolute path.
+
+    The XDG Base Directory specification says a relative value must be ignored, and
+    that covers `~/x`, which no shell expanded here. Used verbatim, one would aim
+    Murmly at whatever folder the current directory happens to hold.
+    """
+    value = environment.get(name)
+    if not value:
+        return None
+    pure = PureWindowsPath(value) if windows else PurePosixPath(value)
+    return Path(value) if pure.is_absolute() else None
+
+
+def home_directory(env: Mapping[str, str] | None = None, windows: bool = False) -> Path:
+    """The home folder: from `env` when one is given, and only then from `Path.home()`.
+
+    A given environment answers for itself, so a caller that supplies a temporary
+    one is never sent to the real person's home. No usable home in it raises
+    rather than guessing one.
+    """
+    if env is None:
+        return Path.home()
+    name = "USERPROFILE" if windows else "HOME"
+    home = absolute_setting(env, name, windows)
+    if home is None:
+        raise RuntimeError(f"The environment names no absolute home folder in {name}.")
+    return home
+
+
 def default_runtime_dir(env: dict[str, str] | None = None) -> Path | None:
     """Where Murmly's own runtime files -- today, just the command socket -- go.
 
@@ -191,14 +223,14 @@ def default_runtime_dir(env: dict[str, str] | None = None) -> Path | None:
     if profile.operating_system is OperatingSystem.WINDOWS:
         return None
     if profile.operating_system is OperatingSystem.MACOS:
-        return Path.home() / "Library" / "Caches" / "murmly"
+        return home_directory(env) / "Library" / "Caches" / "murmly"
     # Linux, and anything `resolve_platform` could not name (OperatingSystem.OTHER)
-    # keep the answer this always gave, unchanged down to the `env or os.environ`
-    # choice below: an existing install must not see its runtime directory move.
-    environment = env or os.environ
-    runtime_dir = environment.get("XDG_RUNTIME_DIR")
+    # keep the answer this always gave: an existing install must not see its
+    # runtime directory move.
+    environment = env if env is not None else os.environ
+    runtime_dir = absolute_setting(environment, "XDG_RUNTIME_DIR")
     if runtime_dir:
-        return Path(runtime_dir)
+        return runtime_dir
     return Path(f"/run/user/{os.getuid()}")
 
 
@@ -223,19 +255,19 @@ def default_data_dir(env: dict[str, str] | None = None) -> Path:
     """
     profile = resolve_platform(env)
     if profile.operating_system is OperatingSystem.WINDOWS:
-        environment = env or os.environ
-        local_app_data = environment.get("LOCALAPPDATA")
+        environment = env if env is not None else os.environ
+        local_app_data = absolute_setting(environment, "LOCALAPPDATA", windows=True)
         if local_app_data:
-            return Path(local_app_data) / "murmly"
-        return Path.home() / "AppData" / "Local" / "murmly"
+            return local_app_data / "murmly"
+        return home_directory(env, windows=True) / "AppData" / "Local" / "murmly"
     if profile.operating_system is OperatingSystem.MACOS:
-        return Path.home() / "Library" / "Application Support" / "murmly"
+        return home_directory(env) / "Library" / "Application Support" / "murmly"
     # Linux, and OperatingSystem.OTHER, unchanged.
-    environment = env or os.environ
-    xdg_data_home = environment.get("XDG_DATA_HOME")
+    environment = env if env is not None else os.environ
+    xdg_data_home = absolute_setting(environment, "XDG_DATA_HOME")
     if xdg_data_home:
-        return Path(xdg_data_home) / "murmly"
-    return Path.home() / ".local" / "share" / "murmly"
+        return xdg_data_home / "murmly"
+    return home_directory(env) / ".local" / "share" / "murmly"
 
 
 def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
@@ -246,19 +278,19 @@ def default_tts_model_dir(env: dict[str, str] | None = None) -> Path:
 def default_config_path(env: dict[str, str] | None = None) -> Path:
     profile = resolve_platform(env)
     if profile.operating_system is OperatingSystem.WINDOWS:
-        environment = env or os.environ
-        app_data = environment.get("APPDATA")
+        environment = env if env is not None else os.environ
+        app_data = absolute_setting(environment, "APPDATA", windows=True)
         if app_data:
-            return Path(app_data) / "murmly" / "config.toml"
-        return Path.home() / "AppData" / "Roaming" / "murmly" / "config.toml"
+            return app_data / "murmly" / "config.toml"
+        return home_directory(env, windows=True) / "AppData" / "Roaming" / "murmly" / "config.toml"
     if profile.operating_system is OperatingSystem.MACOS:
-        return Path.home() / "Library" / "Application Support" / "murmly" / "config.toml"
+        return home_directory(env) / "Library" / "Application Support" / "murmly" / "config.toml"
     # Linux, and OperatingSystem.OTHER, unchanged.
-    environment = env or os.environ
-    xdg_config_home = environment.get("XDG_CONFIG_HOME")
+    environment = env if env is not None else os.environ
+    xdg_config_home = absolute_setting(environment, "XDG_CONFIG_HOME")
     if xdg_config_home:
-        return Path(xdg_config_home) / "murmly" / "config.toml"
-    return Path.home() / ".config" / "murmly" / "config.toml"
+        return xdg_config_home / "murmly" / "config.toml"
+    return home_directory(env) / ".config" / "murmly" / "config.toml"
 
 
 def is_quiet_at(start: time | None, end: time | None, now: time) -> bool:
