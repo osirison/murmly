@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import os
 import stat
@@ -18,9 +19,12 @@ from murmly.config import default_config_path, validate_setting
 #: raced.
 MAX_WRITE_ATTEMPTS = 3
 
-#: A file's modification time and size, or None for a file that does not exist.
-#: Both, because a coarse clock can give an edit the same modification time.
-FileStamp = tuple[int, int] | None
+#: A file's modification time, size and a hash of its content, or None for a file
+#: that does not exist. The content is part of it because a coarse clock (Windows
+#: updates a file's time in steps of several milliseconds) can give an edit the same
+#: modification time, and an edit can keep the size; only the content tells
+#: those apart. A settings file is a few kilobytes, so reading it is cheap.
+FileStamp = tuple[int, int, str] | None
 
 
 class SettingsFileError(RuntimeError):
@@ -41,12 +45,14 @@ class WriteResult:
     created: bool
 
 
-def _stamp(path: Path) -> FileStamp:
+def file_stamp(path: Path) -> FileStamp:
+    """The file's stamp now; two stamps are equal only when nothing about it differs."""
     try:
         info = path.stat()
+        data = path.read_bytes()
     except FileNotFoundError:
         return None
-    return (info.st_mtime_ns, info.st_size)
+    return (info.st_mtime_ns, info.st_size, hashlib.sha256(data).hexdigest())
 
 
 class SettingsWriter:
@@ -80,7 +86,7 @@ class SettingsWriter:
         validate_setting(key, value)
         table_name, _, name = key.partition(".")
 
-        file_changed = self._has_read and _stamp(self.path) != self._read_stamp
+        file_changed = self._has_read and self._stamp_now() != self._read_stamp
         for _ in range(MAX_WRITE_ATTEMPTS):
             stamp, text = self._read_text()
             self._parse(text)
@@ -92,21 +98,31 @@ class SettingsWriter:
             written = tomllib.loads(updated).get(table_name, {})
             if not isinstance(written, dict) or written.get(name) != value:
                 raise SettingsFileError(f"{key} could not be written to {self.path} unchanged.")
-            if _stamp(self.path) != stamp:
+            if self._stamp_now() != stamp:
                 file_changed = True
                 continue
             self._replace(updated, existed=stamp is not None)
-            self._read_stamp = _stamp(self.path)
+            self._read_stamp = self._stamp_now()
             self._has_read = True
             return WriteResult(self.path, file_changed=file_changed, created=stamp is None)
         raise SettingsFileError(f"{self.path} kept changing while {key} was being written.")
 
-    def _read_text(self) -> tuple[FileStamp, str]:
+    def _stamp_now(self) -> FileStamp:
         try:
-            stamp = _stamp(self.path)
-            if stamp is None:
+            return file_stamp(self.path)
+        except OSError as error:
+            raise SettingsFileError(f"Unable to read {self.path}: {error}") from error
+
+    def _read_text(self) -> tuple[FileStamp, str]:
+        """The file's text and the stamp of exactly the bytes that text came from."""
+        try:
+            try:
+                info = self.path.stat()
+                data = self.path.read_bytes()
+            except FileNotFoundError:
                 return None, ""
-            return stamp, self.path.read_bytes().decode("utf-8")
+            stamp = (info.st_mtime_ns, info.st_size, hashlib.sha256(data).hexdigest())
+            return stamp, data.decode("utf-8")
         except (OSError, UnicodeDecodeError) as error:
             raise SettingsFileError(f"Unable to read {self.path}: {error}") from error
 

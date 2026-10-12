@@ -3,6 +3,7 @@ refusals, the unreadable file and the hand edit, all against a temporary file.""
 
 from __future__ import annotations
 
+import os
 import tempfile
 import tomllib
 import unittest
@@ -242,6 +243,21 @@ class HandEditTests(SettingsCase):
         self.assertTrue(state.changed)
         self.assertEqual("accurate", state.values["stt.model_profile"])
         self.assertIsNone(self.model.poll())
+
+    def test_an_edit_that_keeps_the_size_and_the_modification_time_is_still_noticed(self) -> None:
+        self.model.load()
+        before = self.path.stat()
+        edited = ORIGINAL.replace('"balanced"', '"accurate"')
+        self.assertEqual(len(ORIGINAL), len(edited))
+        self.path.write_text(edited, encoding="utf-8")
+        os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = self.path.stat()
+        self.assertEqual((before.st_size, before.st_mtime_ns), (after.st_size, after.st_mtime_ns))
+
+        state = self.model.poll()
+
+        self.assertIsNotNone(state)
+        self.assertEqual("accurate", state.values["stt.model_profile"])
 
     def test_the_apps_own_write_is_not_mistaken_for_a_hand_edit(self) -> None:
         self.model.load()

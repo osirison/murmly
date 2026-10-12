@@ -22,7 +22,13 @@ from pathlib import Path
 from murmly import config
 from murmly.config import MODEL_PROFILES, MurmlyConfig, SettingValueError, load_config
 from murmly.settings_apply import RestartOutcome, RestartStatus
-from murmly.settings_writer import ConfigParseError, SettingsFileError, SettingsWriter
+from murmly.settings_writer import (
+    ConfigParseError,
+    FileStamp,
+    SettingsFileError,
+    SettingsWriter,
+    file_stamp,
+)
 
 #: The quiet window written when the person switches quiet hours on.
 DEFAULT_QUIET_WINDOW = "22:00-07:00"
@@ -179,14 +185,6 @@ def values_from(config_: MurmlyConfig) -> dict[str, object]:
     }
 
 
-def _stamp(path: Path) -> tuple[int, int] | None:
-    try:
-        info = path.stat()
-    except OSError:
-        return None
-    return (info.st_mtime_ns, info.st_size)
-
-
 class SettingsModel:
     """Reads the configuration file and writes one key at a time.
 
@@ -203,7 +201,7 @@ class SettingsModel:
         self.writer = writer if writer is not None else SettingsWriter()
         self._loader = loader
         self._values: dict[str, object] = {}
-        self._stamp: tuple[int, int] | None = None
+        self._stamp: FileStamp = None
         self._read_once = False
 
     @property
@@ -213,7 +211,10 @@ class SettingsModel:
     def load(self, *, changed: bool = False) -> SettingsState:
         """Read the file. A file that does not parse comes back as an error, not raised."""
         path = self.writer.path
-        self._stamp = _stamp(path)
+        try:
+            self._stamp = file_stamp(path)
+        except OSError:
+            self._stamp = None
         self._read_once = True
         try:
             self.writer.read()
@@ -230,7 +231,12 @@ class SettingsModel:
 
     def poll(self) -> SettingsState | None:
         """The file read again if it changed on disk since the last read, else None."""
-        if not self._read_once or _stamp(self.writer.path) == self._stamp:
+        if not self._read_once:
+            return None
+        try:
+            if file_stamp(self.writer.path) == self._stamp:
+                return None
+        except OSError:
             return None
         return self.load(changed=True)
 
