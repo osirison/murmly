@@ -49,13 +49,11 @@ the font. The app loads them from files inside the `murmly.app` package, never
 from the network or from the system, so they are in the wheel, and the wheel
 carries these two license files with them (`license-files` in `pyproject.toml`).
 
-Each is a latin subset of the upstream static TrueType file at the weights the
-design uses (Instrument Sans 400, 500, 600; IBM Plex Mono 400, 600), cut with
-`pyftsubset` and with the style names set so Qt groups the weights into one
-family. `src/murmly/app/fonts/README.md` records each file's source, version and
-recipe.
-
-The Plex license reserves the font name "Plex" for the unmodified font. The
-subsets keep the family name "IBM Plex Mono", as the widely used web-font
-packaging of the same files does, because the app asks for that family by name;
-a stricter reading of the reserved name would mean renaming them.
+Instrument Sans is a latin subset of the upstream static TrueType file at the
+weights the design uses (400, 500, 600), cut with `pyftsubset`, with the style
+names set so Qt groups the weights into one family. It has no reserved font
+name, so a modified version may keep it. IBM Plex Mono (400, 600) is shipped
+unmodified: the Plex license reserves the font name "Plex", and a subset or a
+renamed font may not carry it, so the files are the exact upstream release files
+and their sha256 is checked by a test. `src/murmly/app/fonts/README.md` records
+each file's source, version and recipe.

@@ -1,8 +1,9 @@
 """The fonts the app ships, and how it registers them with Qt.
 
 Instrument Sans for anything a person reads, IBM Plex Mono for anything the
-machine owns. Both are SIL OFL fonts, latin subsets kept as files in this
-package (see `fonts/README.md` for their sources) and loaded from there, so
+machine owns. Both are SIL OFL fonts kept as files in this package (Instrument
+Sans as latin subsets, IBM Plex Mono unmodified because its licence reserves the
+name; see `fonts/README.md`) and loaded from there, so
 the app renders the same with no network and no font installed on the system.
 """
 

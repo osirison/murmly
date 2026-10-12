@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import tomllib
 import unittest
@@ -11,6 +12,11 @@ from qt_app import qt_application
 
 REPO = Path(__file__).resolve().parent.parent
 APP_DIR = Path(fonts.__file__).resolve().parent
+
+PLEX_SHA256 = {
+    "IBMPlexMono-Regular.ttf": "7c6fbddca4b700be918f5f6183d9bd4464fa427fe435f0b480d77fe2bb8c5a43",
+    "IBMPlexMono-SemiBold.ttf": "f04d7c488ddf7d1fa99f2574efc3406ea4cbe17bb1af3a1ab960f84d0c96a172",
+}
 
 
 class BundledFontFileTests(unittest.TestCase):
@@ -34,11 +40,21 @@ class BundledFontFileTests(unittest.TestCase):
             with self.subTest(licence=licence):
                 self.assertIn(licence, readme)
 
-    def test_the_fonts_are_latin_subsets_not_the_full_files(self) -> None:
-        # The upstream files are 85 to 175 kB each; a subset is about 27 to 50.
+    def test_instrument_sans_is_a_latin_subset_not_the_full_file(self) -> None:
+        # The upstream files are about 86 kB each; a subset is about 48.
         for path in fonts.font_paths():
-            with self.subTest(font=path.name):
-                self.assertLess(path.stat().st_size, 60_000)
+            if path.name.startswith("Instrument"):
+                with self.subTest(font=path.name):
+                    self.assertLess(path.stat().st_size, 60_000)
+
+    def test_ibm_plex_mono_is_the_unmodified_upstream_file(self) -> None:
+        # The Plex licence reserves the name "Plex", so a subset or a renamed
+        # font may not carry it. These must stay byte-identical to the
+        # @ibm/plex-mono 2.5.0 release; do not re-subset them.
+        for name, digest in PLEX_SHA256.items():
+            with self.subTest(font=name):
+                data = (fonts.FONTS_DIR / name).read_bytes()
+                self.assertEqual(digest, hashlib.sha256(data).hexdigest())
 
     def test_the_wheel_ships_the_font_files(self) -> None:
         config = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))

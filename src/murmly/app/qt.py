@@ -99,6 +99,7 @@ class Theme(QObject):
     # Qt 6.11 has no setting for the system's reduced-motion preference, so
     # this is False on every platform until Qt (or a per-platform lookup)
     # supplies one. Nothing animates yet; the property is where animations ask.
+    # Any animation added later must first read the platform setting.
     @Property(bool, constant=True)
     def reducedMotion(self) -> bool:
         return False
