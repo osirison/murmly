@@ -632,5 +632,57 @@ class SetupShSurfaceTests(SetupShTestCase):
             self.assertIn(f"ran:{command}", result.stdout)
 
 
+class SetupShUninstallTests(SetupShTestCase):
+    """`uninstall --purge`: where it deletes, and when it refuses to. `rm` is a function
+    that only records its arguments, so nothing here deletes anything."""
+
+    def _uninstall(self, murmly_exit: int, xdg: str = "") -> subprocess.CompletedProcess[str]:
+        home = self.repo / "home"
+        (home / ".local" / "share" / "murmly").mkdir(parents=True)
+        (self.repo / ".venv").mkdir(exist_ok=True)
+        return run_bash(
+            f'export HOME="{home}" XDG_DATA_HOME="" XDG_CONFIG_HOME=""\n{xdg}'
+            "source ./setup.sh\n"
+            "require_uv() { :; }\n"
+            "remove_announce_hook() { :; }\n"
+            f"murmly() {{ return {murmly_exit}; }}\n"
+            "confirm() { return 0; }\n"
+            'rm() { echo "RM $*"; }\n'
+            "PURGE=1\n"
+            "command_uninstall",
+            cwd=self.repo,
+        )
+
+    def test_a_failed_uninstall_keeps_every_file_and_exits_non_zero(self) -> None:
+        result = self._uninstall(murmly_exit=1)
+
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertNotIn("RM", result.stdout)
+        self.assertIn("may still be running", result.stderr)
+
+    def test_a_clean_uninstall_still_purges(self) -> None:
+        result = self._uninstall(murmly_exit=0)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(f"RM -rf -- {self.repo / '.venv'}", result.stdout)
+        self.assertIn(str(self.repo / "home" / ".local" / "share" / "murmly"), result.stdout)
+
+    def test_relative_xdg_values_are_ignored_as_murmly_ignores_them(self) -> None:
+        result = self._uninstall(murmly_exit=0, xdg='export XDG_DATA_HOME="." XDG_CONFIG_HOME="rel/dir"\n')
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn(str(self.repo / "home" / ".local" / "share" / "murmly"), result.stdout)
+        self.assertNotIn("RM -rf -- ./murmly", result.stdout)
+        self.assertNotIn("rel/dir", result.stdout)
+
+    def test_an_absolute_xdg_value_is_used(self) -> None:
+        result = run_bash(
+            'export HOME=/h XDG_DATA_HOME=/data XDG_CONFIG_HOME=""\nsource ./setup.sh\ndata_dir',
+            cwd=self.repo,
+        )
+
+        self.assertEqual("/data/murmly", result.stdout.strip())
+
+
 if __name__ == "__main__":
     unittest.main()

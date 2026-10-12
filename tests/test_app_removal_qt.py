@@ -332,6 +332,24 @@ class RemovingTests(RemovalQtCase):
         self.wait_for(lambda: self.removal.view["step"] == "idle", message="the dialog to close")
         self.assertEqual(0, self.quits)
 
+    def test_settings_work_again_while_the_partial_dialog_shows_and_after_close(self) -> None:
+        self.build()
+        self.child("nav-settings").click()
+        self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
+        self.fake.partial = True
+        self.ask()
+        self.confirm()
+        self.assertEqual("partial", self.removal.view["step"])
+
+        self.settings.change("speak", True)
+        self.wait_for(lambda: self.writer.writes >= 1, message="Settings to write while the dialog shows")
+
+        self.child("remove-close").click()
+        self.wait_for(lambda: self.removal.view["step"] == "idle", message="the dialog to close")
+        writes = self.writer.writes
+        self.settings.change("speak", False)
+        self.wait_for(lambda: self.writer.writes > writes, message="Settings to write after Close")
+
     def test_the_close_button_quits_the_app(self) -> None:
         self.build()
         self.ask()

@@ -48,6 +48,9 @@ from murmly.config import (
     load_config,
 )
 
+# A home folder that is valid on whatever host runs the tests, for a test that patches nothing.
+HOST_HOME_ENV = {"HOME": tempfile.gettempdir(), "USERPROFILE": tempfile.gettempdir()}
+
 
 class ConfigTests(unittest.TestCase):
     def test_default_socket_path_uses_runtime_dir(self) -> None:
@@ -797,8 +800,8 @@ class WindowsAndMacOSPathTests(unittest.TestCase):
 
     def test_macos_paths_use_the_library_directories(self) -> None:
         with patch("sys.platform", "darwin"):
-            home = Path(tempfile.gettempdir())
-            HOME_ENV = {"HOME": str(home)}
+            home = Path("/home/test")  # never written to: only a path to compare
+            HOME_ENV = {"HOME": "/home/test"}
             self.assertEqual(
                 home / "Library" / "Application Support" / "murmly" / "config.toml",
                 default_config_path(HOME_ENV),
@@ -935,7 +938,7 @@ class SpeakerSettingsTests(unittest.TestCase):
             config_path = Path(temp_dir) / "config.toml"
             if body is not None:
                 config_path.write_text(textwrap.dedent(body), encoding="utf-8")
-            return load_config(config_path, {"HOME": tempfile.gettempdir()})
+            return load_config(config_path, HOST_HOME_ENV)
 
     def test_defaults_when_the_table_is_absent(self) -> None:
         config = self._load(None)
@@ -1023,9 +1026,9 @@ class SpeakerSettingsTests(unittest.TestCase):
         """Task 3.2: the data directory is the one place both models live."""
         for platform_name, env in (
             ("linux", {"XDG_DATA_HOME": "/data"}),
-            ("linux", {"HOME": tempfile.gettempdir()}),
+            ("linux", {"HOME": "/home/test"}),
             ("win32", {"LOCALAPPDATA": r"C:\Users\a\AppData\Local"}),
-            ("darwin", {"HOME": tempfile.gettempdir()}),
+            ("darwin", {"HOME": "/home/test"}),
         ):
             with self.subTest(platform=platform_name, env=env), patch("sys.platform", platform_name):
                 self.assertEqual(default_data_dir(env), default_tts_model_dir(env))

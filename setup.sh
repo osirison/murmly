@@ -219,8 +219,17 @@ sync_environment() {
 
 # --------------------------------------------------------------- models -----
 
+#: An XDG folder: the setting when it is an absolute path, else the default. The
+#: XDG specification says to ignore a relative value, and so does `murmly`.
+xdg_home() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s\n' "$2" ;;
+    esac
+}
+
 data_dir() {
-    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/murmly"
+    printf '%s/murmly\n' "$(xdg_home "${XDG_DATA_HOME:-}" "$HOME/.local/share")"
 }
 
 #: The synthesis models live directly in the data directory, which is what
@@ -724,13 +733,15 @@ command_uninstall() {
     remove_announce_hook
 
     step "Service and hotkeys"
+    local uninstall_failed=0
     if ! murmly uninstall; then
+        uninstall_failed=1
         warn "murmly uninstall reported a failure. Check what is left with: uv run --no-sync murmly doctor"
     fi
 
     local models config
     models="$(model_dir)"
-    config="${XDG_CONFIG_HOME:-$HOME/.config}/murmly"
+    config="$(xdg_home "${XDG_CONFIG_HOME:-}" "$HOME/.config")/murmly"
 
     if [ "$PURGE" -eq 0 ]; then
         step "Kept"
@@ -739,6 +750,15 @@ command_uninstall() {
         note "Configuration:       $config"
         note "Pass --purge to remove these too."
         return 0
+    fi
+
+    if [ "$uninstall_failed" -eq 1 ]; then
+        step "Purge"
+        warn "Nothing was removed: the service may still be running with these files open."
+        note "Virtual environment: $REPO/.venv"
+        note "Synthesis models:    $models"
+        note "Configuration:       $config"
+        return 1
     fi
 
     local -a targets=()

@@ -190,8 +190,9 @@ def absolute_setting(
     value = environment.get(name)
     if not value:
         return None
+    # Absolute in the shape the platform being answered for uses, or on this host.
     pure = PureWindowsPath(value) if windows else PurePosixPath(value)
-    return Path(value) if pure.is_absolute() else None
+    return Path(value) if pure.is_absolute() or Path(value).is_absolute() else None
 
 
 def home_directory(env: Mapping[str, str] | None = None, windows: bool = False) -> Path:

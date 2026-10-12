@@ -3506,7 +3506,9 @@ class SocketAccessTests(ServedDaemonTests):
             expected_path = Path(runtime_dir.name) / "murmly.sock"
 
         with patch.object(Path, "home", return_value=Path(home_dir.name)):
-            socket_path = default_socket_path({"XDG_RUNTIME_DIR": runtime_dir.name})
+            socket_path = default_socket_path(
+                {"XDG_RUNTIME_DIR": runtime_dir.name, "HOME": home_dir.name}
+            )
             config = MurmlyConfig(
                 socket_path=socket_path,
                 config_path=Path(runtime_dir.name) / "config.toml",
