@@ -25,9 +25,9 @@ skip themselves when none is available.
 ## 4. Settings
 
 - [x] 4.1 Write a single key with `tomlkit`, validated by `murmly.config`'s rules, written atomically and mtime-checked; verify tests that comments and key order survive, an out-of-range value is refused, an unparseable file is left byte-for-byte unchanged, and a file changed on disk is re-read first
-- [ ] 4.2 Build the Dictation and Speech settings sections from the canvas; verify a test that each control writes the documented key and value
+- [x] 4.2 Build the Dictation and Speech settings sections from the canvas; verify a test that each control writes the documented key and value
 - [x] 4.3 Apply changes by restarting the service through the installer once the daemon reports idle; verify tests that a save while idle restarts at once and a save during capture waits until idle
-- [ ] 4.4 Document the app's Settings in the manual's settings page; verify `mkdocs build --strict` passes
+- [x] 4.4 Document the app's Settings in the manual's settings page; verify `mkdocs build --strict` passes
 
 ## 5. Health
 

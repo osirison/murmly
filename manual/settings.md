@@ -3,6 +3,28 @@
 Murmly runs on its defaults, so you never have to configure it. This page
 exists for when you want to change one thing.
 
+## Changing a setting in the app
+
+The Murmly app (`murmly app`) has a Settings page for the settings most people
+change. Each change is saved as soon as you make it, and Murmly restarts in the
+background to use it once nothing is being recorded, transcribed or spoken, so a
+recording in progress is never cut off. The page says "will apply when Murmly is
+idle" while it waits.
+
+The app writes only the one setting you changed. Your comments, the order of the
+lines and every other value stay as you wrote them. If you edit the file by hand
+while the app is open, the page notices, reads it again and tells you the file
+changed.
+
+Two things stop a change from being saved. A value outside its range is refused,
+and the page says what range the setting accepts. A file that does not parse
+is never written to: Settings shows the parser's error exactly as it reported it,
+turns every control off, and turns them back on once you have fixed the file.
+
+Where a setting below has an **In the app** line, that is where it lives. A
+setting without one is changed in the file, as the rest of this page describes.
+Settings the app does not show are left alone, whatever they hold.
+
 ## Where the file lives
 
 Murmly reads its settings from `~/.config/murmly/config.toml`, or from
@@ -124,12 +146,16 @@ which transcription model murmly uses — a trade between speed, memory, and
 accuracy explained in full on
 [speed, memory, and your graphics card](speed-and-memory.md).
 
+**In the app:** Settings, then Accuracy and speed. Pick Fast, Balanced or Accurate.
+
 ### `stt.device` { #stt-device }
 
 Default `"auto"`. Permitted words: `auto | cpu | cuda`. Chooses the processor
 transcription runs on. See
 [speed, memory, and your graphics card](speed-and-memory.md) for how `auto`
 resolves.
+
+**In the app:** Settings, then Accuracy and speed, then Run it on.
 
 ### `stt.compute_type` { #stt-compute-type }
 
@@ -150,6 +176,8 @@ transcription model's memory after this many idle seconds. Fully explained,
 with what it costs and returns, on
 [speed, memory, and your graphics card](speed-and-memory.md).
 
+**In the app:** Settings, then Accuracy and speed, then Give memory back when idle. Switching it on writes `300`; switching it off writes `0`. Any other period is set in the file, and the app leaves it as you wrote it.
+
 Two more keys live in this section but are commented out by default, and
 follow whichever profile you chose unless you set them yourself:
 
@@ -169,6 +197,8 @@ Default `false`. Shows partial transcripts while you
 speak. Explained in full on
 [seeing your words as you speak](words-as-you-speak.md).
 
+**In the app:** Settings, then Words as you speak, then Show my words while I speak.
+
 ### `stt.live_interval_ms` { #stt-live-interval-ms }
 
 Default `1000`. Range `250-10000`. How often a partial transcript is
@@ -186,10 +216,14 @@ Default `"off"`. Permitted words: `off | stop | continuous`. Lets a pause in
 your speech end the recording instead of pressing the key again. Explained in
 full on [finishing a recording by pausing](pause-to-finish.md).
 
+**In the app:** Settings, then Finishing a recording.
+
 ### `stt.auto_transcribe_silence_ms` { #stt-auto-transcribe-silence-ms }
 
 Default `2000`. Range `250-30000`. How much silence triggers auto-transcribe.
 See [finishing a recording by pausing](pause-to-finish.md).
+
+**In the app:** Settings, then Finishing a recording, then Pause length. It appears once a pause ends a recording, and its slider runs from 250 to 5000. A longer pause, up to `30000`, is set in the file, and the app leaves it as you wrote it.
 
 ### `stt.auto_transcribe_min_speech_ms` { #stt-auto-transcribe-min-speech-ms }
 
@@ -205,6 +239,8 @@ Default `true`. Whether murmly restores whatever was on
 your clipboard before it pasted your transcript. Explained in full on
 [where your words go](where-your-words-go.md).
 
+**In the app:** Settings, then Typing your words, then Put my clipboard back afterwards.
+
 ### `clipboard.restore_delay_ms` { #clipboard-restore-delay-ms }
 
 Default `500`. Range `0-5000`. How long murmly waits before restoring the
@@ -216,12 +252,16 @@ previous clipboard contents. See
 Default `true`. Refuses to paste if focus left the
 window you dictated into. See [where your words go](where-your-words-go.md).
 
+**In the app:** Settings, then Typing your words, then Check the window before typing.
+
 ## `[overlay]` — the on-screen indicator
 
 ### `overlay.enabled` { #overlay-enabled }
 
 Default `true`. Whether the small on-screen indicator
 appears while you record.
+
+**In the app:** Settings, then On-screen indicator, then Show it at the bottom of the screen.
 
 ### `overlay.bottom_margin_px` { #overlay-bottom-margin-px }
 
@@ -232,10 +272,14 @@ the bottom edge of your display.
 
 Default `false`. Turns off the indicator's animation.
 
+**In the app:** Settings, then On-screen indicator, then Reduce motion.
+
 ### `overlay.text_size_px` { #overlay-text-size-px }
 
 Default `13`. Range `8-48`. The text size of the transcript panel shown in
 the indicator.
+
+**In the app:** Settings, then On-screen indicator, then Text size for words as you speak.
 
 ## `[tts]` — speaking back to you
 
@@ -244,15 +288,21 @@ the indicator.
 Default `false`. Turns speech output on. Explained in
 full on [making murmly speak](making-murmly-speak.md).
 
+**In the app:** Settings, then Speech, then Let murmly speak.
+
 ### `tts.voice` { #tts-voice }
 
 Default `"af_heart"`. An English voice the speech model
 carries. See [making murmly speak](making-murmly-speak.md).
 
+**In the app:** Settings, then Speech, then Voice. The app lists four voices, and also the one your file names when it is another. Any other voice is set in the file.
+
 ### `tts.rate` { #tts-rate }
 
 Default `100`. Range `50-200`. A percentage of the voice model's own speaking
 rate. See [making murmly speak](making-murmly-speak.md).
+
+**In the app:** Settings, then Speech, then Speaking rate.
 
 ### `tts.device` { #tts-device }
 
@@ -260,6 +310,8 @@ Default `"cpu"`. Permitted words: `auto | cpu | cuda`, independent of
 `stt.device`. Chooses the processor speech output runs on. Fully explained,
 with the memory and speed trade-off, on
 [speed, memory, and your graphics card](speed-and-memory.md).
+
+**In the app:** Settings, then Speech, then Sound and speed, then Make speech on.
 
 ### `tts.unload_after_idle_s` { #tts-unload-after-idle-s }
 
@@ -305,6 +357,8 @@ choosing to make a noise.
 A window murmly cannot read leaves it with no window rather than
 stopping the service. [`murmly doctor`](troubleshooting.md) names what
 was not honoured, and reports whether the window is in force right now.
+
+**In the app:** Settings, then Speech, then Quiet hours. The switch writes `"22:00-07:00"` or an empty window, and the From and Until fields change one end of it. The app refuses two equal times and says what it accepts.
 
 ### `tts.model_dir` { #tts-model-dir }
 
@@ -361,7 +415,8 @@ Like any value outside the range, it falls back to `30`, and
 
 ## After you change something
 
-Restart the service after changing configuration:
+The app restarts the service for you once Murmly is idle. If you changed the file
+by hand, restart the service yourself:
 
 ```bash
 systemctl --user restart murmly.service
