@@ -13,7 +13,7 @@ from PySide6.QtGui import QFont, QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
-from murmly.app import fonts, shell, theme
+from murmly.app import controller, fonts, shell, theme
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
 MAIN_QML = QML_DIR / "Main.qml"
@@ -122,12 +122,24 @@ def prepare_application() -> list[Path]:
     return refused
 
 
-def create_engine() -> tuple[QQmlApplicationEngine, Theme]:
-    """Load the window. The caller keeps both returned objects alive."""
+def create_engine(
+    home: controller.HomeController | None = None,
+) -> tuple[QQmlApplicationEngine, Theme]:
+    """Load the window. The caller keeps both returned objects alive.
+
+    `home` is the controller QML reads as `home`; by default one that polls the
+    real daemon. A test passes one with a fake behind it, so no test asks the
+    machine's own daemon anything.
+    """
     engine = QQmlApplicationEngine()
     theme_object = Theme(engine)
+    if home is None:
+        home = controller.HomeController(controller.default_model())
+    # The engine owns it from here, so QML never outlives what it reads.
+    home.setParent(engine)
     context = engine.rootContext()
     context.setContextProperty("theme", theme_object)
+    context.setContextProperty("home", home)
     context.setContextProperty("sections", list(shell.SECTIONS))
     engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
     return engine, theme_object

@@ -4,7 +4,8 @@ import time
 import unittest
 from pathlib import Path
 
-from murmly.app import shell, theme
+from home_fakes import FakeChannel
+from murmly.app import home, shell, theme
 
 from qt_app import MessageLog, qt_application
 
@@ -25,13 +26,15 @@ class ShellTests(unittest.TestCase):
         cls.application = qt_application()
 
     def setUp(self) -> None:
-        from murmly.app import qt
+        from murmly.app import controller, qt
 
         self.log = MessageLog()
         self.log.__enter__()
         self.addCleanup(self.log.__exit__)
         self.assertEqual([], qt.prepare_application())
-        self.engine, self.theme = qt.create_engine()
+        # A fake daemon behind Home: no test asks this machine's own daemon anything.
+        self.home = controller.HomeController(home.HomeModel(FakeChannel()))
+        self.engine, self.theme = qt.create_engine(self.home)
         self.addCleanup(self._close)
         roots = self.engine.rootObjects()
         self.assertEqual(1, len(roots))
@@ -39,6 +42,7 @@ class ShellTests(unittest.TestCase):
         self.settle()
 
     def _close(self) -> None:
+        self.home.shutdown()
         self.window.close()
         self.engine.deleteLater()
         self.settle()
@@ -175,7 +179,7 @@ class ShellTests(unittest.TestCase):
         for path in QML_DIR.glob("*.qml"):
             with self.subTest(file=path.name):
                 text = path.read_text(encoding="utf-8")
-                for call in ("raise(", "requestActivate", "forceActiveFocus"):
+                for call in ("raise(", "requestActivate", "forceActiveFocus", "alert("):
                     self.assertNotIn(call, text)
 
 

@@ -15,4 +15,6 @@ Text {
     lineHeight: spec.lineHeight
     lineHeightMode: Text.ProportionalHeight
     wrapMode: Text.Wrap
+    // Daemon strings and transcripts are shown as written: `<b>` and `&amp;` stay literal.
+    textFormat: Text.PlainText
 }

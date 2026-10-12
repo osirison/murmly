@@ -19,6 +19,13 @@ ApplicationWindow {
     visible: true
     color: theme.colors.surface
 
+    // Polling the daemon runs only while a person can see the window. The tray
+    // panel reports itself the same way, as the surface "tray".
+    readonly property bool onScreen: visible && visibility !== Window.Minimized
+        && visibility !== Window.Hidden
+    onOnScreenChanged: home.setSurfaceVisible("window", onScreen)
+    Component.onCompleted: home.setSurfaceVisible("window", onScreen)
+
     header: Rectangle {
         implicitHeight: theme.layout.hHeader
         color: theme.colors.surface
@@ -81,6 +88,13 @@ ApplicationWindow {
             }
 
             Item { Layout.fillWidth: true }
+
+            StateChip {
+                objectName: "state-chip"
+                visible: text !== ""
+                text: home.view.chip !== undefined ? home.view.chip : ""
+                tone: home.view.tone !== undefined ? home.view.tone : "neutral"
+            }
         }
     }
 
@@ -91,9 +105,12 @@ ApplicationWindow {
         Repeater {
             model: sections
 
-            SectionPage {
+            // Home is its own page; the other sections are empty for now.
+            Loader {
                 objectName: "page-" + modelData.id
-                title: modelData.title
+                property string title: modelData.title
+                source: modelData.id === "home" ? "HomePage.qml" : "SectionPage.qml"
+                onLoaded: item.title = title
             }
         }
     }

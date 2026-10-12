@@ -21,14 +21,16 @@ def run() -> int:
 
     from PySide6.QtGui import QGuiApplication
 
-    from murmly.app import qt
+    from murmly.app import controller, qt
 
     application = QGuiApplication(sys.argv[:1])
     application.setApplicationName(APP_TITLE)
     for path in qt.prepare_application():
         print(f"murmly: the bundled font {path.name} could not be loaded.", file=sys.stderr)
-    # Both stay referenced until the event loop ends; QML holds only weak ties.
-    engine, theme = qt.create_engine()
+    # All three stay referenced until the event loop ends; QML holds only weak ties.
+    home = controller.HomeController(controller.default_model())
+    application.aboutToQuit.connect(home.shutdown)
+    engine, theme = qt.create_engine(home)
     if not engine.rootObjects():
         print("murmly: the app window could not be created.", file=sys.stderr)
         return 1

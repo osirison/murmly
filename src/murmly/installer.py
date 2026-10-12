@@ -1121,6 +1121,30 @@ class InstallOutcome:
     session_hotkey_registered: bool = False
 
 
+def default_service(profile: PlatformProfile | None = None) -> object:
+    """The service backend `SERVICE_MANAGEMENT` selects for `profile`.
+
+    `UserService()` -- systemd -- is the fallback when no candidate
+    matches at all: `cli.main` already refuses a platform with no backend
+    here before `Installer` is ever constructed (task 1.7), so this branch
+    exists only for a caller (a test, or a future platform) that reaches
+    this function directly. It is not a claim that systemd works there.
+
+    The desktop app calls this too, to start the service it finds stopped.
+    """
+    from murmly.platform import SERVICE_MANAGEMENT, resolve_platform
+
+    choice = SERVICE_MANAGEMENT.select(profile if profile is not None else resolve_platform())
+    if choice.load is None:
+        return UserService()
+    # `load()` yields the backend *class* (`BackendCandidate.load`'s own
+    # contract -- see `test_platform.py`'s `assertIs(UserService,
+    # choice.load())`), so the class itself has to be instantiated here;
+    # returning `choice.load()` directly would hand `install()` an
+    # unbound class rather than a service to call methods on.
+    return choice.load()()
+
+
 class Installer:
     """Orchestrates the service and the hotkey as one operation.
 
@@ -1205,25 +1229,8 @@ class Installer:
         self._poll_interval = poll_interval
 
     def _default_service(self) -> object:
-        """The service backend `SERVICE_MANAGEMENT` selects for `self._profile`.
-
-        `UserService()` -- systemd -- is the fallback when no candidate
-        matches at all: `cli.main` already refuses a platform with no backend
-        here before `Installer` is ever constructed (task 1.7), so this branch
-        exists only for a caller (a test, or a future platform) that reaches
-        this class directly. It is not a claim that systemd works there.
-        """
-        from murmly.platform import SERVICE_MANAGEMENT
-
-        choice = SERVICE_MANAGEMENT.select(self._profile)
-        if choice.load is None:
-            return UserService()
-        # `load()` yields the backend *class* (`BackendCandidate.load`'s own
-        # contract -- see `test_platform.py`'s `assertIs(UserService,
-        # choice.load())`), so the class itself has to be instantiated here;
-        # returning `choice.load()` directly would hand `install()` an
-        # unbound class rather than a service to call methods on.
-        return choice.load()()
+        """The service backend `SERVICE_MANAGEMENT` selects for `self._profile`."""
+        return default_service(self._profile)
 
     def _current_session(self):
         if self._session is not None:
