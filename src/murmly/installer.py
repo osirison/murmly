@@ -878,8 +878,18 @@ class WindowsUserService:
         `returncode` or logs `stdout`/`stderr` as a diagnostic, so a
         replacement character in place of an unmappable byte costs nothing
         this code relies on.
+
+        The task is started and stopped from the desktop app, which has no
+        console. A process with no console that spawns a console program
+        gets a visible console window, which can take focus from the window
+        the person just dictated into, so Windows spawns pass
+        `CREATE_NO_WINDOW` (a `subprocess` constant that exists only on
+        Windows, hence the literal fallback).
         """
         command = [self._binary, *arguments]
+        extra: dict[str, int] = {}
+        if sys.platform == "win32":
+            extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         try:
             return self._run_command(
                 command,
@@ -889,6 +899,7 @@ class WindowsUserService:
                 errors="replace",
                 check=False,
                 timeout=COMMAND_TIMEOUT_SECONDS,
+                **extra,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise InstallError(f"Unable to run '{' '.join(command)}': {error}") from error
