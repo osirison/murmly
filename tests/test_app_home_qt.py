@@ -191,7 +191,7 @@ class HomeContentTests(HomeQtCase):
         self.home._model._key_reader = lambda: self.model_keys
         self.home._model.reload()
         self.wait_for(lambda: self.child("setup").property("visible"), message="setup summary")
-        self.wait_for(lambda: self.text("footer") == "service running \u00b7 /x/config.toml", message="footer")
+        self.wait_for(lambda: self.text("footer") == f"service running \u00b7 {config.config_path}", message="footer")
         self.wait_for(lambda: self.text("key-note-0") == "set by murmly install", message="keys")
 
     def test_service_not_running_with_no_socket_offers_to_start(self) -> None:
