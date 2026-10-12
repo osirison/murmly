@@ -16,7 +16,7 @@ from murmly.installer import InstallError
 from murmly.settings_apply import RestartWhenIdle
 from murmly.settings_writer import SettingsWriter
 
-from qt_app import MessageLog, qt_application
+from qt_app import MessageLog, qt_application, read_text_retrying
 
 ORIGINAL = """\
 # my own notes
@@ -165,7 +165,7 @@ class SettingsQtCase(unittest.TestCase):
         self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
 
     def data(self) -> dict:
-        return tomllib.loads(self.path.read_text(encoding="utf-8"))
+        return tomllib.loads(read_text_retrying(self.path))
 
     def text(self, name: str) -> str:
         return self.child(name).property("text")

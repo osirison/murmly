@@ -259,6 +259,39 @@ class HandEditTests(SettingsCase):
         self.assertIsNotNone(state)
         self.assertEqual("accurate", state.values["stt.model_profile"])
 
+    def test_a_poll_skips_a_tick_while_the_file_is_locked_and_does_not_see_a_hand_edit(self) -> None:
+        from unittest.mock import patch
+
+        self.model.load()
+        with patch("murmly.app.settings.file_stamp", side_effect=PermissionError(13, "Permission denied")):
+            self.assertIsNone(self.model.poll())
+
+        # The file did not change, so the next tick finds nothing either.
+        self.assertIsNone(self.model.poll())
+
+    def test_a_load_that_meets_a_lock_tries_again_rather_than_reporting_an_error(self) -> None:
+        sleeps: list[float] = []
+        refusals = [2]
+        real = Path.read_bytes
+
+        def read_bytes(path):
+            if refusals[0] > 0:
+                refusals[0] -= 1
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+
+        from unittest.mock import patch
+
+        model = settings.SettingsModel(
+            SettingsWriter(self.path, sleep=sleeps.append, retry_permission_errors=True)
+        )
+        with patch.object(Path, "read_bytes", read_bytes):
+            state = model.load()
+
+        self.assertEqual("", state.error)
+        self.assertTrue(state.values)
+        self.assertIsNone(model.poll())
+
     def test_the_apps_own_write_is_not_mistaken_for_a_hand_edit(self) -> None:
         self.model.load()
         self.model.apply("live", True)

@@ -16,7 +16,12 @@ from murmly.config import (
     load_config,
     validate_setting,
 )
-from murmly.settings_writer import ConfigParseError, SettingsFileError, SettingsWriter
+from murmly.settings_writer import (
+    TRANSIENT_DELAYS_S,
+    ConfigParseError,
+    SettingsFileError,
+    SettingsWriter,
+)
 
 COMMENTED = textwrap.dedent(
     """\
@@ -370,6 +375,83 @@ class SharedValidationTests(unittest.TestCase):
         for key, rule in SETTING_RULES.items():
             with self.subTest(key=key):
                 self.assertTrue(rule.expectation)
+
+
+class LockedFileTests(WriterTestCase):
+    """Windows refuses to replace a file another program has open; that is transient."""
+
+    def writer(self, failures: int, sleeps: list[float], retry: bool = True) -> tuple[SettingsWriter, list[int]]:
+        calls: list[int] = []
+
+        def replace(source, destination) -> None:
+            calls.append(1)
+            if len(calls) <= failures:
+                raise PermissionError(13, "Permission denied", str(destination))
+            os.replace(source, destination)
+
+        return SettingsWriter(self.path, replace=replace, sleep=sleeps.append, retry_permission_errors=retry), calls
+
+    def leftovers(self) -> list[str]:
+        return [name.name for name in self.path.parent.iterdir() if name.name != self.path.name]
+
+    def test_the_replace_is_tried_again_and_succeeds_after_a_few_refusals(self) -> None:
+        self.write_file(COMMENTED)
+        sleeps: list[float] = []
+        writer, calls = self.writer(3, sleeps)
+
+        writer.set("stt.model_profile", "accurate")
+
+        self.assertEqual(4, len(calls))
+        self.assertEqual(3, len(sleeps))
+        self.assertEqual("accurate", tomllib.loads(self.path.read_text(encoding="utf-8"))["stt"]["model_profile"])
+        self.assertEqual([], self.leftovers())
+
+    def test_it_gives_up_after_about_a_second_with_a_clear_error_and_no_temporary_file(self) -> None:
+        self.write_file(COMMENTED)
+        sleeps: list[float] = []
+        writer, calls = self.writer(1000, sleeps)
+
+        with self.assertRaises(SettingsFileError) as raised:
+            writer.set("stt.model_profile", "accurate")
+
+        self.assertIn("Unable to write", str(raised.exception))
+        self.assertIn("Another program may have it open", str(raised.exception))
+        self.assertLessEqual(sum(sleeps), 1.0)
+        self.assertGreater(sum(sleeps), 0.5)
+        self.assertEqual(len(TRANSIENT_DELAYS_S) + 1, len(calls))
+        self.assertEqual(COMMENTED, self.path.read_text(encoding="utf-8"))
+        self.assertEqual([], self.leftovers())
+
+    def test_where_a_permission_error_is_a_permission_it_is_not_retried(self) -> None:
+        self.write_file(COMMENTED)
+        sleeps: list[float] = []
+        writer, calls = self.writer(1000, sleeps, retry=False)
+
+        with self.assertRaises(SettingsFileError):
+            writer.set("stt.model_profile", "accurate")
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], sleeps)
+        self.assertEqual([], self.leftovers())
+
+    def test_reading_the_file_is_tried_again_too(self) -> None:
+        self.write_file(COMMENTED)
+        sleeps: list[float] = []
+        writer, _ = self.writer(0, sleeps)
+        real = Path.read_bytes
+        refusals = [2]
+
+        def read_bytes(path):
+            if refusals[0] > 0:
+                refusals[0] -= 1
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+
+        with patch.object(Path, "read_bytes", read_bytes):
+            data = writer.read()
+
+        self.assertEqual("fast", data["stt"]["model_profile"])
+        self.assertEqual(2, len(sleeps))
 
 
 if __name__ == "__main__":

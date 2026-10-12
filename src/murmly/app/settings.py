@@ -216,7 +216,7 @@ class SettingsModel:
         """Read the file. A file that does not parse comes back as an error, not raised."""
         path = self.writer.path
         try:
-            self._stamp = file_stamp(path)
+            self._stamp = self.writer.stamp()
         except OSError:
             self._stamp = None
         self._read_once = True
