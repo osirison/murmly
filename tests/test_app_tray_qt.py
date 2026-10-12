@@ -16,7 +16,7 @@ from murmly.settings_apply import RestartWhenIdle
 from murmly.settings_writer import SettingsWriter
 from test_app_settings_qt import FakeService
 
-from qt_app import MessageLog, qt_application
+from qt_app import MessageLog, qt_application, read_text_retrying
 
 CONFIG = """\
 # my own notes
@@ -87,7 +87,7 @@ class TrayQtCase(unittest.TestCase):
     def settle(self) -> None:
         self.application.processEvents()
 
-    def wait_for(self, predicate, timeout: float = 4.0, message: str = "condition") -> None:
+    def wait_for(self, predicate, timeout: float = 6.0, message: str = "condition") -> None:
         started = time.monotonic()
         while time.monotonic() - started < timeout:
             self.settle()
@@ -115,7 +115,7 @@ class TrayQtCase(unittest.TestCase):
         return self.child(name).property("text")
 
     def data(self) -> dict:
-        return tomllib.loads(self.path.read_text(encoding="utf-8"))
+        return tomllib.loads(read_text_retrying(self.path))
 
     def click_icon(self) -> None:
         from PySide6.QtWidgets import QSystemTrayIcon
@@ -276,8 +276,17 @@ class PanelContentTests(TrayQtCase):
 
 class SwitchTests(TrayQtCase):
     def toggled(self, switch: str, key: str, expected: object) -> None:
+        # What the panel shows once the change is saved and the file read again.
+        # Waiting on that, not on reading the file every few milliseconds from this
+        # thread, keeps the test from holding the file open while the worker swaps
+        # a new one in (Windows refuses to replace a file that is open).
+        on = expected not in (False, "", "off")
         self.child(f"tray-switch-{switch}").click()
-        self.wait_for(lambda: self.lookup(key) == expected, message=f"{key} to be written")
+        self.wait_for(
+            lambda: self.child(f"tray-switch-{switch}").property("on") is on,
+            message=f"{key} to be written ({self.child('tray-message').property('text')!r})",
+        )
+        self.assertEqual(expected, self.lookup(key))
 
     def lookup(self, key: str) -> object:
         table, _, name = key.partition(".")

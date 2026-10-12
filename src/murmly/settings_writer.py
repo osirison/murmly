@@ -5,8 +5,12 @@ import hashlib
 from pathlib import Path
 import os
 import stat
+import sys
 import tempfile
+import time
 import tomllib
+from collections.abc import Callable
+from typing import TypeVar
 
 import tomlkit
 from tomlkit.items import InlineTable, Table
@@ -18,6 +22,15 @@ from murmly.config import default_config_path, validate_setting
 #: means something else is writing the file, and that is reported rather than
 #: raced.
 MAX_WRITE_ATTEMPTS = 3
+
+#: Windows refuses to open or replace a file while another program has it open
+#: (antivirus, the search indexer, a backup tool, an editor), and says so with
+#: PermissionError, usually for a few milliseconds. These are the waits between
+#: tries, about one second in all, before it is reported. Other platforms do not
+#: retry: there a PermissionError is a permission.
+TRANSIENT_DELAYS_S = (0.02, 0.05, 0.1, 0.2, 0.3, 0.3)
+
+T = TypeVar("T")
 
 #: A file's modification time, size and a hash of its content, or None for a file
 #: that does not exist. The content is part of it because a coarse clock (Windows
@@ -65,10 +78,42 @@ class SettingsWriter:
     file changed: the fresh file is read again and the key applied to that.
     """
 
-    def __init__(self, path: str | Path | None = None, env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        env: dict[str, str] | None = None,
+        *,
+        replace: Callable[[str | Path, str | Path], None] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        retry_permission_errors: bool | None = None,
+    ) -> None:
+        """`replace`, `sleep` and `retry_permission_errors` are injectable so a test can
+        make the file system refuse; the last defaults to on for Windows only."""
         self.path = Path(path) if path else default_config_path(env)
         self._read_stamp: FileStamp = None
         self._has_read = False
+        # Looked up at the time of the call, so patching os.replace reaches it.
+        self._replace_file = replace or (lambda source, destination: os.replace(source, destination))
+        self._sleep = sleep
+        self._retry = sys.platform == "win32" if retry_permission_errors is None else retry_permission_errors
+
+    def retrying(self, action: Callable[[], T]) -> T:
+        """Run `action`, trying again over about a second while it raises PermissionError.
+
+        Only where permission errors are transient (Windows). The last error is raised.
+        """
+        for delay in (*TRANSIENT_DELAYS_S, None):
+            try:
+                return action()
+            except PermissionError:
+                if not self._retry or delay is None:
+                    raise
+                self._sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def stamp(self) -> FileStamp:
+        """The file's stamp now, trying again while another program has it open."""
+        return self.retrying(lambda: file_stamp(self.path))
 
     def read(self) -> dict[str, object]:
         """The file's parsed content, remembering its stamp for the next `set`.
@@ -117,8 +162,7 @@ class SettingsWriter:
         """The file's text and the stamp of exactly the bytes that text came from."""
         try:
             try:
-                info = self.path.stat()
-                data = self.path.read_bytes()
+                info, data = self.retrying(lambda: (self.path.stat(), self.path.read_bytes()))
             except FileNotFoundError:
                 return None, ""
             stamp = (info.st_mtime_ns, info.st_size, hashlib.sha256(data).hexdigest())
@@ -154,7 +198,8 @@ class SettingsWriter:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temporary, mode)
-            os.replace(temporary, self.path)
+            self.retrying(lambda: self._replace_file(temporary, self.path))
         except OSError as error:
             Path(temporary).unlink(missing_ok=True)
-            raise SettingsFileError(f"Unable to write {self.path}: {error}") from error
+            hint = " Another program may have it open." if isinstance(error, PermissionError) else ""
+            raise SettingsFileError(f"Unable to write {self.path}: {error}.{hint}") from error

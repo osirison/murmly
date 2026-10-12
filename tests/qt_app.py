@@ -20,6 +20,25 @@ import unittest
 _PLATFORM_NOISE = ("propagateSizeHints", "systemTrayWindowChanged", "does not support raise()")
 
 
+def read_text_retrying(path, attempts: int = 50) -> str:
+    """The file's text, trying again while Windows has it locked for a swap.
+
+    A test that reads the configuration file every few milliseconds while the
+    app replaces it can hold it open at the moment of the swap, and then reads,
+    or the swap, fails with PermissionError on Windows. Tests read through this.
+    """
+    import time
+
+    for attempt in range(attempts):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.02)
+    raise AssertionError("unreachable")
+
+
 def qt_application():
     """The process's QApplication, or skip the calling test when Qt is not usable."""
     try:
