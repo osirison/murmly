@@ -180,7 +180,9 @@ uv run murmly uninstall --purge
 the models and voices, and asks first. `--yes` answers that question. It leaves the
 announcement hook's script in place, because the coding assistants' own settings still
 point at it until `./setup.sh uninstall` unregisters it. It does not remove the Python
-environment; on Linux `./setup.sh uninstall --purge` does that too.
+environment; on Linux `./setup.sh uninstall --purge` does that too. The transcription
+model is not deleted either: Hugging Face's own cache holds it, outside murmly's folders
+and shared with other programs.
 
 The app does the same from **Settings, Remove murmly**. It first lists everything that
 will be removed, read from what is installed on this computer, and nothing happens until

@@ -595,6 +595,7 @@ def _run_uninstall(purge: bool = False, assume_yes: bool = False) -> int:
         print("--purge deletes:")
         for target in targets:
             print(f"  {target.label}: {target.path}")
+        print("The transcription model is in the shared Hugging Face cache, and stays.")
         delete_files = make_confirm(assume_yes)("Delete these permanently?")
         if not delete_files:
             print("Settings and downloaded models were left in place.")

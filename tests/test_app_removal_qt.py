@@ -147,6 +147,18 @@ class RemovalQtCase(unittest.TestCase):
         self.assertIsNotNone(found, "no dialog named remove-dialog")
         return found
 
+    def activate(self) -> None:
+        """Give the window the focus, as a person clicking into it would. Keys only
+        reach a window that is active, which a real platform (Windows) may not grant
+        a test window."""
+        self.window.requestActivate()
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0 and not self.window.isActive():
+            self.settle()
+            time.sleep(0.01)
+        if not self.window.isActive():
+            self.skipTest("this display does not give a test window the focus")
+
     def open_remove_section(self) -> None:
         self.child("nav-settings").click()
         self.child("settings-go-remove").click()
@@ -226,6 +238,7 @@ class ConfirmationTests(RemovalQtCase):
         paths = [item.property("text") for item in self.items_named("remove-target-path")]
         self.assertCountEqual([str(target.path) for target in TARGETS], paths)
         self.assertEqual("Your settings and downloaded models are kept.", self.child("remove-kept-note").property("text"))
+        self.assertEqual(removal.PURGE_FOOTNOTE, self.child("remove-purge-footnote").property("text"))
         self.assertEqual("Remove murmly", self.child("remove-confirm").property("text"))
 
     def test_the_first_button_to_take_the_focus_is_the_safe_one(self) -> None:
@@ -252,6 +265,7 @@ class ConfirmationTests(RemovalQtCase):
 
         self.build()
         self.ask()
+        self.activate()
 
         QTest.keyClick(self.window, Qt.Key.Key_Escape)
         self.wait_for(lambda: self.removal.view["step"] == "idle", message="Escape to cancel")
@@ -323,7 +337,7 @@ class RemovingTests(RemovalQtCase):
         self.confirm()
         self.assertEqual([True], self.fake.remove_calls)
         lines = [item.property("text") for item in self.items_named("remove-report-line")]
-        self.assertIn("Deleted /home/a/.config/murmly.", lines)
+        self.assertIn(f"Deleted {Path('/home/a/.config/murmly')}.", lines)
 
     def test_settings_changes_stop_once_removal_is_confirmed(self) -> None:
         self.build()

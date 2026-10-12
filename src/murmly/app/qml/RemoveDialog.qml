@@ -205,6 +205,15 @@ Popup {
                     }
 
                     AppText {
+                        objectName: "remove-purge-footnote"
+                        visible: text !== ""
+                        role: "helper"
+                        text: dialog.view.purgeFootnote !== undefined ? dialog.view.purgeFootnote : ""
+                        color: theme.colors.text4
+                        Layout.fillWidth: true
+                    }
+
+                    AppText {
                         objectName: "remove-purge-note"
                         visible: text !== ""
                         role: "body"

@@ -39,6 +39,9 @@ INTRO_NOTHING = "Murmly does not look installed on this computer, so there is no
 KEPT_NOTE = "Your settings and downloaded models are kept."
 PURGE_TITLE = "Also delete my settings and downloaded models"
 PURGE_NOTE = "These are deleted as well, and this cannot be undone."
+#: The transcription model is downloaded by Hugging Face's own cache, shared with other
+#: programs and outside the folders above, so a purge never touches it.
+PURGE_FOOTNOTE = "The transcription model lives in the shared Hugging Face cache and is not deleted."
 CANCEL_LABEL = "Keep murmly"
 CONFIRM_LABEL = "Remove murmly"
 CONFIRM_PURGE_LABEL = "Remove murmly and delete my data"
@@ -149,6 +152,7 @@ def removal_view(state: RemovalState) -> dict:
         "purge": state.purge,
         "purgeTitle": PURGE_TITLE,
         "purgeNote": "",
+        "purgeFootnote": "",
         "purgeTargets": [],
         "keptNote": "",
         "cancelLabel": CANCEL_LABEL,
@@ -168,6 +172,7 @@ def removal_view(state: RemovalState) -> dict:
             {"label": target.label, "path": str(target.path)} for target in plan.purge_targets
         ]
         view["purgeNote"] = PURGE_NOTE if state.purge else ""
+        view["purgeFootnote"] = PURGE_FOOTNOTE
         view["keptNote"] = "" if state.purge else KEPT_NOTE
         view["confirmLabel"] = CONFIRM_PURGE_LABEL if state.purge else CONFIRM_LABEL
     elif state.step == REMOVING:

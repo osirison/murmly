@@ -217,6 +217,12 @@ class PurgeChoiceTests(unittest.TestCase):
 
         self.assertFalse(state.purge)
 
+    def test_it_says_the_transcription_model_is_not_deleted(self) -> None:
+        view = removal.removal_view(self.confirming())
+
+        self.assertIn("Hugging Face cache", view["purgeFootnote"])
+        self.assertIn("not deleted", view["purgeFootnote"])
+
     def test_its_paths_are_named_even_while_it_is_off(self) -> None:
         view = removal.removal_view(self.confirming())
 
