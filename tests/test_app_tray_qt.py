@@ -300,6 +300,19 @@ class SwitchTests(TrayQtCase):
         self.toggled("announce", "tts.enabled", False)
         self.toggled("quiet", "tts.quiet_hours", "")
 
+    def test_off_then_on_restores_the_persons_quiet_window_and_pause_mode(self) -> None:
+        self.build()
+        self.path.write_text(
+            '[stt]\nauto_transcribe = "continuous"\n\n[tts]\nquiet_hours = "23:30-06:00"\n', encoding="utf-8"
+        )
+        self.open_panel()
+        self.wait_for(lambda: self.child("tray-switch-quiet").property("on") is True, message="quiet on")
+
+        self.toggled("quiet", "tts.quiet_hours", "")
+        self.toggled("finish", "stt.auto_transcribe", "off")
+        self.toggled("quiet", "tts.quiet_hours", "23:30-06:00")
+        self.toggled("finish", "stt.auto_transcribe", "continuous")
+
     def test_a_switch_keeps_the_rest_of_the_file_and_the_page_sees_it(self) -> None:
         self.build()
         self.open_panel()

@@ -72,19 +72,53 @@ def is_on(switch_id: str, values: Mapping[str, object]) -> bool:
     return value is True
 
 
-def change_for(switch_id: str, values: Mapping[str, object]) -> tuple[str, object]:
+class SwitchMemory:
+    """What auto-transcribe and quiet hours were set to while they were on.
+
+    Switching either off clears its value in the file, so switching it on again
+    would otherwise lose the person's choice (a custom quiet window, or
+    "continuous"). `observe` is given the Settings view's `values` each time the
+    file is read; it keeps the last value seen while the switch was on. It lives
+    in memory only: a restart of the app forgets it, and the defaults apply.
+    """
+
+    def __init__(self) -> None:
+        self._last: dict[str, str] = {}
+
+    def observe(self, values: Mapping[str, object]) -> None:
+        mode = values.get("finish")
+        if isinstance(mode, str) and mode != FINISH_OFF:
+            self._last["finish"] = mode
+        if values.get("quiet") is True:
+            start, end = values.get("quiet-from"), values.get("quiet-to")
+            if isinstance(start, str) and isinstance(end, str) and start and end:
+                self._last["quiet"] = f"{start}-{end}"
+
+    def last(self, switch_id: str) -> str | None:
+        return self._last.get(switch_id)
+
+
+def change_for(
+    switch_id: str, values: Mapping[str, object], memory: SwitchMemory | None = None
+) -> tuple[str, object]:
     """The Settings control and the value to report for a click on `switch_id`.
 
-    The click wants the opposite of what the switch shows now. The result goes
-    to `SettingsController.change`, so it is written, validated, refused and
+    The click wants the opposite of what the switch shows now. Switching
+    auto-transcribe or quiet hours on again restores what `memory` last saw
+    (otherwise "stop", or Settings' default quiet window). The result goes to
+    `SettingsController.change`, so it is written, validated, refused and
     restarted exactly as the same change on the Settings page would be.
     """
     switch = SWITCH_BY_ID.get(switch_id)
     if switch is None:
         raise UnknownSwitch(f"{switch_id} is not a switch on the tray panel.")
     wanted = not is_on(switch_id, values)
+    remembered = memory.last(switch_id) if memory is not None else None
     if switch_id == "finish":
-        return switch.control, FINISH_ON if wanted else FINISH_OFF
+        return switch.control, (remembered or FINISH_ON) if wanted else FINISH_OFF
+    if switch_id == "quiet" and wanted and remembered:
+        # A window as text: Settings' quiet control writes it as it is.
+        return switch.control, remembered
     return switch.control, wanted
 
 

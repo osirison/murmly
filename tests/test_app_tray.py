@@ -89,6 +89,49 @@ class SwitchWriteTests(unittest.TestCase):
         self.assertEqual(("finish", "off"), tray.change_for("finish", {"finish": "continuous"}))
         self.assertEqual(("finish", "stop"), tray.change_for("finish", {"finish": "off"}))
 
+    def click_remembering(self, switch_id: str, memory: tray.SwitchMemory) -> None:
+        values = settings.build_view(self.state)["values"]
+        memory.observe(values)
+        control, value = tray.change_for(switch_id, values, memory)
+        outcome, self.state = self.model.apply(control, value)
+        self.assertTrue(outcome.saved, outcome.message)
+
+    def set_file(self, text: str) -> None:
+        self.path.write_text(text, encoding="utf-8")
+        self.state = self.model.load()
+
+    def test_continuous_goes_off_then_on_and_comes_back_as_continuous(self) -> None:
+        self.set_file('[stt]\nauto_transcribe = "continuous"\n')
+        memory = tray.SwitchMemory()
+        self.click_remembering("finish", memory)
+        self.assertEqual("off", self.written("stt.auto_transcribe"))
+        self.click_remembering("finish", memory)
+        self.assertEqual("continuous", self.written("stt.auto_transcribe"))
+
+    def test_a_custom_quiet_window_comes_back_after_off_then_on(self) -> None:
+        self.set_file('[tts]\nquiet_hours = "23:30-06:00"\n')
+        memory = tray.SwitchMemory()
+        self.click_remembering("quiet", memory)
+        self.assertEqual("", self.written("tts.quiet_hours"))
+        self.click_remembering("quiet", memory)
+        self.assertEqual("23:30-06:00", self.written("tts.quiet_hours"))
+
+    def test_with_nothing_known_the_defaults_apply(self) -> None:
+        self.set_file('[stt]\nauto_transcribe = "off"\n\n[tts]\nquiet_hours = ""\n')
+        memory = tray.SwitchMemory()
+        self.click_remembering("finish", memory)
+        self.assertEqual("stop", self.written("stt.auto_transcribe"))
+        self.click_remembering("quiet", memory)
+        self.assertEqual(settings.DEFAULT_QUIET_WINDOW, self.written("tts.quiet_hours"))
+
+    def test_a_forgotten_memory_falls_back_to_the_defaults(self) -> None:
+        self.set_file('[stt]\nauto_transcribe = "off"\n\n[tts]\nquiet_hours = ""\n')
+        self.assertEqual(("finish", "stop"), tray.change_for("finish", {"finish": "off"}, tray.SwitchMemory()))
+
+    def test_settings_own_quiet_switch_is_unchanged(self) -> None:
+        self.assertEqual(settings.DEFAULT_QUIET_WINDOW, settings.to_value("quiet", True, {}))
+        self.assertEqual("", settings.to_value("quiet", False, {}))
+
     def test_an_unknown_switch_is_refused(self) -> None:
         with self.assertRaises(tray.UnknownSwitch):
             tray.change_for("verify", {})

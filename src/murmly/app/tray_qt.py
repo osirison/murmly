@@ -67,6 +67,8 @@ class TrayController(QObject):
         self._panel: QObject | None = None
         self._toggle = tray.PanelToggle()
         self._shown: tuple[str, str] | None = None
+        self._memory = tray.SwitchMemory()
+        self._remember()
         self._view: dict = tray.switches_view(settings.view)
         self._menu = QMenu()
         open_action = QAction("Open murmly", self._menu)
@@ -114,7 +116,7 @@ class TrayController(QObject):
         values = self._settings.view.get("values")
         if self._settings.view.get("loaded") is not True or self._settings.view.get("disabled") is True:
             return
-        control, value = tray.change_for(switch_id, values if isinstance(values, dict) else {})
+        control, value = tray.change_for(switch_id, values if isinstance(values, dict) else {}, self._memory)
         self._settings.change(control, value)
 
     @Slot()
@@ -172,7 +174,13 @@ class TrayController(QObject):
 
     # -- plumbing -------------------------------------------------------------
 
+    def _remember(self) -> None:
+        values = self._settings.view.get("values")
+        if isinstance(values, dict):
+            self._memory.observe(values)
+
     def _settings_changed(self) -> None:
+        self._remember()
         view = tray.switches_view(self._settings.view)
         if view != self._view:
             self._view = view
