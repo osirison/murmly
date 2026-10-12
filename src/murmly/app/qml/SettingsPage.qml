@@ -23,7 +23,7 @@ Item {
     function show(pane, section) {
         page.pane = pane
         Qt.callLater(function () {
-            if (section === speechTop) {
+            if (section === speechTop || section === computerTop) {
                 scroller.contentY = 0
                 return
             }
@@ -40,11 +40,22 @@ Item {
         anchors.topMargin: theme.space.space34
         spacing: theme.space.space32
 
-        // The groups.
-        ColumnLayout {
+        // The groups. They scroll when the window is too short to show them all.
+        Flickable {
+            id: groupsNav
             Layout.preferredWidth: 190
             Layout.maximumWidth: 190
-            Layout.alignment: Qt.AlignTop
+            Layout.fillHeight: true
+            contentWidth: width
+            contentHeight: navColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+        ColumnLayout {
+            id: navColumn
+            // Inset so a focus ring drawn outside a button is not clipped.
+            x: 3
+            width: groupsNav.width - 6
             spacing: 2
 
             AppText {
@@ -109,6 +120,24 @@ Item {
                 Layout.fillWidth: true
                 onClicked: page.show("speech", speechTop)
             }
+
+            AppText {
+                role: "label"
+                text: "This computer"
+                color: theme.colors.textLabel
+                leftPadding: theme.space.space10
+                topPadding: theme.space.space18
+                bottomPadding: 6
+            }
+
+            SubNavButton {
+                objectName: "settings-go-remove"
+                text: "Remove murmly"
+                selected: page.pane === "computer"
+                Layout.fillWidth: true
+                onClicked: page.show("computer", computerTop)
+            }
+        }   // navColumn
         }
 
         Flickable {
@@ -133,7 +162,7 @@ Item {
                     AppText {
                         objectName: "settings-title"
                         role: "title26"
-                        text: page.pane === "speech" ? "Speech" : "Settings"
+                        text: page.pane === "speech" ? "Speech" : page.pane === "computer" ? "This computer" : "Settings"
                         color: theme.colors.text
                         Layout.fillWidth: true
                         Accessible.role: Accessible.Heading
@@ -141,7 +170,9 @@ Item {
 
                     AppText {
                         role: "bodyLead"
-                        text: page.pane === "speech"
+                        text: page.pane === "computer"
+                            ? "Removing murmly stops it and clears away what it set up. Nothing you wrote is deleted unless you say so."
+                            : page.pane === "speech"
                             ? "Murmly can read your coding assistant's replies aloud and tell you when it has finished. It stays silent until you turn it on, so nothing makes a sound you didn't ask for."
                             : "Murmly works without changing anything here. Each change is saved straight away, and murmly restarts in the background to pick it up."
                         color: theme.colors.text3
@@ -153,7 +184,7 @@ Item {
                 // The file cannot be read: its own words, and nothing can be changed.
                 Banner {
                     objectName: "settings-error"
-                    visible: view.error !== undefined && view.error !== ""
+                    visible: page.pane !== "computer" && view.error !== undefined && view.error !== ""
                     tone: "crimson"
                     mono: true
                     title: view.errorIsParse === true
@@ -164,7 +195,7 @@ Item {
 
                 Banner {
                     objectName: "settings-message"
-                    visible: !page.locked && view.message !== undefined && view.message !== ""
+                    visible: page.pane !== "computer" && !page.locked && view.message !== undefined && view.message !== ""
                     tone: "crimson"
                     title: "That was not saved"
                     text: view.message !== undefined ? view.message : ""
@@ -173,17 +204,79 @@ Item {
 
                 Banner {
                     objectName: "settings-notice"
-                    visible: view.notice !== undefined && view.notice !== ""
+                    visible: page.pane !== "computer" && view.notice !== undefined && view.notice !== ""
                     tone: "amber"
                     text: view.notice !== undefined ? view.notice : ""
                     textItem.objectName: "settings-notice-text"
                 }
 
                 AppText {
-                    visible: !page.loaded
+                    visible: !page.loaded && page.pane !== "computer"
                     text: "Reading the settings file…"
                     role: "body"
                     color: theme.colors.text4
+                }
+
+                // ---- This computer: taking murmly off it ------------------------
+                // Outside the groups below, which are off while the settings file
+                // cannot be read: removal does not depend on that file.
+                ColumnLayout {
+                    id: computerTop
+                    visible: page.pane === "computer"
+                    spacing: theme.space.space12
+                    Layout.fillWidth: true
+
+                    AppText {
+                        role: "label"
+                        text: "Remove murmly"
+                        color: theme.colors.textLabel
+                        Accessible.role: Accessible.Heading
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        implicitHeight: removeRow.implicitHeight + theme.space.space16 * 2
+                        radius: theme.radii.r13
+                        color: theme.colors.panel
+                        border.width: 1
+                        border.color: theme.colors.borderSubtle
+
+                        Flow {
+                            id: removeRow
+                            x: theme.space.space20
+                            y: theme.space.space16
+                            width: parent.width - theme.space.space20 * 2
+                            spacing: theme.space.space20
+
+                            Column {
+                                width: Math.max(300, removeRow.width - removeButton.implicitWidth - removeRow.spacing)
+                                spacing: 3
+
+                                AppText {
+                                    role: "title14"
+                                    width: parent.width
+                                    text: "Take murmly off this computer"
+                                    color: theme.colors.textBright
+                                }
+
+                                AppText {
+                                    role: "body"
+                                    width: Math.min(parent.width, 520)
+                                    text: "Stops the background service and frees your keys. Your settings and downloaded models are kept unless you choose to delete them on the next step."
+                                    color: theme.colors.text4
+                                }
+                            }
+
+                            AppButton {
+                                id: removeButton
+                                objectName: "remove-open"
+                                kind: "danger"
+                                text: "Remove murmly…"
+                                enabled: !removal.view.busy
+                                onClicked: removal.request()
+                            }
+                        }
+                    }
                 }
 
                 // Every control below is off while the file cannot be read.

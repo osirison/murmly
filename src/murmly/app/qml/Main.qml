@@ -129,4 +129,7 @@ ApplicationWindow {
         // never activates or raises the window.
         focus: active
     }
+
+    // Removing murmly: opens only when the person asks for it in Settings.
+    RemoveDialog {}
 }

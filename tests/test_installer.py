@@ -2307,6 +2307,7 @@ def make_installer(
     session_launcher=None,
     record_store=None,
     profile=None,
+    **extra,
 ):
     from murmly.installer import DESKTOP_ID, SESSION_HOTKEY, Installer
     from murmly.platform import OperatingSystem, PlatformProfile
@@ -2337,7 +2338,224 @@ def make_installer(
         entrypoint_resolver=lambda: Path(entrypoint),
         injection_selector=lambda: selected,
         record_store=record_store or FakeRecordStore(),
+        **extra,
     )
+
+
+class AppShortcutTests(unittest.TestCase):
+    """The app's menu entry: written by install when the app can run, removed by uninstall."""
+
+    def setUp(self) -> None:
+        from murmly.installer import AppShortcut
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.applications = Path(directory.name) / "applications"
+        self.shortcut = AppShortcut(applications_dir=self.applications)
+
+    def installer(self, available: bool = True, **kwargs):
+        return make_installer(
+            app_shortcut=self.shortcut, app_available=lambda: available, **kwargs
+        )
+
+    def install(self, installer):
+        from murmly.hotkey import parse_hotkey
+
+        return installer.install(parse_hotkey("Meta+X"))
+
+    def test_install_with_the_app_available_writes_a_visible_entry_that_runs_the_app(self) -> None:
+        outcome = self.install(self.installer(available=True))
+
+        entry = (self.applications / "net.local.murmly-app.desktop").read_text(encoding="utf-8")
+        self.assertIn("Exec=/bin/murmly app\n", entry)
+        self.assertIn("Name=Murmly\n", entry)
+        # Visible in the menu, and binds no key.
+        self.assertNotIn("NoDisplay", entry)
+        self.assertNotIn("X-KDE-Shortcuts", entry)
+        self.assertTrue(any("applications menu" in message for message in outcome.messages))
+
+    def test_install_without_the_app_writes_nothing(self) -> None:
+        self.install(self.installer(available=False))
+
+        self.assertFalse(self.applications.exists())
+
+    def test_the_entry_is_written_when_the_desktop_registers_no_hotkey_too(self) -> None:
+        installer = self.installer(session=FakeSession(supported=False, detail="No hotkey backend."))
+
+        self.install(installer)
+
+        self.assertTrue(self.shortcut.is_present)
+
+    def test_installing_again_leaves_an_entry_that_is_already_right_alone(self) -> None:
+        installer = self.installer()
+        self.install(installer)
+        first = self.shortcut.path.stat().st_mtime_ns
+
+        outcome = self.install(installer)
+
+        self.assertEqual(first, self.shortcut.path.stat().st_mtime_ns)
+        self.assertFalse(any("applications menu" in message for message in outcome.messages))
+
+    def test_installing_after_the_checkout_moved_rewrites_the_command(self) -> None:
+        self.install(self.installer())
+
+        self.install(self.installer(entrypoint="/elsewhere/murmly"))
+
+        self.assertEqual("/elsewhere/murmly app", self.shortcut.declared_entrypoint())
+
+    def test_a_failure_to_write_the_entry_does_not_fail_the_install(self) -> None:
+        class Refusing:
+            path = Path("/nowhere/net.local.murmly-app.desktop")
+            is_present = False
+
+            def register(self, entrypoint):
+                raise OSError("read-only file system")
+
+            def unregister(self):
+                return False
+
+        installer = make_installer(app_shortcut=Refusing(), app_available=lambda: True)
+
+        outcome = self.install(installer)
+
+        self.assertTrue(outcome.service_installed)
+        self.assertTrue(any("read-only file system" in message for message in outcome.messages))
+
+    def test_uninstall_removes_the_entry_through_the_existing_path(self) -> None:
+        installer = self.installer()
+        self.install(installer)
+
+        outcome = installer.uninstall()
+
+        self.assertFalse(self.shortcut.is_present)
+        self.assertIn("Removed the Murmly app from your applications menu.", outcome.messages)
+
+    def test_uninstall_removes_an_entry_even_when_the_app_is_no_longer_available(self) -> None:
+        self.install(self.installer(available=True))
+
+        self.installer(available=False).uninstall()
+
+        self.assertFalse(self.shortcut.is_present)
+
+    def test_an_entry_left_on_its_own_is_removed_and_reported_not_as_nothing_to_remove(self) -> None:
+        self.shortcut.register(Path("/bin/murmly"))
+
+        outcome = self.installer().uninstall()
+
+        self.assertFalse(self.shortcut.is_present)
+        self.assertNotIn("nothing to remove", " ".join(outcome.messages))
+
+    def test_uninstall_with_no_entry_succeeds(self) -> None:
+        outcome = self.installer().uninstall()
+
+        self.assertIn("nothing to remove", " ".join(outcome.messages))
+
+    def test_a_caller_that_pins_launchers_and_no_entry_never_reaches_the_real_menu(self) -> None:
+        installer = make_installer(app_available=lambda: True)
+
+        self.assertIsNone(installer._app)
+
+    def test_the_app_is_available_when_pyside6_can_be_found(self) -> None:
+        from murmly.installer import app_is_available
+
+        with unittest.mock.patch("importlib.util.find_spec", return_value=object()):
+            self.assertTrue(app_is_available())
+        with unittest.mock.patch("importlib.util.find_spec", return_value=None):
+            self.assertFalse(app_is_available())
+
+
+class InstalledItemsTests(unittest.TestCase):
+    """What `uninstall` would remove, read from the same places it removes them from."""
+
+    def make(self, **kwargs):
+        from murmly.installer import AppShortcut
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.applications = Path(directory.name) / "applications"
+        self.shortcut = AppShortcut(applications_dir=self.applications)
+        return make_installer(app_shortcut=self.shortcut, **kwargs)
+
+    def test_an_installed_system_lists_every_thing_uninstall_removes(self) -> None:
+        from murmly.installer import SESSION_HOTKEY
+
+        installer = self.make(
+            service=FakeService(installed=True),
+            launcher=FakeLauncher(declared="Meta+X"),
+            session_launcher=FakeLauncher(declared="Meta+A", purpose=SESSION_HOTKEY),
+        )
+        self.shortcut.register(Path("/bin/murmly"))
+
+        items = installer.installed_items()
+
+        self.assertEqual(["service", "hotkey", "hotkey", "app-shortcut"], [item.kind for item in items])
+        labels = [item.label for item in items]
+        self.assertIn("Your dictation key", labels)
+        self.assertIn("Your key for replying to your assistant", labels)
+        self.assertEqual(str(self.shortcut.path), items[-1].detail)
+
+    def test_nothing_installed_lists_nothing(self) -> None:
+        installer = self.make(service=FakeService(installed=False), launcher=FakeLauncher(declared=None))
+
+        self.assertEqual((), installer.installed_items())
+
+    def test_one_hotkey_alone_is_listed_alone(self) -> None:
+        installer = self.make(service=FakeService(installed=False), launcher=FakeLauncher(declared="Meta+X"))
+
+        self.assertEqual(["Your dictation key"], [item.label for item in installer.installed_items()])
+
+    def test_the_record_is_listed_with_its_path_when_it_has_keys(self) -> None:
+        from murmly.hotkey_record import HotkeyRecordStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = HotkeyRecordStore(Path(directory) / "hotkeys.json")
+            store.write({"window": "Meta+X"})
+            installer = self.make(launcher=FakeLauncher(declared=None), record_store=store)
+
+            items = installer.installed_items()
+
+        self.assertEqual(["hotkey-record"], [item.kind for item in items])
+        self.assertTrue(items[0].detail.endswith("hotkeys.json"))
+
+    def test_listing_is_read_only(self) -> None:
+        service = FakeService(installed=True)
+        launcher = FakeLauncher(declared="Meta+X")
+        installer = self.make(service=service, launcher=launcher)
+        self.shortcut.register(Path("/bin/murmly"))
+
+        installer.installed_items()
+
+        self.assertEqual(0, service.removes)
+        self.assertEqual(0, launcher.unregistrations)
+        self.assertTrue(self.shortcut.is_present)
+
+    def test_a_service_that_cannot_be_read_is_left_out_not_raised(self) -> None:
+        class Unreadable(FakeService):
+            @property
+            def is_installed(self):
+                raise InstallError("systemctl is unavailable")
+
+            @is_installed.setter
+            def is_installed(self, _value):
+                pass
+
+        installer = self.make(service=Unreadable(), launcher=FakeLauncher(declared="Meta+X"))
+
+        self.assertEqual(["hotkey"], [item.kind for item in installer.installed_items()])
+
+    def test_a_windows_service_is_named_by_its_task(self) -> None:
+        from murmly.platform import OperatingSystem, PlatformProfile
+
+        installer = make_installer(
+            service=FakeService(installed=True),
+            launcher=FakeLauncher(declared=None),
+            profile=PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64"),
+        )
+
+        items = installer.installed_items()
+
+        self.assertEqual("service", items[0].kind)
+        self.assertIn(WINDOWS_TASK_NAME, items[0].detail)
 
 
 class ConflictRefusalTests(unittest.TestCase):

@@ -115,6 +115,7 @@ A few other cases:
 ```powershell
 .\bootstrap.ps1 install Meta+X Meta+A   # also bind the speech-session hotkey
 .\bootstrap.ps1 uninstall               # remove the service and release the hotkeys
+.\bootstrap.ps1 uninstall --purge       # and your settings, models and enrolled voices
 ```
 
 ## Check it worked
@@ -145,6 +146,7 @@ On Linux under KDE Plasma or GNOME, installing murmly writes:
 | `~/.local/share/applications/net.local.murmly.desktop` | carries the hotkey, on KDE Plasma |
 | `~/.local/share/applications/net.local.murmly-session.desktop` | carries the speech-session hotkey, on KDE Plasma, when one was requested |
 | `~/.config/murmly/hotkeys.json` | a record of which purposes are bound to which keys, written on every platform regardless of where the desktop itself holds the binding |
+| `~/.local/share/applications/net.local.murmly-app.desktop` | the Murmly app in your applications menu; written only when the app can run here, which means the `gui` extra is installed |
 
 On GNOME, the hotkey lives in GNOME's own `custom-keybindings` schema instead of a
 `.desktop` file, but the systemd unit and the hotkey record above are still written the
@@ -160,6 +162,31 @@ On Windows, installing murmly writes:
 Nothing else, on either platform. murmly never edits your global shortcut
 configuration, and `murmly uninstall` removes everything in whichever table above
 applies to you.
+
+The applications-menu entry is Linux only. On Windows there is no shortcut: open the app
+with `murmly app`.
+
+## Removing murmly
+
+`murmly uninstall` stops the service, releases the keys, and removes everything in the
+tables above, including the app's menu entry. It leaves your settings, the downloaded
+models and any enrolled voices where they are. Add `--purge` to delete those as well:
+
+```bash
+uv run murmly uninstall --purge
+```
+
+`--purge` names the two folders it will delete, your settings and the data folder with
+the models and voices, and asks first. `--yes` answers that question. It leaves the
+announcement hook's script in place, because the coding assistants' own settings still
+point at it until `./setup.sh uninstall` unregisters it. It does not remove the Python
+environment; on Linux `./setup.sh uninstall --purge` does that too.
+
+The app does the same from **Settings, Remove murmly**. It first lists everything that
+will be removed, read from what is installed on this computer, and nothing happens until
+you confirm. Deleting settings and downloaded models is a separate switch, off by
+default, that shows the folders it would delete. When it finishes, the app tells you what
+was removed and closes, because the service and the menu entry it was using are gone.
 
 ## Installing by hand
 

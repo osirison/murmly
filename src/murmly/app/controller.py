@@ -18,7 +18,7 @@ from datetime import datetime
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 
-from murmly.app import health, home, keys, settings
+from murmly.app import health, home, keys, removal, settings
 from murmly.config import default_config_path, load_config
 from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
 from murmly.settings_apply import RestartWhenIdle
@@ -388,6 +388,7 @@ class SettingsController(QObject):
         self._restart: RestartWhenIdle | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="murmly-settings")
         self._closed = False
+        self._frozen = False
         self._surfaces: set[str] = set()
         self._waiting = False
         self._background_busy = False
@@ -429,7 +430,7 @@ class SettingsController(QObject):
         Each one showing reads the file again; while any is showing, a hand edit
         is noticed within about a second.
         """
-        if self._closed:
+        if self._closed or self._frozen:
             return
         if active == (surface in self._surfaces):
             return
@@ -449,7 +450,29 @@ class SettingsController(QObject):
     @Slot(str, "QVariant")
     def change(self, control_id: str, value: object) -> None:
         """A control was changed: write its key. The result comes back by `view`."""
+        if self._frozen:
+            return
         self._submit("save", lambda: self._save(control_id, value), control_id=control_id)
+
+    @Slot()
+    def freeze(self) -> None:
+        """Write nothing and restart nothing from here on.
+
+        Called when Murmly is being removed: a change saved, or a restart still
+        waiting for the daemon to be idle, would otherwise land after the removal
+        and recreate the file or start the service that was just taken away.
+        Work already queued behind it on the worker still runs first.
+        """
+        self._frozen = True
+        self._waiting = False
+        self._timer.stop()
+
+    @Slot()
+    def thaw(self) -> None:
+        """Settings may be changed again: a removal that was stopped did not remove them."""
+        self._frozen = False
+        if self._active:
+            self._timer.start()
 
     def shutdown(self) -> None:
         """Stop the timer and let the worker finish. Safe to call twice."""
@@ -477,7 +500,7 @@ class SettingsController(QObject):
     # -- plumbing ---------------------------------------------------------------
 
     def _tick(self) -> None:
-        if self._closed or self._background_busy:
+        if self._closed or self._frozen or self._background_busy:
             return
         self._ticks += 1
         if self._waiting:
@@ -752,6 +775,141 @@ class KeysController(QObject):
 
     def _rebuild(self) -> None:
         self._view = keys.keys_view(self._state, self._recorder.recording)
+        self.viewChanged.emit()
+
+
+def default_removal_model() -> removal.RemovalModel:
+    """The model that reads what is installed and removes it through `murmly uninstall`'s own code."""
+    return removal.RemovalModel()
+
+
+class RemovalController(QObject):
+    """QML's `removal`: the confirmation's `view`, and the clicks that drive it.
+
+    Asking to remove only reads what is installed. The removal runs after the
+    person confirms, once, on the worker thread (shared with Settings' and the
+    keys', so it never overlaps a restart or a bind), and the window never waits
+    on it. When it finishes the dialog reports what was removed and, on the
+    person's click, `quit_app` ends the app: its own service and menu entry are
+    gone. Quitting touches no file Murmly keeps, so it cannot fail because they
+    vanished.
+    """
+
+    viewChanged = Signal()
+    _resultReady = Signal(str, object)
+
+    def __init__(
+        self,
+        model: removal.RemovalModel,
+        executor: ThreadPoolExecutor,
+        quit_app: Callable[[], None],
+        before_removal: Callable[[], None] = lambda: None,
+        removal_failed: Callable[[], None] = lambda: None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._model = model
+        self._executor = executor
+        self._quit_app = quit_app
+        self._before_removal = before_removal
+        self._removal_failed = removal_failed
+        self._state = removal.RemovalState()
+        self._closed = False
+        self._view: dict = removal.removal_view(self._state)
+        self._resultReady.connect(self._on_result)
+
+    @Property("QVariantMap", notify=viewChanged)
+    def view(self) -> dict:
+        return self._view
+
+    @Slot()
+    def request(self) -> None:
+        """"Remove murmly…" was clicked: read what is installed. Removes nothing."""
+        if self._closed or not self._state.request():
+            return
+        self._rebuild()
+        self._submit("plan", self._model.plan)
+
+    @Slot(bool)
+    def setPurge(self, purge: bool) -> None:
+        """The person's choice to also delete settings and models. Starts off."""
+        if self._closed:
+            return
+        self._state.set_purge(purge)
+        self._rebuild()
+
+    @Slot()
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        self._state.cancel()
+        self._rebuild()
+
+    @Slot()
+    def confirm(self) -> None:
+        """The person confirmed what the dialog listed. The only call that removes anything."""
+        if self._closed or not self._state.confirm():
+            return
+        purge = self._state.purge
+        self._rebuild()
+        try:
+            self._before_removal()
+        except Exception:  # noqa: BLE001 - freezing Settings must never stop a removal the person confirmed
+            logger.warning("Settings could not be paused before removal.", exc_info=True)
+        self._submit("remove", lambda: self._model.remove(purge))
+
+    @Slot()
+    def finish(self) -> None:
+        """Close the app, once it has reported a finished removal."""
+        if self._closed or not self._state.finished:
+            return
+        try:
+            self._quit_app()
+        except Exception:  # noqa: BLE001 - the app is going away either way
+            logger.warning("The app could not quit cleanly.", exc_info=True)
+
+    def shutdown(self) -> None:
+        self._closed = True
+
+    # -- plumbing ---------------------------------------------------------------
+
+    def _submit(self, kind: str, work: Callable[[], object]) -> None:
+        try:
+            future = self._executor.submit(work)
+        except RuntimeError:  # the executor is shut down
+            return
+        future.add_done_callback(lambda done: self._finished(kind, done))
+
+    def _finished(self, kind: str, future: Future) -> None:
+        # Worker thread: only hand the outcome to the GUI thread.
+        try:
+            outcome: tuple = (future.result(), "")
+        except Exception as error:  # noqa: BLE001 - shown as the reason removal did not happen
+            logger.warning("Removal request failed: %s", type(error).__name__)
+            outcome = (None, str(error) or type(error).__name__)
+        if not self._closed:
+            self._resultReady.emit(kind, outcome)
+
+    @Slot(str, object)
+    def _on_result(self, kind: str, outcome: object) -> None:
+        if self._closed:
+            return
+        value, error = outcome  # type: ignore[misc]
+        if kind == "plan":
+            self._state.planned(value, error)
+        elif error:
+            self._state.failed(error)
+            if self._state.step == removal.FAILED:
+                try:
+                    self._removal_failed()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Settings could not be resumed after a failed removal.", exc_info=True)
+        else:
+            self._state.removed(value)
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self._view = removal.removal_view(self._state)
         self.viewChanged.emit()
 
 

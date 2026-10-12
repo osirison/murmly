@@ -46,10 +46,20 @@ def run() -> int:
     first_run = controller.FirstRunController(
         controller.keys.FirstRun(controller.keys.should_show_first_run(keys_model.read()))
     )
+    # Removing murmly: reads, and removes after a confirmation, on the Settings worker.
+    # Settings is paused once a removal starts, and quitting ends the app afterwards.
+    removal = controller.RemovalController(
+        controller.default_removal_model(),
+        settings.executor,
+        application.quit,
+        before_removal=settings.freeze,
+        removal_failed=settings.thaw,
+    )
+    application.aboutToQuit.connect(removal.shutdown)
     # The tray, where the desktop has one; otherwise Health says none was found and
     # closing the window ends the app. Never raises: no tray is a normal desktop.
     tray = tray_qt.create_tray(home, settings, health, application)
-    engine, theme = qt.create_engine(home, health, settings, keys, first_run, tray)
+    engine, theme = qt.create_engine(home, health, settings, keys, first_run, tray, removal)
     if not engine.rootObjects():
         print("murmly: the app window could not be created.", file=sys.stderr)
         return 1

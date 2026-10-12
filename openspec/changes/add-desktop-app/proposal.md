@@ -74,6 +74,10 @@ built later.
   bounded delivered confirmation before hiding, instead of hiding immediately; when
   "only my voice" leaves out everything in a recording, it shows a brief neutral
   presentation saying so.
+- `desktop-integration`: installation adds an applications-menu entry for the app
+  when it can run, which uninstallation removes; uninstallation can also delete
+  settings, downloaded models and enrolled voices, after naming the folders and
+  asking.
 
 ## Impact
 

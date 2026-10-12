@@ -67,6 +67,10 @@ APPLICATION_NAME = "murmly"
 #: bindings on one component apart, so each purpose gets its own entry.
 SESSION_DESKTOP_ID = "net.local.murmly-session.desktop"
 SESSION_APPLICATION_NAME = "murmly speech session"
+#: The app's own launcher: a visible menu entry that runs `murmly app`. Unlike the
+#: two above it binds no key, so the desktop has nothing to confirm or release.
+APP_DESKTOP_ID = "net.local.murmly-app.desktop"
+APP_LAUNCHER_NAME = "Murmly"
 REGISTRATION_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.2
 #: How long an in-process-hotkey install (task 8.6) waits for the daemon it
@@ -88,6 +92,19 @@ NoDisplay=true
 StartupNotify=false
 X-KDE-GlobalAccel-CommandShortcut=true
 X-KDE-Shortcuts={shortcut}
+"""
+
+#: Shown in the applications menu, so none of the hidden-entry keys the hotkey
+#: launchers carry. `Terminal=false`: the app is a window, not a command line.
+APP_LAUNCHER_TEMPLATE = """\
+[Desktop Entry]
+Type=Application
+Name={name}
+Comment=Dictate with your voice, locally
+Exec={exec_line}
+Terminal=false
+Categories=Utility;
+StartupNotify=false
 """
 
 SERVICE_UNIT_TEMPLATE = """\
@@ -276,6 +293,11 @@ SESSION_HOTKEY = HotkeyPurpose(
     description="dictate into the open speech session",
 )
 HOTKEY_PURPOSES = (WINDOW_HOTKEY, SESSION_HOTKEY)
+#: How the removal list names each key, in the words Home uses for them.
+HOTKEY_ITEM_LABELS = {
+    WINDOW_HOTKEY.key: "Your dictation key",
+    SESSION_HOTKEY.key: "Your key for replying to your assistant",
+}
 
 #: Task 13.7: the one real limitation Carbon's `RegisterEventHotKey` carries
 #: that no other hotkey backend in this codebase does -- design.md's own
@@ -1102,6 +1124,88 @@ class ShortcutLauncher:
             self._sleep(self._poll_interval)
 
 
+def app_launcher_text(entrypoint: Path) -> str:
+    """The app launcher body: `murmly app`, escaped like `launcher_text`'s Exec."""
+    exec_line = f"{entrypoint.as_posix()} app".replace("%", "%%")
+    return APP_LAUNCHER_TEMPLATE.format(name=APP_LAUNCHER_NAME, exec_line=exec_line)
+
+
+def app_is_available() -> bool:
+    """Whether the desktop app can run here: PySide6, from the `gui` extra, is importable.
+
+    Looked up, not imported: loading Qt just to decide whether to write a menu
+    entry would cost an install seconds and, on a machine with no display
+    library, could fail.
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("PySide6") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+class AppShortcut:
+    """The applications-menu entry that opens the app.
+
+    One file at a fixed name, written by install and removed by uninstall, so no
+    separate record is needed: the file's presence is the record, as it is for
+    the hotkey launchers. Linux only. Windows and macOS have no shortcut code in
+    this installer, and the app is reached there with `murmly app`.
+    """
+
+    def __init__(self, applications_dir: Path | None = None, env: dict[str, str] | None = None) -> None:
+        self._applications_dir = (
+            applications_dir if applications_dir is not None else default_applications_dir(env)
+        )
+
+    @property
+    def path(self) -> Path:
+        return self._applications_dir / APP_DESKTOP_ID
+
+    @property
+    def is_present(self) -> bool:
+        return self.path.is_file()
+
+    def declared_entrypoint(self) -> str | None:
+        """The command the entry runs, if it exists."""
+        try:
+            content = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for line in content.splitlines():
+            if line.startswith("Exec="):
+                return line.removeprefix("Exec=").strip().replace("%%", "%") or None
+        return None
+
+    def register(self, entrypoint: Path) -> bool:
+        """Write the entry. False when it already ran this command and was left alone."""
+        if self.declared_entrypoint() == f"{entrypoint.as_posix()} app":
+            return False
+        write_atomically(self.path, app_launcher_text(entrypoint))
+        return True
+
+    def unregister(self) -> bool:
+        """Remove the entry. Reports whether anything was there."""
+        existed = self.is_present
+        self.path.unlink(missing_ok=True)
+        return existed
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledItem:
+    """One thing Murmly installed that `uninstall` removes.
+
+    `kind` is "service", "hotkey", "app-shortcut" or "hotkey-record"; `label` is
+    what it is, in words; `detail` is where it lives (a path in the platform's own
+    form) or the key it holds.
+    """
+
+    kind: str
+    label: str
+    detail: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class InstallOutcome:
     """What an install or uninstall actually did."""
@@ -1193,6 +1297,8 @@ class Installer:
         daemon_timeout: float = WINDOWS_DAEMON_START_TIMEOUT_SECONDS,
         poll_interval: float = WINDOWS_DAEMON_POLL_INTERVAL_SECONDS,
         announce: Callable[[str], None] = print,
+        app_shortcut: AppShortcut | None = None,
+        app_available: Callable[[], bool] = app_is_available,
     ) -> None:
         from murmly.platform import resolve_platform
 
@@ -1204,10 +1310,13 @@ class Installer:
         # *before* `_request_macos_accessibility_permission` below, and
         # `messages` is not read until `install()` has already returned.
         self._announce = announce
+        self._pinned_app_shortcut = app_shortcut
+        self._app_available = app_available
         self._pinned_shortcuts = shortcuts
         self._pinned_launcher = launcher
         self._pinned_session_launcher = session_launcher
         self._backend: tuple[object, object, object] | None = None
+        self._app_entry: AppShortcut | None = None
         # Resolved before `self._service` below, which a Windows profile
         # dispatches on -- task 8.1's own selection, matching how
         # `_backend_for` already dispatches the hotkey backend on the
@@ -1322,6 +1431,41 @@ class Installer:
         )
 
     @property
+    def _app(self) -> AppShortcut | None:
+        """The app's menu entry, or None where this installer makes none.
+
+        Pinned when a caller pins it. Otherwise only the unpinned Linux flow
+        has one: a caller that pins any hotkey launcher is a test driving
+        fakes, and must not reach the real applications directory, and the
+        in-process platforms have no menu entry code at all.
+        """
+        from murmly.platform import hotkey_mechanism_is_in_process
+
+        if self._pinned_app_shortcut is not None:
+            return self._pinned_app_shortcut
+        if (
+            self._pinned_launcher is not None
+            or self._pinned_session_launcher is not None
+            or hotkey_mechanism_is_in_process(self._profile)
+        ):
+            return None
+        if self._app_entry is None:
+            self._app_entry = AppShortcut(env=self._env)
+        return self._app_entry
+
+    def _install_app_shortcut(self, entrypoint: Path, messages: list[str]) -> None:
+        """Add the app's menu entry when the app can run. Never fails the install:
+        the entry is a convenience, and `murmly app` works without it."""
+        app = self._app
+        if app is None or not self._app_available():
+            return
+        try:
+            if app.register(entrypoint):
+                messages.append(f"Added the Murmly app to your applications menu ({app.path}).")
+        except OSError as error:
+            messages.append(f"Could not add the Murmly app to your applications menu: {error}")
+
+    @property
     def _shortcuts(self):
         return self._resolve_backend()[0]
 
@@ -1416,6 +1560,7 @@ class Installer:
                     "Bind this command to a second shortcut to "
                     f"{SESSION_HOTKEY.description}:\n    {entrypoint} toggle-session"
                 )
+            self._install_app_shortcut(entrypoint, messages)
             messages.extend(self._paste_injection_messages())
             return InstallOutcome(
                 entrypoint=entrypoint,
@@ -1548,6 +1693,7 @@ class Installer:
             messages.append(
                 f"Registered {session_hotkey.portable} to {SESSION_HOTKEY.description}."
             )
+        self._install_app_shortcut(entrypoint, messages)
         messages.extend(self._paste_injection_messages())
         return InstallOutcome(
             entrypoint=entrypoint,
@@ -1763,11 +1909,23 @@ class Installer:
             # must not turn an otherwise-successful uninstall into a failure.
             problems.append(f"Could not clear the hotkey record: {error}")
 
+        # Tried whether or not the app is importable now: the entry may have
+        # been written while it was, and what was installed is what is removed.
+        app_removed = False
+        app = self._app
+        if app is not None:
+            try:
+                app_removed = app.unregister()
+            except OSError as error:
+                problems.append(f"Could not remove the Murmly app from your applications menu: {error}")
+
         if service_removed:
             messages.append("Removed the Murmly service.")
         if hotkey_removed:
             messages.append("Released the Murmly hotkey.")
-        if not service_removed and not hotkey_removed:
+        if app_removed:
+            messages.append("Removed the Murmly app from your applications menu.")
+        if not service_removed and not hotkey_removed and not app_removed:
             messages.append("Murmly was not installed; there was nothing to remove.")
         messages.extend(problems)
 
@@ -1784,6 +1942,69 @@ class Installer:
             user_override=None,
             messages=tuple(messages),
         )
+
+    def installed_items(self) -> tuple[InstalledItem, ...]:
+        """What `uninstall` would remove right now, read from the same places it
+        removes them from: the service, each hotkey launcher, the app's menu
+        entry and the hotkey record.
+
+        Read only. Nothing here raises: an item whose state cannot be read is
+        left out, because `uninstall` tolerates it either way.
+        """
+        from murmly.platform import hotkey_mechanism_is_in_process
+
+        items: list[InstalledItem] = []
+        try:
+            if self._service.is_installed:
+                items.append(InstalledItem("service", "The Murmly background service", self._service_location()))
+        except Exception:  # noqa: BLE001 - a plan is advice; uninstall tolerates the same failure
+            logger.debug("Could not read the service state for the removal list.", exc_info=True)
+
+        record: dict[str, str] = {}
+        try:
+            record = dict(self._record_store.read())
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not read the hotkey record for the removal list.", exc_info=True)
+
+        if hotkey_mechanism_is_in_process(self._profile):
+            for purpose in HOTKEY_PURPOSES:
+                held = record.get(purpose.key)
+                if held:
+                    items.append(InstalledItem("hotkey", HOTKEY_ITEM_LABELS[purpose.key], held))
+        else:
+            for launcher in (self._launcher, self._session_launcher):
+                purpose = self._purpose_of(launcher)
+                try:
+                    declared = launcher.declared_hotkey()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Could not read a hotkey launcher for the removal list.", exc_info=True)
+                    continue
+                if declared is None:
+                    continue
+                path = getattr(launcher, "launcher_path", None)
+                where = f"{declared}, in {path}" if path is not None else declared
+                items.append(InstalledItem("hotkey", HOTKEY_ITEM_LABELS.get(purpose.key, "A Murmly key"), where))
+
+        app = self._app
+        if app is not None and app.is_present:
+            items.append(InstalledItem("app-shortcut", "The Murmly app in your applications menu", str(app.path)))
+
+        record_path = getattr(self._record_store, "path", None)
+        if record and record_path is not None:
+            items.append(InstalledItem("hotkey-record", "Murmly's record of your keys", str(record_path)))
+        return tuple(items)
+
+    def _service_location(self) -> str:
+        """Where the service is kept, in the platform's own words."""
+        for name in ("unit_path", "plist_path"):
+            path = getattr(self._service, name, None)
+            if path is not None:
+                return str(path)
+        from murmly.platform import OperatingSystem
+
+        if self._profile.operating_system is OperatingSystem.WINDOWS:
+            return f"Task Scheduler task {WINDOWS_TASK_NAME}"
+        return ""
 
     def status(self) -> dict[str, object]:
         """Installation state for diagnostics.
