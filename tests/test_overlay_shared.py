@@ -42,6 +42,12 @@ _SHARED_NAMES = (
     "MICROPHONE_ACTIVE_RGB",
     "MICROPHONE_INACTIVE_RGB",
     "ERROR_RGB",
+    "DELIVERED_CHECK_POINTS",
+    "DELIVERED_DURATION_MS",
+    "DELIVERED_LINE_WIDTH",
+    "DELIVERED_TEXT",
+    "DELIVERED_TEXT_SIZE_PX",
+    "DELIVERED_TEXT_X",
     "CORNER_RADIUS_PX",
     "BAR_MULTIPLIERS",
     "BAR_START_X",
@@ -128,6 +134,46 @@ class SharedProtocolAndStateTests(unittest.TestCase):
         view = overlay_shared.RendererViewState()
         self.assertFalse(view.apply({"type": "state", "value": "LISTENING"}))
         self.assertTrue(view.apply({"type": "shutdown"}))
+
+
+class DeliveredStateTests(unittest.TestCase):
+    def test_the_confirmation_is_hidden_within_the_spec_limit(self) -> None:
+        self.assertLessEqual(overlay_shared.DELIVERED_DURATION_MS, 1_500)
+
+    def test_the_protocol_carries_delivered_in_both_directions(self) -> None:
+        from murmly.overlay import OverlayState, encode_overlay_message
+
+        encoded = encode_overlay_message({"type": "state", "value": OverlayState.DELIVERED.value})
+
+        self.assertEqual(
+            [{"type": "state", "value": "DELIVERED"}],
+            overlay_shared.MessageParser().feed(encoded),
+        )
+        self.assertEqual(
+            {state.value for state in OverlayState} | {"ERROR"},
+            {state.value for state in overlay_shared.RendererVisualState},
+        )
+
+    def test_delivered_is_visible_and_drops_the_level_and_partial(self) -> None:
+        view = overlay_shared.RendererViewState()
+        view.apply({"type": "state", "value": "LISTENING"})
+        view.apply({"type": "level", "value": 0.5})
+        view.apply({"type": "partial", "value": "words"})
+
+        view.apply({"type": "state", "value": "DELIVERED"})
+
+        self.assertTrue(view.visible)
+        self.assertEqual(0.0, view.level)
+        self.assertEqual("", view.partial)
+
+    def test_each_confirmation_gets_its_own_generation(self) -> None:
+        view = overlay_shared.RendererViewState()
+
+        view.apply({"type": "state", "value": "DELIVERED"})
+        view.apply({"type": "state", "value": "LISTENING"})
+        view.apply({"type": "state", "value": "DELIVERED"})
+
+        self.assertEqual(2, view.delivered_generation)
 
 
 class NoRendererHandlesAStateTheOtherIgnoresTests(unittest.TestCase):

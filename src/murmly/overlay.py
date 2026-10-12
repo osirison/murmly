@@ -97,6 +97,11 @@ class OverlayState(StrEnum):
     IDLE = "IDLE"
     LISTENING = "LISTENING"
     THINKING = "THINKING"
+    #: A recording was transcribed and delivered. The renderer holds it for
+    #: `overlay_shared.DELIVERED_DURATION_MS` and then hides itself, so the
+    #: daemon sends nothing after it and a capture starting meanwhile
+    #: replaces it with LISTENING.
+    DELIVERED = "DELIVERED"
 
 
 class OverlayBackend(StrEnum):

@@ -29,7 +29,14 @@ from murmly.overlay_renderer_qt import (
     missing_property_for_exstyle,
     missing_property_for_macos_window,
 )
-from murmly.overlay_shared import MonitorGeometry, RendererViewState, RendererVisualState
+from murmly.overlay_shared import (
+    DELIVERED_DURATION_MS,
+    WINDOW_HEIGHT,
+    WINDOW_WIDTH,
+    MonitorGeometry,
+    RendererViewState,
+    RendererVisualState,
+)
 
 
 class MissingPropertyTests(unittest.TestCase):
@@ -475,6 +482,108 @@ class ErrorRevertTests(unittest.TestCase):
 
         self.assertEqual(RendererVisualState.ERROR, application._view.state)
         self.assertTrue(application._window.isVisible())
+
+
+class DeliveredRevertTests(unittest.TestCase):
+    """The confirmation hides itself, and only the one that scheduled the hide."""
+
+    def test_a_confirmation_schedules_a_hide_within_the_spec_limit(self) -> None:
+        application, scheduled = ErrorRevertTests._make_application()
+
+        application._handle_message({"type": "state", "value": "DELIVERED"})
+
+        self.assertEqual(RendererVisualState.DELIVERED, application._view.state)
+        self.assertTrue(application._window.isVisible())
+        self.assertEqual(1, len(scheduled))
+        milliseconds, callback = scheduled[0]
+        self.assertEqual(DELIVERED_DURATION_MS, milliseconds)
+        self.assertLessEqual(milliseconds, 1_500)
+
+        callback()
+
+        self.assertEqual(RendererVisualState.IDLE, application._view.state)
+        self.assertFalse(application._window.isVisible())
+
+    def test_a_stale_hide_does_not_hide_the_listening_that_replaced_it(self) -> None:
+        application, scheduled = ErrorRevertTests._make_application()
+
+        application._handle_message({"type": "state", "value": "DELIVERED"})
+        _, stale_callback = scheduled[0]
+        application._handle_message({"type": "state", "value": "LISTENING"})
+
+        stale_callback()
+
+        self.assertEqual(RendererVisualState.LISTENING, application._view.state)
+        self.assertTrue(application._window.isVisible())
+
+    def test_a_stale_hide_does_not_cut_a_newer_confirmation_short(self) -> None:
+        application, scheduled = ErrorRevertTests._make_application()
+
+        application._handle_message({"type": "state", "value": "DELIVERED"})
+        _, stale_callback = scheduled[0]
+        application._handle_message({"type": "state", "value": "LISTENING"})
+        application._handle_message({"type": "state", "value": "DELIVERED"})
+
+        stale_callback()
+
+        self.assertEqual(RendererVisualState.DELIVERED, application._view.state)
+
+    def test_other_messages_while_delivered_schedule_nothing(self) -> None:
+        application, scheduled = ErrorRevertTests._make_application()
+
+        application._handle_message({"type": "state", "value": "DELIVERED"})
+        application._handle_message({"type": "level", "value": 0.4})
+
+        self.assertEqual(1, len(scheduled))
+
+
+class DeliveredPaintTests(unittest.TestCase):
+    """Paints the confirmation offscreen: needs PySide6, which only the
+    `overlay` extra installs, so it skips wherever that is absent."""
+
+    def setUp(self) -> None:
+        try:
+            import PySide6  # noqa: F401
+        except ImportError:
+            self.skipTest("PySide6 is not installed. Run `uv sync --extra overlay`.")
+
+    def _painted(self, state: RendererVisualState, reduced_motion: bool):
+        from PySide6.QtGui import QImage, QPainter, QPainterPath
+        from PySide6.QtWidgets import QApplication
+
+        from murmly.overlay_renderer_qt import _paint_indicator
+
+        QApplication.instance() or QApplication([sys.argv[0]])
+        image = QImage(WINDOW_WIDTH, WINDOW_HEIGHT, QImage.Format.Format_ARGB32)
+        image.fill(0)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        _paint_indicator(painter, QPainterPath, RendererViewState(state=state), 0.0, reduced_motion)
+        painter.end()
+        return image
+
+    @staticmethod
+    def _bright_columns(image) -> list[int]:
+        return [
+            x
+            for x in range(WINDOW_WIDTH)
+            if any(image.pixelColor(x, y).lightness() > 180 for y in range(WINDOW_HEIGHT))
+        ]
+
+    def test_the_confirmation_draws_a_check_then_text_and_no_microphone_or_bars(self) -> None:
+        columns = self._bright_columns(self._painted(RendererVisualState.DELIVERED, False))
+
+        # The check sits left of the word, and nothing is drawn where the
+        # microphone's stem or the level bars would be.
+        self.assertTrue(any(18 <= x <= 30 for x in columns), columns)
+        self.assertTrue(any(42 <= x <= 90 for x in columns), columns)
+        self.assertFalse(any(x >= 100 for x in columns), columns)
+
+    def test_it_is_the_same_picture_with_reduced_motion(self) -> None:
+        moving = self._painted(RendererVisualState.DELIVERED, False)
+        still = self._painted(RendererVisualState.DELIVERED, True)
+
+        self.assertEqual(moving, still)
 
 
 class BuildParserTests(unittest.TestCase):

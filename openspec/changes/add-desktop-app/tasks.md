@@ -44,7 +44,7 @@ skip themselves when none is available.
 
 ## 8. Delivered confirmation in the overlay
 
-- [ ] 8.1 Add a delivered state to the overlay protocol and draw it in the X11, Wayland and Qt renderers (check and "Typed", at most 1.5 s, static under reduced motion, never for a continuous-session segment, replaced at once if capture starts); verify renderer tests where the platform allows, and update `manual/using-murmly.md` with the new state and screenshot
+- [x] 8.1 Add a delivered state to the overlay protocol and draw it in the X11, Wayland and Qt renderers (check and "Typed", at most 1.5 s, static under reduced motion, never for a continuous-session segment, replaced at once if capture starts); verify renderer tests where the platform allows, and update `manual/using-murmly.md` with the new state and screenshot
 
 ## 9. Removing Murmly from the app
 
