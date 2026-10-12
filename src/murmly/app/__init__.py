@@ -33,7 +33,9 @@ def run() -> int:
     application.aboutToQuit.connect(home.shutdown)
     # Stops a `murmly doctor` still running, so quitting never waits for it.
     application.aboutToQuit.connect(health.shutdown)
-    engine, theme = qt.create_engine(home, health)
+    settings = controller.SettingsController(controller.default_settings_model())
+    application.aboutToQuit.connect(settings.shutdown)
+    engine, theme = qt.create_engine(home, health, settings)
     if not engine.rootObjects():
         print("murmly: the app window could not be created.", file=sys.stderr)
         return 1

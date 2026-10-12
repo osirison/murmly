@@ -31,6 +31,10 @@ ApplicationWindow {
     readonly property bool healthShowing: onScreen && sections[current].id === "health"
     onHealthShowingChanged: health.setActive(healthShowing)
 
+    // Settings reads the file when it is shown, and watches it for hand edits while it is.
+    readonly property bool settingsShowing: onScreen && sections[current].id === "settings"
+    onSettingsShowingChanged: settings.setActive(settingsShowing)
+
     header: Rectangle {
         implicitHeight: theme.layout.hHeader
         color: theme.colors.surface
@@ -110,11 +114,12 @@ ApplicationWindow {
         Repeater {
             model: sections
 
-            // Home and Health are their own pages; the other sections are empty for now.
+            // Home, Settings and Health are their own pages.
             Loader {
                 objectName: "page-" + modelData.id
                 property string title: modelData.title
                 source: modelData.id === "home" ? "HomePage.qml"
+                    : modelData.id === "settings" ? "SettingsPage.qml"
                     : modelData.id === "health" ? "HealthPage.qml"
                     : "SectionPage.qml"
                 onLoaded: item.title = title

@@ -216,6 +216,23 @@ class ChangedOnDiskTests(WriterTestCase):
 
         self.assertTrue(writer.set("stt.model_profile", "accurate").file_changed)
 
+    def test_an_edit_that_keeps_the_size_and_the_modification_time_is_still_noticed(self) -> None:
+        self.write_file(COMMENTED)
+        writer = SettingsWriter(self.path)
+        writer.read()
+        before = self.path.stat()
+        edited = COMMENTED.replace('"cpu"', '"gpu"')
+        self.assertEqual(len(COMMENTED), len(edited))
+        self.write_file(edited)
+        os.utime(self.path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = self.path.stat()
+        self.assertEqual((before.st_size, before.st_mtime_ns), (after.st_size, after.st_mtime_ns))
+
+        result = writer.set("stt.model_profile", "accurate")
+
+        self.assertTrue(result.file_changed)
+        self.assertIn('"gpu"', self.path.read_text(encoding="utf-8"))
+
     def test_an_unchanged_file_is_not_reported_as_changed(self) -> None:
         self.write_file(COMMENTED)
         writer = SettingsWriter(self.path)

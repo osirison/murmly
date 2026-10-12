@@ -1,4 +1,4 @@
-"""The Qt side of Home: a timer, a worker thread and the `view` QML reads.
+"""The Qt side of Home, Health and Settings: timers, worker threads and the `view` QML reads.
 
 The logic is in `home.py`; this only wires it to Qt. A QTimer asks the poller
 whether a request is due, `HomeModel.refresh` runs on one worker thread so a
@@ -18,15 +18,20 @@ from datetime import datetime
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 
-from murmly.app import health, home
+from murmly.app import health, home, settings
 from murmly.config import default_config_path, load_config
 from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
+from murmly.settings_apply import RestartWhenIdle
 
 logger = logging.getLogger(__name__)
 
 # How often the timer asks the poller. The poller enforces the 500 ms; this
 # only sets how soon after it elapses a request goes out.
 TICK_MS = 100
+
+# How often Settings asks whether a restart can happen yet, and (every second
+# tick) whether the file was edited by hand. The restart itself holds to 500 ms.
+SETTINGS_TICK_MS = 500
 
 
 def default_model() -> home.HomeModel:
@@ -329,3 +334,216 @@ class HealthController(QObject):
         if view != self._view:
             self._view = view
             self.viewChanged.emit()
+
+
+def default_settings_model() -> settings.SettingsModel:
+    """The model that reads and writes the configuration file Murmly is using."""
+    return settings.SettingsModel()
+
+
+class SettingsController(QObject):
+    """QML's `settings`: the page's `view`, and what a person can change.
+
+    Every read and write of the file, and every restart of the service, runs on
+    one worker thread, so a change and the restart it asks for never overlap and
+    the window never waits on the disk, the daemon or the service manager. The
+    timer only submits work: it asks the restart whether the daemon is idle yet
+    while one is wanted, and looks for a hand edit of the file while Settings is
+    the page being shown.
+
+    A change made while the daemon is busy waits: any number of them make one
+    restart, once nothing is being captured, transcribed or spoken.
+    """
+
+    viewChanged = Signal()
+    _resultReady = Signal(str, object)
+
+    def __init__(
+        self,
+        model: settings.SettingsModel,
+        restart_factory: Callable[[], RestartWhenIdle] | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._model = model
+        # Built on first use, on the worker: it needs the daemon's socket path.
+        self._restart_factory = (
+            restart_factory
+            if restart_factory is not None
+            else lambda: RestartWhenIdle(load_config(model.path))
+        )
+        self._restart: RestartWhenIdle | None = None
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="murmly-settings")
+        self._closed = False
+        self._active = False
+        self._waiting = False
+        self._background_busy = False
+        self._ticks = 0
+        self._state: settings.SettingsState | None = None
+        self._notice = ""
+        self._outcome: settings.SaveOutcome | None = None
+        self._restart_text = ""
+        self._view: dict = settings.build_view(None)
+        self._timer = QTimer(self)
+        self._timer.setInterval(SETTINGS_TICK_MS)
+        self._timer.timeout.connect(self._tick)
+        self._resultReady.connect(self._on_result)
+
+    @Property("QVariantMap", notify=viewChanged)
+    def view(self) -> dict:
+        return self._view
+
+    @Slot(bool)
+    def setActive(self, active: bool) -> None:
+        """Settings is, or is no longer, the page a person is looking at.
+
+        Opening it reads the file again, and while it is open a hand edit of the
+        file is noticed within about a second.
+        """
+        if self._closed or active == self._active:
+            return
+        self._active = active
+        if active:
+            self._submit("state", self._model.load)
+            self._timer.start()
+        elif not self._waiting:
+            self._timer.stop()
+
+    @Slot(str, "QVariant")
+    def change(self, control_id: str, value: object) -> None:
+        """A control was changed: write its key. The result comes back by `view`."""
+        self._submit("save", lambda: self._save(control_id, value), control_id=control_id)
+
+    def shutdown(self) -> None:
+        """Stop the timer and let the worker finish. Safe to call twice."""
+        self._closed = True
+        self._timer.stop()
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    # -- worker thread -------------------------------------------------------
+
+    def _save(self, control_id: str, value: object) -> tuple:
+        outcome, state = self._model.apply(control_id, value)
+        restart_error = ""
+        if outcome.saved:
+            try:
+                if self._restart is None:
+                    self._restart = self._restart_factory()
+                self._restart.request()
+            except Exception as error:  # noqa: BLE001 - shown beside the saved setting
+                restart_error = str(error) or type(error).__name__
+        return outcome, state, restart_error
+
+    def _tick_restart(self) -> object:
+        return self._restart.tick() if self._restart is not None else None
+
+    # -- plumbing ---------------------------------------------------------------
+
+    def _tick(self) -> None:
+        if self._closed or self._background_busy:
+            return
+        self._ticks += 1
+        if self._waiting:
+            self._background_busy = True
+            self._submit("restart", self._tick_restart, background=True)
+        elif self._active and self._ticks % 2 == 0:
+            self._background_busy = True
+            self._submit("poll", self._model.poll, background=True)
+
+    def _submit(
+        self,
+        kind: str,
+        work: Callable[[], object],
+        control_id: str = "",
+        background: bool = False,
+    ) -> None:
+        if self._closed:
+            return
+        try:
+            future = self._executor.submit(work)
+        except RuntimeError:  # the executor is shut down
+            if background:
+                self._background_busy = False
+            return
+        future.add_done_callback(lambda done: self._finished(kind, control_id, done))
+
+    def _finished(self, kind: str, control_id: str, future: Future) -> None:
+        # Worker thread: only hand the outcome to the GUI thread.
+        try:
+            outcome: object = future.result()
+        except Exception as error:  # noqa: BLE001 - shown as the page's message
+            logger.warning("Settings request failed: %s", type(error).__name__)
+            text = str(error) or type(error).__name__
+            if kind == "save":
+                outcome = (settings.SaveOutcome("failed", message=text), None, "")
+            elif kind == "restart":
+                outcome = text
+            else:
+                outcome = None
+        if not self._closed:
+            self._resultReady.emit(kind, outcome)
+
+    @Slot(str, object)
+    def _on_result(self, kind: str, outcome: object) -> None:
+        if self._closed:
+            return
+        if kind == "state":
+            self._take_state(outcome)  # type: ignore[arg-type]
+        elif kind == "poll":
+            self._background_busy = False
+            if outcome is None:
+                return
+            self._take_state(outcome)  # type: ignore[arg-type]
+        elif kind == "restart":
+            self._background_busy = False
+            self._take_restart(outcome)
+        else:
+            self._take_save(*outcome)  # type: ignore[misc]
+        self._rebuild()
+
+    def _take_state(self, state: settings.SettingsState) -> None:
+        self._state = state
+        self._notice = settings.NOTICE_FILE_CHANGED if state.changed else self._notice
+
+    def _take_save(self, outcome: settings.SaveOutcome, state, restart_error: str) -> None:
+        self._outcome = outcome
+        if state is not None:
+            self._state = state
+        changed = outcome.file_changed or (state is not None and state.changed)
+        self._notice = settings.NOTICE_FILE_CHANGED if changed else ""
+        if not outcome.saved:
+            return
+        if restart_error:
+            self._restart_text = restart_error
+            return
+        self._waiting = True
+        self._restart_text = "waiting"
+        self._timer.start()
+
+    def _take_restart(self, outcome: object) -> None:
+        if isinstance(outcome, str):
+            text: str | None = outcome
+        elif outcome is None:
+            text = None
+        else:
+            text = settings.restart_status(outcome)  # type: ignore[arg-type]
+        if text is None:
+            self._waiting = False
+        elif text == "waiting":
+            return
+        else:
+            self._waiting = False
+            self._restart_text = text
+        if not self._waiting and not self._active:
+            self._timer.stop()
+
+    def _rebuild(self) -> None:
+        # Always announced, even when nothing about the view differs: a refused value
+        # changes no file value, and the control that was moved must snap back to it.
+        self._view = settings.build_view(
+            self._state,
+            notice=self._notice,
+            outcome=self._outcome,
+            restart=self._restart_text,
+        )
+        self.viewChanged.emit()
