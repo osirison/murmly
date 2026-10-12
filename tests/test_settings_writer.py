@@ -310,6 +310,107 @@ class AtomicWriteTests(WriterTestCase):
         self.assertEqual(0o640, stat.S_IMODE(self.path.stat().st_mode))
 
 
+def can_symlink() -> bool:
+    """Creating a link needs a privilege on Windows that CI usually lacks."""
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            os.symlink(Path(directory) / "target", Path(directory) / "link")
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+@unittest.skipUnless(can_symlink(), "cannot create symbolic links here")
+class SymlinkedFileTests(WriterTestCase):
+    def link_to(self, target: Path) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, self.path)
+
+    def test_a_save_writes_through_the_link_and_keeps_it(self) -> None:
+        target = self.directory / "dotfiles" / "murmly.toml"
+        target.parent.mkdir()
+        target.write_text(COMMENTED, encoding="utf-8")
+        self.link_to(target)
+
+        writer = SettingsWriter(self.path)
+        writer.read()
+        result = writer.set("stt.model_profile", "accurate")
+
+        self.assertTrue(self.path.is_symlink())
+        self.assertEqual("accurate", tomllib.loads(target.read_text(encoding="utf-8"))["stt"]["model_profile"])
+        self.assertFalse(result.file_changed)
+        self.assertEqual(writer.stamp(), writer._read_stamp)
+        self.assertEqual(["murmly.toml"], [entry.name for entry in target.parent.iterdir()])
+        self.assertEqual(["config.toml"], [entry.name for entry in self.path.parent.iterdir()])
+
+    def test_a_chain_of_links_is_followed_to_the_end(self) -> None:
+        target = self.directory / "real.toml"
+        target.write_text(COMMENTED, encoding="utf-8")
+        middle = self.directory / "middle.toml"
+        os.symlink(target, middle)
+        self.link_to(middle)
+
+        SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertTrue(self.path.is_symlink())
+        self.assertTrue(middle.is_symlink())
+        self.assertEqual("accurate", tomllib.loads(target.read_text(encoding="utf-8"))["stt"]["model_profile"])
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "needs POSIX permission bits")
+    def test_the_targets_permission_bits_are_kept(self) -> None:
+        target = self.directory / "real.toml"
+        target.write_text(COMMENTED, encoding="utf-8")
+        os.chmod(target, 0o600)
+        self.link_to(target)
+
+        SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+
+    def test_a_link_to_a_missing_file_creates_the_file_at_its_destination(self) -> None:
+        target = self.directory / "dotfiles" / "murmly.toml"
+        target.parent.mkdir()
+        self.link_to(target)
+
+        result = SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertTrue(result.created)
+        self.assertTrue(self.path.is_symlink())
+        self.assertEqual("accurate", tomllib.loads(target.read_text(encoding="utf-8"))["stt"]["model_profile"])
+
+
+class FileErrorTests(WriterTestCase):
+    def test_a_file_deleted_before_the_write_is_a_settings_file_error(self) -> None:
+        self.write_file(COMMENTED)
+        writer = SettingsWriter(self.path)
+        self.path.unlink()
+
+        with self.assertRaises(SettingsFileError) as raised:
+            writer._replace("[stt]\n", existed=True)
+
+        self.assertIn("Unable to write", str(raised.exception))
+        self.assertEqual([], list(self.path.parent.iterdir()))
+
+    @unittest.skipUnless(hasattr(os, "getuid") and os.getuid() != 0, "needs POSIX permissions as a non-root user")
+    def test_a_read_only_directory_is_a_settings_file_error_with_a_hint(self) -> None:
+        self.write_file(COMMENTED)
+        os.chmod(self.path.parent, 0o500)
+        self.addCleanup(os.chmod, self.path.parent, 0o700)
+
+        with self.assertRaises(SettingsFileError) as raised:
+            SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertIn("Unable to write", str(raised.exception))
+        self.assertIn("Another program may have it open", str(raised.exception))
+        self.assertEqual(COMMENTED, self.path.read_text(encoding="utf-8"))
+
+    def test_a_directory_that_cannot_be_created_is_a_settings_file_error(self) -> None:
+        (self.directory / "murmly").write_text("a file where the directory should be", encoding="utf-8")
+
+        with self.assertRaises(SettingsFileError):
+            SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+
 class SharedValidationTests(unittest.TestCase):
     """The writer and the reader judge a value by the same rules."""
 
