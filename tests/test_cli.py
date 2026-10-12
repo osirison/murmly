@@ -19,7 +19,7 @@ from types import ModuleType
 from unittest.mock import Mock, patch
 
 from channel_helpers import command_channel_address
-from module_stubs import injected_module
+from module_stubs import injected_module, removed_module
 
 from murmly.cli import (
     _measurement_clip,
@@ -4324,3 +4324,66 @@ class PlaybackDropoutDiagnosticsTests(unittest.TestCase):
         self.assertFalse(report["enabled"])
         self.assertEqual(9, report["playback_dropouts"])
         self.assertEqual(1, report["playback_starvations"])
+
+
+class AppCommandTests(unittest.TestCase):
+    """`murmly app` is the one command that needs the optional `gui` extra."""
+
+    def test_help_prints_usage_without_importing_the_toolkit(self) -> None:
+        output = StringIO()
+        # `None` in `sys.modules` makes any import of PySide6 fail, whether or
+        # not the extra is installed here.
+        with injected_module("PySide6", None), redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                main(["app", "--help"])
+
+        self.assertEqual(0, raised.exception.code)
+        self.assertIn("usage:", output.getvalue())
+        self.assertIn("app", output.getvalue())
+
+    def test_a_missing_extra_exits_non_zero_naming_the_extra(self) -> None:
+        errors = StringIO()
+        with (
+            injected_module("PySide6", None),
+            # `main` refuses an unsupported host before it dispatches anything,
+            # so a macOS runner would never reach the command under test.
+            patch(
+                "murmly.cli.resolve_platform",
+                return_value=PlatformProfile(
+                    operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                ),
+            ),
+            patch("murmly.cli.load_config", return_value=Mock()),
+            redirect_stderr(errors),
+        ):
+            exit_code = main(["app"])
+
+        self.assertNotEqual(0, exit_code)
+        message = errors.getvalue().strip()
+        self.assertEqual(1, len(message.splitlines()))
+        self.assertIn("gui extra", message)
+        self.assertIn("uv sync --extra gui", message)
+
+    def test_an_unrelated_missing_module_is_not_reported_as_the_extra(self) -> None:
+        errors = StringIO()
+        with (
+            patch("murmly.app.run", side_effect=ModuleNotFoundError(name="somethingelse")),
+            # `main` refuses an unsupported host before it dispatches anything,
+            # so a macOS runner would never reach the command under test.
+            patch(
+                "murmly.cli.resolve_platform",
+                return_value=PlatformProfile(
+                    operating_system=OperatingSystem.LINUX, architecture="x86_64"
+                ),
+            ),
+            patch("murmly.cli.load_config", return_value=Mock()),
+            redirect_stderr(errors),
+        ):
+            exit_code = main(["app"])
+
+        self.assertNotEqual(0, exit_code)
+        self.assertNotIn("gui extra", errors.getvalue())
+
+    def test_importing_the_app_package_does_not_import_the_toolkit(self) -> None:
+        with injected_module("PySide6", None), removed_module("murmly.app"):
+            import murmly.app  # noqa: F401

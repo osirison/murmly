@@ -168,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Toggle capture, delivering the transcript to the open speech session.",
     )
     subparsers.add_parser("status", help="Query the daemon state.")
+    subparsers.add_parser("app", help="Open the desktop app (needs the gui extra).")
 
     install = subparsers.add_parser(
         "install",
@@ -392,6 +393,8 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         # The daemon's command vocabulary is not the CLI's: argparse spells a
         # subcommand with a hyphen and the wire protocol does not.
         return _run_client_command(config, DAEMON_COMMANDS.get(args.command, args.command))
+    if args.command == "app":
+        return _run_app()
     if args.command == "install":
         return _run_install(args.hotkey, args.session_hotkey, profile=profile, config=config)
     if args.command == "uninstall":
@@ -731,6 +734,27 @@ def _run_spike(config: MurmlyConfig, seconds: float, paste: bool) -> int:
 
 def _speaker_model_path() -> Path:
     return default_data_dir() / SPEAKER_MODEL_FILENAME
+
+
+def _run_app() -> int:
+    # Imported here, not at the top: PySide6 is an optional extra, and the daemon
+    # and every other command must start without it.
+    from murmly.app import run
+
+    try:
+        return run()
+    except ModuleNotFoundError as error:
+        # Only PySide6 itself being absent means the extra is missing. A Qt
+        # install that fails to load raises a plain ImportError, which is
+        # reported by the backstop in `main` with what it actually said.
+        if (error.name or "").partition(".")[0] != "PySide6":
+            raise
+        print(
+            "murmly app needs the gui extra (PySide6), which is not installed. "
+            "Add it with: uv sync --extra gui",
+            file=sys.stderr,
+        )
+        return 1
 
 
 def _command_line_name(name: str) -> str:

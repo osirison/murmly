@@ -95,6 +95,11 @@ COMMAND_STATUS = "status"
 #: desktop reads. See `hotkey_record.py` -- a no-op reply on every platform
 #: this change targets, since neither Plasma nor GNOME registers in-process.
 COMMAND_REBIND_HOTKEYS = "rebind_hotkeys"
+#: The desktop app's two requests about the last transcript. Read answers the
+#: one slot the daemon holds; clear empties it. Both travel over the command
+#: channel, so they are answered only to the owning account.
+COMMAND_LAST_WORDS = "last_words"
+COMMAND_CLEAR_LAST_WORDS = "clear_last_words"
 
 #: Which command an in-process hotkey purpose (`installer.HotkeyPurpose.key`,
 #: also `HotkeyRecordStore`'s own keys) fires when the platform's own message
@@ -1431,6 +1436,12 @@ class MurmlyDaemon:
         self._capture_session: SpeechSessionConnection | None = None
         self._segments: list[str] = []
         self._session_delivered = True
+        # The last transcript, in memory only: never logged, never written to
+        # disk, gone when the daemon restarts. A dict rather than fields so the
+        # labelled speaker parts of a transcript can be added to it later
+        # without changing what a request for it looks like.
+        self._last_words: dict[str, object] | None = None
+        self._last_words_lock = threading.Lock()
         # Held for the whole produce-and-deliver of one unit of audio, by both the
         # live worker and the toggle path. Mutual exclusion here is what keeps
         # segment order, `_segments`, and `_session_delivered` consistent.
@@ -2529,9 +2540,14 @@ class MurmlyDaemon:
             # caller talking to a daemon too old to include the fields sees them
             # absent -- which is the same case it must handle for a daemon that
             # does not answer at all.
+            state = self.state
             response: dict[str, object] = {
                 "ok": True,
-                "state": self.state,
+                "state": state,
+                # Whether a restart would cut nothing off: no capture, no
+                # transcription in flight and no speech being played. The app
+                # waits on it before restarting the service to apply a setting.
+                "restart_ready": state == STATE_IDLE,
                 **self._residency(),
                 **self._playback(),
             }
@@ -2550,6 +2566,14 @@ class MurmlyDaemon:
             held = getattr(self._hotkey_registrar, "held_purposes", None)
             response["hotkeys_held"] = sorted(held()) if held is not None else []
             return response
+        if command == COMMAND_LAST_WORDS:
+            with self._last_words_lock:
+                last_words = dict(self._last_words) if self._last_words is not None else None
+            return {"ok": True, "last_words": last_words}
+        if command == COMMAND_CLEAR_LAST_WORDS:
+            with self._last_words_lock:
+                self._last_words = None
+            return {"ok": True}
         if command not in (COMMAND_TOGGLE, COMMAND_TOGGLE_SESSION):
             return failure_response(
                 CommandCode.UNSUPPORTED_COMMAND, f"Unsupported command: {command}"
@@ -2715,6 +2739,28 @@ class MurmlyDaemon:
                 finally:
                     self._state = STATE_IDLE
 
+    def _remember_transcript(self, text: str, delivered: bool, detail: str | None) -> None:
+        """Replace the last-words slot with this transcript and how it went.
+
+        Skipped for a capture bound for a speech session, whose transcript goes
+        to that session and nowhere else (the toggle response withholds it for
+        the same reason), and for a recording that produced no text, which has
+        nothing to show and must not wipe the words before it. A refused
+        delivery keeps the daemon's own detail string untouched, because the
+        app shows it as written.
+        """
+        if not text or self._capture_destination == DESTINATION_SESSION:
+            return
+        record: dict[str, object] = {
+            "text": text,
+            "produced_at": self._now().astimezone().isoformat(timespec="seconds"),
+            "delivered": delivered,
+        }
+        if not delivered and detail is not None:
+            record["detail"] = detail
+        with self._last_words_lock:
+            self._last_words = record
+
     def _session_response(self, result: ProcessingResult) -> dict[str, object]:
         """Report the whole session, keeping single-transcript responses identical."""
         with self._lock:
@@ -2746,6 +2792,7 @@ class MurmlyDaemon:
             detail = "Transcript copied to the clipboard but not pasted."
         if detail is not None:
             response["detail"] = detail
+        self._remember_transcript(" ".join(texts), delivered, detail)
         return response
 
     def _on_silence(self) -> None:
@@ -2791,6 +2838,7 @@ class MurmlyDaemon:
             self._publish_state(OverlayState.THINKING)
             target = self._delivery_target()
             result = self._process_recording(pcm_audio, target)
+            self._remember_transcript(result.text, result.delivered, result.detail)
             self._publish_outcome(result)
         except Exception as error:
             logger.warning("Auto-transcribe stop failed: %s", error)
@@ -2845,6 +2893,15 @@ class MurmlyDaemon:
                 self._segments.append(result.text)
                 if not result.delivered:
                     self._session_delivered = False
+                segments = list(self._segments)
+                session_delivered = self._session_delivered
+            # Kept as the session so far, so a segment that was refused ends the
+            # session with its words still readable: no toggle response follows
+            # to carry them. The toggle that ends a healthy session replaces
+            # this with the whole session.
+            self._remember_transcript(
+                " ".join(segments), session_delivered, None if result.delivered else result.detail
+            )
             # This text has been pasted; leaving it under the indicator would show
             # the user speech that is no longer pending.
             if self._partial_sink_owner is not None:
