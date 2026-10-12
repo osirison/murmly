@@ -529,6 +529,61 @@ def _run_overlapped(handle: object, start, timeout_seconds: float | None) -> int
         win32file.CloseHandle(overlapped.hEvent)
 
 
+class _CloseOnce:
+    """The close-exactly-once gate `NamedPipeConnection.close` and
+    `NamedPipeServer.close` share.
+
+    `socket.socket.close` may be called twice, from two threads at once:
+    CPython's `sock_close` writes `INVALID_SOCKET` into the object *before*
+    it releases the GIL to call `close(fd)`, so a second caller finds nothing
+    left to close. `daemon.py` leans on that in two places this module has to
+    match. `daemon.shutdown` calls `server.close()` on the thread that asked
+    for the shutdown, and `_serve_named_pipe`'s `with server:` calls it again
+    on the accept thread as that thread unwinds -- and the first close is
+    what wakes the second: closing the waiting instance cancels its pending
+    `ConnectNamedPipe`, `accept` raises, and the `with` block exits. The same
+    shape recurs for a speech session's two connection handles, closed by
+    `SpeechSessionConnection._shutdown_socket` on a session thread and again
+    by `daemon.shutdown`'s blanket close of every open connection.
+
+    `pywin32`'s `PyHANDLE::Close` (`win32/src/PyHANDLE.cpp`) is not safe
+    that way: it tests `m_handle`, releases the GIL, calls `CloseHandle`, and
+    zeroes `m_handle` only after re-taking the GIL. Two threads that enter it
+    together both pass the test and both close the same HANDLE value, and
+    between the two calls that value is free for Windows to hand to whatever
+    is created next. On Python 3.13+ that is very often a parking-lot
+    semaphore: a thread that blocks on a `threading` lock, event or
+    condition -- `Thread.start`'s own handshake included -- creates one with
+    `CreateSemaphore` and closes it on waking (`Python/parking_lot.c`). The
+    late second `CloseHandle` then destroys a semaphore another thread is
+    parked on, and the next `ReleaseSemaphore` on it is the fatal
+    `_PySemaphore_Wakeup: parking_lot: ReleaseSemaphore failed (error: 6,
+    ...)` that killed the Windows 3.14 CI job intermittently during the
+    speech-session tests, with the accept thread already gone from every
+    thread dump and the main thread a few lines into `daemon.shutdown`.
+    3.12's locks hold no per-wait kernel handle for a stray close to land
+    on, and a UNIX socket's close never doubles in the first place, which is
+    why neither ever showed it.
+
+    So the flag is flipped under a lock *before* the Win32 call, in the
+    order `sock_close` keeps, and exactly one caller ever reaches
+    `CloseHandle`; every other caller returns at once, as it would for a
+    socket.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def claim(self) -> bool:
+        """Report whether the caller is the one that gets to close."""
+        with self._lock:
+            if self._closed:
+                return False
+            self._closed = True
+            return True
+
+
 class NamedPipeConnection:
     """One accepted client.
 
@@ -546,6 +601,7 @@ class NamedPipeConnection:
     def __init__(self, handle: object) -> None:
         self._handle = handle
         self._timeout_seconds: float | None = None
+        self._close_once = _CloseOnce()
 
     @property
     def handle(self) -> object:
@@ -775,6 +831,12 @@ class NamedPipeConnection:
         import pywintypes
         import win32file
 
+        if not self._close_once.claim():
+            # Already closed, or being closed on another thread right now.
+            # Either way there is nothing left for this caller to close --
+            # see `_CloseOnce` for why that second call must not reach
+            # `CloseHandle`.
+            return
         try:
             win32file.CloseHandle(self._handle)
         except (OSError, pywintypes.error):
@@ -806,6 +868,7 @@ class NamedPipeServer:
     def __init__(self, pipe_name: str) -> None:
         self._pipe_name = pipe_name
         self._timeout_seconds: float | None = None
+        self._close_once = _CloseOnce()
         self._pending = create_named_pipe_server(pipe_name, first_instance=True)
 
     @property
@@ -900,6 +963,11 @@ class NamedPipeServer:
         import pywintypes
         import win32file
 
+        if not self._close_once.claim():
+            # `daemon.shutdown` and `_serve_named_pipe`'s `with server:` both
+            # close this server, from two threads, and the first close is
+            # what triggers the second -- see `_CloseOnce`.
+            return
         try:
             win32file.CloseHandle(self._pending)
         except (OSError, pywintypes.error):

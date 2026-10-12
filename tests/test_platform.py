@@ -2328,6 +2328,96 @@ class NamedPipeServerAcceptTests(unittest.TestCase):
         self.assertEqual(["create", "create", "close", "create"], order)
 
 
+class NamedPipeCloseOnceTests(unittest.TestCase):
+    """`close()` reaches `CloseHandle` exactly once, however many threads call
+    it and however their calls overlap -- the contract `socket.socket.close`
+    keeps and `daemon.py` relies on, and the one `pywin32`'s
+    `PyHANDLE::Close` does not keep by itself (see `win_pipe._CloseOnce`).
+    A second `CloseHandle` of a value Windows has already handed out again
+    closes someone else's handle; on Python 3.14 that was the Windows CI
+    job dying with `_PySemaphore_Wakeup: parking_lot: ReleaseSemaphore
+    failed (error: 6, ...)` partway through the speech-session tests."""
+
+    def _blocking_close_handle(self):
+        """A `CloseHandle` that records each call and does not return until
+        released: the window `PyHANDLE::Close` opens when it drops the GIL
+        around the real call, held open on purpose so a second `close()`
+        issued inside it is observed rather than left to timing."""
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[object] = []
+
+        def close_handle(handle: object) -> None:
+            calls.append(handle)
+            entered.set()
+            release.wait(5)
+
+        return close_handle, entered, release, calls
+
+    def _assert_closes_once(self, closable, handle: object) -> None:
+        close_handle, entered, release, calls = self._blocking_close_handle()
+        self.addCleanup(release.set)
+        with _install_fake_win32(close_handle=close_handle):
+            first = threading.Thread(target=closable.close, name="first-close")
+            first.start()
+            self.addCleanup(first.join, 5)
+            self.assertTrue(entered.wait(5), "the first close never reached CloseHandle")
+            # Issued while the first close is still inside `CloseHandle`:
+            # must return at once, without a second call of its own.
+            closable.close()
+            self.assertEqual([handle], calls)
+            release.set()
+            first.join(5)
+            self.assertFalse(first.is_alive(), "the first close did not finish")
+            # And a close after the first has fully finished is a no-op too.
+            closable.close()
+        self.assertEqual([handle], calls)
+
+    def test_a_connection_closes_its_handle_once_across_threads(self) -> None:
+        from murmly.win_pipe import NamedPipeConnection
+
+        handle = object()
+        self._assert_closes_once(NamedPipeConnection(handle), handle)
+
+    def test_a_server_closes_its_waiting_instance_once_across_threads(self) -> None:
+        from murmly.win_pipe import NamedPipeServer
+
+        with patch("murmly.win_pipe.create_named_pipe_server", return_value="instance"):
+            server = NamedPipeServer(r"\\.\pipe\murmly-test")
+        self._assert_closes_once(server, "instance")
+
+    def test_leaving_the_server_context_after_an_explicit_close_does_not_close_again(
+        self,
+    ) -> None:
+        """`daemon.shutdown` calls `server.close()`; `_serve_named_pipe`'s
+        `with server:` then exits on the accept thread. One `CloseHandle`."""
+        from murmly.win_pipe import NamedPipeServer
+
+        calls: list[object] = []
+        with patch("murmly.win_pipe.create_named_pipe_server", return_value="instance"), \
+                _install_fake_win32(close_handle=calls.append):
+            with NamedPipeServer(r"\\.\pipe\murmly-test") as server:
+                server.close()
+        self.assertEqual(["instance"], calls)
+
+    def test_a_duplicate_and_its_original_are_each_closed_once(self) -> None:
+        """Two handles, two gates: closing both twice is still one
+        `CloseHandle` per handle, the way `_shutdown_socket` and
+        `daemon.shutdown` between them close a session's pair."""
+        from murmly.win_pipe import NamedPipeConnection
+
+        calls: list[object] = []
+        original = NamedPipeConnection("original")
+        with _install_fake_win32(
+            close_handle=calls.append,
+            duplicate_handle=lambda *a, **k: "duplicate",
+        ):
+            duplicate = original.dup()
+            for connection in (original, duplicate, original, duplicate):
+                connection.close()
+        self.assertEqual(["original", "duplicate"], calls)
+
+
 class ConnectNamedPipeClientTests(unittest.TestCase):
     """Task item 4 plus the client-side fix: `WaitNamedPipe` failing with
     `ERROR_FILE_NOT_FOUND` (the pipe was there a moment ago, per the
