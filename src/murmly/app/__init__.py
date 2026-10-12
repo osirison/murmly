@@ -35,7 +35,17 @@ def run() -> int:
     application.aboutToQuit.connect(health.shutdown)
     settings = controller.SettingsController(controller.default_settings_model())
     application.aboutToQuit.connect(settings.shutdown)
-    engine, theme = qt.create_engine(home, health, settings)
+    # Shares the Settings worker, so binding a key and restarting the service never overlap.
+    keys_model = controller.default_keys_model()
+    keys = controller.KeysController(keys_model, settings.executor)
+    application.aboutToQuit.connect(keys.shutdown)
+    # First run shows when no dictation key is bound, decided once, here, from the
+    # hotkey record, read before the window exists. Nothing later changes it but
+    # the person.
+    first_run = controller.FirstRunController(
+        controller.keys.FirstRun(controller.keys.should_show_first_run(keys_model.read()))
+    )
+    engine, theme = qt.create_engine(home, health, settings, keys, first_run)
     if not engine.rootObjects():
         print("murmly: the app window could not be created.", file=sys.stderr)
         return 1

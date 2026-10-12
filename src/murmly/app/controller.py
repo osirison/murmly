@@ -18,7 +18,7 @@ from datetime import datetime
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 
-from murmly.app import health, home, settings
+from murmly.app import health, home, keys, settings
 from murmly.config import default_config_path, load_config
 from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
 from murmly.settings_apply import RestartWhenIdle
@@ -118,6 +118,11 @@ class HomeController(QObject):
         words = self._snapshot.last_words
         if words is not None:
             self._copy_text(words.text)
+
+    @Slot()
+    def setupChanged(self) -> None:
+        """The keys were changed: read the hotkey record again on the next refresh."""
+        self._model.reload()
 
     @Slot()
     def clearLastWords(self) -> None:
@@ -393,6 +398,12 @@ class SettingsController(QObject):
     def view(self) -> dict:
         return self._view
 
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        """The one worker. Binding a key shares it, so a bind (which installs and
+        starts the service) and a pending restart never run at the same time."""
+        return self._executor
+
     @Slot(bool)
     def setActive(self, active: bool) -> None:
         """Settings is, or is no longer, the page a person is looking at.
@@ -546,4 +557,217 @@ class SettingsController(QObject):
             outcome=self._outcome,
             restart=self._restart_text,
         )
+        self.viewChanged.emit()
+
+
+def default_keys_model() -> keys.KeysModel:
+    """The model that reads the real hotkey record and binds through the real installer."""
+    return keys.KeysModel(HotkeyRecordStore(default_hotkey_record_path()).read)
+
+
+class KeysController(QObject):
+    """QML's `keys`: the key fields' `view`, and the recorder behind them.
+
+    The window reports the focus of a field (`fieldFocusChanged`) and each key
+    pressed in it (`keyPressed`); `keys.Recorder` decides whether to read it. A
+    combination that passes is bound by the install path on the worker thread,
+    shared with Settings' when one is given so the two never overlap, and the
+    outcome comes back by signal. Nothing here listens outside the window.
+    """
+
+    viewChanged = Signal()
+    #: A key was saved: Home reads the keys again.
+    keysChanged = Signal()
+    _resultReady = Signal(str, object)
+
+    def __init__(
+        self,
+        model: keys.KeysModel,
+        executor: ThreadPoolExecutor | None = None,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._model = model
+        self._owns_executor = executor is None
+        self._executor = (
+            executor if executor is not None else ThreadPoolExecutor(max_workers=1, thread_name_prefix="murmly-keys")
+        )
+        self._recorder = keys.Recorder(model.profile)
+        self._state = keys.KeysState()
+        #: Keys saved but not yet confirmed by the desktop: not in the record yet.
+        self._unconfirmed: dict[str, str] = {}
+        self._closed = False
+        self._view: dict = keys.keys_view(self._state, "")
+        self._resultReady.connect(self._on_result)
+        self.reload()
+
+    @Property("QVariantMap", notify=viewChanged)
+    def view(self) -> dict:
+        return self._view
+
+    @Slot()
+    def reload(self) -> None:
+        """Read the hotkey record again."""
+        self._submit("record", self._model.read)
+
+    @Slot(str)
+    def startRecording(self, purpose: str) -> None:
+        """The person asked to record `purpose`'s key. Only a click or Enter calls this."""
+        if self._closed or self._state.pending:
+            return
+        self._recorder.start(purpose)
+        self._state.hints.pop(purpose, None)
+        self._state.note = {}
+        self._rebuild()
+
+    @Slot()
+    def stopRecording(self) -> None:
+        self._recorder.stop()
+        self._rebuild()
+
+    @Slot(str, bool)
+    def fieldFocusChanged(self, purpose: str, focused: bool) -> None:
+        before = self._recorder.recording
+        self._recorder.focus_changed(purpose, focused)
+        if self._recorder.recording != before:
+            self._rebuild()
+
+    @Slot(str, int, int, result=bool)
+    def keyPressed(self, purpose: str, key: int, modifiers: int) -> bool:
+        """A key was pressed in the field for `purpose`. True when the field used it."""
+        if self._closed:
+            return False
+        press = self._recorder.press(purpose, key, modifiers)
+        if press.kind == "refused":
+            self._state.hints[purpose] = press.message
+            self._rebuild()
+        elif press.kind == "cancelled":
+            self._state.hints.pop(purpose, None)
+            self._rebuild()
+        elif press.kind == "combo":
+            self._state.hints.pop(purpose, None)
+            self._bind(purpose, press.text)
+        return press.accepted
+
+    @Slot(str, str)
+    def pick(self, purpose: str, text: str) -> None:
+        """A suggested combination was chosen: bound through the same path."""
+        if self._closed or self._state.pending:
+            return
+        self._recorder.stop()
+        self._bind(purpose, text)
+
+    def shutdown(self) -> None:
+        self._closed = True
+        if self._owns_executor:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+    # -- plumbing ---------------------------------------------------------------
+
+    def _bind(self, purpose: str, text: str) -> None:
+        self._state.pending[purpose] = text
+        self._state.note = {}
+        self._rebuild()
+        record = dict(self._state.record)
+        self._submit("bind", lambda: self._model.bind(purpose, text, record), purpose=purpose)
+
+    def _submit(self, kind: str, work: Callable[[], object], purpose: str = "") -> None:
+        if self._closed:
+            return
+        try:
+            future = self._executor.submit(work)
+        except RuntimeError:  # the executor is shut down
+            return
+        future.add_done_callback(lambda done: self._finished(kind, purpose, done))
+
+    def _finished(self, kind: str, purpose: str, future: Future) -> None:
+        # Worker thread: only hand the outcome to the GUI thread.
+        try:
+            outcome: object = future.result()
+        except Exception as error:  # noqa: BLE001 - shown as the reason the keys were not set
+            logger.warning("Key request failed: %s", type(error).__name__)
+            if kind == "bind":
+                outcome = keys.BindResult("failed", purpose, "", str(error) or type(error).__name__)
+            else:
+                outcome = None
+        if not self._closed:
+            self._resultReady.emit(kind, outcome)
+
+    @Slot(str, object)
+    def _on_result(self, kind: str, outcome: object) -> None:
+        if self._closed:
+            return
+        if kind == "record":
+            if outcome is not None:
+                record = dict(outcome)  # type: ignore[call-overload]
+                for purpose, text in self._unconfirmed.items():
+                    record.setdefault(purpose, text)
+                self._state.record = record
+            self._state.loaded = True
+        else:
+            result: keys.BindResult = outcome  # type: ignore[assignment]
+            self._state.pending.pop(result.purpose, None)
+            self._state.note = {
+                "purpose": result.purpose,
+                "status": result.status,
+                "tone": result.tone,
+                "text": result.message,
+                "detail": result.detail,
+            }
+            if result.saved:
+                self._state.record[result.purpose] = result.text
+                if result.status == "unconfirmed":
+                    self._unconfirmed[result.purpose] = result.text
+                else:
+                    self._unconfirmed.pop(result.purpose, None)
+                self.keysChanged.emit()
+                self.reload()
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self._view = keys.keys_view(self._state, self._recorder.recording)
+        self.viewChanged.emit()
+
+
+class FirstRunController(QObject):
+    """QML's `firstRun`: whether first run is showing, and which step.
+
+    Decided once, when the app starts, from whether a dictation key is bound. It
+    changes only when the person acts, never because of anything the daemon says,
+    so it can never raise the window or move the focus.
+    """
+
+    viewChanged = Signal()
+
+    def __init__(self, first_run: keys.FirstRun | None = None, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._first_run = first_run if first_run is not None else keys.FirstRun()
+        self._view = self._first_run.view()
+
+    @Property("QVariantMap", notify=viewChanged)
+    def view(self) -> dict:
+        return self._view
+
+    @Slot()
+    def open(self) -> None:
+        self._first_run.open()
+        self._rebuild()
+
+    @Slot()
+    def next(self) -> None:
+        self._first_run.next()
+        self._rebuild()
+
+    @Slot()
+    def back(self) -> None:
+        self._first_run.back()
+        self._rebuild()
+
+    @Slot()
+    def later(self) -> None:
+        self._first_run.later()
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self._view = self._first_run.view()
         self.viewChanged.emit()
