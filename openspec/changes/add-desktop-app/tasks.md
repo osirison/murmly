@@ -17,10 +17,10 @@ skip themselves when none is available.
 
 ## 3. Home and the refused-delivery screen
 
-- [ ] 3.1 Build Home: state, keys, last words and setup summary, polling `status` at most every 500 ms only while visible; verify a test against a fake socket that a state change appears within one second and that polling stops when hidden
-- [ ] 3.2 Show "service not running" with a start action when the socket cannot be reached; verify a test with no socket
-- [ ] 3.3 Build the words-not-typed screen: clipboard reassurance first, the daemon's detail string unaltered, Copy again; verify a test that the detail string is shown byte for byte and Copy again writes the transcript to the clipboard
-- [ ] 3.4 Guard focus: no raise or activate in response to daemon state; verify a test that drives every state change and asserts no focus call is made
+- [x] 3.1 Build Home: state, keys, last words and setup summary, polling `status` at most every 500 ms only while visible; verify a test against a fake socket that a state change appears within one second and that polling stops when hidden
+- [x] 3.2 Show "service not running" with a start action when the socket cannot be reached; verify a test with no socket
+- [x] 3.3 Build the words-not-typed screen: clipboard reassurance first, the daemon's detail string unaltered, Copy again; verify a test that the detail string is shown byte for byte and Copy again writes the transcript to the clipboard
+- [x] 3.4 Guard focus: no raise or activate in response to daemon state; verify a test that drives every state change and asserts no focus call is made
 
 ## 4. Settings
 
