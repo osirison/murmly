@@ -4,6 +4,7 @@ import time
 import unittest
 from pathlib import Path
 
+from health_fakes import FakeHealthModel
 from home_fakes import FakeChannel
 from murmly.app import home, shell, theme
 
@@ -34,7 +35,10 @@ class ShellTests(unittest.TestCase):
         self.assertEqual([], qt.prepare_application())
         # A fake daemon behind Home: no test asks this machine's own daemon anything.
         self.home = controller.HomeController(home.HomeModel(FakeChannel()))
-        self.engine, self.theme = qt.create_engine(self.home)
+        # And a fake doctor behind Health: no test runs `murmly doctor`.
+        self.health_model = FakeHealthModel()
+        self.health = controller.HealthController(self.health_model)
+        self.engine, self.theme = qt.create_engine(self.home, self.health)
         self.addCleanup(self._close)
         roots = self.engine.rootObjects()
         self.assertEqual(1, len(roots))
@@ -43,6 +47,7 @@ class ShellTests(unittest.TestCase):
 
     def _close(self) -> None:
         self.home.shutdown()
+        self.health.shutdown()
         self.window.close()
         self.engine.deleteLater()
         self.settle()

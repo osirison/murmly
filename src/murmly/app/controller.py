@@ -18,7 +18,7 @@ from datetime import datetime
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication
 
-from murmly.app import home
+from murmly.app import health, home
 from murmly.config import default_config_path, load_config
 from murmly.hotkey_record import HotkeyRecordStore, default_hotkey_record_path
 
@@ -208,6 +208,123 @@ class HomeController(QObject):
             dismissed=self._dismissed,
             starting=starting and not self._snapshot.reachable,
             start_error=self._start_error,
+        )
+        if view != self._view:
+            self._view = view
+            self.viewChanged.emit()
+
+
+def default_health_model() -> health.HealthModel:
+    """The model that runs the real `murmly doctor`."""
+    return health.HealthModel()
+
+
+class HealthController(QObject):
+    """QML's `health`: the report, and what a person can do with it.
+
+    Doctor runs in a child process on one worker thread, never on the GUI
+    thread. It runs when Health becomes the page being shown and when asked to
+    run again, and never on a timer. The text offered for copying is doctor's
+    own output, kept exactly as printed.
+    """
+
+    viewChanged = Signal()
+    _resultReady = Signal(object)
+
+    def __init__(
+        self,
+        model: health.HealthModel,
+        copy_text: Callable[[str], None] = copy_to_clipboard,
+        now: Callable[[], datetime] = lambda: datetime.now().astimezone(),
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._model = model
+        self._copy_text = copy_text
+        self._now = now
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="murmly-health")
+        self._closed = False
+        self._active = False
+        self._checking = False
+        self._result: health.DoctorResult | None = None
+        self._checked_at: datetime | None = None
+        self._tray_found: bool | None = None
+        self._view: dict = health.build_view(None, checking=False, checked_at=None)
+        self._resultReady.connect(self._on_result)
+
+    @Property("QVariantMap", notify=viewChanged)
+    def view(self) -> dict:
+        return self._view
+
+    @Slot(bool)
+    def setActive(self, active: bool) -> None:
+        """Health is, or is no longer, the page a person is looking at."""
+        if self._closed or active == self._active:
+            return
+        self._active = active
+        if active:
+            self.check()
+
+    @Slot()
+    def check(self) -> None:
+        """Run the checks again. Ignored while a run is in progress."""
+        if self._closed or self._checking:
+            return
+        try:
+            future = self._executor.submit(self._model.check)
+        except RuntimeError:  # the executor is shut down
+            return
+        self._checking = True
+        self._rebuild()
+        future.add_done_callback(self._finished)
+
+    @Slot()
+    def copyReport(self) -> None:
+        """Copy the report as `murmly doctor` printed it."""
+        if self._result is not None and self._result.report is not None:
+            self._copy_text(self._result.text)
+
+    def set_tray_found(self, found: bool | None) -> None:
+        """What the tray code found: True, False, or None for "not looked yet".
+
+        Health lists an app-side entry for it. It is not part of the copied report.
+        """
+        if found == self._tray_found:
+            return
+        self._tray_found = found
+        self._rebuild()
+
+    def shutdown(self) -> None:
+        """Stop a run in progress and let the worker finish. Safe to call twice."""
+        self._closed = True
+        self._model.cancel()
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
+    def _finished(self, future: Future) -> None:
+        # Worker thread: only hand the outcome to the GUI thread.
+        try:
+            outcome = future.result()
+        except Exception as error:  # noqa: BLE001 - shown as a failed check
+            logger.warning("Health check failed: %s", type(error).__name__)
+            outcome = health.DoctorResult(error=str(error) or type(error).__name__)
+        if not self._closed:
+            self._resultReady.emit(outcome)
+
+    @Slot(object)
+    def _on_result(self, outcome: object) -> None:
+        if self._closed:
+            return
+        self._checking = False
+        self._result = outcome  # type: ignore[assignment]
+        self._checked_at = self._now()
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        view = health.build_view(
+            self._result,
+            checking=self._checking,
+            checked_at=self._checked_at,
+            tray_found=self._tray_found,
         )
         if view != self._view:
             self._view = view

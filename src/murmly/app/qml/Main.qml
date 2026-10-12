@@ -26,6 +26,11 @@ ApplicationWindow {
     onOnScreenChanged: home.setSurfaceVisible("window", onScreen)
     Component.onCompleted: home.setSurfaceVisible("window", onScreen)
 
+    // The checks run when Health is the page a person is looking at, and not
+    // before: running them opens the audio devices.
+    readonly property bool healthShowing: onScreen && sections[current].id === "health"
+    onHealthShowingChanged: health.setActive(healthShowing)
+
     header: Rectangle {
         implicitHeight: theme.layout.hHeader
         color: theme.colors.surface
@@ -105,11 +110,13 @@ ApplicationWindow {
         Repeater {
             model: sections
 
-            // Home is its own page; the other sections are empty for now.
+            // Home and Health are their own pages; the other sections are empty for now.
             Loader {
                 objectName: "page-" + modelData.id
                 property string title: modelData.title
-                source: modelData.id === "home" ? "HomePage.qml" : "SectionPage.qml"
+                source: modelData.id === "home" ? "HomePage.qml"
+                    : modelData.id === "health" ? "HealthPage.qml"
+                    : "SectionPage.qml"
                 onLoaded: item.title = title
             }
         }

@@ -31,7 +31,7 @@ skip themselves when none is available.
 
 ## 5. Health
 
-- [ ] 5.1 Render every `murmly doctor` section as a sentence plus its raw key and value, and add Copy the full report; verify a test over a recorded report that every section appears and the copied text contains no transcript text
+- [x] 5.1 Render every `murmly doctor` section as a sentence plus its raw key and value, and add Copy the full report; verify a test over a recorded report that every section appears and the copied text contains no transcript text
 
 ## 6. First run
 

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from channel_helpers import command_channel_address
+from health_fakes import FakeHealthModel
 from home_fakes import FakeChannel, delivered, refused
 from murmly.app import home
 
@@ -42,13 +43,15 @@ class HomeQtCase(unittest.TestCase):
 
         model = home.HomeModel(self.channel, config_loader=config_loader, start_service=started)
         self.home = controller.HomeController(model)
-        self.engine, self.theme = qt.create_engine(self.home)
+        self.health = controller.HealthController(FakeHealthModel())
+        self.engine, self.theme = qt.create_engine(self.home, self.health)
         self.addCleanup(self._close)
         self.window = self.engine.rootObjects()[0]
         self.settle()
 
     def _close(self) -> None:
         self.home.shutdown()
+        self.health.shutdown()
         self.window.close()
         self.engine.deleteLater()
         self.settle()
@@ -211,7 +214,8 @@ class HomeContentTests(HomeQtCase):
 
             model = home.HomeModel(home.default_send(str(address)), start_service=start)
             self.home = controller.HomeController(model)
-            self.engine, self.theme = qt.create_engine(self.home)
+            self.health = controller.HealthController(FakeHealthModel())
+            self.engine, self.theme = qt.create_engine(self.home, self.health)
             self.addCleanup(self._close)
             self.window = self.engine.rootObjects()[0]
 

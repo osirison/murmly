@@ -27,10 +27,13 @@ def run() -> int:
     application.setApplicationName(APP_TITLE)
     for path in qt.prepare_application():
         print(f"murmly: the bundled font {path.name} could not be loaded.", file=sys.stderr)
-    # All three stay referenced until the event loop ends; QML holds only weak ties.
+    # All of these stay referenced until the event loop ends; QML holds only weak ties.
     home = controller.HomeController(controller.default_model())
+    health = controller.HealthController(controller.default_health_model())
     application.aboutToQuit.connect(home.shutdown)
-    engine, theme = qt.create_engine(home)
+    # Stops a `murmly doctor` still running, so quitting never waits for it.
+    application.aboutToQuit.connect(health.shutdown)
+    engine, theme = qt.create_engine(home, health)
     if not engine.rootObjects():
         print("murmly: the app window could not be created.", file=sys.stderr)
         return 1
