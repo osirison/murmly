@@ -7,8 +7,8 @@ skip themselves when none is available.
 ## 1. Scaffolding
 
 - [x] 1.1 Add the `gui` optional extra (PySide6 on Linux and Windows) and `tomlkit` to `pyproject.toml`, re-lock, and add a `murmly app` command that exits with a clear message when the extra is missing; verify the suite passes without the extra and `uv run --no-sync --extra gui murmly app --help` prints usage
-- [ ] 1.2 Bundle Instrument Sans and IBM Plex Mono (latin subsets) with their SIL OFL licences in `licenses/`; verify the app renders in those fonts with the network disabled
-- [ ] 1.3 Port the canvas's dark and light colour, type, spacing and radius tokens into one Qt Quick theme; verify a test that every colour token has both a dark and a light value
+- [x] 1.2 Bundle Instrument Sans and IBM Plex Mono (latin subsets) with their SIL OFL licences in `licenses/`; verify the app renders in those fonts with the network disabled
+- [x] 1.3 Port the canvas's dark and light colour, type, spacing and radius tokens into one Qt Quick theme; verify a test that every colour token has both a dark and a light value
 
 ## 2. Daemon support
 
