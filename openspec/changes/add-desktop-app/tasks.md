@@ -48,7 +48,7 @@ skip themselves when none is available.
 
 ## 9. Removing Murmly from the app
 
-- [ ] 9.1 Add a confirmation naming what will be removed, run the same removal as `murmly uninstall`, with purge as a separate explicit choice, and record the app shortcut as installed so uninstall removes it; verify tests that removal without purge keeps settings and models and that the shortcut is gone afterwards
+- [x] 9.1 Add a confirmation naming what will be removed, run the same removal as `murmly uninstall`, with purge as a separate explicit choice, and record the app shortcut as installed so uninstall removes it; verify tests that removal without purge keeps settings and models and that the shortcut is gone afterwards
 
 ## 10. Voices
 

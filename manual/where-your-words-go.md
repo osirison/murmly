@@ -141,8 +141,10 @@ voiceprint, and is never written to a file or a log.
   `murmly speakers remove --all` deletes every voice and the file with them.
 - **Uninstalling does not remove them.** `murmly uninstall` removes the service
   and the hotkeys, and leaves the voiceprints in place. Remove them first with
-  `murmly speakers remove --all`, or delete the folder yourself. On Linux,
-  `./setup.sh uninstall --purge` deletes that folder too, after asking.
+  `murmly speakers remove --all`, or delete the folder yourself. `murmly uninstall
+  --purge` deletes that folder too, after asking, and so does the app's Remove murmly
+  when you choose to delete your settings and downloaded models. On Linux,
+  `./setup.sh uninstall --purge` does it as well.
 - **Ask before you enrol someone else.** A voiceprint identifies a person. Enrol
   another person's voice only if they agree, and remove it if they ask.
 

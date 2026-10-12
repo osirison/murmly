@@ -134,6 +134,7 @@ def create_engine(
     keys: controller.KeysController | None = None,
     first_run: controller.FirstRunController | None = None,
     tray: "tray_qt.TrayController | None" = None,
+    removal: controller.RemovalController | None = None,
 ) -> tuple[QQmlApplicationEngine, Theme]:
     """Load the window. The caller keeps both returned objects alive.
 
@@ -142,7 +143,8 @@ def create_engine(
     `murmly doctor`, read the real configuration file and read the real hotkey
     record. A test passes ones with a fake behind them, so no test asks the
     machine's own daemon anything, runs doctor, touches the person's settings or
-    binds a key. `first_run` is `firstRun`; by default first run is not showing,
+    binds a key. `removal` is `removal`: by default one that removes what is really
+    installed once confirmed, so a test passes one with fakes behind it. `first_run` is `firstRun`; by default first run is not showing,
     because whether it shows depends on the machine, and `run` decides that.
     """
     engine = QQmlApplicationEngine()
@@ -157,6 +159,14 @@ def create_engine(
         keys = controller.KeysController(controller.default_keys_model(), settings.executor)
     if first_run is None:
         first_run = controller.FirstRunController()
+    if removal is None:
+        removal = controller.RemovalController(
+            controller.default_removal_model(),
+            settings.executor,
+            QGuiApplication.quit,
+            before_removal=settings.freeze,
+            removal_failed=settings.thaw,
+        )
     # Home reads the keys again once one is saved.
     keys.keysChanged.connect(home.setupChanged)
     # The engine owns them from here, so QML never outlives what it reads.
@@ -165,6 +175,7 @@ def create_engine(
     settings.setParent(engine)
     keys.setParent(engine)
     first_run.setParent(engine)
+    removal.setParent(engine)
     context = engine.rootContext()
     context.setContextProperty("theme", theme_object)
     context.setContextProperty("home", home)
@@ -172,6 +183,7 @@ def create_engine(
     context.setContextProperty("settings", settings)
     context.setContextProperty("hotkeys", keys)
     context.setContextProperty("firstRun", first_run)
+    context.setContextProperty("removal", removal)
     context.setContextProperty("sections", list(shell.SECTIONS))
     if tray is not None:
         tray.setParent(engine)

@@ -21,6 +21,10 @@ and the page says what range the setting accepts. A file that does not parse
 is never written to: Settings shows the parser's error exactly as it reported it,
 turns every control off, and turns them back on once you have fixed the file.
 
+The last group on the page, **This computer**, has **Remove murmly**. It lists what
+will be removed and asks you to confirm; see [Removing murmly](install.md#removing-murmly).
+It works even when the settings file cannot be read.
+
 Where a setting below has an **In the app** line, that is where it lives. A
 setting without one is changed in the file, as the rest of this page describes.
 Settings the app does not show are left alone, whatever they hold.

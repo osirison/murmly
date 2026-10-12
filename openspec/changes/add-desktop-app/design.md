@@ -137,6 +137,20 @@ The app runs the same uninstall, and `--purge` only when the person has chosen i
 explicitly. The app shortcut is recorded as something Murmly installed, so the
 existing "uninstall removes everything Murmly installed" requirement covers it.
 
+`murmly uninstall` had no purge: only `setup.sh` deleted settings and models, along
+with the Python environment. It gains `--purge`, which deletes the settings folder and
+the data folder (models and voices) and leaves the environment alone, because the app
+runs from it and Windows cannot delete files in use. Both the command and the app call
+one function, `remove_murmly`, so the removal and the purge cannot differ. A purge
+leaves the announcement hook's script, because the assistants' own settings point at
+it until `setup.sh` unregisters it.
+
+The shortcut is a fixed-name `.desktop` file written beside the hotkey launchers when
+PySide6 is importable, and the installer lists what is installed from the same objects
+it removes them through, so the confirmation names exactly what will go. There is no
+separate manifest. Linux only: the installer has no Windows or macOS shortcut code, and
+adding some was left out of this change.
+
 ### Delivered confirmation in every renderer
 
 The overlay protocol gains a "delivered" state, sent when delivery succeeds and

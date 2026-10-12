@@ -188,7 +188,22 @@ def build_parser() -> argparse.ArgumentParser:
             "focused-window hotkey alone."
         ),
     )
-    subparsers.add_parser("uninstall", help="Remove the session service and release the hotkeys.")
+    uninstall = subparsers.add_parser(
+        "uninstall",
+        help="Remove the session service, release the hotkeys and remove the app's menu entry.",
+    )
+    uninstall.add_argument(
+        "--purge",
+        action="store_true",
+        help=(
+            "Also delete Murmly's settings and its downloaded models and enrolled voices, "
+            "after naming the folders and asking. Never the Python environment: "
+            "`setup.sh uninstall --purge` removes that too."
+        ),
+    )
+    uninstall.add_argument(
+        "-y", "--yes", action="store_true", help="With --purge, answer its question with yes."
+    )
 
     # Task 16.1: what `setup.sh`'s own `sync_environment` (`setup.sh:275-336`)
     # got right, moved here so it is testable -- carrying the extras already
@@ -398,7 +413,7 @@ def _dispatch(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.command == "install":
         return _run_install(args.hotkey, args.session_hotkey, profile=profile, config=config)
     if args.command == "uninstall":
-        return _run_uninstall()
+        return _run_uninstall(purge=args.purge, assume_yes=args.yes)
     if args.command == "sync":
         return _run_sync(args, profile)
     if args.command == "spike":
@@ -566,14 +581,32 @@ def _request_hotkey_rebind(
         logger.debug("Could not reach the running daemon to rebind hotkeys: %s", error)
 
 
-def _run_uninstall() -> int:
+def _run_uninstall(purge: bool = False, assume_yes: bool = False) -> int:
+    """`murmly uninstall`, through `removal.remove_murmly` -- the function the app's
+    "Remove murmly" runs. `--purge` names the folders it would delete and asks first;
+    with nothing to answer the question it declines and deletes nothing.
+    """
+    from murmly.environment import make_confirm
+    from murmly.removal import purge_targets, remove_murmly
+
+    delete_files = False
+    if purge:
+        targets = purge_targets()
+        print("--purge deletes:")
+        for target in targets:
+            print(f"  {target.label}: {target.path}")
+        print("The transcription model is in the shared Hugging Face cache, and stays.")
+        delete_files = make_confirm(assume_yes)("Delete these permanently?")
+        if not delete_files:
+            print("Settings and downloaded models were left in place.")
+
     try:
-        outcome = Installer().uninstall()
+        result = remove_murmly(Installer(), purge_user_files=delete_files)
     except InstallError as error:
         print(str(error), file=sys.stderr)
         return 1
 
-    for message in outcome.messages:
+    for message in result.messages:
         print(message)
     return 0
 

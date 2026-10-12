@@ -1073,6 +1073,96 @@ class UninstallCommandTests(unittest.TestCase):
         self.assertIn("systemctl unavailable", errors.getvalue())
 
 
+class UninstallPurgeCommandTests(unittest.TestCase):
+    """`murmly uninstall --purge`: the same removal the app runs, plus the deletion."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        from murmly import removal
+        from murmly.installer import InstallOutcome
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.config_dir = Path(directory.name) / "config" / "murmly"
+        self.data_dir = Path(directory.name) / "data" / "murmly"
+        for folder in (self.config_dir, self.data_dir):
+            folder.mkdir(parents=True)
+            (folder / "file.txt").write_text("x", encoding="utf-8")
+        targets = (
+            removal.PurgeTarget("Settings", self.config_dir),
+            removal.PurgeTarget("Downloaded models and enrolled voices", self.data_dir),
+        )
+        patcher = patch("murmly.removal.purge_targets", lambda env=None: targets)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.outcome = InstallOutcome(
+            entrypoint=None,
+            hotkey=None,
+            service_installed=False,
+            hotkey_registered=False,
+            already_bound=False,
+            session_supported=True,
+            session_verified=True,
+            user_override=None,
+            messages=("Removed the Murmly service.",),
+        )
+
+    def run_command(self, purge: bool, answer: bool | None = None, assume_yes: bool = False):
+        from murmly.cli import _run_uninstall
+
+        with (
+            patch("murmly.cli.Installer") as installer,
+            patch("murmly.environment.make_confirm", lambda assume: (lambda prompt: bool(answer) or assume)),
+            redirect_stdout(StringIO()) as output,
+        ):
+            installer.return_value.uninstall.return_value = self.outcome
+            exit_code = _run_uninstall(purge=purge, assume_yes=assume_yes)
+        return exit_code, output.getvalue(), installer
+
+    def test_without_purge_nothing_is_named_or_deleted(self) -> None:
+        exit_code, output, installer = self.run_command(purge=False)
+
+        self.assertEqual(0, exit_code)
+        self.assertNotIn("--purge", output)
+        self.assertTrue((self.config_dir / "file.txt").is_file())
+        self.assertTrue((self.data_dir / "file.txt").is_file())
+        installer.return_value.uninstall.assert_called_once_with()
+
+    def test_purge_names_the_folders_then_deletes_them_once_confirmed(self) -> None:
+        exit_code, output, _installer = self.run_command(purge=True, answer=True)
+
+        self.assertEqual(0, exit_code)
+        self.assertIn(str(self.config_dir), output)
+        self.assertIn(str(self.data_dir), output)
+        self.assertFalse(self.config_dir.exists())
+        self.assertFalse(self.data_dir.exists())
+
+    def test_purge_declined_still_removes_murmly_and_keeps_the_files(self) -> None:
+        exit_code, output, installer = self.run_command(purge=True, answer=False)
+
+        self.assertEqual(0, exit_code)
+        installer.return_value.uninstall.assert_called_once_with()
+        self.assertIn("were left in place", output)
+        self.assertTrue((self.config_dir / "file.txt").is_file())
+        self.assertTrue((self.data_dir / "file.txt").is_file())
+
+    def test_yes_answers_the_question(self) -> None:
+        exit_code, _output, _installer = self.run_command(purge=True, assume_yes=True)
+
+        self.assertEqual(0, exit_code)
+        self.assertFalse(self.config_dir.exists())
+
+    def test_the_flags_are_parsed(self) -> None:
+        from murmly.cli import build_parser
+
+        arguments = build_parser().parse_args(["uninstall", "--purge", "--yes"])
+
+        self.assertTrue(arguments.purge)
+        self.assertTrue(arguments.yes)
+        self.assertFalse(build_parser().parse_args(["uninstall"]).purge)
+
+
 class SyncCommandTests(unittest.TestCase):
     """Task 16.1's caller in `cli.py`: `murmly sync` reaches
     `environment.py`'s pre-sync gates and its extras/GPU-swap logic, refusing
