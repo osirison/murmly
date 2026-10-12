@@ -1,8 +1,8 @@
 ---
-title: Intermittent ReleaseSemaphore crash on the Windows Python 3.14 job
-description: Fatal Python error from the daemon's pipe flush thread, seen twice in about twenty runs; a rerun passes, and the cause is not confirmed
+title: ReleaseSemaphore crash on the Windows Python 3.14 job
+description: Fatal Python error from the daemon's pipe flush thread, caused by two threads closing the same pipe handle at shutdown; fixed in #86, so a recurrence means a second concurrent close somewhere
 trigger: ReleaseSemaphore, _PySemaphore_Wakeup, parking_lot, murmly-pipe-flush, unittest (Windows, Python 3.14)
-depends_on: src/murmly/win_pipe.py, tests/test_daemon.py, .github/workflows/tests.yml
+depends_on: src/murmly/win_pipe.py, src/murmly/daemon.py, tests/test_platform.py, .github/workflows/tests.yml
 recorded: 2026-10-12
 ---
 
@@ -19,39 +19,42 @@ The thread named in the dump is the daemon's `murmly-pipe-flush` thread, in
 during the speech-session tests in `tests/test_daemon.py`. No test reports a
 failure first: the process is gone, so there is no unittest summary.
 
-## How often
+It was seen three times in about twenty runs on 2026-10-11 and 2026-10-12, never
+on another operating system or Python version. Rerunning the job passed each
+time, which is why it was first taken for a flake. It was not one.
 
-Intermittent. Seen twice in about 20 runs, on 2026-10-11 and 2026-10-12. Rerunning
-the failed job passed both times. It has not been seen on any other operating
-system or Python version, so it is not a reason to hold a pull request: rerun the
-job, and look at the failure only if it repeats on the same commit.
+## Cause, and the fix (#86)
 
-## Cause: not confirmed
+Confirmed from the code: two threads closed the same pipe handle at once at every
+daemon shutdown.
 
-**Everything in this section is inferred. None of it has been reproduced.**
+- `NamedPipeServer.close()` ran on the caller's thread from `daemon.shutdown()`
+  and again on the accept thread when `_serve_named_pipe`'s `with server:` block
+  exited. The first close cancels the pending `ConnectNamedPipe`, which is what
+  makes the accept thread leave the block and close a second time.
+- `NamedPipeConnection.close()` had the same shape: `_shutdown_socket` on a
+  session thread against `daemon.shutdown()` closing every connection.
 
-Error 6 is `ERROR_INVALID_HANDLE`. CPython 3.14 releases a Windows semaphore when
-it wakes a parked thread, and it was told the handle is invalid. One way that
-happens: a handle is closed twice. The number of a closed handle can be handed out
-again, so a second close of the same number could close a handle CPython has since
-opened for its own semaphore, and the later wake fails with error 6.
+pywin32's `PyHANDLE::Close` releases the GIL around `CloseHandle` before it marks
+the handle closed, so two callers can both close the same raw handle value.
+CPython's own socket close marks the descriptor closed before releasing the GIL,
+which is the contract `daemon.py` was written against.
 
-What the code shows, which is confirmed: `_flush_completed_within` runs
-`FlushFileBuffers(self._handle)` on a daemon thread and gives up waiting after a
-timeout, so that thread can still be running when `close()` calls
-`CloseHandle(self._handle)` on the same handle (its own docstring says the
-daemon closes every server handle right after). Whether that, or a second close
-elsewhere, produces the crash is the unconfirmed part.
+Inferred, consistent with every dump: Python 3.13 and later create a Windows
+semaphore for each blocking wait on a threading primitive and close it on waking,
+so a freed handle value is handed to a live semaphore within microseconds. The
+second `CloseHandle` then closes that semaphore, and the next wake fails with
+error 6 (`ERROR_INVALID_HANDLE`). Python 3.12 holds no per-wait handle, which is
+why only the 3.14 job showed it.
 
-## First thing to check
+#86 adds a close-once gate in `win_pipe.py` (a lock and a flag flipped before the
+Win32 call) used by both `close()` methods. Tests in `tests/test_platform.py`
+hold a fake `CloseHandle` open while a second `close()` arrives from another
+thread, and fail with the gate removed.
 
-Whether any pywin32 handle in `win_pipe.py` can be closed twice, or used after it
-was closed, in particular `self._handle` between the flush thread and `close()`.
-If so, the fix is to close it exactly once and keep the flush thread from using it
-afterwards (for example `DuplicateHandle` it for the flush, or join the thread
-before closing). If every handle is closed once and never used after, this
-inference is wrong, and the next suspect is the flush thread still running when
-the interpreter finalizes.
+## If it comes back
 
-A reproduction would settle it: loop the speech-session tests in `test_daemon`
-on a Windows 3.14 machine until it fails, with `PYTHONFAULTHANDLER=1`.
+Then something else closes a shared pywin32 handle from two threads. Look for
+any `CloseHandle`/`.Close()` on a handle more than one thread can reach, and give
+it the same close-once gate. A reproduction settles it: loop the speech-session
+tests in `test_daemon` on a Windows 3.14 machine with `PYTHONFAULTHANDLER=1`.
