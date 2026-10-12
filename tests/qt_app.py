@@ -14,8 +14,10 @@ import sys
 import unittest
 
 # A message Qt prints on its own platforms and none of this code's: the
-# offscreen and X11 platform plugins cannot honour a size hint.
-_PLATFORM_NOISE = ("propagateSizeHints",)
+# offscreen and X11 platform plugins cannot honour a size hint, the offscreen one
+# has no system tray signal for a tray icon to connect to and cannot raise a
+# window (the tray's "Open murmly" does, on a person's click).
+_PLATFORM_NOISE = ("propagateSizeHints", "systemTrayWindowChanged", "does not support raise()")
 
 
 def qt_application():

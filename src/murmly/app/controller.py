@@ -53,6 +53,8 @@ class HomeController(QObject):
     """QML's `home`: the view, and the few things a person can do from Home."""
 
     viewChanged = Signal()
+    # Polling started or stopped: some surface became visible, or none is left.
+    pollingChanged = Signal()
     # Emitted on the worker thread, received on the GUI thread (a queued call,
     # because the receiving slot belongs to this object).
     _resultReady = Signal(str, object)
@@ -110,6 +112,12 @@ class HomeController(QObject):
             self._tick()
         else:
             self._timer.stop()
+        self.pollingChanged.emit()
+
+    @property
+    def polling(self) -> bool:
+        """True while a window or the tray panel is visible, so the view is being kept current."""
+        return self._poller.visible
 
     # -- what a person can do ----------------------------------------------
 
@@ -380,7 +388,7 @@ class SettingsController(QObject):
         self._restart: RestartWhenIdle | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="murmly-settings")
         self._closed = False
-        self._active = False
+        self._surfaces: set[str] = set()
         self._waiting = False
         self._background_busy = False
         self._ticks = 0
@@ -411,14 +419,32 @@ class SettingsController(QObject):
         Opening it reads the file again, and while it is open a hand edit of the
         file is noticed within about a second.
         """
-        if self._closed or active == self._active:
+        self.setSurfaceActive("window", active)
+
+    @Slot(str, bool)
+    def setSurfaceActive(self, surface: str, active: bool) -> None:
+        """A surface that shows these settings ("window" for the page, "tray" for the
+        panel's switches) is, or is no longer, on screen.
+
+        Each one showing reads the file again; while any is showing, a hand edit
+        is noticed within about a second.
+        """
+        if self._closed:
             return
-        self._active = active
+        if active == (surface in self._surfaces):
+            return
         if active:
+            self._surfaces.add(surface)
             self._submit("state", self._model.load)
             self._timer.start()
-        elif not self._waiting:
-            self._timer.stop()
+        else:
+            self._surfaces.discard(surface)
+            if not self._surfaces and not self._waiting:
+                self._timer.stop()
+
+    @property
+    def _active(self) -> bool:
+        return bool(self._surfaces)
 
     @Slot(str, "QVariant")
     def change(self, control_id: str, value: object) -> None:

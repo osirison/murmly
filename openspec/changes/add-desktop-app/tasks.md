@@ -40,7 +40,7 @@ skip themselves when none is available.
 
 ## 7. Tray panel
 
-- [ ] 7.1 Tray icon and panel with state, last words and the four quick switches, which save as Settings does; verify a test that toggling a switch writes its key, and that with no tray available the app still starts and Health reports that no tray was found
+- [x] 7.1 Tray icon and panel with state, last words and the four quick switches, which save as Settings does; verify a test that toggling a switch writes its key, and that with no tray available the app still starts and Health reports that no tray was found
 
 ## 8. Delivered confirmation in the overlay
 

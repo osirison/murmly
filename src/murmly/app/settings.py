@@ -110,6 +110,10 @@ def to_value(control_id: str, raw: object, values: Mapping[str, object]) -> obje
     if control.kind == "idle":
         return config.DEFAULT_STT_UNLOAD_AFTER_IDLE_S if raw else 0
     if control.kind == "quiet":
+        # A switch reports on or off; a window as text (the tray restoring the
+        # last one) is written as it is.
+        if isinstance(raw, str) and raw:
+            return raw
         return DEFAULT_QUIET_WINDOW if raw else ""
     if control.kind in ("quiet-from", "quiet-to"):
         start, end = quiet_ends(values.get(control.key))
