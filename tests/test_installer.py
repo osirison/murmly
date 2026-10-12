@@ -866,6 +866,37 @@ class WindowsServiceInstallTests(unittest.TestCase):
         self.assertEqual("onlogon", create_call[create_call.index("/sc") + 1])
         self.assertTrue(service.is_installed)
 
+    def test_windows_spawns_without_a_console_window(self) -> None:
+        seen: list[dict] = []
+        schtasks = FakeSchtasks()
+
+        def runner(command, **kwargs):
+            seen.append(kwargs)
+            return schtasks(command, **kwargs)
+
+        with unittest.mock.patch("murmly.installer.sys.platform", "win32"):
+            WindowsUserService(run_command=runner).install(Path("C:/murmly/murmly.exe"))
+
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        self.assertTrue(seen)
+        for kwargs in seen:
+            self.assertEqual(no_window, kwargs["creationflags"])
+
+    def test_other_platforms_pass_no_creationflags(self) -> None:
+        seen: list[dict] = []
+        schtasks = FakeSchtasks()
+
+        def runner(command, **kwargs):
+            seen.append(kwargs)
+            return schtasks(command, **kwargs)
+
+        with unittest.mock.patch("murmly.installer.sys.platform", "linux"):
+            WindowsUserService(run_command=runner).install(Path("C:/murmly/murmly.exe"))
+
+        self.assertTrue(seen)
+        for kwargs in seen:
+            self.assertNotIn("creationflags", kwargs)
+
     def test_never_requests_elevation(self) -> None:
         """Task 8.2's testable half: no `/ru` (run as a different account,
         e.g. SYSTEM) and no `/rl HIGHEST` anywhere in the invocation --
