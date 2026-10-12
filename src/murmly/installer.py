@@ -1145,6 +1145,21 @@ def default_service(profile: PlatformProfile | None = None) -> object:
     return choice.load()()
 
 
+def in_process_hotkey_encoder(profile: PlatformProfile) -> Callable[[str], object]:
+    """The encoder that validates a hotkey for the in-process platform `profile` names.
+
+    Windows and macOS register in the daemon's own process and disagree on what
+    they can express (macOS stops at F20, Windows at F24), so each has its own.
+    `install` applies it before writing anything; the desktop app applies it
+    before binding, so both refuse the same keys.
+    """
+    from murmly.platform import OperatingSystem
+
+    if profile.operating_system is OperatingSystem.MACOS:
+        return macos_hotkey_for_portable
+    return windows_hotkey_for_portable
+
+
 class Installer:
     """Orchestrates the service and the hotkey as one operation.
 
@@ -1938,11 +1953,7 @@ class Installer:
         true -- today, Windows and macOS -- so macOS is the only case besides
         the Windows default that needs naming here.
         """
-        from murmly.platform import OperatingSystem
-
-        if self._profile.operating_system is OperatingSystem.MACOS:
-            return macos_hotkey_for_portable
-        return windows_hotkey_for_portable
+        return in_process_hotkey_encoder(self._profile)
 
     def _install_in_process(
         self, hotkey: Hotkey, session_hotkey: Hotkey | None

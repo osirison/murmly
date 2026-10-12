@@ -32,10 +32,14 @@ ApplicationWindow {
     onHealthShowingChanged: health.setActive(healthShowing)
 
     // Settings reads the file when it is shown, and watches it for hand edits while it is.
-    readonly property bool settingsShowing: onScreen && sections[current].id === "settings"
+    // First run reads it too, for the accuracy choice.
+    readonly property bool firstRunShowing: firstRun.view.visible === true
+    readonly property bool settingsShowing: onScreen && (firstRunShowing || sections[current].id === "settings")
     onSettingsShowingChanged: settings.setActive(settingsShowing)
 
+    // First run has a header of its own, so this one is not shown behind it.
     header: Rectangle {
+        visible: !window.firstRunShowing
         implicitHeight: theme.layout.hHeader
         color: theme.colors.surface
 
@@ -55,23 +59,7 @@ ApplicationWindow {
             RowLayout {
                 spacing: 9
 
-                Shape {
-                    // The mark: a speech bubble holding three voice bars.
-                    implicitWidth: 20
-                    implicitHeight: 20
-                    opacity: theme.scheme === "light" ? 0.65 : 0.75
-                    Accessible.ignored: true
-
-                    ShapePath {
-                        fillColor: theme.colors.textBright
-                        strokeColor: "transparent"
-                        fillRule: ShapePath.OddEvenFill
-                        scale: Qt.size(20 / 32, 20 / 32)
-                        PathSvg {
-                            path: "M8,2H24A6,6 0 0 1 30,8V17A6,6 0 0 1 24,23H14.6C14.6,26.1 13.1,28.4 9.6,29.8C10.9,27.9 11.2,25.6 11.2,23H8A6,6 0 0 1 2,17V8A6,6 0 0 1 8,2ZM9.3,7.2H9.3A2,2 0 0 1 11.3,9.2V15.8A2,2 0 0 1 9.3,17.8H9.3A2,2 0 0 1 7.3,15.8V9.2A2,2 0 0 1 9.3,7.2ZM16.9,5.2H16.9A2,2 0 0 1 18.9,7.2V17.8A2,2 0 0 1 16.9,19.8H16.9A2,2 0 0 1 14.9,17.8V7.2A2,2 0 0 1 16.9,5.2ZM23.6,4.2H23.6A1.1,1.1 0 0 1 24.7,5.3V19.7A1.1,1.1 0 0 1 23.6,20.8H23.6A1.1,1.1 0 0 1 22.5,19.7V5.3A1.1,1.1 0 0 1 23.6,4.2Z"
-                        }
-                    }
-                }
+                Mark {}
 
                 AppText {
                     role: "title14"
@@ -110,6 +98,8 @@ ApplicationWindow {
     StackLayout {
         anchors.fill: parent
         currentIndex: window.current
+        // Nothing behind first run can be reached by Tab while it covers the window.
+        enabled: !window.firstRunShowing
 
         Repeater {
             model: sections
@@ -125,5 +115,18 @@ ApplicationWindow {
                 onLoaded: item.title = title
             }
         }
+    }
+
+    // First run: a layer in this window, shown once from the start and never in
+    // response to anything the daemon reports.
+    Loader {
+        objectName: "first-run"
+        anchors.fill: parent
+        active: window.firstRunShowing
+        source: "FirstRunPage.qml"
+        // A Loader is a focus scope of its own. Taking the focus within this window
+        // when first run opens lets its key field take it in turn when clicked; it
+        // never activates or raises the window.
+        focus: active
     }
 }

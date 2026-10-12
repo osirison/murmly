@@ -126,14 +126,18 @@ def create_engine(
     home: controller.HomeController | None = None,
     health: controller.HealthController | None = None,
     settings: controller.SettingsController | None = None,
+    keys: controller.KeysController | None = None,
+    first_run: controller.FirstRunController | None = None,
 ) -> tuple[QQmlApplicationEngine, Theme]:
     """Load the window. The caller keeps both returned objects alive.
 
-    `home`, `health` and `settings` are the controllers QML reads as `home`,
-    `health` and `settings`; by default ones that poll the real daemon, run the
-    real `murmly doctor` and read the real configuration file. A test passes ones
-    with a fake behind them, so no test asks the machine's own daemon anything,
-    runs doctor or touches the person's settings.
+    `home`, `health`, `settings` and `keys` (QML's `hotkeys`) are the controllers QML reads under
+    those names; by default ones that poll the real daemon, run the real
+    `murmly doctor`, read the real configuration file and read the real hotkey
+    record. A test passes ones with a fake behind them, so no test asks the
+    machine's own daemon anything, runs doctor, touches the person's settings or
+    binds a key. `first_run` is `firstRun`; by default first run is not showing,
+    because whether it shows depends on the machine, and `run` decides that.
     """
     engine = QQmlApplicationEngine()
     theme_object = Theme(engine)
@@ -143,15 +147,25 @@ def create_engine(
         health = controller.HealthController(controller.default_health_model())
     if settings is None:
         settings = controller.SettingsController(controller.default_settings_model())
+    if keys is None:
+        keys = controller.KeysController(controller.default_keys_model(), settings.executor)
+    if first_run is None:
+        first_run = controller.FirstRunController()
+    # Home reads the keys again once one is saved.
+    keys.keysChanged.connect(home.setupChanged)
     # The engine owns them from here, so QML never outlives what it reads.
     home.setParent(engine)
     health.setParent(engine)
     settings.setParent(engine)
+    keys.setParent(engine)
+    first_run.setParent(engine)
     context = engine.rootContext()
     context.setContextProperty("theme", theme_object)
     context.setContextProperty("home", home)
     context.setContextProperty("health", health)
     context.setContextProperty("settings", settings)
+    context.setContextProperty("hotkeys", keys)
+    context.setContextProperty("firstRun", first_run)
     context.setContextProperty("sections", list(shell.SECTIONS))
     engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
     return engine, theme_object

@@ -35,8 +35,8 @@ skip themselves when none is available.
 
 ## 6. First run
 
-- [ ] 6.1 Key recorder confined to its focused field, validated by `murmly install`'s rules and bound through the same install path; verify tests that a combination without Meta, Ctrl or Alt is refused, a held key is refused (naming the holder where reported), and keystrokes are ignored when the field is not recording
-- [ ] 6.2 Accuracy step and the try-it text box; verify a test that choosing a profile writes `stt.model_profile`
+- [x] 6.1 Key recorder confined to its focused field, validated by `murmly install`'s rules and bound through the same install path; verify tests that a combination without Meta, Ctrl or Alt is refused, a held key is refused (naming the holder where reported), and keystrokes are ignored when the field is not recording
+- [x] 6.2 Accuracy step and the try-it text box; verify a test that choosing a profile writes `stt.model_profile`
 
 ## 7. Tray panel
 

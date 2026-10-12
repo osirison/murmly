@@ -346,6 +346,14 @@ Item {
                                         wrapMode: Text.NoWrap
                                     }
                                 }
+
+                                // Setting up again after "Set up later": the person asks for it.
+                                AppButton {
+                                    objectName: "key-setup-" + index
+                                    visible: modelData.keys.length === 0 && index === 0
+                                    text: "Set up"
+                                    onClicked: firstRun.open()
+                                }
                             }
 
                             AppText {

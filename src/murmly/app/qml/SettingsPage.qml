@@ -56,9 +56,15 @@ Item {
             }
 
             SubNavButton {
+                objectName: "settings-go-keys"
+                text: "Your keys"
+                selected: page.pane === "dictation"
+                Layout.fillWidth: true
+                onClicked: page.show("dictation", keysSection)
+            }
+            SubNavButton {
                 objectName: "settings-go-accuracy"
                 text: "Accuracy and speed"
-                selected: page.pane === "dictation"
                 Layout.fillWidth: true
                 onClicked: page.show("dictation", accuracySection)
             }
@@ -193,6 +199,61 @@ Item {
                         visible: page.pane === "dictation"
                         spacing: theme.space.space30
                         Layout.fillWidth: true
+
+                        ColumnLayout {
+                            id: keysSection
+                            spacing: theme.space.space12
+                            Layout.fillWidth: true
+
+                            AppText {
+                                role: "label"
+                                text: "Your keys"
+                                color: theme.colors.textLabel
+                                Accessible.role: Accessible.Heading
+                            }
+
+                            // What binding a key came to; a refusal is an outline, never a fill.
+                            Banner {
+                                objectName: "settings-keys-note"
+                                visible: hotkeys.view.note.tone !== undefined && hotkeys.view.note.tone !== ""
+                                tone: hotkeys.view.note.tone === "amber" ? "amber" : "crimson"
+                                title: hotkeys.view.note.status === "held" ? "Those keys are taken"
+                                    : hotkeys.view.note.status === "unconfirmed" ? "Saved for your next sign-in"
+                                    : "The keys were not set"
+                                text: hotkeys.view.note.text !== undefined ? hotkeys.view.note.text : ""
+                                textItem.objectName: "settings-keys-note-text"
+                            }
+
+                            AppText {
+                                objectName: "settings-keys-detail"
+                                visible: hotkeys.view.note.tone !== undefined && hotkeys.view.note.tone !== ""
+                                    && hotkeys.view.note.detail !== undefined && hotkeys.view.note.detail !== ""
+                                role: "monoMeta"
+                                text: hotkeys.view.note.detail !== undefined ? hotkeys.view.note.detail : ""
+                                color: theme.colors.text5
+                                Layout.fillWidth: true
+                            }
+
+                            SettingsCard {
+                                SettingRow {
+                                    title: "Dictate"
+                                    text: "Types into the window you started in."
+                                    divider: true
+                                    KeyField {
+                                        objectName: "settings-key-window"
+                                        purpose: "window"
+                                    }
+                                }
+                                SettingRow {
+                                    title: "Reply to your assistant"
+                                    text: "Sends your reply to the assistant that is speaking, not to the window in front."
+                                    KeyField {
+                                        objectName: "settings-key-session"
+                                        purpose: "session"
+                                    }
+                                }
+                            }
+                        }
 
                         ColumnLayout {
                             id: accuracySection

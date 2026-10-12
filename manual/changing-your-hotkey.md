@@ -40,6 +40,23 @@ uv run murmly install Meta+Shift+Space Meta+A
 Asking for a key that murmly's *other* binding currently holds is refused
 rather than silently unbinding it — name both keys in one command instead.
 
+## Choosing it in the app
+
+The Murmly app (`murmly app`) offers the same choice. The first time it opens with
+no dictation key bound, it starts with a page for choosing the keys: click the box,
+then press the combination you want, or pick one of the three it suggests. Settings,
+then Your keys, does the same later, for the dictation key and for the reply key.
+
+The app records only while you have clicked **Change** (or the box) and that field
+has the keyboard. It does not watch the keyboard anywhere else, in any other window,
+or in the rest of the app. Press Escape to stop without choosing.
+
+The app binds the combination by running the same installation as `murmly install`,
+so it refuses what the command refuses, and a key another application holds is
+refused with that application's name where your desktop reports it. It is stricter
+in one way: the combination must include Meta, Ctrl or Alt, so a key with only Shift
+is refused, which `murmly install` would accept.
+
 ## Removing it
 
 Remove everything:
