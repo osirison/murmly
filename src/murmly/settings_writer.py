@@ -185,21 +185,28 @@ class SettingsWriter:
         table[name] = value
 
     def _replace(self, text: str, *, existed: bool) -> None:
-        """Write beside the file and swap it in, so a reader never sees half a file."""
-        directory = self.path.parent
-        directory.mkdir(parents=True, exist_ok=True)
-        mode = stat.S_IMODE(self.path.stat().st_mode) if existed else 0o644
-        descriptor, temporary = tempfile.mkstemp(
-            dir=directory, prefix=f".{self.path.name}.", suffix=".tmp"
-        )
+        """Write beside the file and swap it in, so a reader never sees half a file.
+
+        A symbolic link is written through: the temporary file goes next to the
+        link's final target and replaces that, so the link stays and the target
+        has the new content. A link to a missing file creates the file there.
+        """
+        target = Path(os.path.realpath(self.path))
+        temporary: str | None = None
         try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            mode = stat.S_IMODE(target.stat().st_mode) if existed else 0o644
+            descriptor, temporary = tempfile.mkstemp(
+                dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+            )
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(text.encode("utf-8"))
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(temporary, mode)
-            self.retrying(lambda: self._replace_file(temporary, self.path))
+            self.retrying(lambda: self._replace_file(temporary, target))
         except OSError as error:
-            Path(temporary).unlink(missing_ok=True)
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
             hint = " Another program may have it open." if isinstance(error, PermissionError) else ""
             raise SettingsFileError(f"Unable to write {self.path}: {error}.{hint}") from error
