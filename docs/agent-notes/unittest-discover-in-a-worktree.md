@@ -3,7 +3,7 @@ title: The documented test command fails in a worktree, and the fix is recorded 
 description: uv run --no-sync leaves a worktree with an empty .venv and sixteen load errors; the two notes that explain it are keyed to triggers nobody greps for when running tests
 trigger: uv run --no-sync python -m unittest discover -s tests, uv run --no-sync python -m unittest, unittest discover -s tests
 
-depends_on: AGENTS.md, docs/agent-notes/onnxruntime-gpu-cuda-version.md, docs/agent-notes/capturing-the-overlay-for-docs.md
+depends_on: AGENTS.md, pyproject.toml, uv.lock, docs/agent-notes/onnxruntime-gpu-cuda-version.md, docs/agent-notes/capturing-the-overlay-for-docs.md
 recorded: 2026-08-28
 ---
 
@@ -43,6 +43,20 @@ PYTHONPATH="$PWD/src" "$MAIN/.venv/bin/python3" -m unittest discover -s tests
 
 `--git-common-dir` resolves to the main checkout's `.git` from inside any
 worktree, so its parent is the checkout whose `.venv` was populated.
+
+**If `tomlkit` is missing (since #78),** test modules that import the settings
+writer fail to load with `ModuleNotFoundError: No module named 'tomlkit'`. #78
+made `tomlkit` a core dependency, and the main checkout's venv lacks it until that
+checkout is synced. Do not sync it. Install the package into a scratch directory
+at the version `uv.lock` pins and add that directory to `PYTHONPATH`:
+
+```bash
+uv pip install --target "$SCRATCH/deps-core" tomlkit==<version in uv.lock>
+PYTHONPATH="$PWD/src:$SCRATCH/deps-core" "$MAIN/.venv/bin/python3" -m unittest discover -s tests
+```
+
+Confirmed on 2026-10-12. The same applies to any later core dependency the main
+checkout's venv has not caught up with.
 
 **Confirm it imported the right branch before trusting the result.** The
 borrowed venv carries an editable install pointing at the main checkout's
