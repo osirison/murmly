@@ -64,5 +64,5 @@ skip themselves when none is available.
 
 ## 11. Integration
 
-- [ ] 11.1 Write `manual/using-the-app.md` and add it to the `mkdocs.yml` navigation; verify `mkdocs build --strict` passes
+- [x] 11.1 Write `manual/using-the-app.md` and add it to the `mkdocs.yml` navigation; verify `mkdocs build --strict` passes
 - [ ] 11.2 Run the app end to end on KDE Plasma X11 and on Windows: dictate with the app open behind the target window, change a setting while recording, refuse a delivery by switching windows, enrol a voice and switch to "only my voice", remove the owner's voice and see the voices-not-checked notice, and remove Murmly; record the results in the change before archiving

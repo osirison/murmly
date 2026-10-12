@@ -14,6 +14,8 @@ is about ten minutes and it is the whole of getting going.
 
 **Already installed it?** The page you want is probably one of these:
 
+- [Using the app](using-the-app.md) — see what murmly is doing, change settings
+  and check its health without a terminal.
 - [Changing your hotkey](changing-your-hotkey.md) — pick a different key, or take
   the key away.
 - [Where your words go](where-your-words-go.md) — why a transcript sometimes
@@ -40,6 +42,7 @@ wrong](troubleshooting.md).
 | [What you need before you start](what-you-need.md) | The computer and the software murmly expects, and what it needs to paste into your windows |
 | [Installing murmly](install.md) | One command, what it writes, and the ways to do it by hand |
 | [Using murmly](using-murmly.md) | The three-step loop, and the little window that appears while you speak |
+| [Using the app](using-the-app.md) | The desktop app: Home, Settings, Health, the tray, and removing murmly |
 | [Changing your hotkey](changing-your-hotkey.md) | Rebinding, moving both keys at once, and removing them |
 | [Where your words go](where-your-words-go.md) | Pasting, the clipboard, and why murmly sometimes refuses to paste |
 | [Typing only your own voice](typing-only-your-own-voice.md) | Setting up speaker recognition: enrolling your voice, leaving out other voices or labelling them |

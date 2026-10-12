@@ -76,6 +76,9 @@ screen ([`overlay.bottom_margin_px`](settings.md#overlay-bottom-margin-px)),
 whether it uses [reduced motion](settings.md#overlay-reduced-motion), and the
 [size of its text](settings.md#overlay-text-size-px).
 
+Prefer a window to a terminal? [The app](using-the-app.md) shows what murmly is
+doing and changes settings for you.
+
 Next: see [where your words go](where-your-words-go.md) once murmly has
 delivered them, or [change your hotkey](changing-your-hotkey.md) if the one
 you picked at install time is not the one you want.
