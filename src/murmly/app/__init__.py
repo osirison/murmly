@@ -19,11 +19,12 @@ def run() -> int:
     """
     import sys
 
-    from PySide6.QtGui import QGuiApplication
+    # A QApplication, not a bare QGuiApplication: the tray icon's menu is a widget.
+    from PySide6.QtWidgets import QApplication
 
-    from murmly.app import controller, qt
+    from murmly.app import controller, qt, tray_qt
 
-    application = QGuiApplication(sys.argv[:1])
+    application = QApplication(sys.argv[:1])
     application.setApplicationName(APP_TITLE)
     for path in qt.prepare_application():
         print(f"murmly: the bundled font {path.name} could not be loaded.", file=sys.stderr)
@@ -45,7 +46,10 @@ def run() -> int:
     first_run = controller.FirstRunController(
         controller.keys.FirstRun(controller.keys.should_show_first_run(keys_model.read()))
     )
-    engine, theme = qt.create_engine(home, health, settings, keys, first_run)
+    # The tray, where the desktop has one; otherwise Health says none was found and
+    # closing the window ends the app. Never raises: no tray is a normal desktop.
+    tray = tray_qt.create_tray(home, settings, health, application)
+    engine, theme = qt.create_engine(home, health, settings, keys, first_run, tray)
     if not engine.rootObjects():
         print("murmly: the app window could not be created.", file=sys.stderr)
         return 1

@@ -39,9 +39,9 @@ which is `QApplication.instance() or QApplication(...)`. A `QApplication` is a
 Never write `QGuiApplication(...)` in a test, and never create the application
 in a `setUp` that runs before `qt_application`.
 
-The app itself (`murmly.app.run`) does create a bare `QGuiApplication`, which is
-right for a process that never shows a widget. Tests share a process, so they
-cannot make the same choice.
+The app itself (`murmly.app.run`) also creates a `QApplication` now: the tray icon
+(`QSystemTrayIcon`) and its menu are widgets. Before the tray it was a bare
+`QGuiApplication`, which suited a process that showed no widget.
 
 ## Checking
 

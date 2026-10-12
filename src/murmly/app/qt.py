@@ -7,6 +7,7 @@ when PySide6 is absent) imports this module.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Property, QObject, Qt, QUrl, Signal
 from PySide6.QtGui import QFont, QGuiApplication
@@ -15,8 +16,12 @@ from PySide6.QtQuickControls2 import QQuickStyle
 
 from murmly.app import controller, fonts, shell, theme
 
+if TYPE_CHECKING:
+    from murmly.app import tray_qt
+
 QML_DIR = Path(__file__).resolve().parent / "qml"
 MAIN_QML = QML_DIR / "Main.qml"
+TRAY_QML = QML_DIR / "TrayPanel.qml"
 
 # The text the window shows when nothing else sizes it; also the application
 # font's pixel size for anything that does not name a type step.
@@ -128,6 +133,7 @@ def create_engine(
     settings: controller.SettingsController | None = None,
     keys: controller.KeysController | None = None,
     first_run: controller.FirstRunController | None = None,
+    tray: "tray_qt.TrayController | None" = None,
 ) -> tuple[QQmlApplicationEngine, Theme]:
     """Load the window. The caller keeps both returned objects alive.
 
@@ -167,5 +173,14 @@ def create_engine(
     context.setContextProperty("hotkeys", keys)
     context.setContextProperty("firstRun", first_run)
     context.setContextProperty("sections", list(shell.SECTIONS))
+    if tray is not None:
+        tray.setParent(engine)
+        context.setContextProperty("tray", tray)
     engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
+    if tray is not None and engine.rootObjects():
+        # The panel is a second window, hidden until the person clicks the icon.
+        engine.load(QUrl.fromLocalFile(str(TRAY_QML)))
+        roots = engine.rootObjects()
+        if len(roots) == 2:
+            tray.attach(roots[0], roots[1])
     return engine, theme_object
