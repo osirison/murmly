@@ -48,6 +48,9 @@ from murmly.config import (
     load_config,
 )
 
+# A home folder that is valid on whatever host runs the tests, for a test that patches nothing.
+HOST_HOME_ENV = {"HOME": tempfile.gettempdir(), "USERPROFILE": tempfile.gettempdir()}
+
 
 class ConfigTests(unittest.TestCase):
     def test_default_socket_path_uses_runtime_dir(self) -> None:
@@ -717,16 +720,14 @@ class LinuxPathsAreUnmovedTests(unittest.TestCase):
             uid_runtime_dir = Path(f"/run/user/{os.getuid()}")
 
             # Each of the three overrides is independently set or unset, for every
-            # one of the eight combinations. `env` always carries an unrelated key
-            # so an "unset" combination is never the empty dict: `default_*`'s
-            # `env or os.environ` treats `{}` as falsy and would silently read the
-            # real process environment instead of the combination under test.
+            # one of the eight combinations. `env` always carries the home folder,
+            # which an "unset" combination falls back to.
             for config_home, data_home, runtime_dir in itertools.product(
                 ("/tmp/murmly-test-config", None),
                 ("/tmp/murmly-test-data", None),
                 ("/tmp/murmly-test-runtime", None),
             ):
-                env = {"MURMLY_TEST_UNRELATED": "1"}
+                env = {"HOME": str(home)}
                 if config_home is not None:
                     env["XDG_CONFIG_HOME"] = config_home
                 if data_home is not None:
@@ -799,24 +800,134 @@ class WindowsAndMacOSPathTests(unittest.TestCase):
 
     def test_macos_paths_use_the_library_directories(self) -> None:
         with patch("sys.platform", "darwin"):
-            home = Path.home()
+            home = Path("/home/test")  # never written to: only a path to compare
+            HOME_ENV = {"HOME": "/home/test"}
             self.assertEqual(
                 home / "Library" / "Application Support" / "murmly" / "config.toml",
-                default_config_path({}),
+                default_config_path(HOME_ENV),
             )
             self.assertEqual(
                 home / "Library" / "Application Support" / "murmly",
-                default_tts_model_dir({}),
+                default_tts_model_dir(HOME_ENV),
             )
             self.assertEqual(
                 home / "Library" / "Application Support" / "murmly",
-                default_data_dir({}),
+                default_data_dir(HOME_ENV),
             )
-            self.assertEqual(home / "Library" / "Caches" / "murmly", default_runtime_dir({}))
+            self.assertEqual(home / "Library" / "Caches" / "murmly", default_runtime_dir(HOME_ENV))
             self.assertEqual(
                 home / "Library" / "Caches" / "murmly" / "murmly.sock",
-                default_socket_path({}),
+                default_socket_path(HOME_ENV),
             )
+
+
+class ReadsOnlyTheGivenEnvironmentTests(unittest.TestCase):
+    """A supplied environment answers for the home folder too, never the real one.
+
+    A purge pointed at a temporary home must not resolve to the real person's
+    folders, and a relative XDG value is ignored as the XDG specification says.
+    """
+
+    def setUp(self) -> None:
+        if os.name != "posix":
+            self.skipTest("builds POSIX-shaped environments")
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.home = Path(directory.name)
+        patcher = patch("pathlib.Path.home", side_effect=AssertionError("the real home was read"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_linux_home_comes_from_the_environment(self) -> None:
+        env = {"HOME": str(self.home)}
+        with patch("sys.platform", "linux"):
+            self.assertEqual(self.home / ".config" / "murmly" / "config.toml", default_config_path(env))
+            self.assertEqual(self.home / ".local" / "share" / "murmly", default_data_dir(env))
+
+    def test_macos_home_comes_from_the_environment(self) -> None:
+        env = {"HOME": str(self.home)}
+        with patch("sys.platform", "darwin"):
+            support = self.home / "Library" / "Application Support" / "murmly"
+            self.assertEqual(support / "config.toml", default_config_path(env))
+            self.assertEqual(support, default_data_dir(env))
+            self.assertEqual(self.home / "Library" / "Caches" / "murmly", default_runtime_dir(env))
+
+    def test_an_environment_without_a_home_raises(self) -> None:
+        for platform in ("linux", "darwin", "win32"):
+            for function in (default_config_path, default_data_dir):
+                with self.subTest(platform=platform, function=function.__name__):
+                    with patch("sys.platform", platform):
+                        with self.assertRaises(RuntimeError):
+                            function({})
+
+    def test_a_relative_home_is_not_a_home(self) -> None:
+        with patch("sys.platform", "linux"):
+            with self.assertRaises(RuntimeError):
+                default_data_dir({"HOME": "relative/home"})
+
+    def test_relative_xdg_values_are_ignored(self) -> None:
+        for value in (".", "relative/dir", "~/elsewhere", "~", ""):
+            env = {"HOME": str(self.home), "XDG_CONFIG_HOME": value, "XDG_DATA_HOME": value}
+            with self.subTest(value=value), patch("sys.platform", "linux"):
+                self.assertEqual(
+                    self.home / ".config" / "murmly" / "config.toml", default_config_path(env)
+                )
+                self.assertEqual(self.home / ".local" / "share" / "murmly", default_data_dir(env))
+
+    def test_a_relative_runtime_dir_is_ignored(self) -> None:
+        env = {"HOME": str(self.home), "XDG_RUNTIME_DIR": "run"}
+        with patch("sys.platform", "linux"):
+            self.assertEqual(Path(f"/run/user/{os.getuid()}"), default_runtime_dir(env))
+
+    def test_absolute_xdg_values_are_still_used(self) -> None:
+        env = {
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.home / "c"),
+            "XDG_DATA_HOME": str(self.home / "d"),
+        }
+        with patch("sys.platform", "linux"):
+            self.assertEqual(self.home / "c" / "murmly" / "config.toml", default_config_path(env))
+            self.assertEqual(self.home / "d" / "murmly", default_data_dir(env))
+
+    def test_installer_folders_follow_the_same_rules(self) -> None:
+        from murmly.installer import (
+            default_applications_dir,
+            default_launch_agents_dir,
+            default_shortcut_config_path,
+            default_unit_dir,
+        )
+
+        env = {"HOME": str(self.home), "XDG_CONFIG_HOME": ".", "XDG_DATA_HOME": "~/x"}
+        self.assertEqual(self.home / ".config" / "systemd" / "user", default_unit_dir(env))
+        self.assertEqual(self.home / ".local" / "share" / "applications", default_applications_dir(env))
+        self.assertEqual(self.home / ".config" / "kglobalshortcutsrc", default_shortcut_config_path(env))
+        self.assertEqual(self.home / "Library" / "LaunchAgents", default_launch_agents_dir(env))
+        for function in (default_unit_dir, default_applications_dir, default_launch_agents_dir):
+            with self.subTest(function=function.__name__):
+                with self.assertRaises(RuntimeError):
+                    function({})
+
+
+class WindowsReadsOnlyTheGivenEnvironmentTests(unittest.TestCase):
+    def test_home_comes_from_userprofile(self) -> None:
+        env = {"USERPROFILE": r"C:\Users\a"}
+        with patch("sys.platform", "win32"), patch(
+            "pathlib.Path.home", side_effect=AssertionError("the real home was read")
+        ):
+            self.assertEqual(
+                Path(r"C:\Users\a") / "AppData" / "Roaming" / "murmly" / "config.toml",
+                default_config_path(env),
+            )
+            self.assertEqual(Path(r"C:\Users\a") / "AppData" / "Local" / "murmly", default_data_dir(env))
+
+    def test_relative_appdata_is_ignored(self) -> None:
+        env = {"USERPROFILE": r"C:\Users\a", "APPDATA": "roaming", "LOCALAPPDATA": r".\local"}
+        with patch("sys.platform", "win32"):
+            self.assertEqual(
+                Path(r"C:\Users\a") / "AppData" / "Roaming" / "murmly" / "config.toml",
+                default_config_path(env),
+            )
+            self.assertEqual(Path(r"C:\Users\a") / "AppData" / "Local" / "murmly", default_data_dir(env))
 
 
 class SpeakerSettingsTests(unittest.TestCase):
@@ -827,7 +938,7 @@ class SpeakerSettingsTests(unittest.TestCase):
             config_path = Path(temp_dir) / "config.toml"
             if body is not None:
                 config_path.write_text(textwrap.dedent(body), encoding="utf-8")
-            return load_config(config_path, {})
+            return load_config(config_path, HOST_HOME_ENV)
 
     def test_defaults_when_the_table_is_absent(self) -> None:
         config = self._load(None)
@@ -915,9 +1026,9 @@ class SpeakerSettingsTests(unittest.TestCase):
         """Task 3.2: the data directory is the one place both models live."""
         for platform_name, env in (
             ("linux", {"XDG_DATA_HOME": "/data"}),
-            ("linux", {}),
+            ("linux", {"HOME": "/home/test"}),
             ("win32", {"LOCALAPPDATA": r"C:\Users\a\AppData\Local"}),
-            ("darwin", {}),
+            ("darwin", {"HOME": "/home/test"}),
         ):
             with self.subTest(platform=platform_name, env=env), patch("sys.platform", platform_name):
                 self.assertEqual(default_data_dir(env), default_tts_model_dir(env))

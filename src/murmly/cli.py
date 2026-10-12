@@ -608,6 +608,9 @@ def _run_uninstall(purge: bool = False, assume_yes: bool = False) -> int:
 
     for message in result.messages:
         print(message)
+    if result.failed:
+        print("Murmly was not completely removed. See above for what is left.", file=sys.stderr)
+        return 1
     return 0
 
 

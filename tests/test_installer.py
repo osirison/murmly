@@ -3917,6 +3917,7 @@ class EndToEndBackendSelectionTests(unittest.TestCase):
             env = {
                 "XDG_DATA_HOME": str(Path(temp_dir) / "data"),
                 "XDG_CONFIG_HOME": str(Path(temp_dir) / "config"),
+                "HOME": temp_dir,
             }
             applications_dir = default_applications_dir(env)
             bus = FakePlasmaBus(applications_dir)

@@ -906,6 +906,12 @@ class RemovalController(QObject):
                     logger.warning("Settings could not be resumed after a failed removal.", exc_info=True)
         else:
             self._state.removed(value)
+            if self._state.step == removal.PARTIAL:
+                # The app stays open, so Settings must work again.
+                try:
+                    self._removal_failed()
+                except Exception:  # noqa: BLE001
+                    logger.warning("Settings could not be resumed after a partial removal.", exc_info=True)
         self._rebuild()
 
     def _rebuild(self) -> None:

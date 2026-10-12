@@ -33,6 +33,12 @@ KEEP_IN_DATA_DIR = ("hooks",)
 OWN_DIRECTORY_NAME = "murmly"
 
 
+PURGE_SKIPPED = (
+    "Settings and downloaded files were kept: the Murmly service could not be removed "
+    "and may still be using them."
+)
+
+
 @dataclass(frozen=True, slots=True)
 class PurgeTarget:
     """A folder a purge empties: what is in it, in words, and where it is."""
@@ -81,6 +87,30 @@ class PurgeResult:
         return tuple(lines) + self.problems
 
 
+def refusal(path: Path) -> str | None:
+    """Why a purge must not delete `path`, or None when every rule allows it.
+
+    Checked by the purge itself, on top of where the folders were resolved from, so a
+    wrong setting upstream still cannot aim a deletion at a person's own folders.
+    """
+    if not path.is_absolute():
+        return "it is not an absolute path."
+    if path == Path(path.anchor) or path.parent == path:
+        return "it is a root folder."
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = None
+    if path == home:
+        return "it is the home folder."
+    if path.name != OWN_DIRECTORY_NAME:
+        return "it is not a folder Murmly made."
+    # A junction is Windows' link between folders and is not a symbolic link.
+    if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+        return "it is a link, not a folder."
+    return None
+
+
 def purge(
     targets: tuple[PurgeTarget, ...],
     rmtree: Callable[[Path], None] = shutil.rmtree,
@@ -95,12 +125,11 @@ def purge(
     problems: list[str] = []
     for target in targets:
         path = target.path
-        if path.name != OWN_DIRECTORY_NAME:
-            problems.append(f"Did not delete {path}: it is not a folder Murmly made.")
+        reason = refusal(path)
+        if reason is not None:
+            problems.append(f"Did not delete {path}: {reason}")
             continue
-        if path.is_symlink() or not path.is_dir():
-            if path.is_symlink():
-                problems.append(f"Did not delete {path}: it is a link, not a folder.")
+        if not path.is_dir():
             continue
         try:
             children = sorted(path.iterdir())
@@ -149,12 +178,22 @@ class RemovalResult:
 
     outcome: InstallOutcome
     purged: PurgeResult | None = None
+    #: True when a purge was asked for and not run, because the service was not removed.
+    purge_skipped: bool = False
+
+    @property
+    def failed(self) -> bool:
+        """Whether any part of the removal, or of the purge, did not happen."""
+        purge_problems = self.purged.problems if self.purged is not None else ()
+        return bool(self.outcome.problems or purge_problems or self.purge_skipped)
 
     @property
     def messages(self) -> tuple[str, ...]:
         lines = tuple(self.outcome.messages)
         if self.purged is not None:
             lines += self.purged.messages
+        if self.purge_skipped:
+            lines += (PURGE_SKIPPED,)
         return lines
 
 
@@ -166,8 +205,12 @@ def remove_murmly(
     """Run `murmly uninstall`, and delete settings and models only when asked.
 
     `InstallError` from the uninstall propagates and nothing is purged: files a
-    person asked to be deleted along with a removal that did not happen stay.
+    person asked to be deleted along with a removal that did not happen stay. So
+    they do when the service could not be removed, since it may still be running
+    with those files open.
     """
     outcome = installer.uninstall()
+    if purge_user_files and outcome.service_removal_failed:
+        return RemovalResult(outcome, None, purge_skipped=True)
     purged = purge(purge_targets(env)) if purge_user_files else None
     return RemovalResult(outcome, purged)

@@ -161,6 +161,47 @@ class StepTests(unittest.TestCase):
         self.assertEqual(["Removed the Murmly service.", "Released the Murmly hotkey."], view["report"])
         self.assertTrue(state.finished)
 
+    def test_a_removal_that_left_parts_behind_is_not_reported_as_done(self) -> None:
+        import dataclasses
+
+        state = removal.RemovalState()
+        state.request()
+        state.planned(a_plan())
+        state.confirm()
+        partial = dataclasses.replace(
+            outcome("Released the Murmly hotkey.", "systemctl could not stop the service"),
+            problems=("systemctl could not stop the service",),
+            service_removal_failed=True,
+        )
+
+        state.removed(plain.RemovalResult(partial, purge_skipped=True))
+
+        view = removal.removal_view(state)
+        self.assertEqual("partial", view["step"])
+        self.assertTrue(view["open"])
+        self.assertFalse(state.finished)
+        self.assertEqual(removal.TITLE_PARTIAL, view["title"])
+        self.assertEqual(
+            ["Released the Murmly hotkey.", "systemctl could not stop the service", plain.PURGE_SKIPPED],
+            view["report"],
+        )
+        self.assertEqual(removal.PARTIAL_NOTE, view["doneNote"])
+        self.assertNotEqual(removal.TITLE_DONE, view["title"])
+
+    def test_a_partial_removal_can_be_closed_and_asked_for_again(self) -> None:
+        import dataclasses
+
+        state = removal.RemovalState()
+        state.request()
+        state.planned(a_plan())
+        state.confirm()
+        state.removed(plain.RemovalResult(dataclasses.replace(outcome("x"), problems=("x",))))
+
+        state.cancel()
+        self.assertEqual("idle", state.step)
+        self.assertEqual((), state.report)
+        self.assertTrue(state.request())
+
     def test_a_failed_removal_says_why_and_can_be_closed(self) -> None:
         state = removal.RemovalState()
         state.request()
