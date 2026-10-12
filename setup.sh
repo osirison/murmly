@@ -219,17 +219,26 @@ sync_environment() {
 
 # --------------------------------------------------------------- models -----
 
-#: An XDG folder: the setting when it is an absolute path, else the default. The
-#: XDG specification says to ignore a relative value, and so does `murmly`.
+#: An XDG folder: the setting when it is an absolute path, else `$2` under the home
+#: folder. The XDG specification says to ignore a relative value, and so does
+#: `murmly`. With no absolute setting and no absolute home it fails, rather than
+#: answer with a path at the root of the disk.
 xdg_home() {
     case "$1" in
         /*) printf '%s\n' "$1" ;;
-        *) printf '%s\n' "$2" ;;
+        *)
+            case "${HOME:-}" in
+                /*) printf '%s/%s\n' "$HOME" "$2" ;;
+                *) fail "HOME is not set to an absolute path, and no absolute XDG folder is set." ;;
+            esac
+            ;;
     esac
 }
 
 data_dir() {
-    printf '%s/murmly\n' "$(xdg_home "${XDG_DATA_HOME:-}" "$HOME/.local/share")"
+    local base
+    base="$(xdg_home "${XDG_DATA_HOME:-}" ".local/share")" || return 1
+    printf '%s/murmly\n' "$base"
 }
 
 #: The synthesis models live directly in the data directory, which is what
@@ -239,7 +248,9 @@ model_dir() {
 }
 
 hook_dir() {
-    printf '%s\n' "$(data_dir)/hooks"
+    local base
+    base="$(data_dir)" || return 1
+    printf '%s/hooks\n' "$base"
 }
 
 install_models() {
@@ -479,18 +490,20 @@ announce_copilot_instruction() {
 
 remove_announce_hook() {
     local installer="$REPO/hooks/install_hooks.py"
+    local hooks
+    hooks="$(hook_dir)" || return 1
     step "Agent announcements"
     if [ -f "$installer" ]; then
-        python3 "$installer" --script "$(hook_dir)/murmly-announce.py" \
+        python3 "$installer" --script "$hooks/murmly-announce.py" \
             --agents claude,copilot --remove | while IFS= read -r line; do
             info "$line"
         done
     else
         warn "This checkout has no hook installer, so any registration was left in place."
     fi
-    rm -f -- "$(hook_dir)/murmly-announce.py"
-    rm -f -- "$(hook_dir)/murmly-voice-note.py"
-    rmdir -- "$(hook_dir)" 2>/dev/null || true
+    rm -f -- "$hooks/murmly-announce.py"
+    rm -f -- "$hooks/murmly-voice-note.py"
+    rmdir -- "$hooks" 2>/dev/null || true
 }
 
 #: Offered during an install, where it is one more question rather than the
@@ -740,8 +753,9 @@ command_uninstall() {
     fi
 
     local models config
-    models="$(model_dir)"
-    config="$(xdg_home "${XDG_CONFIG_HOME:-}" "$HOME/.config")/murmly"
+    models="$(model_dir)" || return 1
+    config="$(xdg_home "${XDG_CONFIG_HOME:-}" ".config")" || return 1
+    config="$config/murmly"
 
     if [ "$PURGE" -eq 0 ]; then
         step "Kept"
@@ -749,12 +763,12 @@ command_uninstall() {
         note "Synthesis models:    $models"
         note "Configuration:       $config"
         note "Pass --purge to remove these too."
-        return 0
+        return "$uninstall_failed"
     fi
 
     if [ "$uninstall_failed" -eq 1 ]; then
         step "Purge"
-        warn "Nothing was removed: the service may still be running with these files open."
+        warn "Nothing was removed: murmly uninstall did not finish cleanly, so these files were kept. Fix what it reported, then run this again."
         note "Virtual environment: $REPO/.venv"
         note "Synthesis models:    $models"
         note "Configuration:       $config"

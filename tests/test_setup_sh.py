@@ -636,7 +636,9 @@ class SetupShUninstallTests(SetupShTestCase):
     """`uninstall --purge`: where it deletes, and when it refuses to. `rm` is a function
     that only records its arguments, so nothing here deletes anything."""
 
-    def _uninstall(self, murmly_exit: int, xdg: str = "") -> subprocess.CompletedProcess[str]:
+    def _uninstall(
+        self, murmly_exit: int, xdg: str = "", purge: int = 1
+    ) -> subprocess.CompletedProcess[str]:
         home = self.repo / "home"
         (home / ".local" / "share" / "murmly").mkdir(parents=True)
         (self.repo / ".venv").mkdir(exist_ok=True)
@@ -648,7 +650,7 @@ class SetupShUninstallTests(SetupShTestCase):
             f"murmly() {{ return {murmly_exit}; }}\n"
             "confirm() { return 0; }\n"
             'rm() { echo "RM $*"; }\n'
-            "PURGE=1\n"
+            f"PURGE={purge}\n"
             "command_uninstall",
             cwd=self.repo,
         )
@@ -658,7 +660,31 @@ class SetupShUninstallTests(SetupShTestCase):
 
         self.assertEqual(1, result.returncode, result.stderr)
         self.assertNotIn("RM", result.stdout)
-        self.assertIn("may still be running", result.stderr)
+        self.assertIn("did not finish cleanly", result.stderr)
+
+    def test_a_failed_uninstall_without_purge_still_exits_non_zero_with_the_warning(self) -> None:
+        result = self._uninstall(murmly_exit=1, purge=0)
+
+        self.assertEqual(1, result.returncode, result.stderr)
+        self.assertIn("murmly uninstall reported a failure", result.stderr)
+        self.assertNotIn("RM", result.stdout)
+
+    def test_a_clean_uninstall_without_purge_exits_zero(self) -> None:
+        result = self._uninstall(murmly_exit=0, purge=0)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_no_home_and_no_absolute_xdg_value_fails_instead_of_answering_at_the_root(self) -> None:
+        result = run_bash(
+            'unset HOME XDG_DATA_HOME\nsource ./setup.sh\nx="$(data_dir)" || echo "failed:$?"\n'
+            'echo "value:${x:-}"',
+            cwd=self.repo,
+        )
+
+        self.assertIn("failed:1", result.stdout)
+        self.assertIn("value:\n", result.stdout + "\n")
+        self.assertNotIn("/murmly", result.stdout)
+        self.assertIn("HOME is not set", result.stderr)
 
     def test_a_clean_uninstall_still_purges(self) -> None:
         result = self._uninstall(murmly_exit=0)

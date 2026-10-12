@@ -111,7 +111,9 @@ class RoundTripTests(WriterTestCase):
         env = {
             "XDG_CONFIG_HOME": str(self.directory / "xdg"),
             "APPDATA": str(self.directory / "appdata"),
+            "LOCALAPPDATA": str(self.directory / "localappdata"),
             "HOME": str(self.directory),
+            "USERPROFILE": str(self.directory),
         }
 
         self.assertEqual(default_config_path(env), SettingsWriter(env=env).path)
