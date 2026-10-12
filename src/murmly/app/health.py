@@ -20,6 +20,7 @@ the text offered for copying is doctor's own output, unchanged.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -59,6 +60,16 @@ def doctor_command() -> list[str]:
     return [sys.executable, "-m", "murmly", "doctor"]
 
 
+def child_environment() -> dict[str, str]:
+    """The environment doctor runs in: ours, with its pipes in UTF-8.
+
+    A Python child writing to a pipe on Windows uses the ANSI code page unless
+    told otherwise, and this side decodes UTF-8; the two must agree or any
+    accent or dash in doctor's output is garbled.
+    """
+    return {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
 class DoctorRunner:
     """Runs `murmly doctor` and parses its answer. Blocking: call it from a worker thread."""
 
@@ -92,6 +103,7 @@ class DoctorRunner:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    env=child_environment(),
                     **kwargs,
                 )
             except OSError as error:

@@ -374,6 +374,7 @@ class RunnerTests(unittest.TestCase):
         arguments, options = popen.call_args
         self.assertEqual([sys.executable, "-m", "murmly", "doctor"], arguments[0])
         self.assertIs(subprocess.DEVNULL, options["stdin"])
+        self.assertEqual("utf-8", options["env"]["PYTHONIOENCODING"])
         self.assertEqual(recorded_text(), result.text)
         self.assertEqual("", result.error)
 
