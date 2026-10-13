@@ -20,8 +20,9 @@ loses the Toggle pattern.
 ## What to do
 
 Drive the button's own `checkable: true` and `checked: <state>`, and restore the
-binding in `onToggled`. `ChoiceCard.qml`, `NavButton.qml` and `Segmented.qml` do it
-this way:
+binding in `onToggled`. All five controls do it: `ToggleSwitch.qml`, `ChoiceCard.qml`,
+`NavButton.qml`, `SubNavButton.qml` and `Segmented.qml`. `ToggleSwitch` binds to `on`;
+the other four bind to `selected`:
 
 ```qml
 onToggled: checked = Qt.binding(function () { return selected })
