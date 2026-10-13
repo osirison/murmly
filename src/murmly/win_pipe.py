@@ -868,7 +868,11 @@ class NamedPipeServer:
     def __init__(self, pipe_name: str) -> None:
         self._pipe_name = pipe_name
         self._timeout_seconds: float | None = None
-        self._close_once = _CloseOnce()
+        # Not a `_CloseOnce`: `accept` swaps `_pending` for a fresh instance,
+        # and that swap and `close`'s claim must be one decision, or an
+        # instance made after the close is never closed.
+        self._lock = threading.Lock()
+        self._closed = False
         self._pending = create_named_pipe_server(pipe_name, first_instance=True)
 
     @property
@@ -944,9 +948,9 @@ class NamedPipeServer:
             except NamedPipeIOError as error:
                 if error.win32_error_code != ERROR_NO_DATA:
                     raise
-                self._pending = create_named_pipe_server(self._pipe_name, first_instance=False)
+                dead = self._replace_pending()
                 try:
-                    win32file.CloseHandle(handle)
+                    win32file.CloseHandle(dead)
                 except pywintypes.error:
                     pass
                 continue
@@ -956,20 +960,44 @@ class NamedPipeServer:
         # channel is never left with nothing waiting between one accepted
         # connection and the next -- the same reason the instance above is
         # created eagerly in `__init__` rather than from inside this method.
-        self._pending = create_named_pipe_server(self._pipe_name, first_instance=False)
+        self._replace_pending()
         return NamedPipeConnection(handle), (self._pipe_name, 0)
+
+    def _replace_pending(self) -> object:
+        """Put a fresh waiting instance in place of the current one and return the old one.
+
+        Raises when `close` has already run: it closed the old instance, so
+        that one must not be closed again or handed to a connection, and a
+        fresh instance made now would be one nothing ever closes.
+        """
+        import pywintypes
+        import win32file
+
+        fresh = create_named_pipe_server(self._pipe_name, first_instance=False)
+        with self._lock:
+            if not self._closed:
+                old, self._pending = self._pending, fresh
+                return old
+        try:
+            win32file.CloseHandle(fresh)
+        except (OSError, pywintypes.error):
+            pass
+        raise NamedPipeIOError(ERROR_OPERATION_ABORTED, "The pipe server was closed.")
 
     def close(self) -> None:
         import pywintypes
         import win32file
 
-        if not self._close_once.claim():
-            # `daemon.shutdown` and `_serve_named_pipe`'s `with server:` both
-            # close this server, from two threads, and the first close is
-            # what triggers the second -- see `_CloseOnce`.
-            return
+        with self._lock:
+            if self._closed:
+                # `daemon.shutdown` and `_serve_named_pipe`'s `with server:` both
+                # close this server, from two threads, and the first close is
+                # what triggers the second -- see `_CloseOnce`.
+                return
+            self._closed = True
+            pending = self._pending
         try:
-            win32file.CloseHandle(self._pending)
+            win32file.CloseHandle(pending)
         except (OSError, pywintypes.error):
             # See `NamedPipeConnection.close` -- `pywintypes.error` does not
             # subclass `OSError`, so a bare `except OSError` here would not

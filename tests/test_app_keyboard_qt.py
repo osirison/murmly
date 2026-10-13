@@ -426,6 +426,39 @@ class SettingsSubNavTests(KeyboardMixin, KeysQtCase):
     def test_five_keys_fit_their_card_at_the_narrowest_window(self) -> None:
         self.assert_key_row_fits("Meta+Shift+Ctrl+Alt+Space")
 
+    def test_a_wrapped_key_row_never_starts_a_line_with_a_plus(self) -> None:
+        from PySide6.QtCore import QPointF
+
+        self.build(show_first_run=False, record={"window": "Meta+Shift+Ctrl+Alt+Space", "session": "Meta+A"})
+        self.resize_window(640, 480)
+        self.click(self.child("nav-settings"))
+        self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
+        self.pause()
+
+        caps, pluses = [], []
+        pending = [self.child("settings-key-window")]
+        while pending:
+            item = pending.pop()
+            if item.isVisible() and item.objectName() == "keycap":
+                caps.append(item)
+            elif item.isVisible() and item.property("text") == "+":
+                pluses.append(item)
+            pending.extend(item.childItems())
+
+        def box(item):
+            left = item.mapToScene(QPointF(0, 0))
+            return left.x(), left.x() + item.width(), left.y() + item.height() / 2
+
+        lines = {round(box(cap)[2] / 10) for cap in caps}
+        self.assertGreater(len(lines), 1, "the row did not wrap, so this checks nothing")
+        self.assertEqual(4, len(pluses))
+        for plus in pluses:
+            left, _right, middle = box(plus)
+            self.assertTrue(
+                any(box(cap)[1] <= left + 1 and abs(box(cap)[2] - middle) < 8 for cap in caps),
+                "a plus starts its line, with no key before it",
+            )
+
 
 class ReflowTests(KeyboardMixin, KeysQtCase):
     """The layout moving under a control that was just revealed."""
@@ -492,6 +525,21 @@ class ReflowTests(KeyboardMixin, KeysQtCase):
         self.pause(0.5)
 
         self.assertEqual(kept, self.scroller().property("contentY"))
+
+    def test_the_view_stops_following_a_control_when_the_focus_is_lost(self) -> None:
+        from PySide6.QtCore import QEvent, Qt
+        from PySide6.QtGui import QFocusEvent, QGuiApplication
+
+        self.open_settings()
+        self.focus("set-overlay")
+        self.assertIsNotNone(self.scroller().property("following"))
+
+        QGuiApplication.sendEvent(
+            self.window, QFocusEvent(QEvent.Type.FocusOut, Qt.FocusReason.ActiveWindowFocusReason)
+        )
+        self.settle()
+
+        self.assertIsNone(self.scroller().property("following"))
 
 
 class HomeScrollTests(KeyboardMixin, HomeQtCase):

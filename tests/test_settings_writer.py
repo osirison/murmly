@@ -6,6 +6,7 @@ import tempfile
 import textwrap
 import tomllib
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -366,6 +367,7 @@ class SymlinkedFileTests(WriterTestCase):
         SettingsWriter(self.path).set("stt.model_profile", "accurate")
 
         self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+        self.assertEqual("accurate", tomllib.loads(target.read_text(encoding="utf-8"))["stt"]["model_profile"])
 
     def test_a_link_to_a_missing_file_creates_the_file_at_its_destination(self) -> None:
         target = self.directory / "dotfiles" / "murmly.toml"
@@ -377,6 +379,82 @@ class SymlinkedFileTests(WriterTestCase):
         self.assertTrue(result.created)
         self.assertTrue(self.path.is_symlink())
         self.assertEqual("accurate", tomllib.loads(target.read_text(encoding="utf-8"))["stt"]["model_profile"])
+
+    def test_a_link_to_a_missing_folder_is_an_error_and_creates_nothing(self) -> None:
+        target = self.directory / "gone" / "deeper" / "murmly.toml"
+        self.link_to(target)
+
+        with self.assertRaises(SettingsFileError) as raised:
+            SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertIn("does not exist", str(raised.exception))
+        self.assertIn("gone", str(raised.exception))
+        self.assertIn("deeper", str(raised.exception))
+        self.assertFalse((self.directory / "gone").exists())
+        self.assertEqual(["config.toml"], [entry.name for entry in self.path.parent.iterdir()])
+
+    def test_a_link_in_place_of_the_folder_to_a_missing_folder_is_an_error_and_creates_nothing(self) -> None:
+        target = self.directory / "gone" / "deeper" / "murmly"
+        os.symlink(target, self.path.parent, target_is_directory=True)
+
+        with self.assertRaises(SettingsFileError) as raised:
+            SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertIn("does not exist", str(raised.exception))
+        self.assertIn("gone", str(raised.exception))
+        self.assertIn("deeper", str(raised.exception))
+        self.assertFalse((self.directory / "gone").exists())
+
+    def written(self, path: Path) -> str:
+        return tomllib.loads(path.read_text(encoding="utf-8"))["stt"]["model_profile"]
+
+    def test_a_first_run_through_a_live_link_creates_the_folders_below_it(self) -> None:
+        real = self.directory / "var" / "home"
+        real.mkdir(parents=True)
+        os.symlink(real, self.directory / "home", target_is_directory=True)
+        path = self.directory / "home" / ".config" / "murmly" / "config.toml"
+
+        SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", self.written(real / ".config" / "murmly" / "config.toml"))
+
+    def test_a_live_link_with_only_the_murmly_folder_missing_creates_it(self) -> None:
+        real = self.directory / "var" / "home"
+        (real / ".config").mkdir(parents=True)
+        os.symlink(real, self.directory / "home", target_is_directory=True)
+        path = self.directory / "home" / ".config" / "murmly" / "config.toml"
+
+        SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", self.written(real / ".config" / "murmly" / "config.toml"))
+
+    def test_a_linked_xdg_config_home_creates_the_murmly_folder(self) -> None:
+        real = self.directory / "dotconfig"
+        real.mkdir()
+        os.symlink(real, self.directory / "xdg", target_is_directory=True)
+        path = self.directory / "xdg" / "murmly" / "config.toml"
+
+        SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", self.written(real / "murmly" / "config.toml"))
+
+    def test_a_dangling_link_higher_up_the_path_is_refused_and_creates_nothing(self) -> None:
+        os.symlink(self.directory / "nowhere", self.directory / "home", target_is_directory=True)
+        path = self.directory / "home" / ".config" / "murmly" / "config.toml"
+
+        with self.assertRaises(SettingsFileError):
+            SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertFalse((self.directory / "nowhere").exists())
+
+    def test_a_link_in_place_of_the_folder_to_a_real_folder_is_written_through(self) -> None:
+        target = self.directory / "dotfiles" / "murmly"
+        target.mkdir(parents=True)
+        os.symlink(target, self.path.parent, target_is_directory=True)
+
+        SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", tomllib.loads((target / "config.toml").read_text(encoding="utf-8"))["stt"]["model_profile"])
 
 
 class FileErrorTests(WriterTestCase):
@@ -401,14 +479,59 @@ class FileErrorTests(WriterTestCase):
             SettingsWriter(self.path).set("stt.model_profile", "accurate")
 
         self.assertIn("Unable to write", str(raised.exception))
-        self.assertIn("Another program may have it open", str(raised.exception))
+        self.assertIn("not allowed to write", str(raised.exception))
+        self.assertNotIn("Another program", str(raised.exception))
         self.assertEqual(COMMENTED, self.path.read_text(encoding="utf-8"))
+
+    def test_where_a_sharing_violation_is_the_cause_the_hint_names_another_program(self) -> None:
+        self.write_file(COMMENTED)
+        writer = SettingsWriter(
+            self.path,
+            replace=unittest.mock.Mock(side_effect=PermissionError(13, "Permission denied")),
+            sleep=lambda seconds: None,
+            retry_permission_errors=True,
+        )
+
+        with self.assertRaises(SettingsFileError) as raised:
+            writer.set("stt.model_profile", "accurate")
+
+        self.assertIn("Another program may have it open", str(raised.exception))
 
     def test_a_directory_that_cannot_be_created_is_a_settings_file_error(self) -> None:
         (self.directory / "murmly").write_text("a file where the directory should be", encoding="utf-8")
 
-        with self.assertRaises(SettingsFileError):
-            SettingsWriter(self.path).set("stt.model_profile", "accurate")
+        with self.assertRaises(SettingsFileError) as raised:
+            SettingsWriter(self.path)._replace("[stt]\n", existed=False)
+
+        self.assertIn("Unable to write", str(raised.exception))
+
+    def test_a_path_that_cannot_be_resolved_is_a_settings_file_error(self) -> None:
+        self.write_file(COMMENTED)
+
+        with patch("murmly.settings_writer.os.path.realpath", side_effect=OSError(1231, "network unreachable")):
+            with self.assertRaises(SettingsFileError) as raised:
+                SettingsWriter(self.path)._replace("[stt]\n", existed=True)
+
+        self.assertIn("Unable to write", str(raised.exception))
+
+    def test_an_interrupted_write_leaves_no_temporary_file(self) -> None:
+        self.write_file(COMMENTED)
+        writer = SettingsWriter(self.path, replace=unittest.mock.Mock(side_effect=KeyboardInterrupt))
+
+        with self.assertRaises(KeyboardInterrupt):
+            writer.set("stt.model_profile", "accurate")
+
+        self.assertEqual([self.path.name], [entry.name for entry in self.path.parent.iterdir()])
+        self.assertEqual(COMMENTED, self.path.read_text(encoding="utf-8"))
+
+    def test_text_that_cannot_be_written_as_utf8_is_refused_and_nothing_is_left(self) -> None:
+        self.write_file(COMMENTED)
+
+        with self.assertRaises(SettingValueError):
+            SettingsWriter(self.path).set("speakers.owner", "a\ud800b")
+
+        self.assertEqual([self.path.name], [entry.name for entry in self.path.parent.iterdir()])
+        self.assertEqual(COMMENTED, self.path.read_text(encoding="utf-8"))
 
 
 class SharedValidationTests(unittest.TestCase):

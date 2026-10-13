@@ -46,8 +46,12 @@ Rectangle {
                 focusPolicy: Qt.StrongFocus
                 Accessible.role: Accessible.RadioButton
                 Accessible.name: text
-                Accessible.checkable: true
-                Accessible.checked: selected
+                // Qt reports a button's own `checkable` and `checked` to assistive technology, over
+                // the Accessible ones, so these are what a screen reader reads. A click toggles a
+                // checkable button, so the binding to the file's choice is put back at once.
+                checkable: true
+                checked: selected
+                onToggled: checked = Qt.binding(function () { return selected })
                 Accessible.focusable: true
                 onClicked: control.picked(modelData.id)
                 Keys.onReturnPressed: click()

@@ -2328,6 +2328,59 @@ class NamedPipeServerAcceptTests(unittest.TestCase):
         self.assertEqual(["create", "create", "close", "create"], order)
 
 
+class NamedPipeCloseDuringAcceptTests(unittest.TestCase):
+    """A `close()` that lands inside `accept()` closes the waiting instance, so
+    `accept()` must neither close that instance again nor leave a replacement
+    open that nothing will ever close."""
+
+    def _accept_while_closing(self, outcome: int):
+        """`accept()` where the first instance reports `outcome` and `close()`
+        arrives just before it does. Returns what was raised, every instance
+        created, and every instance closed."""
+        from murmly.win_pipe import ERROR_PIPE_CONNECTED, NamedPipeServer
+
+        created: list[str] = []
+        closed: list[str] = []
+        instances = iter(["first", "second", "third"])
+        servers: list[NamedPipeServer] = []
+
+        def fake_create(pipe_name: str, *, first_instance: bool) -> str:
+            created.append(next(instances))
+            return created[-1]
+
+        def connect_named_pipe(handle: object, overlapped: object) -> int:
+            servers[0].close()
+            if outcome == ERROR_PIPE_CONNECTED:
+                return outcome
+            raise _FakeWin32Error(outcome, "ConnectNamedPipe", "no data")
+
+        def close_handle(handle: object) -> None:
+            if isinstance(handle, str):
+                closed.append(handle)
+
+        with patch("murmly.win_pipe.create_named_pipe_server", side_effect=fake_create), \
+                _install_fake_win32(connect_named_pipe=connect_named_pipe, close_handle=close_handle):
+            servers.append(NamedPipeServer(r"\\.\pipe\murmly-test"))
+            with self.assertRaises(OSError):
+                servers[0].accept()
+            servers[0].close()
+        return created, closed
+
+    def test_a_close_during_the_no_data_race_closes_each_instance_once(self) -> None:
+        from murmly.win_pipe import ERROR_NO_DATA
+
+        created, closed = self._accept_while_closing(ERROR_NO_DATA)
+
+        self.assertEqual(sorted(created), sorted(closed))
+
+    def test_a_close_after_a_client_connected_does_not_leave_a_new_instance_open(self) -> None:
+        from murmly.win_pipe import ERROR_PIPE_CONNECTED
+
+        created, closed = self._accept_while_closing(ERROR_PIPE_CONNECTED)
+
+        self.assertEqual(sorted(created), sorted(closed))
+
+
 class NamedPipeCloseOnceTests(unittest.TestCase):
     """`close()` reaches `CloseHandle` exactly once, however many threads call
     it and however their calls overlap -- the contract `socket.socket.close`
