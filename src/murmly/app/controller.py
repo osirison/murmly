@@ -399,6 +399,7 @@ class SettingsController(QObject):
         self._restart_text = ""
         self._pending = settings.PendingChanges()
         self._view: dict = settings.build_view(None)
+        self._file_values: dict = {}
         self._timer = QTimer(self)
         self._timer.setInterval(SETTINGS_TICK_MS)
         self._timer.timeout.connect(self._tick)
@@ -407,6 +408,11 @@ class SettingsController(QObject):
     @Property("QVariantMap", notify=viewChanged)
     def view(self) -> dict:
         return self._view
+
+    @property
+    def file_values(self) -> dict:
+        """The view's `values` as the file says them, without what is asked and not yet saved."""
+        return self._file_values
 
     @property
     def executor(self) -> ThreadPoolExecutor:
@@ -615,14 +621,14 @@ class SettingsController(QObject):
     def _rebuild(self) -> None:
         # Always announced, even when nothing about the view differs: a refused value
         # changes no file value, and the control that was moved must snap back to it.
-        self._view = self._pending.overlay(
-            settings.build_view(
-                self._state,
-                notice=self._notice,
-                outcome=self._outcome,
-                restart=self._restart_text,
-            )
+        view = settings.build_view(
+            self._state,
+            notice=self._notice,
+            outcome=self._outcome,
+            restart=self._restart_text,
         )
+        self._file_values = view["values"]  # type: ignore[assignment]
+        self._view = self._pending.overlay(view)
         self.viewChanged.emit()
 
 
