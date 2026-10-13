@@ -511,5 +511,116 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertRegex(result.stdout, r"UVCALL:\[run --no-sync --project .+ murmly install Meta\+X\]")
 
 
+class BootstrapPs1PromptReachesThePersonTests(unittest.TestCase):
+    """A real native `uv`, not a PowerShell function, because the question is how
+    PowerShell wires a native command's output, which a function stub cannot show.
+
+    The fake prints a prompt with no trailing newline, as `murmly sync` does
+    ("Install the GPU runtime? [y/N] "), flushes, then waits for one line on
+    standard input and exits with the number it reads. Put in a pipeline
+    (`| Out-Host`, or a parenthesised call), PowerShell holds a partial line back
+    until the process ends, so the person sits at a prompt they cannot see. The
+    test reads the script's output on a thread and requires the prompt to arrive
+    BEFORE any answer is written.
+    """
+
+    PROMPT = "Install the GPU runtime? [y/N] "
+    FAKE_UV = (
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[:1] == ['run'] and 'murmly' in args and args[args.index('murmly') + 1:][:1] == ['sync']:\n"
+        f"    sys.stdout.write({PROMPT!r})\n"
+        "    sys.stdout.flush()\n"
+        "    line = sys.stdin.readline()\n"
+        "    sys.exit(int(line.strip() or 0))\n"
+        "sys.exit(0)\n"
+    )
+
+    def setUp(self) -> None:
+        if _INTERPRETER is None:
+            self.skipTest("no PowerShell interpreter (pwsh or powershell) on PATH")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.dir = Path(temp_dir.name)
+        script = self.dir / "fake_uv.py"
+        script.write_text(self.FAKE_UV, encoding="utf-8")
+        if sys.platform == "win32":
+            launcher = self.dir / "uv.cmd"
+            launcher.write_text(f'@"{sys.executable}" -u "{script}" %*\r\n', encoding="utf-8")
+        else:
+            launcher = self.dir / "uv"
+            launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" -u "{script}" "$@"\n', encoding="utf-8")
+            launcher.chmod(0o755)
+
+    def _start(self, *arguments: str) -> subprocess.Popen:
+        env = os.environ.copy()
+        env["PATH"] = str(self.dir) + os.pathsep + _path_without_real_uv()
+        # Never let a real run write under a real profile.
+        for name in ("LOCALAPPDATA", "APPDATA", "XDG_DATA_HOME", "XDG_CONFIG_HOME"):
+            env[name] = str(self.dir / name)
+        process = subprocess.Popen(
+            [_INTERPRETER, "-NoProfile", "-NonInteractive", "-File", str(BOOTSTRAP_PS1), *arguments],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        self.addCleanup(self._kill, process)
+        return process
+
+    @staticmethod
+    def _kill(process: subprocess.Popen) -> None:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                stream.close()
+
+    def _answer_when_prompted(self, process: subprocess.Popen, answer: str, timeout: float = 20.0) -> tuple[str, int]:
+        import threading
+        import time
+
+        seen = bytearray()
+
+        def read() -> None:
+            assert process.stdout is not None
+            while True:
+                chunk = process.stdout.read(1)
+                if not chunk:
+                    return
+                seen.extend(chunk)
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+
+        deadline = time.monotonic() + timeout
+        while self.PROMPT.encode() not in bytes(seen):
+            if time.monotonic() > deadline or process.poll() is not None:
+                break
+            time.sleep(0.05)
+        before_answer = bytes(seen).decode("utf-8", errors="replace")
+        self.assertIn(
+            self.PROMPT,
+            before_answer,
+            "the prompt did not reach the person before the process ended: the native "
+            "command's output is being held back by a pipeline",
+        )
+
+        assert process.stdin is not None
+        process.stdin.write((answer + "\n").encode())
+        process.stdin.flush()
+        code = process.wait(timeout=timeout)
+        reader.join(timeout=10)
+        return before_answer, code
+
+    def test_a_prompt_with_no_newline_is_shown_before_it_is_answered_and_the_exit_code_comes_back(self) -> None:
+        process = self._start("sync", "--cuda")
+
+        _shown, code = self._answer_when_prompted(process, "7")
+
+        self.assertEqual(7, code)
+
+
 if __name__ == "__main__":
     unittest.main()
