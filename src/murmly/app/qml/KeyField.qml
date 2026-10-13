@@ -30,7 +30,24 @@ Item {
         target.focus = true
     }
 
-    implicitWidth: large ? 400 : strip.implicitWidth
+    // Settings: the most width the row can give. The strip wraps its button below the
+    // keys, and the keys themselves onto a second line, rather than run past it.
+    property real room: 1e6
+    // What the strip would take on one line.
+    readonly property real onOneLine: {
+        var width = 0
+        var shown = 0
+        for (var i = 0; i < strip.children.length; i++) {
+            var part = strip.children[i]
+            if (part.visible && part.implicitWidth > 0) {
+                width += part.implicitWidth
+                shown++
+            }
+        }
+        return width + Math.max(0, shown - 1) * strip.spacing
+    }
+
+    implicitWidth: large ? 400 : Math.min(onOneLine, room)
     implicitHeight: large ? 168 : strip.implicitHeight
 
     // Once a combination is taken or cancelled, the focus goes back to what was asked from.
@@ -200,35 +217,32 @@ Item {
     }
 
     // ---- Settings: a row of keys and a button -------------------------------
-    RowLayout {
+    Flow {
         id: strip
         visible: !field.large
+        width: field.width
         spacing: theme.space.space10
 
-        // The keys now bound.
-        RowLayout {
-            visible: !field.recording && field.row.parts.length > 0
-            spacing: 8
+        // The keys now bound: each with the "+" before it, so the strip can wrap between them.
+        Repeater {
+            model: field.row.parts
 
-            Repeater {
-                model: field.row.parts
+            RowLayout {
+                required property var modelData
+                required property int index
+                visible: !field.recording
+                spacing: 8
 
-                RowLayout {
-                    required property var modelData
-                    required property int index
-                    spacing: 8
-
-                    AppText {
-                        visible: index > 0
-                        role: "monoFile"
-                        font.pixelSize: 13
-                        text: "+"
-                        color: theme.colors.text5
-                    }
-                    KeyCap {
-                        objectName: "keycap"
-                        text: modelData
-                    }
+                AppText {
+                    visible: index > 0
+                    role: "monoFile"
+                    font.pixelSize: 13
+                    text: "+"
+                    color: theme.colors.text5
+                }
+                KeyCap {
+                    objectName: "keycap"
+                    text: modelData
                 }
             }
         }

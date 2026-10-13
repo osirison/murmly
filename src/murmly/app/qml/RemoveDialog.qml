@@ -69,7 +69,7 @@ Popup {
 
         // The confirmation. What will be removed scrolls when the window is short;
         // the two buttons below it stay in view.
-        Flickable {
+        FocusFlickable {
             id: body
             visible: dialog.step === "confirming"
             Layout.fillWidth: true
@@ -77,8 +77,6 @@ Popup {
             Layout.preferredHeight: bodyColumn.implicitHeight
             contentWidth: width
             contentHeight: bodyColumn.implicitHeight
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar {}
 
             ColumnLayout {

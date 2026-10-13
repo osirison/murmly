@@ -20,16 +20,55 @@ Item {
     readonly property var ranges: view.ranges !== undefined ? view.ranges : ({})
     readonly property bool locked: view.disabled === true
 
+    // The group the list marks as the one shown.
+    property Item current: keysSection
+    // Set while a pane that was not showing is still to be laid out.
+    property Item settling: null
+
+    function aim(section) {
+        if (section === speechTop || section === computerTop) {
+            scroller.contentY = 0
+            return
+        }
+        var target = section.mapToItem(column, 0, 0).y + column.y - theme.space.space8
+        scroller.contentY = Math.max(0, Math.min(target, scroller.contentHeight - scroller.height))
+    }
+
     function show(pane, section) {
+        var other = page.pane !== pane
         page.pane = pane
-        Qt.callLater(function () {
-            if (section === speechTop || section === computerTop) {
-                scroller.contentY = 0
-                return
+        page.current = section
+        aim(section)
+        // A pane that was not showing has no layout until the next frame, so its
+        // groups are not where they will be: aim again once they are.
+        if (other)
+            page.settling = section
+    }
+
+    // The focus moving into a group marks it in the list, as choosing it there does.
+    Connections {
+        target: page.Window.window
+
+        function onActiveFocusItemChanged() {
+            var groups = [keysSection, accuracySection, finishingSection, liveSection,
+                deliverySection, indicatorSection, speechTop, computerTop]
+            for (var item = page.Window.window.activeFocusItem; item; item = item.parent) {
+                if (groups.indexOf(item) >= 0) {
+                    page.current = item
+                    return
+                }
             }
-            var target = section.mapToItem(column, 0, 0).y + column.y - theme.space.space8
-            scroller.contentY = Math.max(0, Math.min(target, scroller.contentHeight - scroller.height))
-        })
+        }
+    }
+
+    Connections {
+        target: page.settling !== null ? page.Window.window : null
+
+        function onAfterAnimating() {
+            var section = page.settling
+            page.settling = null
+            page.aim(section)
+        }
     }
 
     RowLayout {
@@ -41,15 +80,13 @@ Item {
         spacing: theme.space.space32
 
         // The groups. They scroll when the window is too short to show them all.
-        Flickable {
+        FocusFlickable {
             id: groupsNav
             Layout.preferredWidth: 190
             Layout.maximumWidth: 190
             Layout.fillHeight: true
             contentWidth: width
-            contentHeight: navColumn.implicitHeight
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
+            contentHeight: navColumn.implicitHeight + 6
 
         ColumnLayout {
             id: navColumn
@@ -69,37 +106,42 @@ Item {
             SubNavButton {
                 objectName: "settings-go-keys"
                 text: "Your keys"
-                selected: page.pane === "dictation"
+                selected: page.current === keysSection
                 Layout.fillWidth: true
                 onClicked: page.show("dictation", keysSection)
             }
             SubNavButton {
                 objectName: "settings-go-accuracy"
                 text: "Accuracy and speed"
+                selected: page.current === accuracySection
                 Layout.fillWidth: true
                 onClicked: page.show("dictation", accuracySection)
             }
             SubNavButton {
                 objectName: "settings-go-finishing"
                 text: "Finishing a recording"
+                selected: page.current === finishingSection
                 Layout.fillWidth: true
                 onClicked: page.show("dictation", finishingSection)
             }
             SubNavButton {
                 objectName: "settings-go-live"
                 text: "Words as you speak"
+                selected: page.current === liveSection
                 Layout.fillWidth: true
                 onClicked: page.show("dictation", liveSection)
             }
             SubNavButton {
                 objectName: "settings-go-delivery"
                 text: "Typing your words"
+                selected: page.current === deliverySection
                 Layout.fillWidth: true
                 onClicked: page.show("dictation", deliverySection)
             }
             SubNavButton {
                 objectName: "settings-go-indicator"
                 text: "On-screen indicator"
+                selected: page.current === indicatorSection
                 Layout.fillWidth: true
                 onClicked: page.show("dictation", indicatorSection)
             }
@@ -116,7 +158,7 @@ Item {
             SubNavButton {
                 objectName: "settings-go-speech"
                 text: "Speech"
-                selected: page.pane === "speech"
+                selected: page.current === speechTop
                 Layout.fillWidth: true
                 onClicked: page.show("speech", speechTop)
             }
@@ -133,21 +175,19 @@ Item {
             SubNavButton {
                 objectName: "settings-go-remove"
                 text: "Remove murmly"
-                selected: page.pane === "computer"
+                selected: page.current === computerTop
                 Layout.fillWidth: true
                 onClicked: page.show("computer", computerTop)
             }
         }   // navColumn
         }
 
-        Flickable {
+        FocusFlickable {
             id: scroller
             Layout.fillWidth: true
             Layout.fillHeight: true
             contentWidth: width
             contentHeight: column.implicitHeight + theme.space.space40
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar {}
 
             ColumnLayout {
@@ -295,6 +335,7 @@ Item {
 
                         ColumnLayout {
                             id: keysSection
+                            objectName: "settings-section-keys"
                             spacing: theme.space.space12
                             Layout.fillWidth: true
 
@@ -329,20 +370,24 @@ Item {
 
                             SettingsCard {
                                 SettingRow {
+                                    id: dictateRow
                                     title: "Dictate"
                                     text: "Types into the window you started in."
                                     divider: true
                                     KeyField {
                                         objectName: "settings-key-window"
                                         purpose: "window"
+                                        room: dictateRow.room
                                     }
                                 }
                                 SettingRow {
+                                    id: replyRow
                                     title: "Reply to your assistant"
                                     text: "Sends your reply to the assistant that is speaking, not to the window in front."
                                     KeyField {
                                         objectName: "settings-key-session"
                                         purpose: "session"
+                                        room: replyRow.room
                                     }
                                 }
                             }
@@ -350,6 +395,7 @@ Item {
 
                         ColumnLayout {
                             id: accuracySection
+                            objectName: "settings-section-accuracy"
                             spacing: theme.space.space12
                             Layout.fillWidth: true
 
@@ -365,10 +411,14 @@ Item {
                                 Layout.fillWidth: true
 
                                 Repeater {
-                                    model: page.options["profile"] !== undefined ? page.options["profile"] : []
+                                    // A count, not the list: the list is a new one on every change,
+                                    // which would rebuild the cards and drop the focus from the one
+                                    // just chosen with Space.
+                                    model: page.options["profile"] !== undefined ? page.options["profile"].length : 0
 
                                     ChoiceCard {
-                                        required property var modelData
+                                        required property int index
+                                        readonly property var modelData: page.options["profile"][index]
                                         objectName: "set-profile-" + modelData.id
                                         Layout.fillWidth: true
                                         title: modelData.name
@@ -408,6 +458,7 @@ Item {
 
                         ColumnLayout {
                             id: finishingSection
+                            objectName: "settings-section-finishing"
                             spacing: theme.space.space12
                             Layout.fillWidth: true
 
@@ -497,6 +548,7 @@ Item {
 
                         ColumnLayout {
                             id: liveSection
+                            objectName: "settings-section-live"
                             spacing: theme.space.space12
                             Layout.fillWidth: true
 
@@ -532,6 +584,7 @@ Item {
 
                         ColumnLayout {
                             id: deliverySection
+                            objectName: "settings-section-delivery"
                             spacing: theme.space.space12
                             Layout.fillWidth: true
 
@@ -571,6 +624,7 @@ Item {
 
                         ColumnLayout {
                             id: indicatorSection
+                            objectName: "settings-section-indicator"
                             spacing: theme.space.space12
                             Layout.fillWidth: true
 
@@ -610,11 +664,18 @@ Item {
                                     title: "Text size for words as you speak"
                                     keyLine: page.keys["text-size"] || ""
                                     AppButton {
+                                        id: textLess
                                         objectName: "set-text-size-less"
                                         text: "−"
                                         Accessible.name: "Smaller text"
                                         enabled: page.values["text-size"] > (page.ranges["text-size"] ? page.ranges["text-size"].min : 8)
                                         onClicked: settings.change("text-size", page.values["text-size"] - 1)
+                                        // Reaching the limit disables a button and the focus with it:
+                                        // hand it to the other, ring showing as after a Tab.
+                                        onActiveFocusChanged: if (!activeFocus && !enabled) {
+                                            textMore.focus = true
+                                            textMore.focusReason = Qt.TabFocusReason
+                                        }
                                     }
                                     AppText {
                                         objectName: "set-text-size-value"
@@ -628,11 +689,16 @@ Item {
                                         width: 52
                                     }
                                     AppButton {
+                                        id: textMore
                                         objectName: "set-text-size-more"
                                         text: "+"
                                         Accessible.name: "Larger text"
                                         enabled: page.values["text-size"] < (page.ranges["text-size"] ? page.ranges["text-size"].max : 48)
                                         onClicked: settings.change("text-size", page.values["text-size"] + 1)
+                                        onActiveFocusChanged: if (!activeFocus && !enabled) {
+                                            textLess.focus = true
+                                            textLess.focusReason = Qt.TabFocusReason
+                                        }
                                     }
                                 }
                             }
@@ -683,10 +749,12 @@ Item {
                                     Layout.fillWidth: true
 
                                     Repeater {
-                                        model: page.options["voice"] !== undefined ? page.options["voice"] : []
+                                        // A count, as for the accuracy cards.
+                                        model: page.options["voice"] !== undefined ? page.options["voice"].length : 0
 
                                         ChoiceCard {
-                                            required property var modelData
+                                            required property int index
+                                            readonly property var modelData: page.options["voice"][index]
                                             objectName: "set-voice-" + modelData.id
                                             Layout.fillWidth: true
                                             Layout.preferredWidth: 1

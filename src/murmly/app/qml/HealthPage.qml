@@ -14,13 +14,11 @@ Item {
     readonly property var view: health.view
     readonly property var rows: view.rows !== undefined ? view.rows : []
 
-    Flickable {
+    FocusFlickable {
         id: scroller
         anchors.fill: parent
         contentWidth: width
         contentHeight: column.implicitHeight + theme.space.space34 + theme.space.space40
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
         ScrollBar.vertical: ScrollBar {}
 
         ColumnLayout {

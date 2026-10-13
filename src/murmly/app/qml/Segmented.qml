@@ -27,11 +27,15 @@ Rectangle {
         spacing: 2
 
         Repeater {
-            model: control.options
+            // A count, not the list: the list is a new one on every change, which
+            // would rebuild the options and drop the focus from the one just chosen
+            // with Space.
+            model: control.options.length
 
             AbstractButton {
                 id: option
-                required property var modelData
+                required property int index
+                readonly property var modelData: control.options[index]
 
                 objectName: control.objectName + "-" + modelData.id
                 property bool selected: modelData.checked === true

@@ -111,14 +111,12 @@ Rectangle {
         }
 
         // ---- the step ---------------------------------------------------------
-        Flickable {
+        FocusFlickable {
             id: scroller
             Layout.fillWidth: true
             Layout.fillHeight: true
             contentWidth: width
             contentHeight: body.implicitHeight + theme.space.space40 + theme.space.space34
-            clip: true
-            boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar {}
 
             ColumnLayout {
@@ -302,10 +300,15 @@ Rectangle {
                             bottomPadding: 12
                             Accessible.name: "Try it here"
                             Accessible.description: "A text box to check that dictation types into a window."
-                            // Tab leaves the box instead of typing a tab.
-                            KeyNavigation.priority: KeyNavigation.BeforeItem
-                            KeyNavigation.tab: next
-                            KeyNavigation.backtab: later
+                            // Tab leaves the box instead of typing a tab, for the footer that
+                            // follows it. Not a KeyNavigation: that also makes this box where
+                            // Shift+Tab goes from the footer, whatever step is showing.
+                            Keys.priority: Keys.BeforeItem
+                            Keys.onTabPressed: function (event) {
+                                event.accepted = true
+                                later.focus = true
+                                later.focusReason = Qt.TabFocusReason
+                            }
 
                             background: Rectangle {
                                 radius: theme.radii.r9
@@ -376,10 +379,14 @@ Rectangle {
                         Layout.fillWidth: true
 
                         Repeater {
-                            model: page.profiles
+                            // A count, not the list: the list is a new one on every change,
+                            // which would rebuild the cards and drop the focus from the one
+                            // just chosen with Space.
+                            model: page.profiles.length
 
                             ChoiceCard {
-                                required property var modelData
+                                required property int index
+                                readonly property var modelData: page.profiles[index]
                                 objectName: "first-run-profile-" + modelData.id
                                 Layout.fillWidth: true
                                 title: modelData.name
@@ -429,7 +436,6 @@ Rectangle {
                     kind: "quiet"
                     text: "Set up later"
                     onClicked: firstRun.later()
-                    KeyNavigation.tab: next
                 }
 
                 AppButton {

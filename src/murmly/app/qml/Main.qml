@@ -37,6 +37,14 @@ ApplicationWindow {
     readonly property bool settingsShowing: onScreen && (firstRunShowing || sections[current].id === "settings")
     onSettingsShowingChanged: settings.setActive(settingsShowing)
 
+    // Closing first run takes the focus with it. The first control of the window
+    // is where Tab would have gone next; it is marked as a Tab would mark it.
+    onFirstRunShowingChanged: if (!firstRunShowing) Qt.callLater(function () {
+        var first = navigation.itemAt(0)
+        first.focus = true
+        first.focusReason = Qt.TabFocusReason
+    })
+
     // First run has a header of its own, so this one is not shown behind it.
     header: Rectangle {
         visible: !window.firstRunShowing
@@ -73,6 +81,7 @@ ApplicationWindow {
                 spacing: 2
 
                 Repeater {
+                    id: navigation
                     model: sections
 
                     NavButton {
