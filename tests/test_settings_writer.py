@@ -391,6 +391,25 @@ class SymlinkedFileTests(WriterTestCase):
         self.assertFalse((self.directory / "gone").exists())
         self.assertEqual(["config.toml"], [entry.name for entry in self.path.parent.iterdir()])
 
+    def test_a_link_in_place_of_the_folder_to_a_missing_folder_is_an_error_and_creates_nothing(self) -> None:
+        target = self.directory / "gone" / "deeper" / "murmly"
+        os.symlink(target, self.path.parent, target_is_directory=True)
+
+        with self.assertRaises(SettingsFileError) as raised:
+            SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertIn(str(target), str(raised.exception))
+        self.assertFalse((self.directory / "gone").exists())
+
+    def test_a_link_in_place_of_the_folder_to_a_real_folder_is_written_through(self) -> None:
+        target = self.directory / "dotfiles" / "murmly"
+        target.mkdir(parents=True)
+        os.symlink(target, self.path.parent, target_is_directory=True)
+
+        SettingsWriter(self.path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", tomllib.loads((target / "config.toml").read_text(encoding="utf-8"))["stt"]["model_profile"])
+
 
 class FileErrorTests(WriterTestCase):
     def test_a_file_deleted_before_the_write_is_a_settings_file_error(self) -> None:

@@ -127,6 +127,19 @@ class ReadEventTests(unittest.TestCase):
         self.assertEqual(("refused", keys.HINT_UNSUPPORTED_SHIFTED), (press.kind, press.message))
         self.assertIn("without Shift", press.message)
 
+    def test_every_shifted_digit_of_a_us_keyboard_gets_the_shift_hint(self) -> None:
+        for key in (0x21, 0x40, 0x23, 0x24, 0x25, 0x5E, 0x26, 0x2A, 0x28, 0x29):
+            with self.subTest(key=hex(key)):
+                self.assertEqual(keys.HINT_UNSUPPORTED_SHIFTED, self.read(key, META | SHIFT).message)
+
+    def test_a_shifted_key_that_is_refused_without_shift_too_gets_the_general_hint(self) -> None:
+        underscore, plus, o_umlaut, menu = 0x5F, 0x2B, 0xD6, 0x01000055
+        for key in (underscore, plus, o_umlaut, menu):
+            with self.subTest(key=hex(key)):
+                press = self.read(key, META | SHIFT)
+
+                self.assertEqual(("refused", keys.HINT_UNSUPPORTED), (press.kind, press.message))
+
     def test_the_hint_for_a_key_with_no_shift_still_offers_the_digit(self) -> None:
         press = self.read(KEY_EXCLAM, META)
 

@@ -199,9 +199,9 @@ class SettingsWriter:
         temporary: str | None = None
         try:
             target = Path(os.path.realpath(self.path))
-            if not target.parent.is_dir() and self.path.is_symlink():
+            if not target.parent.is_dir() and any(part.is_symlink() for part in (self.path, *self.path.parents)):
                 raise SettingsFileError(
-                    f"{self.path} is a link to {target}, and the folder {target.parent} does not exist."
+                    f"{self.path} leads through a link to {target}, and the folder {target.parent} does not exist."
                 )
             target.parent.mkdir(parents=True, exist_ok=True)
             mode = stat.S_IMODE(target.stat().st_mode) if existed else 0o644

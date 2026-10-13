@@ -14,8 +14,12 @@ AbstractButton {
     focusPolicy: Qt.StrongFocus
     Accessible.role: Accessible.CheckBox
     Accessible.name: text
-    Accessible.checkable: true
-    Accessible.checked: on
+    // Qt reports a button's own `checkable` and `checked` to assistive technology, over
+    // the Accessible ones, so these are what a screen reader reads. A click toggles a
+    // checkable button, so the binding to the value in the file is put back at once.
+    checkable: true
+    checked: on
+    onToggled: checked = Qt.binding(function () { return on })
     Accessible.focusable: true
 
     Keys.onReturnPressed: click()

@@ -56,7 +56,8 @@ HINT_RECORDING = "Press your keys now. Escape cancels."
 HINT_NEEDS_MODIFIER = "Add Meta, Ctrl or Alt, so ordinary typing never sets it off."
 HINT_UNSUPPORTED = "Murmly cannot use that key. Try a letter, a digit, a function key or Space."
 # Shift+1 reaches the app as "!", and Qt's key event does not say which key it came
-# from, so the digit cannot be recovered; the person is told to leave Shift out.
+# from, so the digit cannot be recovered; the person is told to leave Shift out. Only
+# for the digit row, where the key without Shift is a digit this accepts.
 HINT_UNSUPPORTED_SHIFTED = "Murmly cannot use that key with Shift. Try it without Shift, or a letter or a function key."
 
 # ---------------------------------------------------------------------------
@@ -89,6 +90,12 @@ _MODIFIER_KEYS = frozenset(
         0x01001103,  # AltGr
     }
 )
+
+#: What a US keyboard's digit row types with Shift, and the digit it types without.
+_SHIFTED_DIGITS = {
+    0x21: 0x31, 0x40: 0x32, 0x23: 0x33, 0x24: 0x34, 0x25: 0x35,
+    0x5E: 0x36, 0x26: 0x37, 0x2A: 0x38, 0x28: 0x39, 0x29: 0x30,
+}
 
 _REQUIRED_MODIFIERS = frozenset({"Meta", "Ctrl", "Alt"})
 
@@ -144,6 +151,18 @@ class Press:
 IGNORED = Press("ignored", False)
 
 
+def _digit_without_shift(key: int, modifiers: int) -> bool:
+    """Whether `key`, typed with Shift, is a digit-row symbol whose digit this would take."""
+    digit = _SHIFTED_DIGITS.get(key)
+    if digit is None or not modifiers & SHIFT_MODIFIER:
+        return False
+    try:
+        decode_kde_keycode(digit | modifiers & ~SHIFT_MODIFIER)
+    except HotkeyError:
+        return False
+    return True
+
+
 def read_event(key: int, modifiers: int, profile: object | None = None) -> Press:
     """Turn a Qt key event into a `Press`; the field's focus is the recorder's business."""
     modifiers &= _MODIFIER_MASK
@@ -159,7 +178,7 @@ def read_event(key: int, modifiers: int, profile: object | None = None) -> Press
     try:
         spec = decode_kde_keycode(key | modifiers)
     except HotkeyError:
-        shifted = bool(modifiers & SHIFT_MODIFIER)
+        shifted = _digit_without_shift(key, modifiers)
         return Press("refused", True, message=HINT_UNSUPPORTED_SHIFTED if shifted else HINT_UNSUPPORTED)
     text = encode_for_kde(spec).portable
     try:
