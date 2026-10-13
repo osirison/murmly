@@ -21,6 +21,7 @@ Slider {
     focusPolicy: Qt.StrongFocus
     Accessible.role: Accessible.Slider
     Accessible.name: label
+    Accessible.description: valueText
     Accessible.focusable: true
 
     onMoved: settle.restart()

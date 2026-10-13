@@ -377,17 +377,17 @@ class SwitchTests(TrayQtCase):
 
     def test_a_time_asked_for_and_refused_is_not_what_quiet_hours_comes_back_to(self) -> None:
         self.build()
-        self.path.write_text('[tts]\nquiet_hours = "22:00-07:00"\n', encoding="utf-8")
+        self.path.write_text('[tts]\nquiet_hours = "23:30-06:00"\n', encoding="utf-8")
         self.open_panel()
         self.wait_for(lambda: self.child("tray-switch-quiet").property("on") is True, message="quiet on")
-        self.assertEqual("22:00-07:00", self.tray._memory.last("quiet"))
+        self.assertEqual("23:30-06:00", self.tray._memory.last("quiet"))
 
         # The refused time and the click that switches quiet hours off are both asked
         # before either save has come back, so the file never holds "25:00".
         self.settings.change("quiet-from", "25:00")
         self.toggled("quiet", "tts.quiet_hours", "")
 
-        self.toggled("quiet", "tts.quiet_hours", "22:00-07:00")
+        self.toggled("quiet", "tts.quiet_hours", "23:30-06:00")
 
     def test_the_switch_shows_a_click_before_its_save_has_come_back(self) -> None:
         self.build()

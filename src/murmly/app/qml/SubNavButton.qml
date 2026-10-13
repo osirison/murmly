@@ -13,6 +13,8 @@ AbstractButton {
     focusPolicy: Qt.StrongFocus
     Accessible.role: Accessible.Button
     Accessible.name: text
+    Accessible.checkable: true
+    Accessible.checked: selected
     Accessible.focusable: true
 
     Keys.onReturnPressed: click()

@@ -223,7 +223,8 @@ Item {
         width: field.width
         spacing: theme.space.space10
 
-        // The keys now bound: each with the "+" before it, so the strip can wrap between them.
+        // The keys now bound: each with the "+" after it, so the strip wraps after a "+"
+        // and never starts a line with one.
         Repeater {
             model: field.row.parts
 
@@ -233,16 +234,16 @@ Item {
                 visible: !field.recording
                 spacing: 8
 
+                KeyCap {
+                    objectName: "keycap"
+                    text: modelData
+                }
                 AppText {
-                    visible: index > 0
+                    visible: index < field.row.parts.length - 1
                     role: "monoFile"
                     font.pixelSize: 13
                     text: "+"
                     color: theme.colors.text5
-                }
-                KeyCap {
-                    objectName: "keycap"
-                    text: modelData
                 }
             }
         }
@@ -293,6 +294,9 @@ Item {
             visible: !field.recording
             enabled: !field.busy && hotkeys.view.busy !== true
             text: field.busy ? "Setting it…" : field.row.set ? "Change" : "Choose a key"
+            Accessible.name: field.busy ? text
+                : field.row.set ? "Change your " + field.row.label + " keys"
+                : "Choose a key for " + field.row.label
             onClicked: field.begin()
         }
 
