@@ -387,7 +387,9 @@ class SymlinkedFileTests(WriterTestCase):
         with self.assertRaises(SettingsFileError) as raised:
             SettingsWriter(self.path).set("stt.model_profile", "accurate")
 
-        self.assertIn(os.path.realpath(target.parent), str(raised.exception))
+        self.assertIn("does not exist", str(raised.exception))
+        self.assertIn("gone", str(raised.exception))
+        self.assertIn("deeper", str(raised.exception))
         self.assertFalse((self.directory / "gone").exists())
         self.assertEqual(["config.toml"], [entry.name for entry in self.path.parent.iterdir()])
 
@@ -398,7 +400,9 @@ class SymlinkedFileTests(WriterTestCase):
         with self.assertRaises(SettingsFileError) as raised:
             SettingsWriter(self.path).set("stt.model_profile", "accurate")
 
-        self.assertIn(os.path.realpath(target), str(raised.exception))
+        self.assertIn("does not exist", str(raised.exception))
+        self.assertIn("gone", str(raised.exception))
+        self.assertIn("deeper", str(raised.exception))
         self.assertFalse((self.directory / "gone").exists())
 
     def written(self, path: Path) -> str:
