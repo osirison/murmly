@@ -225,7 +225,7 @@ class FasterWhisperTranscriberTests(unittest.TestCase):
             transcriber = FasterWhisperTranscriber(config)
 
         with patch.object(FasterWhisperTranscriber, "_load_cuda_runtime", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "uv sync --extra cuda"):
+            with self.assertRaisesRegex(RuntimeError, "murmly sync --cuda"):
                 FasterWhisperTranscriber.resolve_runtime(config)
 
     def test_cuda_runtime_loads_libraries_from_installed_distributions(self) -> None:

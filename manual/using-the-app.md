@@ -9,21 +9,24 @@ The app runs on Linux and on Windows.
 
 ## Getting it
 
-The app is an optional part of murmly called the `gui` extra. Add it, then open the
-app:
+The app comes with murmly. Installing or upgrading murmly adds the toolkit it
+draws with (PySide6, about 85 MB to download and about 245 MB on disk), and there
+is no switch to leave it out. The one exception is a system too old for it: the app
+needs glibc 2.34 or newer (2.39 on aarch64). Below that, murmly installs without the
+app and says so.
 
-```bash
-uv sync --extra gui
-uv run murmly app
-```
+On Linux, installing murmly puts **Murmly** in your applications menu. Open the app
+from there, or run `murmly app` in a terminal. If you installed murmly before the
+app was part of it, run `./setup.sh upgrade`: it adds the toolkit and the menu entry.
+Removing murmly takes the menu entry away with the rest.
 
-If you run `murmly app` without the extra, murmly tells you to add it and stops.
+On Windows, `.\bootstrap.ps1 install` and `.\bootstrap.ps1 upgrade` add the toolkit.
+Open a terminal and run `murmly app`. There is no Start menu shortcut yet.
 
-On Linux, installing murmly with the extra present also puts **Murmly** in your
-applications menu, so you can open the app from there. If you add the extra after
-installing, run `murmly install` again to get the menu entry.
-
-On Windows there is no shortcut yet. Open a terminal and run `murmly app` each time.
+If you run `murmly app` before the toolkit is there, murmly tells you to run
+`murmly sync` and stops. Do not run a plain `uv sync` to add it: on a machine that uses
+the GPU, that puts the slower CPU build of ONNX Runtime back, and `murmly sync` is what
+puts the GPU build back afterwards.
 
 ## Home
 

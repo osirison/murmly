@@ -168,7 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Toggle capture, delivering the transcript to the open speech session.",
     )
     subparsers.add_parser("status", help="Query the daemon state.")
-    subparsers.add_parser("app", help="Open the desktop app (needs the gui extra).")
+    subparsers.add_parser("app", help="Open the desktop app.")
 
     install = subparsers.add_parser(
         "install",
@@ -666,6 +666,7 @@ def _run_sync(args: argparse.Namespace, profile: PlatformProfile) -> int:
             want_tts=args.want_tts,
             confirm=confirm,
             announce=print,
+            profile=profile,
         )
     except EnvironmentSyncError as error:
         print(f"murmly: {error}", file=sys.stderr)
@@ -787,7 +788,7 @@ def _run_app() -> int:
             raise
         print(
             "murmly app needs the gui extra (PySide6), which is not installed. "
-            "Add it with: uv sync --extra gui",
+            "murmly sync adds it.",
             file=sys.stderr,
         )
         return 1

@@ -2369,6 +2369,10 @@ class AppShortcutTests(unittest.TestCase):
         entry = (self.applications / "net.local.murmly-app.desktop").read_text(encoding="utf-8")
         self.assertIn("Exec=/bin/murmly app\n", entry)
         self.assertIn("Name=Murmly\n", entry)
+        self.assertIn("Icon=audio-input-microphone\n", entry)
+        self.assertIn("Categories=Utility;\n", entry)
+        # An absolute command, so the menu does not depend on the search path.
+        self.assertTrue(entry.split("Exec=", 1)[1].startswith("/"))
         # Visible in the menu, and binds no key.
         self.assertNotIn("NoDisplay", entry)
         self.assertNotIn("X-KDE-Shortcuts", entry)
@@ -2395,6 +2399,78 @@ class AppShortcutTests(unittest.TestCase):
 
         self.assertEqual(first, self.shortcut.path.stat().st_mtime_ns)
         self.assertFalse(any("applications menu" in message for message in outcome.messages))
+
+    def test_an_entry_written_before_it_had_an_icon_is_rewritten_with_one(self) -> None:
+        self.applications.mkdir(parents=True)
+        self.shortcut.path.write_text(
+            "[Desktop Entry]\nType=Application\nName=Murmly\n"
+            "Comment=Dictate with your voice, locally\nExec=/bin/murmly app\n"
+            "Terminal=false\nCategories=Utility;\nStartupNotify=false\n",
+            encoding="utf-8",
+        )
+
+        outcome = self.install(self.installer())
+
+        self.assertIn("Icon=audio-input-microphone\n", self.shortcut.path.read_text(encoding="utf-8"))
+        self.assertTrue(any("applications menu" in message for message in outcome.messages))
+
+    def test_writing_and_removing_the_entry_nudge_the_menu_cache(self) -> None:
+        from murmly.installer import AppShortcut
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        shortcut = AppShortcut(applications_dir=self.applications, run_command=fake_run)
+
+        self.assertTrue(shortcut.register(Path("/bin/murmly")))
+        self.assertEqual([["kbuildsycoca6"]], calls)
+        self.assertFalse(shortcut.register(Path("/bin/murmly")))
+        self.assertEqual(1, len(calls))
+        self.assertTrue(shortcut.unregister())
+        self.assertEqual(2, len(calls))
+        self.assertFalse(shortcut.unregister())
+        self.assertEqual(2, len(calls))
+
+    def test_a_missing_cache_builder_is_not_an_error(self) -> None:
+        from murmly.installer import AppShortcut
+
+        def missing(argv, **kwargs):
+            raise FileNotFoundError(argv[0])
+
+        shortcut = AppShortcut(applications_dir=self.applications, run_command=missing)
+
+        self.assertTrue(shortcut.register(Path("/bin/murmly")))
+        self.assertTrue(shortcut.is_present)
+
+    def test_only_a_kde_desktop_is_asked_to_rebuild_its_menu_cache(self) -> None:
+        from murmly.installer import Installer
+        from murmly.platform import Desktop, OperatingSystem, PlatformProfile
+
+        env = {"HOME": str(self.applications.parent), "XDG_DATA_HOME": str(self.applications.parent)}
+        for desktop, expected in ((Desktop.PLASMA, True), (Desktop.GNOME, False), (Desktop.OTHER, False)):
+            profile = PlatformProfile(
+                operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc", desktop=desktop
+            )
+            installer = Installer(profile=profile, env=env)
+
+            app = installer._app
+
+            self.assertIsNotNone(app, desktop)
+            self.assertEqual(expected, app._run_command is not None, desktop)
+
+    def test_a_runner_that_does_not_expect_the_cache_builder_does_not_fail_the_install(self) -> None:
+        from murmly.installer import AppShortcut
+
+        def unexpected(argv, **kwargs):
+            raise ValueError("a runner that only knows gsettings")
+
+        shortcut = AppShortcut(applications_dir=self.applications, run_command=unexpected)
+
+        self.assertTrue(shortcut.register(Path("/bin/murmly")))
+        self.assertTrue(shortcut.unregister())
 
     def test_installing_after_the_checkout_moved_rewrites_the_command(self) -> None:
         self.install(self.installer())

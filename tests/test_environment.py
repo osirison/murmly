@@ -8,6 +8,7 @@ from murmly.environment import (
     EnvironmentSyncError,
     ONNXRUNTIME_GPU_VERSION,
     SyncPlan,
+    app_toolkit_glibc_floor,
     current_extras,
     install_system_packages,
     installed_package,
@@ -306,14 +307,14 @@ class ResolveExtrasTests(unittest.TestCase):
             current=("cuda",), want_cuda="no", has_nvidia_driver=True,
             confirm=lambda _p: True, announce=lambda _m: None,
         )
-        self.assertEqual((), result)
+        self.assertEqual(("gui",), result)
 
     def test_cuda_flag_adds_it_even_without_a_driver(self) -> None:
         result = resolve_extras(
             current=(), want_cuda="yes", has_nvidia_driver=False,
             confirm=lambda _p: False, announce=lambda _m: None,
         )
-        self.assertEqual(("cuda",), result)
+        self.assertEqual(("cuda", "gui"), result)
 
     def test_auto_keeps_an_installed_extra_without_asking(self) -> None:
         asked = []
@@ -321,7 +322,7 @@ class ResolveExtrasTests(unittest.TestCase):
             current=("cuda",), want_cuda="auto", has_nvidia_driver=True,
             confirm=lambda p: asked.append(p) or True, announce=lambda _m: None,
         )
-        self.assertEqual(("cuda",), result)
+        self.assertEqual(("cuda", "gui"), result)
         self.assertEqual([], asked)
 
     def test_auto_offers_it_once_when_a_driver_is_found_and_not_yet_installed(self) -> None:
@@ -330,7 +331,7 @@ class ResolveExtrasTests(unittest.TestCase):
             current=(), want_cuda="auto", has_nvidia_driver=True,
             confirm=lambda _p: True, announce=announced.append,
         )
-        self.assertEqual(("cuda",), result)
+        self.assertEqual(("cuda", "gui"), result)
         self.assertTrue(any("NVIDIA driver" in message for message in announced))
 
     def test_auto_declines_leaves_it_out(self) -> None:
@@ -338,7 +339,18 @@ class ResolveExtrasTests(unittest.TestCase):
             current=(), want_cuda="auto", has_nvidia_driver=True,
             confirm=lambda _p: False, announce=lambda _m: None,
         )
-        self.assertEqual((), result)
+        self.assertEqual(("gui",), result)
+
+    def test_the_gui_extra_is_always_there_whatever_the_environment_held(self) -> None:
+        # An existing environment with no PySide6 in it was never offered the
+        # app, so its absence is not a refusal and the sync must add it.
+        for current in ((), ("cuda",)):
+            for want_cuda in ("auto", "no", "yes"):
+                result = resolve_extras(
+                    current=current, want_cuda=want_cuda, has_nvidia_driver=False,
+                    confirm=lambda _p: False, announce=lambda _m: None,
+                )
+                self.assertIn("gui", result, (current, want_cuda))
 
     def test_auto_with_no_driver_never_asks(self) -> None:
         asked = []
@@ -346,7 +358,7 @@ class ResolveExtrasTests(unittest.TestCase):
             current=(), want_cuda="auto", has_nvidia_driver=False,
             confirm=lambda p: asked.append(p) or True, announce=lambda _m: None,
         )
-        self.assertEqual((), result)
+        self.assertEqual(("gui",), result)
         self.assertEqual([], asked)
 
 
@@ -354,11 +366,143 @@ class SyncArgumentsTests(unittest.TestCase):
     def test_no_extras_no_tts_flag(self) -> None:
         self.assertEqual((), sync_arguments(SyncPlan(extras=(), include_tts=True)))
 
+    def test_the_gui_extra_is_named(self) -> None:
+        self.assertEqual(("--extra", "gui"), sync_arguments(SyncPlan(extras=("gui",), include_tts=True)))
+
     def test_cuda_extra_is_named(self) -> None:
         self.assertEqual(("--extra", "cuda"), sync_arguments(SyncPlan(extras=("cuda",), include_tts=True)))
 
     def test_tts_left_out_adds_no_group(self) -> None:
         self.assertEqual(("--no-group", "tts"), sync_arguments(SyncPlan(extras=(), include_tts=False)))
+
+
+def lock_with_toolkit(*wheel_tags: str) -> str:
+    wheels = "\n".join(
+        f'    {{ url = "https://files.example/pyside6_essentials-6.12.0-cp310-abi3-{tag}.whl", size = 1 }},'
+        for tag in wheel_tags
+    )
+    return f'''[[package]]
+name = "pyside6-essentials"
+version = "6.12.0"
+wheels = [
+{wheels}
+]
+'''
+
+
+class AppToolkitGlibcFloorTests(unittest.TestCase):
+    LOCK = lock_with_toolkit(
+        "macosx_14_0_universal2", "manylinux_2_34_x86_64", "manylinux_2_39_aarch64", "win_amd64"
+    )
+
+    def test_each_architecture_gets_its_own_floor_from_the_lock(self) -> None:
+        self.assertEqual((2, 34), app_toolkit_glibc_floor(self.LOCK, "x86_64"))
+        self.assertEqual((2, 39), app_toolkit_glibc_floor(self.LOCK, "aarch64"))
+
+    def test_the_lowest_of_several_wheels_is_the_floor(self) -> None:
+        lock = lock_with_toolkit("manylinux_2_39_x86_64", "manylinux2014_x86_64.manylinux_2_17_x86_64")
+        self.assertEqual((2, 17), app_toolkit_glibc_floor(lock, "x86_64"))
+
+    def test_no_answer_where_the_lock_does_not_say(self) -> None:
+        self.assertIsNone(app_toolkit_glibc_floor(self.LOCK, "riscv64"))
+        self.assertIsNone(app_toolkit_glibc_floor("[[package]]\nname = \"other\"\n", "x86_64"))
+        self.assertIsNone(app_toolkit_glibc_floor("not toml [", "x86_64"))
+
+    def test_this_projects_own_lock_names_a_floor_for_x86_64(self) -> None:
+        lock = (Path(__file__).resolve().parent.parent / "uv.lock").read_text(encoding="utf-8")
+        floor = app_toolkit_glibc_floor(lock, "x86_64")
+        self.assertIsNotNone(floor)
+
+
+class DetectedGlibcTests(unittest.TestCase):
+    def test_a_version_is_read_as_major_and_minor(self) -> None:
+        from unittest import mock
+
+        from murmly.environment import detected_glibc
+
+        with mock.patch("platform.libc_ver", return_value=("glibc", "2.34")):
+            self.assertEqual((2, 34), detected_glibc())
+        with mock.patch("platform.libc_ver", return_value=("glibc", "2.17.1")):
+            self.assertEqual((2, 17), detected_glibc())
+
+    def test_nothing_is_claimed_where_it_is_not_glibc_or_cannot_be_read(self) -> None:
+        from unittest import mock
+
+        from murmly.environment import detected_glibc
+
+        with mock.patch("platform.libc_ver", return_value=("", "")):
+            self.assertIsNone(detected_glibc())
+        with mock.patch("platform.libc_ver", return_value=("glibc", "unknown")):
+            self.assertIsNone(detected_glibc())
+        with mock.patch("platform.libc_ver", side_effect=OSError("cannot read the interpreter")):
+            self.assertIsNone(detected_glibc())
+
+
+class SyncEnvironmentGlibcFloorTests(unittest.TestCase):
+    LOCK = lock_with_toolkit("manylinux_2_34_x86_64", "manylinux_2_39_aarch64")
+
+    def sync(self, *, glibc, architecture="x86_64", lock=LOCK, libc="glibc", announced=None):
+        runner = FakeRunCommand({("uv", "pip", "show", "--project", str(PROJECT), "nvidia-cublas-cu12"): 1})
+        plan = sync_environment(
+            PROJECT,
+            want_cuda="no",
+            want_tts="auto",
+            confirm=lambda _p: True,
+            announce=announced.append if announced is not None else (lambda _m: None),
+            run_command=runner,
+            which=lambda _c: None,
+            venv_exists=lambda _project_dir: True,
+            profile=profile(architecture=architecture, libc=libc),
+            glibc=lambda: glibc,
+            read_lock=lambda _project_dir: lock,
+        )
+        return plan, runner
+
+    def test_below_the_floor_the_app_is_left_out_and_said_so(self) -> None:
+        announced: list[str] = []
+        plan, runner = self.sync(glibc=(2, 31), announced=announced)
+
+        self.assertEqual((), plan.extras)
+        sync_call = next(call for call in runner.calls if call[:2] == ["uv", "sync"])
+        self.assertNotIn("gui", sync_call)
+        self.assertIn(
+            "The desktop app needs glibc 2.34 or newer here; this system has 2.31. "
+            "Murmly works without it, and the app is not installed.",
+            announced,
+        )
+
+    def test_at_or_above_the_floor_the_app_is_kept(self) -> None:
+        for installed in ((2, 34), (2, 43)):
+            plan, _runner = self.sync(glibc=installed)
+            self.assertEqual(("gui",), plan.extras, installed)
+
+    def test_arm64_uses_the_aarch64_floor(self) -> None:
+        plan, _runner = self.sync(glibc=(2, 36), architecture="arm64")
+        self.assertEqual((), plan.extras)
+
+    def test_the_app_is_kept_when_the_floor_or_the_version_cannot_be_read(self) -> None:
+        self.assertEqual(("gui",), self.sync(glibc=None)[0].extras)
+        self.assertEqual(("gui",), self.sync(glibc=(2, 17), lock="not toml [")[0].extras)
+        self.assertEqual(("gui",), self.sync(glibc=(2, 17), architecture="riscv64")[0].extras)
+
+    def test_a_machine_that_is_not_glibc_is_not_judged_by_glibc(self) -> None:
+        self.assertEqual(("gui",), self.sync(glibc=(2, 17), libc=None)[0].extras)
+
+    def test_cuda_is_still_carried_when_the_app_is_left_out(self) -> None:
+        runner = FakeRunCommand()
+        plan = sync_environment(
+            PROJECT,
+            want_cuda="auto",
+            want_tts="auto",
+            confirm=lambda _p: True,
+            announce=lambda _m: None,
+            run_command=runner,
+            which=lambda _c: None,
+            profile=profile(),
+            glibc=lambda: (2, 31),
+            read_lock=lambda _project_dir: self.LOCK,
+        )
+        self.assertEqual(("cuda",), plan.extras)
 
 
 class SwapInGpuOnnxruntimeTests(unittest.TestCase):
@@ -399,11 +543,12 @@ class SyncEnvironmentTests(unittest.TestCase):
             run_command=runner,
             which=lambda _c: None,
         )
-        self.assertEqual(("cuda",), plan.extras)
+        self.assertEqual(("cuda", "gui"), plan.extras)
         self.assertEqual([], asked)  # never asked: it was already there
         sync_call = next(call for call in runner.calls if call[:2] == ["uv", "sync"])
         self.assertIn("--extra", sync_call)
         self.assertIn("cuda", sync_call)
+        self.assertIn("gui", sync_call)
 
     def test_opting_out_of_tts_before_is_preserved_on_upgrade(self) -> None:
         # `.venv` exists and kokoro-onnx is not installed: a deliberate opt-out.
@@ -454,6 +599,48 @@ class SyncEnvironmentTests(unittest.TestCase):
         )
         self.assertTrue(any("--reinstall" in " ".join(call) for call in runner.calls))
         self.assertTrue(any("restoring it" in message for message in announced))
+
+    def test_an_environment_without_the_gui_extra_gets_it_with_no_prompt_and_no_flag(self) -> None:
+        # Nothing but the default groups installed, which is what an install made
+        # before the app was part of it looks like.
+        runner = FakeRunCommand({("uv", "pip", "show", "--project", str(PROJECT), "nvidia-cublas-cu12"): 1})
+        asked: list[str] = []
+        plan = sync_environment(
+            PROJECT,
+            want_cuda="auto",
+            want_tts="auto",
+            confirm=lambda p: asked.append(p) or True,
+            announce=lambda _m: None,
+            run_command=runner,
+            which=lambda _c: None,
+            venv_exists=lambda _project_dir: True,
+        )
+        self.assertEqual(("gui",), plan.extras)
+        self.assertEqual([], asked)
+        sync_call = next(call for call in runner.calls if call[:2] == ["uv", "sync"])
+        self.assertEqual(["--extra", "gui"], sync_call[sync_call.index("--extra"):])
+
+    def test_the_gpu_swap_is_reapplied_after_a_sync_that_also_carries_the_gui_extra(self) -> None:
+        # cuda and onnxruntime-gpu both present: the sync names both extras and
+        # puts the CPU build back, and the swap that follows must still run.
+        runner = FakeRunCommand()
+        sync_environment(
+            PROJECT,
+            want_cuda="auto",
+            want_tts="auto",
+            confirm=lambda _p: True,
+            announce=lambda _m: None,
+            run_command=runner,
+            which=lambda _c: None,
+        )
+        sync_index = next(i for i, call in enumerate(runner.calls) if call[:2] == ["uv", "sync"])
+        sync_call = runner.calls[sync_index]
+        self.assertEqual(["--extra", "cuda", "--extra", "gui"], sync_call[sync_call.index("--extra"):])
+        later = runner.calls[sync_index + 1:]
+        self.assertTrue(any(call[:3] == ["uv", "pip", "uninstall"] for call in later))
+        self.assertTrue(
+            any(call[:3] == ["uv", "pip", "install"] and f"onnxruntime-gpu=={ONNXRUNTIME_GPU_VERSION}" in call for call in later)
+        )
 
     def test_a_failing_sync_raises_and_never_attempts_the_swap(self) -> None:
         runner = FakeRunCommand({("uv", "sync",): 1})

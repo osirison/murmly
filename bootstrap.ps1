@@ -10,16 +10,20 @@
 #   .\bootstrap.ps1 sync --cuda
 #   .\bootstrap.ps1 upgrade
 #
-# `upgrade` is the one command that is not handed to `murmly`, which has no
-# such subcommand: it fetches the speaker model, or confirms the one already
-# there, and stops. It exits 0 when the model is in place and matches its
-# checksum, and 1 when it is not, because the model is all `upgrade` does. (On
-# `install` a failed fetch stays a warning: the daemon runs without it.)
+# `install` and `upgrade` run `murmly sync` first, as `setup.sh` does, so the
+# desktop app's toolkit arrives with them and a GPU build of ONNX Runtime is put
+# back after the sync. `upgrade` is the one command that is not then handed to
+# `murmly`, which has no such subcommand: it fetches the speaker model, or
+# confirms the one already there, and stops. It exits 0 when the model is in
+# place and matches its checksum, and 1 when it is not, or when the sync failed.
+# (On `install` a failed fetch stays a warning: the daemon runs without it.)
 #
 # Every other argument is passed straight through to `murmly`, run inside this
-# checkout's own environment (`uv run`, which syncs it on demand -- the same
-# "no environment yet" bootstrap `setup.sh`'s own `sync_environment` performs
-# with a plain `uv sync --locked` before it can call `murmly sync` itself).
+# checkout's own environment with `uv run --no-sync`. Never a plain `uv run`: its
+# on-demand sync puts the CPU ONNX Runtime back over the GPU build `murmly sync`
+# swapped in. The one plain sync is `uv sync --locked`, run only when there is
+# no environment yet, which is what makes `murmly` runnable at all -- the same
+# bootstrap `setup.sh`'s own `sync_environment` performs before `murmly sync`.
 #
 # Task 16.2: parsed and its argument handling exercised against a stubbed
 # `uv` in `tests/test_bootstrap_ps1.py`, on both `pwsh` and, on the Windows CI
@@ -131,26 +135,45 @@ function Install-SpeakerModel {
     }
 }
 
-# What `upgrade` does: the model, and nothing else. The exit code answers
-# whether the model is now in place and verified, which `Install-SpeakerModel`
-# does not return because on `install` its failure is only a warning.
-function Invoke-Upgrade {
-    Install-SpeakerModel
-    if (Test-SpeakerModel -Path (Join-Path (Get-DataDir) $SpeakerModelFile)) {
-        return 0
-    }
-    return 1
+# What the last step left behind. Every step that runs a native command sets it
+# instead of returning a code, because a function's return value is collected
+# from everything it writes: a native command run inside a parenthesised call or
+# a pipeline (`| Out-Host`, `exit (Invoke-Bootstrap ...)`) has its output
+# captured and handed on a complete line at a time, which holds back a prompt
+# that ends without a newline until the process exits. Run as a plain statement,
+# the command keeps the console, so `murmly sync`'s "[y/N] " is seen as it is
+# asked. `tests/test_bootstrap_ps1.py` runs a real native `uv` that asks exactly
+# that and fails if the prompt does not arrive first.
+$script:ExitCode = 0
+
+# The options `setup.sh` forwards to the sync it runs (`setup.sh:200-211`): each
+# answers one of `murmly sync`'s questions up front, for an unattended install.
+$SyncOptionNames = @("--cuda", "--no-cuda", "--tts", "--no-tts", "--yes")
+
+function Select-SyncOptions {
+    param([string[]]$Arguments)
+
+    return @($Arguments | Where-Object { $SyncOptionNames -contains $_ })
 }
 
-function Invoke-Bootstrap {
+function Remove-SyncOptions {
+    param([string[]]$Arguments)
+
+    return @($Arguments | Where-Object { $SyncOptionNames -notcontains $_ })
+}
+
+# `uv`, installed if it is missing. `$false` when it is still not reachable.
+function Confirm-Uv {
     param([string[]]$Arguments)
 
     if (-not (Test-Uv)) {
-        Install-Uv
+        # To the console, not the pipeline: this function's own result is what
+        # the caller tests, and anything the installer printed would join it.
+        Install-Uv | Out-Host
         if (-not (Test-Uv)) {
             # -ErrorAction Continue overrides the script-wide "Stop" above for
             # this one call: with it inherited, `Write-Error` becomes a
-            # terminating error and the `return 1` right after it never runs
+            # terminating error and the `return` right after it never runs
             # -- confirmed by dot-sourcing this file and calling
             # `Invoke-Bootstrap` directly, which is exactly the composition
             # the guard below exists for. Run as the top-level script this
@@ -160,12 +183,82 @@ function Invoke-Bootstrap {
             # returned code, the way the guard below's own comment describes,
             # got an unhandled exception instead of a 1.
             Write-Error "uv installed but is still not on PATH. Open a new terminal and run:`n    uv run --project `"$RepoDir`" murmly $Arguments" -ErrorAction Continue
-            return 1
+            return $false
         }
     }
+    return $true
+}
 
-    & uv run --project $RepoDir murmly @Arguments
-    return $LASTEXITCODE
+# The one plain sync: only where there is no environment, so `murmly` can run
+# at all. Sets `$script:ExitCode`.
+function Confirm-Environment {
+    $script:ExitCode = 0
+    if (Test-Path -LiteralPath (Join-Path $RepoDir ".venv")) {
+        return
+    }
+    Write-Host "No environment yet. Creating one before murmly's own sync runs."
+    & uv sync --project $RepoDir --locked
+    $script:ExitCode = $LASTEXITCODE
+}
+
+# `murmly`, run in this checkout's own environment. Sets `$script:ExitCode`.
+function Invoke-Murmly {
+    param([string[]]$Arguments)
+
+    & uv run --no-sync --project $RepoDir murmly @Arguments
+    $script:ExitCode = $LASTEXITCODE
+}
+
+# `murmly sync`, preceded by whatever it needs to be runnable. What `install` and
+# `upgrade` do before anything else. Sets `$script:ExitCode`.
+function Invoke-Sync {
+    param([string[]]$Arguments, [string[]]$SyncOptions)
+
+    if (-not (Confirm-Uv -Arguments $Arguments)) {
+        $script:ExitCode = 1
+        return
+    }
+    Confirm-Environment
+    if ($script:ExitCode -ne 0) {
+        return
+    }
+    # Filtered, because an empty list arriving here as `$null` would otherwise
+    # become one empty argument.
+    Invoke-Murmly -Arguments (@("sync") + @($SyncOptions | Where-Object { $_ }))
+}
+
+# What `upgrade` does: sync, then the model. The exit code answers whether the
+# sync worked and the model is now in place and verified, which
+# `Install-SpeakerModel` does not return because on `install` its failure is only
+# a warning. Sets `$script:ExitCode`.
+function Invoke-Upgrade {
+    param([string[]]$Arguments)
+
+    Invoke-Sync -Arguments $Arguments -SyncOptions (Select-SyncOptions -Arguments $Arguments)
+    if ($script:ExitCode -ne 0) {
+        return
+    }
+    Install-SpeakerModel
+    if (Test-SpeakerModel -Path (Join-Path (Get-DataDir) $SpeakerModelFile)) {
+        $script:ExitCode = 0
+    } else {
+        $script:ExitCode = 1
+    }
+}
+
+# Sets `$script:ExitCode`.
+function Invoke-Bootstrap {
+    param([string[]]$Arguments)
+
+    if (-not (Confirm-Uv -Arguments $Arguments)) {
+        $script:ExitCode = 1
+        return
+    }
+    Confirm-Environment
+    if ($script:ExitCode -ne 0) {
+        return
+    }
+    Invoke-Murmly -Arguments $Arguments
 }
 
 # `$MyInvocation.InvocationName` is `.` when this file has been dot-sourced
@@ -174,16 +267,27 @@ function Invoke-Bootstrap {
 # dot-source this file and call `Invoke-Bootstrap` directly, against faked
 # `Test-Uv`/`Install-Uv`, without it running for real.
 #
-# The speaker model is fetched on `install` and `upgrade`, the two commands
-# `setup.sh` fetches it on, and outside `Invoke-Bootstrap` so that a test of the
-# hand-off to `uv` never reaches the network. `install` then hands off to
+# `install` and `upgrade` sync first and then fetch the speaker model, the two
+# commands `setup.sh` does both on, outside `Invoke-Bootstrap` so that a test of
+# the hand-off to `uv` never reaches the network. `install` then hands off to
 # `murmly`; `upgrade` ends here, because `murmly` has no `upgrade` subcommand.
+# `--cuda`, `--no-cuda`, `--tts`, `--no-tts` and `--yes` go to the sync, not to
+# `murmly install`, which does not take them. Every call below is a statement and
+# the code is read from `$script:ExitCode`, never from a call's value.
 if ($MyInvocation.InvocationName -ne '.') {
     if ($args.Count -gt 0 -and $args[0] -eq "upgrade") {
-        exit (Invoke-Upgrade)
+        Invoke-Upgrade -Arguments $args
+        exit $script:ExitCode
     }
     if ($args.Count -gt 0 -and $args[0] -eq "install") {
+        Invoke-Sync -Arguments $args -SyncOptions (Select-SyncOptions -Arguments $args)
+        if ($script:ExitCode -ne 0) {
+            exit $script:ExitCode
+        }
         Install-SpeakerModel
+        Invoke-Bootstrap -Arguments (Remove-SyncOptions -Arguments $args)
+        exit $script:ExitCode
     }
-    exit (Invoke-Bootstrap -Arguments $args)
+    Invoke-Bootstrap -Arguments $args
+    exit $script:ExitCode
 }

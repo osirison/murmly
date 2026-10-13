@@ -1,5 +1,6 @@
 """`bootstrap.ps1`, task 16.2's Windows half: install `uv` if it is missing,
-then hand off to `uv run --project <repo> murmly @Arguments` directly --
+sync first on `install` and `upgrade`, then hand off to
+`uv run --no-sync --project <repo> murmly @Arguments` directly --
 Windows has no `setup.sh` to hand off to, unlike `bootstrap.sh`'s Linux side
 (`test_bootstrap_sh.py`).
 
@@ -47,7 +48,7 @@ BOOTSTRAP_PS1 = REPO_ROOT / "bootstrap.ps1"
 # `System.Management.Automation`, not something `pwsh` added.
 _INTERPRETER = shutil.which("pwsh") or shutil.which("powershell")
 
-_CALL_PATTERN = re.compile(r"^run --project (.+) murmly (.*)$")
+_CALL_PATTERN = re.compile(r"^run --no-sync --project (.+) murmly (.*)$")
 
 
 def _path_without_real_uv() -> str:
@@ -147,8 +148,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
         result = self._run(
             'function uv { $global:UvCallArgs = $args -join " "; $global:LASTEXITCODE = 0 }\n'
             f'. "{BOOTSTRAP_PS1}"\n'
-            '$exitCode = Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "CALLARGS:[$UvCallArgs]"\n'
         )
 
@@ -161,8 +162,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
             'function uv { $global:LASTEXITCODE = 0 }\n'
             f'. "{BOOTSTRAP_PS1}"\n'
             "function Install-Uv { $global:InstallCalled = $true }\n"
-            '$exitCode = Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "INSTALLCALLED:[$([bool]$InstallCalled)]"\n'
         )
 
@@ -185,8 +186,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
             "        $global:LASTEXITCODE = 0\n"
             "    }\n"
             "}\n"
-            '$exitCode = Invoke-Bootstrap -Arguments @("upgrade")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("upgrade")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "CALLARGS:[$UvCallArgs]"\n',
             hide_real_uv=True,
         )
@@ -211,8 +212,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
             f'. "{BOOTSTRAP_PS1}"\n'
             'function Install-Uv { Write-Host "install attempted" }\n'
             "try {\n"
-            '    $exitCode = Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
-            '    Write-Output "EXITCODE:[$exitCode]"\n'
+            '    Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
+            '    Write-Output "EXITCODE:[$script:ExitCode]"\n'
             "} catch {\n"
             '    Write-Output "CAUGHT:[$($_.Exception.Message)]"\n'
             "}\n",
@@ -228,8 +229,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
         result = self._run(
             'function uv { $global:UvCallArgs = $args -join " "; $global:LASTEXITCODE = 0 }\n'
             f'. "{BOOTSTRAP_PS1}"\n'
-            '$exitCode = Invoke-Bootstrap -Arguments @("uninstall", "--purge", "--yes")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("uninstall", "--purge", "--yes")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "CALLARGS:[$UvCallArgs]"\n'
         )
 
@@ -390,7 +391,7 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         assert match is not None
         self.checksum = match.group(1)
 
-    def _run(self, command: str, *, download_fails: bool = False):
+    def _run(self, command: str, *, download_fails: bool = False, sync_fails: bool = False):
         download = (
             'throw "network down"'
             if download_fails
@@ -404,12 +405,19 @@ class BootstrapPs1CommandTests(unittest.TestCase):
             f"    {download}\n"
             "}\n"
             f'function Get-FileHash {{ param($LiteralPath, $Algorithm) [pscustomobject]@{{ Hash = "{self.checksum}" }} }}\n'
-            "function uv { $global:UvCallArgs = $args -join \" \"; $global:LASTEXITCODE = 0 }\n"
+            "function uv {\n"
+            '    $global:UvCallArgs = $args -join " "\n'
+            '    $global:UvCalls += ,($args -join " ")\n'
+            '    if ($global:FailSync -and ($args -contains "sync")) { $global:LASTEXITCODE = 1 }\n'
+            "    else { $global:LASTEXITCODE = 0 }\n"
+            "}\n"
             f'$env:LOCALAPPDATA = "{self.local}"\n'
+            f'{"$global:FailSync = $true" if sync_fails else ""}\n'
             f'& "{BOOTSTRAP_PS1}" {command}\n'
             'Write-Output "EXITCODE:[$LASTEXITCODE]"\n'
             'Write-Output "FETCHES:[$Fetches]"\n'
-            'Write-Output "UVCALL:[$UvCallArgs]"\n',
+            'Write-Output "UVCALL:[$UvCallArgs]"\n'
+            'Write-Output "UVCALLS:[$($UvCalls -join "|")]"\n',
             encoding="utf-8",
         )
         return subprocess.run(
@@ -421,14 +429,35 @@ class BootstrapPs1CommandTests(unittest.TestCase):
             timeout=60,
         )
 
-    def test_upgrade_fetches_the_model_and_does_not_hand_off(self) -> None:
+    def _murmly_calls(self, stdout: str) -> list[str]:
+        """The `murmly` arguments of every `uv run` the script made, in order."""
+        match = re.search(r"^UVCALLS:\[(.*)\]$", stdout, re.MULTILINE)
+        self.assertIsNotNone(match, f"no UVCALLS line in:\n{stdout}")
+        calls = [call for call in match.group(1).split("|") if call]
+        for call in calls:
+            if call.startswith("run"):
+                self.assertTrue(
+                    call.startswith("run --no-sync --project "),
+                    f"a plain on-demand sync would put the CPU ONNX Runtime back: {call}",
+                )
+        return [call.split(" murmly ", 1)[1] for call in calls if call.startswith("run")]
+
+    def test_upgrade_syncs_then_fetches_the_model_and_does_not_hand_off(self) -> None:
         result = self._run("upgrade")
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("FETCHES:[1]", result.stdout)
-        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertEqual(["sync"], self._murmly_calls(result.stdout))
         self.assertTrue(self.model.is_file())
+
+    def test_upgrade_stops_when_the_sync_fails(self) -> None:
+        result = self._run("upgrade", sync_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[1]", result.stdout)
+        self.assertIn("FETCHES:[]", result.stdout)
+        self.assertFalse(self.model.exists())
 
     def test_upgrade_with_the_model_already_there_exits_zero_without_fetching(self) -> None:
         self.model.parent.mkdir(parents=True)
@@ -439,7 +468,7 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("FETCHES:[]", result.stdout)
-        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertEqual(["sync"], self._murmly_calls(result.stdout))
 
     def test_upgrade_exits_one_when_the_model_could_not_be_fetched(self) -> None:
         result = self._run("upgrade", download_fails=True)
@@ -447,16 +476,51 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[1]", result.stdout)
         self.assertIn("Could not fetch", result.stdout + result.stderr)
-        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertEqual(["sync"], self._murmly_calls(result.stdout))
         self.assertFalse(self.model.exists())
 
-    def test_install_fetches_the_model_then_hands_off(self) -> None:
+    def test_install_syncs_first_fetches_the_model_then_hands_off(self) -> None:
         result = self._run("install Meta+X")
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("FETCHES:[1]", result.stdout)
-        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
+        self.assertEqual(["sync", "install Meta+X"], self._murmly_calls(result.stdout))
+        self.assertRegex(result.stdout, r"UVCALL:\[run --no-sync --project .+ murmly install Meta\+X\]")
+
+    def test_the_sync_options_go_to_the_sync_and_not_to_install(self) -> None:
+        result = self._run("install --cuda --yes Meta+X Meta+A")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            ["sync --cuda --yes", "install Meta+X Meta+A"], self._murmly_calls(result.stdout)
+        )
+
+    def test_upgrade_forwards_the_sync_options_too(self) -> None:
+        result = self._run("upgrade --no-tts --yes")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sync --no-tts --yes"], self._murmly_calls(result.stdout))
+
+    def test_a_plain_sync_keeps_its_own_arguments(self) -> None:
+        result = self._run("sync --cuda")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sync --cuda"], self._murmly_calls(result.stdout))
+
+    def test_install_does_nothing_more_when_the_sync_fails(self) -> None:
+        result = self._run("install Meta+X", sync_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[1]", result.stdout)
+        self.assertIn("FETCHES:[]", result.stdout)
+        self.assertNotIn("install Meta+X", " ".join(self._murmly_calls(result.stdout)))
+
+    def test_a_plain_command_is_never_synced_first(self) -> None:
+        result = self._run("status")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["status"], self._murmly_calls(result.stdout))
 
     def test_install_still_hands_off_when_the_model_could_not_be_fetched(self) -> None:
         result = self._run("install Meta+X", download_fails=True)
@@ -464,7 +528,118 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("Could not fetch", result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
+        self.assertRegex(result.stdout, r"UVCALL:\[run --no-sync --project .+ murmly install Meta\+X\]")
+
+
+class BootstrapPs1PromptReachesThePersonTests(unittest.TestCase):
+    """A real native `uv`, not a PowerShell function, because the question is how
+    PowerShell wires a native command's output, which a function stub cannot show.
+
+    The fake prints a prompt with no trailing newline, as `murmly sync` does
+    ("Install the GPU runtime? [y/N] "), flushes, then waits for one line on
+    standard input and exits with the number it reads. Put in a pipeline
+    (`| Out-Host`, or a parenthesised call), PowerShell holds a partial line back
+    until the process ends, so the person sits at a prompt they cannot see. The
+    test reads the script's output on a thread and requires the prompt to arrive
+    BEFORE any answer is written.
+    """
+
+    PROMPT = "Install the GPU runtime? [y/N] "
+    FAKE_UV = (
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        "if args[:1] == ['run'] and 'murmly' in args and args[args.index('murmly') + 1:][:1] == ['sync']:\n"
+        f"    sys.stdout.write({PROMPT!r})\n"
+        "    sys.stdout.flush()\n"
+        "    line = sys.stdin.readline()\n"
+        "    sys.exit(int(line.strip() or 0))\n"
+        "sys.exit(0)\n"
+    )
+
+    def setUp(self) -> None:
+        if _INTERPRETER is None:
+            self.skipTest("no PowerShell interpreter (pwsh or powershell) on PATH")
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.dir = Path(temp_dir.name)
+        script = self.dir / "fake_uv.py"
+        script.write_text(self.FAKE_UV, encoding="utf-8")
+        if sys.platform == "win32":
+            launcher = self.dir / "uv.cmd"
+            launcher.write_text(f'@"{sys.executable}" -u "{script}" %*\r\n', encoding="utf-8")
+        else:
+            launcher = self.dir / "uv"
+            launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" -u "{script}" "$@"\n', encoding="utf-8")
+            launcher.chmod(0o755)
+
+    def _start(self, *arguments: str) -> subprocess.Popen:
+        env = os.environ.copy()
+        env["PATH"] = str(self.dir) + os.pathsep + _path_without_real_uv()
+        # Never let a real run write under a real profile.
+        for name in ("LOCALAPPDATA", "APPDATA", "XDG_DATA_HOME", "XDG_CONFIG_HOME"):
+            env[name] = str(self.dir / name)
+        process = subprocess.Popen(
+            [_INTERPRETER, "-NoProfile", "-NonInteractive", "-File", str(BOOTSTRAP_PS1), *arguments],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+        self.addCleanup(self._kill, process)
+        return process
+
+    @staticmethod
+    def _kill(process: subprocess.Popen) -> None:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                stream.close()
+
+    def _answer_when_prompted(self, process: subprocess.Popen, answer: str, timeout: float = 20.0) -> tuple[str, int]:
+        import threading
+        import time
+
+        seen = bytearray()
+
+        def read() -> None:
+            assert process.stdout is not None
+            while True:
+                chunk = process.stdout.read(1)
+                if not chunk:
+                    return
+                seen.extend(chunk)
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+
+        deadline = time.monotonic() + timeout
+        while self.PROMPT.encode() not in bytes(seen):
+            if time.monotonic() > deadline or process.poll() is not None:
+                break
+            time.sleep(0.05)
+        before_answer = bytes(seen).decode("utf-8", errors="replace")
+        self.assertIn(
+            self.PROMPT,
+            before_answer,
+            "the prompt did not reach the person before the process ended: the native "
+            "command's output is being held back by a pipeline",
+        )
+
+        assert process.stdin is not None
+        process.stdin.write((answer + "\n").encode())
+        process.stdin.flush()
+        code = process.wait(timeout=timeout)
+        reader.join(timeout=10)
+        return before_answer, code
+
+    def test_a_prompt_with_no_newline_is_shown_before_it_is_answered_and_the_exit_code_comes_back(self) -> None:
+        process = self._start("sync", "--cuda")
+
+        _shown, code = self._answer_when_prompted(process, "7")
+
+        self.assertEqual(7, code)
 
 
 if __name__ == "__main__":

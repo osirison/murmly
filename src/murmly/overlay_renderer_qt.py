@@ -425,7 +425,7 @@ def check_visual_runtime(backend: str) -> dict[str, object]:
         # `doctor`'s equivalent GTK4 message ("kokoro-onnx is not installed.
         # Run `uv sync`...") already sets this bar, and a bare
         # "No module named 'PySide6'" would not meet it.
-        result["error"] = "PySide6 is not installed. Run `uv sync --extra overlay`."
+        result["error"] = "PySide6 is not installed. Run `.\\bootstrap.ps1 sync`."
         return result
     try:
         from PySide6.QtWidgets import QApplication

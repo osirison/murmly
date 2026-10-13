@@ -40,7 +40,9 @@ on `PATH`, then hands every argument straight to `setup.sh`. `setup.sh` is what 
 covers installing, upgrading, and removing. It installs the system packages for your
 session after showing you the command for your package manager and asking, syncs the
 Python environment, binds the hotkey, and starts the part of murmly that keeps running
-in the background — the murmly service.
+in the background — the murmly service. It also adds the desktop app, which opens from
+your applications menu: see [Using the app](using-the-app.md). On a system with a glibc
+older than 2.34 (2.39 on aarch64) it leaves the app out, says so, and installs the rest.
 
 Once `uv` is on `PATH`, the commands below can call `setup.sh` directly — that is what
 `bootstrap.sh` itself does on every run after the first:
@@ -74,7 +76,8 @@ rather than assumed.
     replaces the CPU one, so every sync puts the CPU one back. `murmly sync` — which
     `setup.sh` calls rather than `uv sync` directly — reads what is installed before each
     sync, names all of it, and reapplies the swap afterwards, so an upgrade never removes
-    a feature you had. Speech output needs none of that care: it is installed by default,
+    a feature you had. The one thing it always adds is the desktop app's toolkit, PySide6,
+    even to an environment that never had it. Speech output needs none of that care: it is installed by default,
     as a dependency group rather than an extra, and only `--no-group tts` leaves it out.
 
 ## Install it on Windows
@@ -88,22 +91,27 @@ checkout's own environment.
 .\bootstrap.ps1 install Meta+X
 ```
 
-`uv run`, which `bootstrap.ps1` hands off to, syncs the environment on demand, so this
-one line is the whole install for the base capability: capture, transcription,
-clipboard, paste, and the hotkey. Two things are opt-in extras that a plain sync does
-not carry, and each needs its own `uv sync` first:
+`bootstrap.ps1 install` and `bootstrap.ps1 upgrade` run murmly's own sync first, which
+installs the environment, adds PySide6 (the toolkit the desktop app and the recording
+overlay both draw with), and keeps anything else you had, the GPU runtime included. So
+this one line is the whole install: capture, transcription, clipboard, paste, the
+hotkey, the overlay and the app. Every other command `bootstrap.ps1` hands to murmly
+runs without syncing, so nothing it does puts the CPU build of ONNX Runtime back over
+the GPU one.
+
+The sync asks the same two questions as on Linux (the GPU runtime, and speech output on the
+GPU). `--cuda`/`--no-cuda`, `--tts`/`--no-tts` and `--yes` given to `install` or `upgrade`
+go to that sync and answer them up front, for an unattended run:
 
 ```powershell
-uv sync --extra overlay   # the recording overlay's Qt toolkit
-uv sync --extra cuda      # the GPU-backed transcription and speech runtime
-.\bootstrap.ps1 install Meta+X
+.\bootstrap.ps1 install --cuda --yes Meta+X
 ```
 
-`uv sync --extra overlay` installs PySide6, the toolkit the Windows overlay renderer
-draws with. Without it, only the overlay is disabled — recording, transcription,
-clipboard, and paste handling all keep working, the same rule Linux's missing GTK4
-packages follow. `uv sync --extra cuda` behaves exactly as it does on Linux: see [Using
-your graphics card](#using-your-graphics-card) below.
+If PySide6 is ever missing, only the overlay and the app are missing — recording,
+transcription, clipboard, and paste handling all keep working, the same rule Linux's
+missing GTK4 packages follow. `.\bootstrap.ps1 sync` adds it without a full install. The
+GPU-backed runtime is an extra a plain sync does not carry: see [Using your graphics
+card](#using-your-graphics-card) below.
 
 Registering the hotkey needs no permission. If another application already holds the
 combination, Windows refuses the registration and murmly reports the key as taken — but
@@ -146,7 +154,7 @@ On Linux under KDE Plasma or GNOME, installing murmly writes:
 | `~/.local/share/applications/net.local.murmly.desktop` | carries the hotkey, on KDE Plasma |
 | `~/.local/share/applications/net.local.murmly-session.desktop` | carries the speech-session hotkey, on KDE Plasma, when one was requested |
 | `~/.config/murmly/hotkeys.json` | a record of which purposes are bound to which keys, written on every platform regardless of where the desktop itself holds the binding |
-| `~/.local/share/applications/net.local.murmly-app.desktop` | the Murmly app in your applications menu; written only when the app can run here, which means the `gui` extra is installed |
+| `~/.local/share/applications/net.local.murmly-app.desktop` | the Murmly app in your applications menu, on every Linux desktop |
 
 On GNOME, the hotkey lives in GNOME's own `custom-keybindings` schema instead of a
 `.desktop` file, but the systemd unit and the hotkey record above are still written the
@@ -270,11 +278,9 @@ The overlay runs as a separate helper under `/usr/bin/python3` — the system Py
 not murmly's own environment — so it can use the distribution's own tested PyGObject
 and GTK packages instead of compiling duplicates inside the virtual environment.
 
-On Windows, the overlay's toolkit is a pip extra rather than a system package:
-
-```powershell
-uv sync --extra overlay
-```
+On Windows, the overlay's toolkit is a Python package rather than a system package. It
+is the same PySide6 the desktop app uses, and `.\bootstrap.ps1 install` or
+`.\bootstrap.ps1 upgrade` adds it.
 
 On either platform, if the overlay's packages are missing, only the overlay is disabled
 — recording, transcription, clipboard, and paste handling all keep working.

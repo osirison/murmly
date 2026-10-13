@@ -22,7 +22,8 @@ built later.
 ## What Changes
 
 - A desktop app on Linux and Windows, `murmly app`, with three sections: Home,
-  Settings and Health. It is optional: dictation works the same with or without it.
+  Settings and Health. It is part of the install, and dictation works the same
+  whether it is open or closed.
 - **Home** shows the current state (ready, listening, writing, needs you, service
   not running), the keys that are bound, the last words, and a summary of how
   Murmly is set up.
@@ -74,18 +75,25 @@ built later.
   bounded delivered confirmation before hiding, instead of hiding immediately; when
   "only my voice" leaves out everything in a recording, it shows a brief neutral
   presentation saying so.
-- `desktop-integration`: installation adds an applications-menu entry for the app
-  when it can run, which uninstallation removes; uninstallation can also delete
-  settings, downloaded models and enrolled voices, after naming the folders and
-  asking.
+- `desktop-integration`: installation adds an applications-menu entry for the app,
+  which uninstallation removes; syncing the environment always installs the app's
+  toolkit, so an existing environment gets it on its next sync; uninstallation can
+  also delete settings, downloaded models and enrolled voices, after naming the
+  folders and asking.
 
 ## Impact
 
 - **Order**: depends on `add-speaker-recognition`, whose `speaker-recognition`
   capability the Voices requirements build on. Archive that change first.
-- **Packaging**: a new optional extra, `gui`, carrying PySide6 on Linux as well as
-  Windows (today it is installed for the Windows overlay only), and a new
-  `murmly app` command. Nothing in the default install changes.
+- **Packaging**: a new extra, `gui`, carrying PySide6 on Linux as well as Windows
+  (today it is installed for the Windows overlay only), and a new `murmly app`
+  command. `murmly sync` always adds the extra, so the app is part of every install
+  and upgrade. This reverses the first draft of this change, which left the app out
+  of the default install; the person asked for it to be part of the install. There
+  is no opt-out. Both extras name `PySide6-Essentials`, so the cost is about 85 MB to
+  download and 245 MB on disk for Linux x86_64. On a glibc older than the wheels need
+  (2.34 on x86_64, 2.39 on aarch64) the sync leaves the app out and says so, rather
+  than failing. On Windows `bootstrap.ps1 install` and `upgrade` run `murmly sync`.
 - **Daemon**: holds the last transcript in memory, with its speaker parts when it
   was labelled, and answers a request for it over the command socket; reports
   whether it is idle enough to restart; tells the overlay when "only my voice" left
@@ -95,7 +103,8 @@ built later.
 - **Fonts**: Instrument Sans and IBM Plex Mono are bundled for offline use, both
   under the SIL Open Font License, with their licences in `licenses/`.
 - **Installer**: an app shortcut (desktop entry on Linux, Start menu on Windows);
-  uninstall removes it.
+  uninstall removes it. The Linux entry has a menu icon and is written by the
+  `murmly install` that follows the sync, in a new process, so it sees the toolkit.
 - **Overlay renderers**: every renderer (X11, Wayland, Qt) draws the new delivered
   confirmation and the "not your voice" presentation.
 - **Documentation**: a manual page for the app, the overlay page updated for the

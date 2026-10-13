@@ -61,7 +61,7 @@ colour that carries meaning only:
 
 ## Decisions
 
-### Qt for Python (PySide6) with Qt Quick, as an optional `gui` extra
+### Qt for Python (PySide6) with Qt Quick, in a `gui` extra that every sync carries
 
 PySide6 is already a Murmly dependency for the Windows overlay. It runs on Linux and
 Windows from the same code, has a system tray (`QSystemTrayIcon`), follows the
@@ -77,8 +77,40 @@ Alternatives considered:
 - **GTK**: native on Linux, weak on Windows.
 - **Tk**: cannot meet the design without drawing most controls by hand.
 
-The extra is opt-in because the PySide6 wheel is large. The `overlay` extra keeps
-its current meaning; `gui` adds PySide6 on Linux too.
+The first draft made the extra opt-in because the PySide6 wheel is large. That is
+reversed: the person asked for the app to be part of the install, and an app that
+needs a manual `uv sync --extra gui` is one nobody opens. Worse, a plain
+`uv sync --extra gui` on a machine with the GPU build of ONNX Runtime puts the CPU
+build back. So `murmly sync`, which already names every extra it found and reapplies
+the GPU swap afterwards, now always names `gui` as well.
+
+It stays an extra, not a default dependency, so CI, which installs no extras, does
+not download the wheel for tests that skip without it. It is added unconditionally
+rather than kept "if already present": an existing environment without PySide6 must
+get it on the next sync. Speech output's rule, where a missing synthesizer in an
+existing environment means a deliberate opt-out, is not reused: nothing ever offered
+a choice, so reading absence as refusal would leave every existing install without
+the app. There is no flag to leave it out.
+
+Both extras name `PySide6-Essentials`, not the `PySide6` meta package. The app and
+the overlay import only QtCore, QtGui, QtWidgets, QtSvg, QtQml and QtQuick with its
+Controls, Layouts, Shapes and Window modules, all of which ship in Essentials, and
+the meta package adds Addons, WebEngine and Pdf that nothing here imports. The whole
+Qt test set for the app and the overlay runs, and passes, in an environment built
+from the lock with Essentials only. Cost, measured for Linux x86_64 and PySide6
+6.12.0: about 85 MB to download (the Essentials wheel is 84 MB, shiboken6 0.3 MB) and
+about 245 MB installed. The meta package would have been about 264 MB to download.
+
+The toolkit has wheels only for glibc 2.34 or newer on x86_64 and 2.39 or newer on
+aarch64, and `uv sync` fails outright on an older system, taking the whole install
+with it. So `murmly sync` reads the oldest glibc the lock has an Essentials wheel
+for on this architecture, compares it with the installed glibc, and below it leaves
+`gui` out and says so, rather than carrying a floor of its own that dependency
+updates would make wrong. Where the lock or the glibc cannot be read it keeps `gui`.
+
+The `overlay` extra keeps its current meaning. On Windows, `murmly sync` could not
+see whether `overlay` had been installed and so dropped it; naming `gui` keeps
+PySide6 there, which is all the overlay needs.
 
 ### The app is a separate process that talks to the daemon over the command socket
 
@@ -199,8 +231,11 @@ requires: nothing is pasted and no failure is signalled.
   never calls raise or activate in response to daemon state; only the person
   opening it brings it forward. A test asserts that state changes make no focus
   calls.
-- [PySide6 adds a large download] → It stays in an optional extra; the default
-  install is unchanged.
+- [PySide6 adds a download: about 85 MB, 245 MB on disk] → Accepted, because the app
+  is meant to be part of the install. Essentials holds every Qt module the app and
+  overlay use, and the larger meta package is not installed.
+- [A glibc older than the toolkit's wheels would fail the whole sync] → The sync
+  leaves the app out below the floor the lock records, and says so.
 - [GNOME without an AppIndicator extension has no tray] → The app runs from its
   window, and Health says that no tray was found.
 - [A hand edit to `config.toml` races with an app edit] → The mtime check makes the
@@ -224,8 +259,13 @@ requires: nothing is pasted and no failure is signalled.
 ## Migration Plan
 
 Nothing to migrate. The command line, the configuration file format and the
-service are unchanged; the app is additive and opt-in. Removing the `gui` extra
-removes the app and nothing else. Voices enrolled with `murmly enrol` appear in the
+service are unchanged. An existing installation gets the app on its next
+`./setup.sh upgrade`: the sync adds PySide6, and the `murmly install` that upgrade
+runs afterwards, in a new process, writes the menu entry (and rewrites an older
+entry that has no icon). On Windows `bootstrap.ps1 install` and `upgrade` now run
+`murmly sync` first, and every other `bootstrap.ps1` command runs `uv run --no-sync`,
+so no on-demand sync puts the CPU ONNX Runtime back after the GPU swap.
+Removing the app means removing murmly. Voices enrolled with `murmly enrol` appear in the
 app as they are, and voices enrolled in the app are listed by
 `murmly speakers list`.
 

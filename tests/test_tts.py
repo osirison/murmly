@@ -276,7 +276,7 @@ class AvailabilityTests(unittest.TestCase):
         # dependency group. `--extra tts` was the answer while it was an extra
         # and now names one that does not exist, so a reader who follows it gets
         # an error instead of a synthesizer.
-        self.assertIn("uv sync", synthesizer.unavailable_reason)
+        self.assertIn("murmly sync", synthesizer.unavailable_reason)
         self.assertNotIn("--extra tts", synthesizer.unavailable_reason)
 
     def test_an_absent_phoneme_library_is_reported_rather_than_raised(self) -> None:
@@ -488,7 +488,7 @@ class AvailabilityTests(unittest.TestCase):
                     PlatformProfile(operating_system=OperatingSystem.WINDOWS, architecture="x86_64")
                 )
 
-        self.assertIn("uv sync", str(raised.exception))
+        self.assertIn("murmly sync", str(raised.exception))
 
     def test_windows_with_corrupt_bundled_data_names_the_remedy(self) -> None:
         """`espeakng_loader.get_data_path()` already raises `RuntimeError`
@@ -898,7 +898,7 @@ class RuntimeResolutionTests(unittest.TestCase):
                     collapsed,
                     f"a remedy names an extra that no longer exists: {literal!r}",
                 )
-        self.assertIn("uv sync --extra cuda", " ".join(CUDA_EXTRA_REMEDY.split()))
+        self.assertIn("murmly sync --cuda", " ".join(CUDA_EXTRA_REMEDY.split()))
 
     def test_the_cuda_extra_missing_falls_back_and_logs_the_remedy(self) -> None:
         """An accelerator asked for and unusable falls back rather than refusing.
@@ -915,7 +915,7 @@ class RuntimeResolutionTests(unittest.TestCase):
         ):
             self.assertEqual([CPU_PROVIDER], resolve_providers(self._config("cuda")))
 
-        self.assertIn("--extra cuda", "\n".join(logged.output))
+        self.assertIn("murmly sync --cuda", "\n".join(logged.output))
 
     def test_a_cpu_only_runtime_build_falls_back_and_names_the_swap_it_needs(self) -> None:
         """The CPU and GPU builds share one package namespace.

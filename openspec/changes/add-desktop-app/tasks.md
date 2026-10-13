@@ -66,3 +66,16 @@ skip themselves when none is available.
 
 - [x] 11.1 Write `manual/using-the-app.md` and add it to the `mkdocs.yml` navigation; verify `mkdocs build --strict` passes
 - [ ] 11.2 Run the app end to end on KDE Plasma X11 and on Windows: dictate with the app open behind the target window, change a setting while recording, refuse a delivery by switching windows, enrol a voice and switch to "only my voice", remove the owner's voice and see the voices-not-checked notice, and remove Murmly; record the results in the change before archiving
+
+## 12. The app is part of the install
+
+- [x] 12.1 Make `murmly sync` always add the `gui` extra, keeping the GPU swap working with it; verify tests that an environment with no PySide6 is synced with `--extra gui` and no prompt, that cuda and gui are named together, and that the swap still follows
+- [x] 12.2 Give the menu entry an icon, and make the missing-toolkit message of `murmly app` name `murmly sync` instead of a plain `uv sync`; verify tests for both
+- [x] 12.3 Rewrite `manual/using-the-app.md` and `manual/install.md` for an app that comes with the install, and remove every instruction to run `uv sync --extra gui` or `uv sync --extra overlay`; verify `mkdocs build --strict` passes
+- [x] 12.4 Confirm `setup.sh install` and `setup.sh upgrade` run `murmly install` after the sync, in a new process; verify by reading both commands (done: both call `bind_hotkeys` after `sync_environment`; upgrade does so only when a hotkey was already recorded)
+- [ ] 12.5 Run `./setup.sh upgrade` on a Linux machine without PySide6 and confirm the menu entry appears and opens the app, and that `murmly doctor` still reports the GPU build of ONNX Runtime; record the result before archiving
+- [x] 12.6 Switch the `gui` and `overlay` extras to `PySide6-Essentials`; verify the Qt tests for the app and the overlay run, not skip, in an environment built from the lock without PySide6-Addons
+- [x] 12.7 Leave the app out, with a plain announcement, when the system's glibc is older than the Essentials wheels the lock holds for this architecture; verify tests on both sides of the floor and that an unreadable lock keeps the app
+- [x] 12.8 Rewrite an existing menu entry that differs from what would be written now, and refresh the KDE menu cache after writing or removing it; verify tests for an entry without an icon
+- [x] 12.9 Make `bootstrap.ps1 install` and `upgrade` run `murmly sync` first, and every other `uv run` there `--no-sync`; verify the `bootstrap.ps1` tests
+- [ ] 12.10 Run `.\bootstrap.ps1 install` and `upgrade` on a real Windows machine and confirm PySide6 arrives, `murmly app` opens, and a GPU build of ONNX Runtime survives; record the result before archiving

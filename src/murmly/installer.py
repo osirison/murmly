@@ -103,6 +103,7 @@ Type=Application
 Name={name}
 Comment=Dictate with your voice, locally
 Exec={exec_line}
+Icon=audio-input-microphone
 Terminal=false
 Categories=Utility;
 StartupNotify=false
@@ -1093,21 +1094,7 @@ class ShortcutLauncher:
         The cache also rebuilds itself when the applications directory changes,
         so a failure here is not fatal; the poll decides the outcome.
         """
-        try:
-            result = self._run_command(
-                [self._cache_builder],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=COMMAND_TIMEOUT_SECONDS,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            logger.debug("Desktop service cache rebuild did not run: %s", error)
-            return
-        if result.returncode != 0:
-            logger.debug("Desktop service cache rebuild reported an error: %s", (result.stderr or "").strip())
+        rebuild_desktop_cache(self._run_command, self._cache_builder)
 
     def _wait_until(self, predicate: Callable[[], bool]) -> bool:
         deadline = self._clock() + self._timeout
@@ -1117,6 +1104,30 @@ class ShortcutLauncher:
             if self._clock() >= deadline:
                 return False
             self._sleep(self._poll_interval)
+
+
+def rebuild_desktop_cache(run_command: RunCommand, cache_builder: str = "kbuildsycoca6") -> None:
+    """Ask KDE to re-read its menu, quietly where it is not there or fails.
+
+    Plasma also notices a change to the applications directory on its own, so
+    this only hurries it; nothing waits on the result. Any failure at all is
+    swallowed: the menu entry is a convenience and must not fail an install.
+    """
+    try:
+        result = run_command(
+            [cache_builder],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except Exception as error:  # noqa: BLE001 -- best effort, see above
+        logger.debug("Desktop service cache rebuild did not run: %s", error)
+        return
+    if result.returncode != 0:
+        logger.debug("Desktop service cache rebuild reported an error: %s", (result.stderr or "").strip())
 
 
 def app_launcher_text(entrypoint: Path) -> str:
@@ -1149,10 +1160,18 @@ class AppShortcut:
     this installer, and the app is reached there with `murmly app`.
     """
 
-    def __init__(self, applications_dir: Path | None = None, env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        applications_dir: Path | None = None,
+        env: dict[str, str] | None = None,
+        run_command: RunCommand | None = None,
+    ) -> None:
         self._applications_dir = (
             applications_dir if applications_dir is not None else default_applications_dir(env)
         )
+        # None means no menu-cache nudge, so a test that builds one over a
+        # temporary directory never runs the desktop's own tools.
+        self._run_command = run_command
 
     @property
     def path(self) -> Path:
@@ -1174,17 +1193,32 @@ class AppShortcut:
         return None
 
     def register(self, entrypoint: Path) -> bool:
-        """Write the entry. False when it already ran this command and was left alone."""
-        if self.declared_entrypoint() == f"{entrypoint.as_posix()} app":
-            return False
-        write_atomically(self.path, app_launcher_text(entrypoint))
+        """Write the entry. False when it is already exactly what would be written.
+
+        The whole file is compared, not only the command: an entry written by an
+        earlier version, before it carried an icon, must be rewritten too.
+        """
+        text = app_launcher_text(entrypoint)
+        try:
+            if self.path.read_text(encoding="utf-8") == text:
+                return False
+        except OSError:
+            pass
+        write_atomically(self.path, text)
+        self._refresh_menu()
         return True
 
     def unregister(self) -> bool:
         """Remove the entry. Reports whether anything was there."""
         existed = self.is_present
         self.path.unlink(missing_ok=True)
+        if existed:
+            self._refresh_menu()
         return existed
+
+    def _refresh_menu(self) -> None:
+        if self._run_command is not None:
+            rebuild_desktop_cache(self._run_command)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1438,7 +1472,7 @@ class Installer:
         fakes, and must not reach the real applications directory, and the
         in-process platforms have no menu entry code at all.
         """
-        from murmly.platform import hotkey_mechanism_is_in_process
+        from murmly.platform import Desktop, hotkey_mechanism_is_in_process
 
         if self._pinned_app_shortcut is not None:
             return self._pinned_app_shortcut
@@ -1449,7 +1483,11 @@ class Installer:
         ):
             return None
         if self._app_entry is None:
-            self._app_entry = AppShortcut(env=self._env)
+            # The menu cache is KDE's; no other desktop is asked to rebuild it.
+            runner = None
+            if self._profile.desktop is Desktop.PLASMA:
+                runner = self._run_command if self._run_command is not None else subprocess.run
+            self._app_entry = AppShortcut(env=self._env, run_command=runner)
         return self._app_entry
 
     def _install_app_shortcut(self, entrypoint: Path, messages: list[str]) -> None:
