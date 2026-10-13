@@ -112,13 +112,14 @@ TINTS = ("note-band-bg", "needs-you-band-bg", "needs-you-card-bg", "destructive-
 # Every text token and the backgrounds it is drawn on. A tinted background (a
 # band, a tinted button) is laid over a surface, so it is checked over each one.
 TEXT_ON = {
-    "text": SURFACES,
+    "text": SURFACES + TINTS,
     "text-bright": SURFACES + TINTS,
     "text-2": SURFACES + TINTS,
     "text-3": SURFACES + TINTS,
     "text-4": SURFACES + TINTS,
     "text-5": SURFACES + TINTS,
-    "text-label": SURFACES,
+    # "What you said" on Home sits on the needs-you band.
+    "text-label": SURFACES + ("needs-you-band-bg",),
     "needs-you-text": SURFACES + ("needs-you-band-bg", "needs-you-btn-bg"),
     "destructive-text": SURFACES + ("destructive-btn-bg",),
     "note": SURFACES + ("note-band-bg",),

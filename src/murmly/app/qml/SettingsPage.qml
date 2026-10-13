@@ -370,20 +370,24 @@ Item {
 
                             SettingsCard {
                                 SettingRow {
+                                    id: dictateRow
                                     title: "Dictate"
                                     text: "Types into the window you started in."
                                     divider: true
                                     KeyField {
                                         objectName: "settings-key-window"
                                         purpose: "window"
+                                        room: dictateRow.room
                                     }
                                 }
                                 SettingRow {
+                                    id: replyRow
                                     title: "Reply to your assistant"
                                     text: "Sends your reply to the assistant that is speaking, not to the window in front."
                                     KeyField {
                                         objectName: "settings-key-session"
                                         purpose: "session"
+                                        room: replyRow.room
                                     }
                                 }
                             }

@@ -45,6 +45,13 @@ class KeyboardMixin:
         if not self.window.isActive():
             self.skipTest("this display does not give a test window the focus")
 
+    def resize_window(self, width: int, height: int) -> None:
+        """Resize, but never past the screen: a platform that cannot honour a size
+        warns, and a warning fails the test. A small CI screen is 1024 px wide."""
+        screen = self.window.screen().availableGeometry()
+        self.window.resize(min(width, screen.width()), min(height, screen.height()))
+        self.settle()
+
     def key(self, name: str) -> None:
         from PySide6.QtCore import Qt
         from PySide6.QtTest import QTest
@@ -176,12 +183,11 @@ class FirstRunTabTests(KeyboardMixin, KeysQtCase):
 class OperatedKeepsFocusTests(KeyboardMixin, KeysQtCase):
     def choose_with_space(self, prefix: str) -> None:
         """Space on an option that is not chosen: it becomes chosen and keeps the focus."""
-        options = [
-            item.objectName()
-            for item in self.tabbables_by_prefix(prefix)
-            if not item.property("selected")
-        ]
-        self.assertTrue(options, f"every {prefix} option is already chosen")
+        def unchosen() -> list[str]:
+            return [item.objectName() for item in self.tabbables_by_prefix(prefix) if not item.property("selected")]
+
+        self.wait_for(lambda: unchosen(), message=f"a {prefix} option that is shown, enabled and not chosen")
+        options = unchosen()
         name = options[0]
         self.focus(name)
 
@@ -221,7 +227,7 @@ class OperatedKeepsFocusTests(KeyboardMixin, KeysQtCase):
 
     def test_a_voice_card_keeps_the_focus(self) -> None:
         self.open_settings()
-        self.click(self.child("settings-go-speech"))
+        self.child("settings-go-speech").click()
         self.choose_with_space("set-voice-")
 
     def test_a_first_run_profile_card_keeps_the_focus(self) -> None:
@@ -264,7 +270,7 @@ class OperatedKeepsFocusTests(KeyboardMixin, KeysQtCase):
 class ScrollIntoViewTests(KeyboardMixin, KeysQtCase):
     def short(self) -> None:
         self.activate_window()
-        self.window.resize(1040, 480)
+        self.resize_window(1040, 480)
         self.settle()
 
     def test_tab_through_settings_keeps_each_focused_control_in_view(self) -> None:
@@ -283,7 +289,7 @@ class ScrollIntoViewTests(KeyboardMixin, KeysQtCase):
         self.short()
         self.click(self.child("nav-settings"))
         self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
-        self.click(self.child("settings-go-speech"))
+        self.child("settings-go-speech").click()
 
         visited = self.tab_through_in_view()
 
@@ -295,7 +301,7 @@ class ScrollIntoViewTests(KeyboardMixin, KeysQtCase):
         self.click(self.child("first-run-next"))
         self.wait_for(lambda: self.find("first-run-profile-fast") is not None, message="the choices")
         self.focus("first-run-profile-fast")
-        self.window.resize(1040, 480)
+        self.resize_window(1040, 480)
         self.settle()
 
         visited = self.tab_through_in_view()
@@ -308,7 +314,7 @@ class SettingsSubNavTests(KeyboardMixin, KeysQtCase):
 
     def open_settings(self) -> None:
         self.build(show_first_run=False, record=KEYS)
-        self.window.resize(1040, 480)
+        self.resize_window(1040, 480)
         self.click(self.child("nav-settings"))
         self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
 
@@ -367,13 +373,36 @@ class SettingsSubNavTests(KeyboardMixin, KeysQtCase):
         entries = [f"settings-go-{name}" for name in self.GROUPS + ("speech", "remove")]
         self.assertEqual(["settings-go-indicator"], [name for name in entries if self.child(name).property("selected")])
 
+    def assert_key_row_fits(self, keys: str) -> None:
+        from PySide6.QtCore import QPointF
+
+        self.build(show_first_run=False, record={"window": keys, "session": "Meta+A"})
+        self.resize_window(640, 480)
+        self.click(self.child("nav-settings"))
+        self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
+        self.pause()
+
+        button = self.child("settings-key-window-change")
+        row = button.parentItem()
+        while row.property("keyLine") is None:
+            row = row.parentItem()
+        right = button.mapToScene(QPointF(button.width(), 0)).x()
+        edge = row.mapToScene(QPointF(row.width(), 0)).x()
+        self.assertLessEqual(right, edge, f"the Change button ends {right - edge:.0f} px past its card")
+
+    def test_a_long_key_row_fits_its_card_at_the_narrowest_window(self) -> None:
+        self.assert_key_row_fits("Ctrl+Alt+Shift+D")
+
+    def test_a_key_with_a_long_name_fits_its_card_at_the_narrowest_window(self) -> None:
+        self.assert_key_row_fits("Meta+Shift+Space")
+
 
 class HomeScrollTests(KeyboardMixin, HomeQtCase):
     def test_tab_through_home_keeps_each_focused_control_in_view(self) -> None:
         self.channel.last_words = delivered()
         self.build()
         self.activate_window()
-        self.window.resize(640, 480)
+        self.resize_window(640, 480)
         self.wait_for(lambda: self.child("clear-last-words").isVisible(), message="the last words")
         self.settle()
         self.focus("nav-home")
@@ -387,7 +416,7 @@ class HealthScrollTests(KeyboardMixin, HealthQtCase):
     def test_tab_through_health_keeps_each_focused_control_in_view(self) -> None:
         self.build()
         self.activate_window()
-        self.window.resize(640, 480)
+        self.resize_window(640, 480)
         self.open_health()
         self.wait_for(lambda: self.rows_shown() > 0, message="the rows")
         self.settle()
@@ -403,14 +432,14 @@ class RemoveDialogScrollTests(KeyboardMixin, RemovalQtCase):
 
         self.build()
         self.activate_window()
-        self.window.resize(640, 480)
+        self.resize_window(640, 480)
         self.child("nav-settings").click()
         self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
         self.child("settings-go-remove").click()
         self.settle()
         self.child("remove-open").click()
         self.wait_for(lambda: self.window.findChild(QObject, "remove-dialog").property("opened"), message="the dialog")
-        self.settle()
+        self.wait_for(lambda: next(flickables(self.child("remove-purge"))).height() > 100, message="the dialog body")
 
         visited = self.tab_through_in_view()
 

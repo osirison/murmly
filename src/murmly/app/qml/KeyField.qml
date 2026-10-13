@@ -30,7 +30,24 @@ Item {
         target.focus = true
     }
 
-    implicitWidth: large ? 400 : strip.implicitWidth
+    // Settings: the most width the row can give. The strip wraps its button below the
+    // keys, and the keys themselves onto a second line, rather than run past it.
+    property real room: 1e6
+    // What the strip would take on one line.
+    readonly property real onOneLine: {
+        var width = 0
+        var shown = 0
+        for (var i = 0; i < strip.children.length; i++) {
+            var part = strip.children[i]
+            if (part.visible) {
+                width += part.implicitWidth
+                shown++
+            }
+        }
+        return width + Math.max(0, shown - 1) * strip.spacing
+    }
+
+    implicitWidth: large ? 400 : Math.min(onOneLine, room)
     implicitHeight: large ? 168 : strip.implicitHeight
 
     // Once a combination is taken or cancelled, the focus goes back to what was asked from.
@@ -200,9 +217,10 @@ Item {
     }
 
     // ---- Settings: a row of keys and a button -------------------------------
-    RowLayout {
+    Flow {
         id: strip
         visible: !field.large
+        width: field.width
         spacing: theme.space.space10
 
         // The keys now bound.

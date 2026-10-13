@@ -13,6 +13,12 @@ Colours are named by what they mean, as the design's colour table says:
 * `note-*`: amber. A note where nothing is at risk.
 * everything else is neutral: surfaces, rules, text and buttons.
 
+Where this departs from the canvas: five colours were changed so text reaches the
+WCAG AA contrast of 4.5:1 on every background it is drawn on (`text-5`,
+`text-label` and `btn-destructive-bg` in the dark scheme, `text-5` and
+`text-label` in the light one). Each has a comment with the canvas value.
+`tests/test_app_theme.py` checks the ratios.
+
 Left out, because Murmly has no screen for them: the canvas's diff view,
 hexagon status mark, folder seam and compact tray-row tokens (`diff-*`, `hex-*`,
 `seam*`, `compact-*`, `deletion-kind`), and the shadows, which the operating
@@ -68,8 +74,10 @@ COLORS: dict[str, dict[str, str]] = {
     "text-2": {"dark": "#c9d0da", "light": "#374151"},
     "text-3": {"dark": "#99a2ae", "light": "#4b5563"},
     "text-4": {"dark": "#828b98", "light": "#4b5563"},
-    "text-5": {"dark": "#7a8593", "light": "#656c79"},
-    "text-label": {"dark": "#757f8f", "light": "#6b7280"},
+    # text-5 and text-label differ from the canvas (dark #6d7783 and #626b78, light
+    # #6b7280 for both), which were 3.5 to 4.3:1 on some backgrounds; AA needs 4.5:1.
+    "text-5": {"dark": "#7f8a98", "light": "#606774"},
+    "text-label": {"dark": "#7a8492", "light": "#656c79"},
     "text-disabled": {"dark": "#4e5661", "light": "#b9bec6"},
 
     # Listening: warm, your voice going in
@@ -117,6 +125,7 @@ COLORS: dict[str, dict[str, str]] = {
     "destructive-input-border": {"dark": "rgba(255, 59, 59, 0.35)", "light": "rgba(220, 38, 38, 0.35)"},
     "destructive-input-bg": {"dark": "#0a0b0d", "light": "#ffffff"},
     "destructive-armed-border": {"dark": "rgba(255, 59, 59, 0.5)", "light": "rgba(220, 38, 38, 0.5)"},
+    # The canvas dark value is #ff3b3b, which is 3.5:1 under the white text; AA needs 4.5:1.
     "btn-destructive-bg": {"dark": "#e02d2d", "light": "#dc2626"},
     "btn-destructive-text": {"dark": "#ffffff", "light": "#ffffff"},
     "btn-destructive-disabled-text": {"dark": "#8a5a5a", "light": "#c08a8a"},

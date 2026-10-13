@@ -11,6 +11,8 @@ Item {
     property string keyLine: ""
     property bool divider: false
     default property alias control: slot.data
+    // The width the control may take, for one that can wrap itself to fit.
+    readonly property real room: flow.width
 
     Layout.fillWidth: true
     implicitHeight: flow.implicitHeight + theme.space.space16 * 2
