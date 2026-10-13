@@ -103,6 +103,7 @@ Type=Application
 Name={name}
 Comment=Dictate with your voice, locally
 Exec={exec_line}
+Icon=audio-input-microphone
 Terminal=false
 Categories=Utility;
 StartupNotify=false

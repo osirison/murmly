@@ -29,7 +29,7 @@ in one page with pictures. The
   other desktop registers no hotkey and shows no overlay automatically, though
   everything else still installs.
 - **On Windows, the hotkey and clipboard always work with no permission
-  needed**; the overlay needs a separate `uv sync --extra overlay`, and
+  needed**; the overlay needs `.\bootstrap.ps1 sync` run once, and
   microphone capture depends on Windows' own privacy setting, which
   `murmly doctor` reports. Every Windows capability listed here has run as an
   automated test on a real Windows machine; a second account and an elevated

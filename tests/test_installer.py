@@ -2369,6 +2369,10 @@ class AppShortcutTests(unittest.TestCase):
         entry = (self.applications / "net.local.murmly-app.desktop").read_text(encoding="utf-8")
         self.assertIn("Exec=/bin/murmly app\n", entry)
         self.assertIn("Name=Murmly\n", entry)
+        self.assertIn("Icon=audio-input-microphone\n", entry)
+        self.assertIn("Categories=Utility;\n", entry)
+        # An absolute command, so the menu does not depend on the search path.
+        self.assertTrue(entry.split("Exec=", 1)[1].startswith("/"))
         # Visible in the menu, and binds no key.
         self.assertNotIn("NoDisplay", entry)
         self.assertNotIn("X-KDE-Shortcuts", entry)

@@ -61,7 +61,7 @@ colour that carries meaning only:
 
 ## Decisions
 
-### Qt for Python (PySide6) with Qt Quick, as an optional `gui` extra
+### Qt for Python (PySide6) with Qt Quick, in a `gui` extra that every sync carries
 
 PySide6 is already a Murmly dependency for the Windows overlay. It runs on Linux and
 Windows from the same code, has a system tray (`QSystemTrayIcon`), follows the
@@ -77,8 +77,30 @@ Alternatives considered:
 - **GTK**: native on Linux, weak on Windows.
 - **Tk**: cannot meet the design without drawing most controls by hand.
 
-The extra is opt-in because the PySide6 wheel is large. The `overlay` extra keeps
-its current meaning; `gui` adds PySide6 on Linux too.
+The first draft made the extra opt-in because the PySide6 wheel is large. That is
+reversed: the person asked for the app to be part of the install, and an app that
+needs a manual `uv sync --extra gui` is one nobody opens. Worse, a plain
+`uv sync --extra gui` on a machine with the GPU build of ONNX Runtime puts the CPU
+build back. So `murmly sync`, which already names every extra it found and reapplies
+the GPU swap afterwards, now always names `gui` as well.
+
+It stays an extra, not a default dependency, so CI, which installs no extras, does
+not download the wheel for tests that skip without it. It is added unconditionally
+rather than kept "if already present": an existing environment without PySide6 must
+get it on the next sync. Speech output's rule, where a missing synthesizer in an
+existing environment means a deliberate opt-out, is not reused: nothing ever offered
+a choice, so reading absence as refusal would leave every existing install without
+the app. There is no flag to leave it out. Cost, measured for Linux x86_64 and
+PySide6 6.12.0: about 529 MB of wheels (84 MB of that is `pyside6-essentials`, 117 MB
+`pyside6-webengine`, 59 MB `pyside6-addons`) and about 670 MB installed. The app and
+the overlay import only QtCore, QtGui, QtWidgets, QtSvg, QtQml and QtQuick with its
+Controls, Layouts, Shapes and Window modules, all of which ship in
+`pyside6-essentials`, so a later change could depend on that package alone and
+avoid most of the download. This change does not.
+
+The `overlay` extra keeps its current meaning. On Windows, `murmly sync` could not
+see whether `overlay` had been installed and so dropped it; naming `gui` keeps
+PySide6 there, which is all the overlay needs.
 
 ### The app is a separate process that talks to the daemon over the command socket
 
@@ -199,8 +221,10 @@ requires: nothing is pasted and no failure is signalled.
   never calls raise or activate in response to daemon state; only the person
   opening it brings it forward. A test asserts that state changes make no focus
   calls.
-- [PySide6 adds a large download] → It stays in an optional extra; the default
-  install is unchanged.
+- [PySide6 adds a large download: about 530 MB, 670 MB on disk] → Accepted, because
+  the app is meant to be part of the install. `pyside6-essentials` alone would be
+  about 85 MB and holds every Qt module the app uses; a later change can switch to
+  it.
 - [GNOME without an AppIndicator extension has no tray] → The app runs from its
   window, and Health says that no tray was found.
 - [A hand edit to `config.toml` races with an app edit] → The mtime check makes the
@@ -224,8 +248,11 @@ requires: nothing is pasted and no failure is signalled.
 ## Migration Plan
 
 Nothing to migrate. The command line, the configuration file format and the
-service are unchanged; the app is additive and opt-in. Removing the `gui` extra
-removes the app and nothing else. Voices enrolled with `murmly enrol` appear in the
+service are unchanged. An existing installation gets the app on its next
+`./setup.sh upgrade`: the sync adds PySide6, and the `murmly install` that upgrade
+runs afterwards, in a new process, writes the menu entry. On Windows the toolkit
+arrives with `.\bootstrap.ps1 sync`, which `bootstrap.ps1 install` does not run.
+Removing the app means removing murmly. Voices enrolled with `murmly enrol` appear in the
 app as they are, and voices enrolled in the app are listed by
 `murmly speakers list`.
 

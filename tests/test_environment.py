@@ -306,14 +306,14 @@ class ResolveExtrasTests(unittest.TestCase):
             current=("cuda",), want_cuda="no", has_nvidia_driver=True,
             confirm=lambda _p: True, announce=lambda _m: None,
         )
-        self.assertEqual((), result)
+        self.assertEqual(("gui",), result)
 
     def test_cuda_flag_adds_it_even_without_a_driver(self) -> None:
         result = resolve_extras(
             current=(), want_cuda="yes", has_nvidia_driver=False,
             confirm=lambda _p: False, announce=lambda _m: None,
         )
-        self.assertEqual(("cuda",), result)
+        self.assertEqual(("cuda", "gui"), result)
 
     def test_auto_keeps_an_installed_extra_without_asking(self) -> None:
         asked = []
@@ -321,7 +321,7 @@ class ResolveExtrasTests(unittest.TestCase):
             current=("cuda",), want_cuda="auto", has_nvidia_driver=True,
             confirm=lambda p: asked.append(p) or True, announce=lambda _m: None,
         )
-        self.assertEqual(("cuda",), result)
+        self.assertEqual(("cuda", "gui"), result)
         self.assertEqual([], asked)
 
     def test_auto_offers_it_once_when_a_driver_is_found_and_not_yet_installed(self) -> None:
@@ -330,7 +330,7 @@ class ResolveExtrasTests(unittest.TestCase):
             current=(), want_cuda="auto", has_nvidia_driver=True,
             confirm=lambda _p: True, announce=announced.append,
         )
-        self.assertEqual(("cuda",), result)
+        self.assertEqual(("cuda", "gui"), result)
         self.assertTrue(any("NVIDIA driver" in message for message in announced))
 
     def test_auto_declines_leaves_it_out(self) -> None:
@@ -338,7 +338,18 @@ class ResolveExtrasTests(unittest.TestCase):
             current=(), want_cuda="auto", has_nvidia_driver=True,
             confirm=lambda _p: False, announce=lambda _m: None,
         )
-        self.assertEqual((), result)
+        self.assertEqual(("gui",), result)
+
+    def test_the_gui_extra_is_always_there_whatever_the_environment_held(self) -> None:
+        # An existing environment with no PySide6 in it was never offered the
+        # app, so its absence is not a refusal and the sync must add it.
+        for current in ((), ("cuda",)):
+            for want_cuda in ("auto", "no", "yes"):
+                result = resolve_extras(
+                    current=current, want_cuda=want_cuda, has_nvidia_driver=False,
+                    confirm=lambda _p: False, announce=lambda _m: None,
+                )
+                self.assertIn("gui", result, (current, want_cuda))
 
     def test_auto_with_no_driver_never_asks(self) -> None:
         asked = []
@@ -346,13 +357,16 @@ class ResolveExtrasTests(unittest.TestCase):
             current=(), want_cuda="auto", has_nvidia_driver=False,
             confirm=lambda p: asked.append(p) or True, announce=lambda _m: None,
         )
-        self.assertEqual((), result)
+        self.assertEqual(("gui",), result)
         self.assertEqual([], asked)
 
 
 class SyncArgumentsTests(unittest.TestCase):
     def test_no_extras_no_tts_flag(self) -> None:
         self.assertEqual((), sync_arguments(SyncPlan(extras=(), include_tts=True)))
+
+    def test_the_gui_extra_is_named(self) -> None:
+        self.assertEqual(("--extra", "gui"), sync_arguments(SyncPlan(extras=("gui",), include_tts=True)))
 
     def test_cuda_extra_is_named(self) -> None:
         self.assertEqual(("--extra", "cuda"), sync_arguments(SyncPlan(extras=("cuda",), include_tts=True)))
@@ -399,11 +413,12 @@ class SyncEnvironmentTests(unittest.TestCase):
             run_command=runner,
             which=lambda _c: None,
         )
-        self.assertEqual(("cuda",), plan.extras)
+        self.assertEqual(("cuda", "gui"), plan.extras)
         self.assertEqual([], asked)  # never asked: it was already there
         sync_call = next(call for call in runner.calls if call[:2] == ["uv", "sync"])
         self.assertIn("--extra", sync_call)
         self.assertIn("cuda", sync_call)
+        self.assertIn("gui", sync_call)
 
     def test_opting_out_of_tts_before_is_preserved_on_upgrade(self) -> None:
         # `.venv` exists and kokoro-onnx is not installed: a deliberate opt-out.
@@ -454,6 +469,48 @@ class SyncEnvironmentTests(unittest.TestCase):
         )
         self.assertTrue(any("--reinstall" in " ".join(call) for call in runner.calls))
         self.assertTrue(any("restoring it" in message for message in announced))
+
+    def test_an_environment_without_the_gui_extra_gets_it_with_no_prompt_and_no_flag(self) -> None:
+        # Nothing but the default groups installed, which is what an install made
+        # before the app was part of it looks like.
+        runner = FakeRunCommand({("uv", "pip", "show", "--project", str(PROJECT), "nvidia-cublas-cu12"): 1})
+        asked: list[str] = []
+        plan = sync_environment(
+            PROJECT,
+            want_cuda="auto",
+            want_tts="auto",
+            confirm=lambda p: asked.append(p) or True,
+            announce=lambda _m: None,
+            run_command=runner,
+            which=lambda _c: None,
+            venv_exists=lambda _project_dir: True,
+        )
+        self.assertEqual(("gui",), plan.extras)
+        self.assertEqual([], asked)
+        sync_call = next(call for call in runner.calls if call[:2] == ["uv", "sync"])
+        self.assertEqual(["--extra", "gui"], sync_call[sync_call.index("--extra"):])
+
+    def test_the_gpu_swap_is_reapplied_after_a_sync_that_also_carries_the_gui_extra(self) -> None:
+        # cuda and onnxruntime-gpu both present: the sync names both extras and
+        # puts the CPU build back, and the swap that follows must still run.
+        runner = FakeRunCommand()
+        sync_environment(
+            PROJECT,
+            want_cuda="auto",
+            want_tts="auto",
+            confirm=lambda _p: True,
+            announce=lambda _m: None,
+            run_command=runner,
+            which=lambda _c: None,
+        )
+        sync_index = next(i for i, call in enumerate(runner.calls) if call[:2] == ["uv", "sync"])
+        sync_call = runner.calls[sync_index]
+        self.assertEqual(["--extra", "cuda", "--extra", "gui"], sync_call[sync_call.index("--extra"):])
+        later = runner.calls[sync_index + 1:]
+        self.assertTrue(any(call[:3] == ["uv", "pip", "uninstall"] for call in later))
+        self.assertTrue(
+            any(call[:3] == ["uv", "pip", "install"] and f"onnxruntime-gpu=={ONNXRUNTIME_GPU_VERSION}" in call for call in later)
+        )
 
     def test_a_failing_sync_raises_and_never_attempts_the_swap(self) -> None:
         runner = FakeRunCommand({("uv", "sync",): 1})

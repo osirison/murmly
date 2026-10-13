@@ -4492,7 +4492,8 @@ class AppCommandTests(unittest.TestCase):
         message = errors.getvalue().strip()
         self.assertEqual(1, len(message.splitlines()))
         self.assertIn("gui extra", message)
-        self.assertIn("uv sync --extra gui", message)
+        self.assertIn("murmly sync", message)
+        self.assertNotIn("uv sync", message)
 
     def test_an_unrelated_missing_module_is_not_reported_as_the_extra(self) -> None:
         errors = StringIO()

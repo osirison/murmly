@@ -133,7 +133,7 @@ step.
   able to name the application.
 - **Overlay.** Appears through a Qt-based renderer, drawn the same way and
   showing the same states as the Linux one. Its toolkit is not part of a plain
-  sync — run `uv sync --extra overlay` first, or the overlay is simply
+  sync — run `.\bootstrap.ps1 sync` first, or the overlay is simply
   disabled while everything else keeps working.
 - **Microphone permission.** Windows gates microphone access behind two
   settings under **Settings → Privacy & security → Microphone**: the overall

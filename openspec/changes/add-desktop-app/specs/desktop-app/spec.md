@@ -8,14 +8,20 @@ health and removes it, without needing a terminal.
 
 ## ADDED Requirements
 
-### Requirement: The app is optional on every supported platform
+### Requirement: The app is part of the install and dictation does not depend on it
 
-Murmly SHALL provide the desktop app on every platform it supports. The app MUST be optional: capture, transcription and delivery MUST behave identically whether the app is installed, running, or closed, and closing the app window MUST NOT stop the daemon.
+Murmly SHALL provide the desktop app on every platform it supports, as part of installing and upgrading. Capture, transcription and delivery MUST behave identically whether the app is running or closed, and closing the app window MUST NOT stop the daemon.
 
-#### Scenario: Dictation without the app installed
+#### Scenario: Dictation with the app never opened
 
-- **WHEN** Murmly is installed without the app and the person presses the dictation key
-- **THEN** capture, transcription and delivery behave exactly as they do with the app installed
+- **WHEN** the app has never been opened and the person presses the dictation key
+- **THEN** capture, transcription and delivery behave exactly as they do with the app open
+
+#### Scenario: The app's toolkit is missing
+
+- **WHEN** the person runs `murmly app` and PySide6 is not installed
+- **THEN** Murmly says that `murmly sync` adds it and exits without a traceback
+- **AND** it does not tell the person to run a plain `uv sync`
 
 #### Scenario: Closing the window
 

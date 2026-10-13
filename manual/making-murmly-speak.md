@@ -27,7 +27,7 @@ before the port to Windows and not re-verified on X11 since;
 Plasma Wayland and GNOME are not, and any other desktop registers no hotkey
 and shows no overlay automatically — though everything below still installs
 and works regardless of desktop. On Windows, the hotkey is always automatic
-and the overlay needs its own `uv sync --extra overlay`. Speech output itself
+and the overlay needs `.\bootstrap.ps1 sync` run once. Speech output itself
 needs no permission on either platform, granted or otherwise: it is separate
 from the microphone and paste permissions capture already needs. See [What
 you need before you start](what-you-need.md) and [installing

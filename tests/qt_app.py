@@ -46,7 +46,7 @@ def qt_application():
     except ModuleNotFoundError as error:
         if (error.name or "").partition(".")[0] != "PySide6":
             raise
-        raise unittest.SkipTest("PySide6 is not installed. Run `uv sync --extra gui`.")
+        raise unittest.SkipTest("PySide6 is not installed. Run `murmly sync`.")
     if sys.platform != "win32":
         # No display needed. Windows keeps its real platform: the overlay's own
         # tests share this process and check real window styles.

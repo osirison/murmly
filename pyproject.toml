@@ -73,13 +73,14 @@ overlay = [
     "PySide6>=6.7,<7 ; sys_platform == 'win32' or sys_platform == 'darwin'",
 ]
 
-# The desktop app's toolkit (`murmly app`). An extra for the same reason
-# `overlay` is: PySide6 is a large wheel, and nothing about starting Murmly or
-# serving a command needs it, so a default dependency would put it in every
-# install and CI run whether or not the app is wanted. Separate from `overlay`,
-# which keeps its meaning (the Windows and macOS overlay renderers); `gui` is
-# marked for Linux and Windows, the platforms the app supports. Installed with
-# `uv sync --extra gui`.
+# The desktop app's toolkit (`murmly app`). Part of the install: `murmly sync`
+# adds this extra on every run (`environment.ALWAYS_EXTRAS`), which is how the app
+# reaches an existing environment. It stays an extra rather than a default
+# dependency so CI, which installs no extras, does not download a large wheel for
+# tests that skip without it. Separate from `overlay`, which keeps its meaning
+# (the Windows and macOS overlay renderers); `gui` is marked for Linux and
+# Windows, the platforms the app supports. Never `uv sync --extra gui` on its own
+# on a machine with the GPU onnxruntime: `murmly sync` is what reapplies the swap.
 gui = [
     "PySide6>=6.7,<7 ; sys_platform == 'linux' or sys_platform == 'win32'",
 ]

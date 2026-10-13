@@ -61,6 +61,17 @@ Confirm = Callable[[str], bool]
 #: `.append` in a test, so what was said is exactly what got asserted.
 Announce = Callable[[str], None]
 
+#: Extras every sync carries, whatever the environment held before. The desktop
+#: app is part of the install, so an environment without its toolkit gets it on
+#: the next sync, and there is no way to opt out. Unlike speech output, "missing
+#: from an existing environment" does not mean declined: nothing ever offered a
+#: choice, and reading it that way would leave every existing install without the
+#: app. The extra's own marker (Linux and Windows) keeps it off a platform with
+#: no app; macOS is refused before a sync gets this far. It also keeps PySide6 on
+#: Windows, where `current_extras` cannot see the `overlay` extra and a sync
+#: would otherwise drop it.
+ALWAYS_EXTRAS = ("gui",)
+
 #: Pinned by `docs/agent-notes/onnxruntime-gpu-cuda-version.md`: 1.25+ moved to
 #: CUDA 13, whose wheels are not usable from PyPI yet, while the `cuda` extra
 #: pins CUDA 12. The one place this version is named now -- `setup.sh`'s own
@@ -319,6 +330,8 @@ def resolve_extras(
 ) -> tuple[str, ...]:
     """The extras the next sync should be given (`setup.sh:245-269`).
 
+    `cuda` is decided below; `ALWAYS_EXTRAS` follow it whatever `current` held.
+
     `want_cuda` is `"yes"`, `"no"`, or `"auto"` -- `--cuda`/`--no-cuda`/neither.
     Under `"auto"`, an environment that does not already carry the extra is
     offered it once an NVIDIA driver is detected, exactly as `setup.sh`'s own
@@ -338,7 +351,7 @@ def resolve_extras(
         if confirm("Install the GPU runtime?"):
             wants_cuda = True
 
-    return ("cuda",) if wants_cuda else ()
+    return (("cuda",) if wants_cuda else ()) + ALWAYS_EXTRAS
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,10 +460,7 @@ def sync_environment(
         include_tts=wants_speech_output(want_tts, venv_exists=venv_present, kokoro_installed=kokoro_installed),
     )
 
-    if plan.extras:
-        announce(f"Syncing with: {' '.join(plan.extras)}")
-    else:
-        announce("Syncing with no extras.")
+    announce(f"Syncing with: {' '.join(plan.extras)}")
     if not plan.include_tts:
         announce("Leaving speech output out.")
 
@@ -523,6 +533,7 @@ def make_confirm(
 
 __all__ = [
     "Announce",
+    "ALWAYS_EXTRAS",
     "Confirm",
     "EnvironmentSyncError",
     "ONNXRUNTIME_GPU_VERSION",
