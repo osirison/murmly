@@ -545,7 +545,7 @@ class DeliveredPaintTests(unittest.TestCase):
         try:
             import PySide6  # noqa: F401
         except ImportError:
-            self.skipTest("PySide6 is not installed. Run `uv sync --extra overlay`.")
+            self.skipTest("PySide6 is not installed. Run `.\\bootstrap.ps1 sync`.")
 
     def _painted(self, state: RendererVisualState, reduced_motion: bool):
         from PySide6.QtGui import QImage, QPainter, QPainterPath
@@ -628,7 +628,7 @@ class MacosWindowReadbackRuntimeIntegrationTests(unittest.TestCase):
         try:
             import PySide6  # noqa: F401
         except ModuleNotFoundError:
-            self.skipTest("PySide6 is not installed. Run `uv sync --extra overlay`.")
+            self.skipTest("PySide6 is not installed. Run `.\\bootstrap.ps1 sync`.")
 
     def test_the_real_readback_round_trips_without_raising(self) -> None:
         from murmly.overlay_renderer_qt import _real_macos_window_properties
@@ -674,7 +674,7 @@ def _skip_without_pyside6(test: unittest.TestCase) -> None:
     try:
         import PySide6  # noqa: F401
     except ModuleNotFoundError:
-        test.skipTest("PySide6 is not installed. Run `uv sync --extra overlay`.")
+        test.skipTest("PySide6 is not installed. Run `.\\bootstrap.ps1 sync`.")
 
 
 class WindowsWindowReadbackRuntimeIntegrationTests(unittest.TestCase):

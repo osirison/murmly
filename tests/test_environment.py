@@ -8,6 +8,7 @@ from murmly.environment import (
     EnvironmentSyncError,
     ONNXRUNTIME_GPU_VERSION,
     SyncPlan,
+    app_toolkit_glibc_floor,
     current_extras,
     install_system_packages,
     installed_package,
@@ -373,6 +374,111 @@ class SyncArgumentsTests(unittest.TestCase):
 
     def test_tts_left_out_adds_no_group(self) -> None:
         self.assertEqual(("--no-group", "tts"), sync_arguments(SyncPlan(extras=(), include_tts=False)))
+
+
+def lock_with_toolkit(*wheel_tags: str) -> str:
+    wheels = "\n".join(
+        f'    {{ url = "https://files.example/pyside6_essentials-6.12.0-cp310-abi3-{tag}.whl", size = 1 }},'
+        for tag in wheel_tags
+    )
+    return f'''[[package]]
+name = "pyside6-essentials"
+version = "6.12.0"
+wheels = [
+{wheels}
+]
+'''
+
+
+class AppToolkitGlibcFloorTests(unittest.TestCase):
+    LOCK = lock_with_toolkit(
+        "macosx_14_0_universal2", "manylinux_2_34_x86_64", "manylinux_2_39_aarch64", "win_amd64"
+    )
+
+    def test_each_architecture_gets_its_own_floor_from_the_lock(self) -> None:
+        self.assertEqual((2, 34), app_toolkit_glibc_floor(self.LOCK, "x86_64"))
+        self.assertEqual((2, 39), app_toolkit_glibc_floor(self.LOCK, "aarch64"))
+
+    def test_the_lowest_of_several_wheels_is_the_floor(self) -> None:
+        lock = lock_with_toolkit("manylinux_2_39_x86_64", "manylinux2014_x86_64.manylinux_2_17_x86_64")
+        self.assertEqual((2, 17), app_toolkit_glibc_floor(lock, "x86_64"))
+
+    def test_no_answer_where_the_lock_does_not_say(self) -> None:
+        self.assertIsNone(app_toolkit_glibc_floor(self.LOCK, "riscv64"))
+        self.assertIsNone(app_toolkit_glibc_floor("[[package]]\nname = \"other\"\n", "x86_64"))
+        self.assertIsNone(app_toolkit_glibc_floor("not toml [", "x86_64"))
+
+    def test_this_projects_own_lock_names_a_floor_for_x86_64(self) -> None:
+        lock = (Path(__file__).resolve().parent.parent / "uv.lock").read_text(encoding="utf-8")
+        floor = app_toolkit_glibc_floor(lock, "x86_64")
+        self.assertIsNotNone(floor)
+
+
+class SyncEnvironmentGlibcFloorTests(unittest.TestCase):
+    LOCK = lock_with_toolkit("manylinux_2_34_x86_64", "manylinux_2_39_aarch64")
+
+    def sync(self, *, glibc, architecture="x86_64", lock=LOCK, libc="glibc", announced=None):
+        runner = FakeRunCommand({("uv", "pip", "show", "--project", str(PROJECT), "nvidia-cublas-cu12"): 1})
+        plan = sync_environment(
+            PROJECT,
+            want_cuda="no",
+            want_tts="auto",
+            confirm=lambda _p: True,
+            announce=announced.append if announced is not None else (lambda _m: None),
+            run_command=runner,
+            which=lambda _c: None,
+            venv_exists=lambda _project_dir: True,
+            profile=profile(architecture=architecture, libc=libc),
+            glibc=lambda: glibc,
+            read_lock=lambda _project_dir: lock,
+        )
+        return plan, runner
+
+    def test_below_the_floor_the_app_is_left_out_and_said_so(self) -> None:
+        announced: list[str] = []
+        plan, runner = self.sync(glibc=(2, 31), announced=announced)
+
+        self.assertEqual((), plan.extras)
+        sync_call = next(call for call in runner.calls if call[:2] == ["uv", "sync"])
+        self.assertNotIn("gui", sync_call)
+        self.assertIn(
+            "The desktop app needs glibc 2.34 or newer here; this system has 2.31. "
+            "Murmly works without it, and the app is not installed.",
+            announced,
+        )
+
+    def test_at_or_above_the_floor_the_app_is_kept(self) -> None:
+        for installed in ((2, 34), (2, 43)):
+            plan, _runner = self.sync(glibc=installed)
+            self.assertEqual(("gui",), plan.extras, installed)
+
+    def test_arm64_uses_the_aarch64_floor(self) -> None:
+        plan, _runner = self.sync(glibc=(2, 36), architecture="arm64")
+        self.assertEqual((), plan.extras)
+
+    def test_the_app_is_kept_when_the_floor_or_the_version_cannot_be_read(self) -> None:
+        self.assertEqual(("gui",), self.sync(glibc=None)[0].extras)
+        self.assertEqual(("gui",), self.sync(glibc=(2, 17), lock="not toml [")[0].extras)
+        self.assertEqual(("gui",), self.sync(glibc=(2, 17), architecture="riscv64")[0].extras)
+
+    def test_a_machine_that_is_not_glibc_is_not_judged_by_glibc(self) -> None:
+        self.assertEqual(("gui",), self.sync(glibc=(2, 17), libc=None)[0].extras)
+
+    def test_cuda_is_still_carried_when_the_app_is_left_out(self) -> None:
+        runner = FakeRunCommand()
+        plan = sync_environment(
+            PROJECT,
+            want_cuda="auto",
+            want_tts="auto",
+            confirm=lambda _p: True,
+            announce=lambda _m: None,
+            run_command=runner,
+            which=lambda _c: None,
+            profile=profile(),
+            glibc=lambda: (2, 31),
+            read_lock=lambda _project_dir: self.LOCK,
+        )
+        self.assertEqual(("cuda",), plan.extras)
 
 
 class SwapInGpuOnnxruntimeTests(unittest.TestCase):

@@ -34,9 +34,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import platform as stdlib_platform
+import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from typing import TYPE_CHECKING
 
 from murmly.packages import (
@@ -71,6 +74,12 @@ Announce = Callable[[str], None]
 #: Windows, where `current_extras` cannot see the `overlay` extra and a sync
 #: would otherwise drop it.
 ALWAYS_EXTRAS = ("gui",)
+
+#: The package whose wheels decide whether the desktop app can be installed on
+#: a given machine: `PySide6-Essentials` ships only for recent glibc.
+APP_TOOLKIT_PACKAGE = "pyside6-essentials"
+
+GlibcVersion = tuple[int, int]
 
 #: Pinned by `docs/agent-notes/onnxruntime-gpu-cuda-version.md`: 1.25+ moved to
 #: CUDA 13, whose wheels are not usable from PyPI yet, while the `cuda` extra
@@ -286,6 +295,57 @@ def installed_package(project_dir: Path, name: str, run_command: RunCommand) -> 
     return getattr(result, "returncode", 1) == 0
 
 
+def detected_glibc() -> GlibcVersion | None:
+    """This machine's glibc as (major, minor), or None where it is not glibc or unreadable."""
+    name, version = stdlib_platform.libc_ver()
+    if name != "glibc":
+        return None
+    match = re.match(r"(\d+)\.(\d+)", version)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+#: The pre-PEP 600 spellings of a glibc floor, which older wheels still use.
+_LEGACY_MANYLINUX = {"manylinux1": (2, 5), "manylinux2010": (2, 12), "manylinux2014": (2, 17)}
+
+
+def app_toolkit_glibc_floor(lock_text: str, architecture: str) -> GlibcVersion | None:
+    """The oldest glibc a wheel of the app's toolkit exists for on `architecture`.
+
+    Read from the project's own lock rather than written down here, so a
+    dependency update that moves the floor moves this with it. `architecture`
+    is the wheel tag's spelling (`x86_64`, `aarch64`). None when the lock does
+    not say: no such package, no Linux wheel for this architecture, or a lock
+    that cannot be read, which callers treat as "carry on and try".
+    """
+    try:
+        packages = tomllib.loads(lock_text).get("package", [])
+    except tomllib.TOMLDecodeError:
+        return None
+    floors: list[GlibcVersion] = []
+    for package in packages:
+        if package.get("name") != APP_TOOLKIT_PACKAGE:
+            continue
+        for wheel in package.get("wheels", []):
+            filename = str(wheel.get("url", "")).rsplit("/", 1)[-1]
+            platform_tags = filename.removesuffix(".whl").rsplit("-", 1)[-1].split(".")
+            for tag in platform_tags:
+                if not tag.endswith(f"_{architecture}"):
+                    continue
+                modern = re.match(r"manylinux_(\d+)_(\d+)_", tag)
+                if modern:
+                    floors.append((int(modern.group(1)), int(modern.group(2))))
+                elif tag.removesuffix(f"_{architecture}") in _LEGACY_MANYLINUX:
+                    floors.append(_LEGACY_MANYLINUX[tag.removesuffix(f"_{architecture}")])
+    return min(floors) if floors else None
+
+
+def _read_lock(project_dir: Path) -> str | None:
+    try:
+        return (project_dir / "uv.lock").read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def current_extras(project_dir: Path, run_command: RunCommand) -> tuple[str, ...]:
     """Extras already present, so a sync is never given a smaller set than it found.
 
@@ -327,10 +387,13 @@ def resolve_extras(
     has_nvidia_driver: bool,
     confirm: Confirm,
     announce: Announce,
+    include_gui: bool = True,
 ) -> tuple[str, ...]:
     """The extras the next sync should be given (`setup.sh:245-269`).
 
-    `cuda` is decided below; `ALWAYS_EXTRAS` follow it whatever `current` held.
+    `cuda` is decided below; `ALWAYS_EXTRAS` follow it whatever `current` held,
+    unless `include_gui` is False, which only a machine the app has no wheel
+    for gets (see `sync_environment`).
 
     `want_cuda` is `"yes"`, `"no"`, or `"auto"` -- `--cuda`/`--no-cuda`/neither.
     Under `"auto"`, an environment that does not already carry the extra is
@@ -351,7 +414,7 @@ def resolve_extras(
         if confirm("Install the GPU runtime?"):
             wants_cuda = True
 
-    return (("cuda",) if wants_cuda else ()) + ALWAYS_EXTRAS
+    return (("cuda",) if wants_cuda else ()) + (ALWAYS_EXTRAS if include_gui else ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +486,9 @@ def sync_environment(
     run_command: RunCommand = subprocess.run,
     which: WhichCommand = shutil.which,
     venv_exists: Callable[[Path], bool] = lambda project_dir: (project_dir / ".venv").is_dir(),
+    profile: "PlatformProfile | None" = None,
+    glibc: Callable[[], GlibcVersion | None] = detected_glibc,
+    read_lock: Callable[[Path], str | None] = _read_lock,
 ) -> SyncPlan:
     """`setup.sh:275-336`'s `sync_environment`, moved here per task 16.1.
 
@@ -443,7 +509,28 @@ def sync_environment(
     in this module does: a test drives "an environment already exists and
     opted out of speech output" against a directory that was never created,
     rather than needing a real `.venv` on disk to exercise it.
+
+    `profile`, `glibc` and `read_lock` decide whether the desktop app can be
+    installed here at all. Its toolkit has wheels only for recent glibc, and a
+    sync that names it on an older system fails outright, taking the whole
+    install or upgrade with it. Below the floor the lock records for this
+    architecture the app is left out and that is said plainly; Murmly itself
+    needs far less. Where the floor cannot be established the app is kept, which
+    is what the sync did before this check existed.
     """
+    include_gui = True
+    if profile is not None and profile.libc == "glibc":
+        wheel_architecture = {"arm64": "aarch64"}.get(profile.architecture, profile.architecture)
+        lock_text = read_lock(project_dir)
+        floor = app_toolkit_glibc_floor(lock_text, wheel_architecture) if lock_text is not None else None
+        installed = glibc()
+        if floor is not None and installed is not None and installed < floor:
+            include_gui = False
+            announce(
+                f"The desktop app needs glibc {floor[0]}.{floor[1]} or newer here; this system has "
+                f"{installed[0]}.{installed[1]}. Murmly works without it, and the app is not installed."
+            )
+
     venv_present = venv_exists(project_dir)
     current = current_extras(project_dir, run_command)
     kokoro_installed = installed_package(project_dir, "kokoro-onnx", run_command)
@@ -456,11 +543,12 @@ def sync_environment(
             has_nvidia_driver=has_nvidia_gpu(which),
             confirm=confirm,
             announce=announce,
+            include_gui=include_gui,
         ),
         include_tts=wants_speech_output(want_tts, venv_exists=venv_present, kokoro_installed=kokoro_installed),
     )
 
-    announce(f"Syncing with: {' '.join(plan.extras)}")
+    announce(f"Syncing with: {' '.join(plan.extras)}" if plan.extras else "Syncing with no extras.")
     if not plan.include_tts:
         announce("Leaving speech output out.")
 
@@ -534,12 +622,16 @@ def make_confirm(
 __all__ = [
     "Announce",
     "ALWAYS_EXTRAS",
+    "APP_TOOLKIT_PACKAGE",
+    "GlibcVersion",
     "Confirm",
     "EnvironmentSyncError",
     "ONNXRUNTIME_GPU_VERSION",
     "RunCommand",
     "SyncPlan",
+    "app_toolkit_glibc_floor",
     "current_extras",
+    "detected_glibc",
     "install_system_packages",
     "installed_package",
     "make_confirm",

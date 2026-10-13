@@ -90,8 +90,10 @@ built later.
   command. `murmly sync` always adds the extra, so the app is part of every install
   and upgrade. This reverses the first draft of this change, which left the app out
   of the default install; the person asked for it to be part of the install. There
-  is no opt-out, and the download is large: about 530 MB of wheels for Linux x86_64,
-  about 670 MB on disk.
+  is no opt-out. Both extras name `PySide6-Essentials`, so the cost is about 85 MB to
+  download and 245 MB on disk for Linux x86_64. On a glibc older than the wheels need
+  (2.34 on x86_64, 2.39 on aarch64) the sync leaves the app out and says so, rather
+  than failing. On Windows `bootstrap.ps1 install` and `upgrade` run `murmly sync`.
 - **Daemon**: holds the last transcript in memory, with its speaker parts when it
   was labelled, and answers a request for it over the command socket; reports
   whether it is idle enough to restart; tells the overlay when "only my voice" left

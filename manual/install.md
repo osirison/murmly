@@ -41,7 +41,8 @@ covers installing, upgrading, and removing. It installs the system packages for 
 session after showing you the command for your package manager and asking, syncs the
 Python environment, binds the hotkey, and starts the part of murmly that keeps running
 in the background — the murmly service. It also adds the desktop app, which opens from
-your applications menu: see [Using the app](using-the-app.md).
+your applications menu: see [Using the app](using-the-app.md). On a system with a glibc
+older than 2.34 (2.39 on aarch64) it leaves the app out, says so, and installs the rest.
 
 Once `uv` is on `PATH`, the commands below can call `setup.sh` directly — that is what
 `bootstrap.sh` itself does on every run after the first:
@@ -90,21 +91,19 @@ checkout's own environment.
 .\bootstrap.ps1 install Meta+X
 ```
 
-`uv run`, which `bootstrap.ps1` hands off to, syncs the environment on demand, so this
-one line is the whole install for the base capability: capture, transcription,
-clipboard, paste, and the hotkey. It does not add the toolkit the desktop app and the
-recording overlay both draw with, PySide6. Add it with murmly's own sync, which keeps
-everything else you had:
+`bootstrap.ps1 install` and `bootstrap.ps1 upgrade` run murmly's own sync first, which
+installs the environment, adds PySide6 (the toolkit the desktop app and the recording
+overlay both draw with), and keeps anything else you had, the GPU runtime included. So
+this one line is the whole install: capture, transcription, clipboard, paste, the
+hotkey, the overlay and the app. Every other command `bootstrap.ps1` hands to murmly
+runs without syncing, so nothing it does puts the CPU build of ONNX Runtime back over
+the GPU one.
 
-```powershell
-.\bootstrap.ps1 sync
-.\bootstrap.ps1 install Meta+X
-```
-
-Without PySide6, only the overlay and the app are missing — recording, transcription,
-clipboard, and paste handling all keep working, the same rule Linux's missing GTK4
-packages follow. The GPU-backed runtime is an extra a plain sync does not carry: see
-[Using your graphics card](#using-your-graphics-card) below.
+If PySide6 is ever missing, only the overlay and the app are missing — recording,
+transcription, clipboard, and paste handling all keep working, the same rule Linux's
+missing GTK4 packages follow. `.\bootstrap.ps1 sync` adds it without a full install. The
+GPU-backed runtime is an extra a plain sync does not carry: see [Using your graphics
+card](#using-your-graphics-card) below.
 
 Registering the hotkey needs no permission. If another application already holds the
 combination, Windows refuses the registration and murmly reports the key as taken — but
@@ -272,11 +271,8 @@ not murmly's own environment — so it can use the distribution's own tested PyG
 and GTK packages instead of compiling duplicates inside the virtual environment.
 
 On Windows, the overlay's toolkit is a Python package rather than a system package. It
-is the same PySide6 the desktop app uses, and murmly's own sync adds it:
-
-```powershell
-.\bootstrap.ps1 sync
-```
+is the same PySide6 the desktop app uses, and `.\bootstrap.ps1 install` or
+`.\bootstrap.ps1 upgrade` adds it.
 
 On either platform, if the overlay's packages are missing, only the overlay is disabled
 — recording, transcription, clipboard, and paste handling all keep working.

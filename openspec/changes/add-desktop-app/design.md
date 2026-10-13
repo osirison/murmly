@@ -90,13 +90,23 @@ rather than kept "if already present": an existing environment without PySide6 m
 get it on the next sync. Speech output's rule, where a missing synthesizer in an
 existing environment means a deliberate opt-out, is not reused: nothing ever offered
 a choice, so reading absence as refusal would leave every existing install without
-the app. There is no flag to leave it out. Cost, measured for Linux x86_64 and
-PySide6 6.12.0: about 529 MB of wheels (84 MB of that is `pyside6-essentials`, 117 MB
-`pyside6-webengine`, 59 MB `pyside6-addons`) and about 670 MB installed. The app and
+the app. There is no flag to leave it out.
+
+Both extras name `PySide6-Essentials`, not the `PySide6` meta package. The app and
 the overlay import only QtCore, QtGui, QtWidgets, QtSvg, QtQml and QtQuick with its
-Controls, Layouts, Shapes and Window modules, all of which ship in
-`pyside6-essentials`, so a later change could depend on that package alone and
-avoid most of the download. This change does not.
+Controls, Layouts, Shapes and Window modules, all of which ship in Essentials, and
+the meta package adds Addons, WebEngine and Pdf that nothing here imports. The whole
+Qt test set for the app and the overlay runs, and passes, in an environment built
+from the lock with Essentials only. Cost, measured for Linux x86_64 and PySide6
+6.12.0: about 85 MB to download (the Essentials wheel is 84 MB, shiboken6 0.3 MB) and
+about 245 MB installed. The meta package would have been about 264 MB to download.
+
+The toolkit has wheels only for glibc 2.34 or newer on x86_64 and 2.39 or newer on
+aarch64, and `uv sync` fails outright on an older system, taking the whole install
+with it. So `murmly sync` reads the oldest glibc the lock has an Essentials wheel
+for on this architecture, compares it with the installed glibc, and below it leaves
+`gui` out and says so, rather than carrying a floor of its own that dependency
+updates would make wrong. Where the lock or the glibc cannot be read it keeps `gui`.
 
 The `overlay` extra keeps its current meaning. On Windows, `murmly sync` could not
 see whether `overlay` had been installed and so dropped it; naming `gui` keeps
@@ -221,10 +231,11 @@ requires: nothing is pasted and no failure is signalled.
   never calls raise or activate in response to daemon state; only the person
   opening it brings it forward. A test asserts that state changes make no focus
   calls.
-- [PySide6 adds a large download: about 530 MB, 670 MB on disk] → Accepted, because
-  the app is meant to be part of the install. `pyside6-essentials` alone would be
-  about 85 MB and holds every Qt module the app uses; a later change can switch to
-  it.
+- [PySide6 adds a download: about 85 MB, 245 MB on disk] → Accepted, because the app
+  is meant to be part of the install. Essentials holds every Qt module the app and
+  overlay use, and the larger meta package is not installed.
+- [A glibc older than the toolkit's wheels would fail the whole sync] → The sync
+  leaves the app out below the floor the lock records, and says so.
 - [GNOME without an AppIndicator extension has no tray] → The app runs from its
   window, and Health says that no tray was found.
 - [A hand edit to `config.toml` races with an app edit] → The mtime check makes the
@@ -250,8 +261,10 @@ requires: nothing is pasted and no failure is signalled.
 Nothing to migrate. The command line, the configuration file format and the
 service are unchanged. An existing installation gets the app on its next
 `./setup.sh upgrade`: the sync adds PySide6, and the `murmly install` that upgrade
-runs afterwards, in a new process, writes the menu entry. On Windows the toolkit
-arrives with `.\bootstrap.ps1 sync`, which `bootstrap.ps1 install` does not run.
+runs afterwards, in a new process, writes the menu entry (and rewrites an older
+entry that has no icon). On Windows `bootstrap.ps1 install` and `upgrade` now run
+`murmly sync` first, and every other `bootstrap.ps1` command runs `uv run --no-sync`,
+so no on-demand sync puts the CPU ONNX Runtime back after the GPU swap.
 Removing the app means removing murmly. Voices enrolled with `murmly enrol` appear in the
 app as they are, and voices enrolled in the app are listed by
 `murmly speakers list`.

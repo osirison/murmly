@@ -10,16 +10,18 @@ The app runs on Linux and on Windows.
 ## Getting it
 
 The app comes with murmly. Installing or upgrading murmly adds the toolkit it
-draws with (PySide6, a large download: about 530 MB, and about 670 MB on disk), and
-there is no switch to leave it out.
+draws with (PySide6, about 85 MB to download and about 245 MB on disk), and there
+is no switch to leave it out. The one exception is a system too old for it: the app
+needs glibc 2.34 or newer (2.39 on aarch64). Below that, murmly installs without the
+app and says so.
 
 On Linux, installing murmly puts **Murmly** in your applications menu. Open the app
 from there, or run `murmly app` in a terminal. If you installed murmly before the
 app was part of it, run `./setup.sh upgrade`: it adds the toolkit and the menu entry.
 Removing murmly takes the menu entry away with the rest.
 
-On Windows, run `.\bootstrap.ps1 sync` once to add the toolkit, then open a terminal
-and run `murmly app`. There is no Start menu shortcut yet.
+On Windows, `.\bootstrap.ps1 install` and `.\bootstrap.ps1 upgrade` add the toolkit.
+Open a terminal and run `murmly app`. There is no Start menu shortcut yet.
 
 If you run `murmly app` before the toolkit is there, murmly tells you to run
 `murmly sync` and stops. Do not run a plain `uv sync` to add it: on a machine that uses

@@ -1,5 +1,6 @@
 """`bootstrap.ps1`, task 16.2's Windows half: install `uv` if it is missing,
-then hand off to `uv run --project <repo> murmly @Arguments` directly --
+sync first on `install` and `upgrade`, then hand off to
+`uv run --no-sync --project <repo> murmly @Arguments` directly --
 Windows has no `setup.sh` to hand off to, unlike `bootstrap.sh`'s Linux side
 (`test_bootstrap_sh.py`).
 
@@ -47,7 +48,7 @@ BOOTSTRAP_PS1 = REPO_ROOT / "bootstrap.ps1"
 # `System.Management.Automation`, not something `pwsh` added.
 _INTERPRETER = shutil.which("pwsh") or shutil.which("powershell")
 
-_CALL_PATTERN = re.compile(r"^run --project (.+) murmly (.*)$")
+_CALL_PATTERN = re.compile(r"^run --no-sync --project (.+) murmly (.*)$")
 
 
 def _path_without_real_uv() -> str:
@@ -390,7 +391,7 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         assert match is not None
         self.checksum = match.group(1)
 
-    def _run(self, command: str, *, download_fails: bool = False):
+    def _run(self, command: str, *, download_fails: bool = False, sync_fails: bool = False):
         download = (
             'throw "network down"'
             if download_fails
@@ -404,12 +405,19 @@ class BootstrapPs1CommandTests(unittest.TestCase):
             f"    {download}\n"
             "}\n"
             f'function Get-FileHash {{ param($LiteralPath, $Algorithm) [pscustomobject]@{{ Hash = "{self.checksum}" }} }}\n'
-            "function uv { $global:UvCallArgs = $args -join \" \"; $global:LASTEXITCODE = 0 }\n"
+            "function uv {\n"
+            '    $global:UvCallArgs = $args -join " "\n'
+            '    $global:UvCalls += ,($args -join " ")\n'
+            '    if ($global:FailSync -and ($args -contains "sync")) { $global:LASTEXITCODE = 1 }\n'
+            "    else { $global:LASTEXITCODE = 0 }\n"
+            "}\n"
             f'$env:LOCALAPPDATA = "{self.local}"\n'
+            f'{"$global:FailSync = $true" if sync_fails else ""}\n'
             f'& "{BOOTSTRAP_PS1}" {command}\n'
             'Write-Output "EXITCODE:[$LASTEXITCODE]"\n'
             'Write-Output "FETCHES:[$Fetches]"\n'
-            'Write-Output "UVCALL:[$UvCallArgs]"\n',
+            'Write-Output "UVCALL:[$UvCallArgs]"\n'
+            'Write-Output "UVCALLS:[$($UvCalls -join "|")]"\n',
             encoding="utf-8",
         )
         return subprocess.run(
@@ -421,14 +429,35 @@ class BootstrapPs1CommandTests(unittest.TestCase):
             timeout=60,
         )
 
-    def test_upgrade_fetches_the_model_and_does_not_hand_off(self) -> None:
+    def _murmly_calls(self, stdout: str) -> list[str]:
+        """The `murmly` arguments of every `uv run` the script made, in order."""
+        match = re.search(r"^UVCALLS:\[(.*)\]$", stdout, re.MULTILINE)
+        self.assertIsNotNone(match, f"no UVCALLS line in:\n{stdout}")
+        calls = [call for call in match.group(1).split("|") if call]
+        for call in calls:
+            if call.startswith("run"):
+                self.assertTrue(
+                    call.startswith("run --no-sync --project "),
+                    f"a plain on-demand sync would put the CPU ONNX Runtime back: {call}",
+                )
+        return [call.split(" murmly ", 1)[1] for call in calls if call.startswith("run")]
+
+    def test_upgrade_syncs_then_fetches_the_model_and_does_not_hand_off(self) -> None:
         result = self._run("upgrade")
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("FETCHES:[1]", result.stdout)
-        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertEqual(["sync"], self._murmly_calls(result.stdout))
         self.assertTrue(self.model.is_file())
+
+    def test_upgrade_stops_when_the_sync_fails(self) -> None:
+        result = self._run("upgrade", sync_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[1]", result.stdout)
+        self.assertIn("FETCHES:[]", result.stdout)
+        self.assertFalse(self.model.exists())
 
     def test_upgrade_with_the_model_already_there_exits_zero_without_fetching(self) -> None:
         self.model.parent.mkdir(parents=True)
@@ -439,7 +468,7 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("FETCHES:[]", result.stdout)
-        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertEqual(["sync"], self._murmly_calls(result.stdout))
 
     def test_upgrade_exits_one_when_the_model_could_not_be_fetched(self) -> None:
         result = self._run("upgrade", download_fails=True)
@@ -447,16 +476,31 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[1]", result.stdout)
         self.assertIn("Could not fetch", result.stdout + result.stderr)
-        self.assertIn("UVCALL:[]", result.stdout)
+        self.assertEqual(["sync"], self._murmly_calls(result.stdout))
         self.assertFalse(self.model.exists())
 
-    def test_install_fetches_the_model_then_hands_off(self) -> None:
+    def test_install_syncs_first_fetches_the_model_then_hands_off(self) -> None:
         result = self._run("install Meta+X")
 
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("FETCHES:[1]", result.stdout)
-        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
+        self.assertEqual(["sync", "install Meta+X"], self._murmly_calls(result.stdout))
+        self.assertRegex(result.stdout, r"UVCALL:\[run --no-sync --project .+ murmly install Meta\+X\]")
+
+    def test_install_does_nothing_more_when_the_sync_fails(self) -> None:
+        result = self._run("install Meta+X", sync_fails=True)
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("EXITCODE:[1]", result.stdout)
+        self.assertIn("FETCHES:[]", result.stdout)
+        self.assertNotIn("install Meta+X", " ".join(self._murmly_calls(result.stdout)))
+
+    def test_a_plain_command_is_never_synced_first(self) -> None:
+        result = self._run("status")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["status"], self._murmly_calls(result.stdout))
 
     def test_install_still_hands_off_when_the_model_could_not_be_fetched(self) -> None:
         result = self._run("install Meta+X", download_fails=True)
@@ -464,7 +508,7 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("EXITCODE:[0]", result.stdout)
         self.assertIn("Could not fetch", result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r"UVCALL:\[run --project .+ murmly install Meta\+X\]")
+        self.assertRegex(result.stdout, r"UVCALL:\[run --no-sync --project .+ murmly install Meta\+X\]")
 
 
 if __name__ == "__main__":

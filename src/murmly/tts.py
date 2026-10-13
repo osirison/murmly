@@ -112,10 +112,11 @@ GPU_RUNTIME_REMEDY = (
 # A literal command, which it could not be while speech output was an extra:
 # `uv sync --extra cuda` then removed kokoro-onnx and the very feature this
 # message is about, so the message had to state a rule and hope. Speech output
-# is a default dependency group now and this sync keeps it.
+# is a default dependency group now. `murmly sync` is named rather than a plain
+# `uv sync`, because a plain sync puts the CPU ONNX Runtime back over the GPU one.
 CUDA_EXTRA_REMEDY = (
-    "synthesis on CUDA needs the Murmly CUDA extra. Run `uv sync --extra cuda`, "
-    "then reapply the ONNX Runtime swap -- the sync restores the CPU build."
+    "synthesis on CUDA needs the Murmly CUDA extra. Run `murmly sync --cuda`, "
+    "which reapplies the ONNX Runtime GPU swap after the sync."
 )
 RUNTIME_UNUSABLE_REMEDY = (
     "the ONNX Runtime is missing or unusable. Reinstall it with `uv sync "
@@ -202,7 +203,7 @@ def _resolve_bundled_espeak() -> tuple[str, str]:
     except ModuleNotFoundError as error:
         raise RuntimeError(
             f"{SYNTHESIS_PACKAGE} is required for speech output, and it carries "
-            "the espeak-ng library Windows uses. Run `uv sync`; speech output "
+            "the espeak-ng library Windows uses. Run `murmly sync`; speech output "
             "is installed by default and only `--no-group tts` leaves it out."
         ) from error
 
@@ -640,7 +641,7 @@ class KokoroSynthesizer:
                 raise ModuleNotFoundError(name="kokoro_onnx")
         except ModuleNotFoundError:
             return (
-                f"{SYNTHESIS_PACKAGE} is not installed. Run `uv sync`, which "
+                f"{SYNTHESIS_PACKAGE} is not installed. Run `murmly sync`, which "
                 f"installs speech output by default; only `--no-group tts` "
                 f"leaves it out."
             )
@@ -706,7 +707,7 @@ class KokoroSynthesizer:
         except ModuleNotFoundError as error:
             raise RuntimeError(
                 f"{SYNTHESIS_PACKAGE} is required for speech output. Run "
-                f"`uv sync` before enabling it; speech output is installed by "
+                f"`murmly sync` before enabling it; speech output is installed by "
                 f"default and only `--no-group tts` leaves it out."
             ) from error
 

@@ -15,7 +15,9 @@ in one page with pictures. The
 
 ## What you need
 
-- **Linux** (any distribution, glibc-based) or **Windows** (x86_64).
+- **Linux** (any distribution, glibc-based) or **Windows** (x86_64). The desktop
+  app needs glibc 2.34 or newer (2.39 on aarch64); on an older system murmly
+  installs without the app and says so.
   Two machines within those two platforms cannot run murmly at all: musl-based
   Linux and Windows on ARM64, neither of which has a build of the
   transcription runtime. macOS is not supported.
@@ -29,7 +31,7 @@ in one page with pictures. The
   other desktop registers no hotkey and shows no overlay automatically, though
   everything else still installs.
 - **On Windows, the hotkey and clipboard always work with no permission
-  needed**; the overlay needs `.\bootstrap.ps1 sync` run once, and
+  needed**; the overlay's toolkit comes with `install` and `upgrade`, and
   microphone capture depends on Windows' own privacy setting, which
   `murmly doctor` reports. Every Windows capability listed here has run as an
   automated test on a real Windows machine; a second account and an elevated
@@ -55,8 +57,9 @@ that hand-off goes to `setup.sh`, which installs the system packages for your
 session after showing you the command and asking, syncs the Python
 environment, binds the hotkey, and starts the service — and which the
 commands below call directly, since by then `uv` is already there. On
-Windows, the hand-off goes straight to `murmly` — there are no system
-packages to install first.
+Windows, `install` and `upgrade` run `murmly sync` first and then hand off to
+`murmly` — there are no system packages to install first. Both add the desktop
+app, which opens from the applications menu on Linux.
 
 ```bash
 ./setup.sh upgrade      # Linux: pull, re-sync, rebind, restart

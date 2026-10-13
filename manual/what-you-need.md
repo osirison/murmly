@@ -9,6 +9,8 @@ Murmly runs on:
 
 - **Linux**, any distribution, with a glibc-based system — see [machines that
   cannot run murmly](#machines-that-cannot-run-murmly) below for the one gap.
+  The desktop app needs glibc 2.34 or newer (2.39 on aarch64). On an older
+  system murmly installs and works without the app, and says so while it syncs.
   Which desktop you run decides whether the hotkey and the overlay work
   automatically; see [Linux: your desktop](#linux-your-desktop).
 - **Windows**, on the x86_64 architecture — see the same section below for the
@@ -132,8 +134,8 @@ step.
   ask who holds it, so murmly can report that the key is taken without being
   able to name the application.
 - **Overlay.** Appears through a Qt-based renderer, drawn the same way and
-  showing the same states as the Linux one. Its toolkit is not part of a plain
-  sync — run `.\bootstrap.ps1 sync` first, or the overlay is simply
+  showing the same states as the Linux one. Its toolkit comes with
+  `.\bootstrap.ps1 install` and `upgrade`; without it the overlay is simply
   disabled while everything else keeps working.
 - **Microphone permission.** Windows gates microphone access behind two
   settings under **Settings → Privacy & security → Microphone**: the overall

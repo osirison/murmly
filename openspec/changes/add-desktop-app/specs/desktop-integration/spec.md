@@ -20,7 +20,7 @@ Installation SHALL add an applications-menu entry that opens the Murmly app, and
 
 ### Requirement: Syncing always installs the app's toolkit
 
-`murmly sync` SHALL install the desktop app's toolkit on every run on Linux and Windows, whether or not the environment held it before, and MUST NOT offer a way to leave it out. It MUST still reapply the GPU runtime swap afterwards. An environment made before the app was part of the install therefore gets the toolkit on its next sync.
+`murmly sync` SHALL install the desktop app's toolkit on every run on Linux and Windows, whether or not the environment held it before, and MUST NOT offer a way to leave it out. It MUST still reapply the GPU runtime swap afterwards. The one exception is a Linux system whose glibc is older than the toolkit's wheels need, which MUST be told so plainly and synced without it.
 
 #### Scenario: Syncing an environment without the toolkit
 
@@ -32,6 +32,12 @@ Installation SHALL add an applications-menu entry that opens the Murmly app, and
 - **WHEN** `murmly sync` runs on an environment with the GPU runtime and the GPU build of ONNX Runtime
 - **THEN** the sync carries the GPU extra and the app's toolkit together
 - **AND** the GPU build of ONNX Runtime is back afterwards
+
+#### Scenario: A system too old for the toolkit
+
+- **WHEN** `murmly sync` runs on a system whose glibc is older than the oldest toolkit wheel for its architecture
+- **THEN** it says that the app needs a newer glibc and is not installed
+- **AND** the sync completes without the app
 
 ### Requirement: Uninstall can also delete what Murmly keeps
 

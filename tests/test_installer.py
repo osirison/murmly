@@ -2400,6 +2400,51 @@ class AppShortcutTests(unittest.TestCase):
         self.assertEqual(first, self.shortcut.path.stat().st_mtime_ns)
         self.assertFalse(any("applications menu" in message for message in outcome.messages))
 
+    def test_an_entry_written_before_it_had_an_icon_is_rewritten_with_one(self) -> None:
+        self.applications.mkdir(parents=True)
+        self.shortcut.path.write_text(
+            "[Desktop Entry]\nType=Application\nName=Murmly\n"
+            "Comment=Dictate with your voice, locally\nExec=/bin/murmly app\n"
+            "Terminal=false\nCategories=Utility;\nStartupNotify=false\n",
+            encoding="utf-8",
+        )
+
+        outcome = self.install(self.installer())
+
+        self.assertIn("Icon=audio-input-microphone\n", self.shortcut.path.read_text(encoding="utf-8"))
+        self.assertTrue(any("applications menu" in message for message in outcome.messages))
+
+    def test_writing_and_removing_the_entry_nudge_the_menu_cache(self) -> None:
+        from murmly.installer import AppShortcut
+
+        calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        shortcut = AppShortcut(applications_dir=self.applications, run_command=fake_run)
+
+        self.assertTrue(shortcut.register(Path("/bin/murmly")))
+        self.assertEqual([["kbuildsycoca6"]], calls)
+        self.assertFalse(shortcut.register(Path("/bin/murmly")))
+        self.assertEqual(1, len(calls))
+        self.assertTrue(shortcut.unregister())
+        self.assertEqual(2, len(calls))
+        self.assertFalse(shortcut.unregister())
+        self.assertEqual(2, len(calls))
+
+    def test_a_missing_cache_builder_is_not_an_error(self) -> None:
+        from murmly.installer import AppShortcut
+
+        def missing(argv, **kwargs):
+            raise FileNotFoundError(argv[0])
+
+        shortcut = AppShortcut(applications_dir=self.applications, run_command=missing)
+
+        self.assertTrue(shortcut.register(Path("/bin/murmly")))
+        self.assertTrue(shortcut.is_present)
+
     def test_installing_after_the_checkout_moved_rewrites_the_command(self) -> None:
         self.install(self.installer())
 

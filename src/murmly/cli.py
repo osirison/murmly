@@ -666,6 +666,7 @@ def _run_sync(args: argparse.Namespace, profile: PlatformProfile) -> int:
             want_tts=args.want_tts,
             confirm=confirm,
             announce=print,
+            profile=profile,
         )
     except EnvironmentSyncError as error:
         print(f"murmly: {error}", file=sys.stderr)
