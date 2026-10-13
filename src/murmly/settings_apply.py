@@ -13,6 +13,11 @@ from murmly.platform import SERVICE_MANAGEMENT, PlatformProfile, resolve_platfor
 #: The least time between two `status` requests while waiting, matching how often
 #: the app's screens poll.
 MIN_POLL_INTERVAL_SECONDS = 0.5
+#: How long one `status` request may take, to connect and to be answered. The
+#: answer is immediate, and the app waits for this poll when it quits, so a
+#: daemon that holds the request open must not hold the app (the same bound
+#: Home puts on its own status request).
+STATUS_TIMEOUT_SECONDS = 1.0
 
 
 class RestartStatus(StrEnum):
@@ -80,7 +85,12 @@ class RestartWhenIdle:
             if config is None:
                 raise ValueError("A config or a status function is needed to ask the daemon.")
             socket_path = str(config.socket_path)
-            status = lambda: send_command(socket_path, COMMAND_STATUS)  # noqa: E731
+            status = lambda: send_command(  # noqa: E731
+                socket_path,
+                COMMAND_STATUS,
+                connect_timeout=STATUS_TIMEOUT_SECONDS,
+                response_timeout=STATUS_TIMEOUT_SECONDS,
+            )
         self._status = status
         self._restart = restart if restart is not None else default_restart()
         self._clock = clock

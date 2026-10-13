@@ -27,14 +27,21 @@ TextField {
     Accessible.name: label
     Accessible.focusable: true
 
+    // Typed into and not yet committed: the file's value must not replace it.
+    property bool dirty: false
+    onTextEdited: dirty = true
     onEditingFinished: {
+        dirty = false
         if (text !== bound)
             committed(text)
     }
 
     Connections {
         target: settings
-        function onViewChanged() { field.text = Qt.binding(function () { return field.bound }) }
+        function onViewChanged() {
+            if (!(field.activeFocus && field.dirty))
+                field.text = Qt.binding(function () { return field.bound })
+        }
     }
 
     background: Rectangle {

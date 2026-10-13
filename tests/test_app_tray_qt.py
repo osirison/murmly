@@ -341,6 +341,57 @@ class SwitchTests(TrayQtCase):
         self.service.state = "IDLE"
         self.wait_for(lambda: self.service.restarts == 1, message="the restart once idle")
 
+    def two_quick_clicks(self, switch: str, key: str, off: object) -> None:
+        self.build()
+        self.open_panel()
+        self.child(f"tray-switch-{switch}").click()
+        # The panel is given new rows on a change: find the switch again.
+        self.child(f"tray-switch-{switch}").click()
+        self.pause(0.6)
+
+        self.assertIs(False, self.child(f"tray-switch-{switch}").property("on"))
+        self.assertEqual(off, self.lookup(key))
+
+    def test_two_quick_clicks_on_live_leave_it_and_the_file_where_they_started(self) -> None:
+        self.two_quick_clicks("live", "stt.live_transcribe", False)
+
+    def test_two_quick_clicks_on_quiet_hours_leave_them_and_the_file_where_they_started(self) -> None:
+        self.two_quick_clicks("quiet", "tts.quiet_hours", "")
+
+    def test_two_quick_clicks_on_stop_when_i_pause_leave_it_and_the_file_where_it_started(self) -> None:
+        self.two_quick_clicks("finish", "stt.auto_transcribe", "off")
+
+    def test_the_switch_shows_a_click_before_its_save_has_come_back(self) -> None:
+        self.build()
+        self.open_panel()
+
+        self.child("tray-switch-live").click()
+
+        self.assertIs(True, self.child("tray-switch-live").property("on"))
+
+    def test_a_keyboard_toggle_leaves_the_focus_on_the_same_switch(self) -> None:
+        from PySide6.QtCore import QMetaObject, Qt
+        from PySide6.QtTest import QTest
+
+        self.build()
+        self.open_panel()
+        self.panel.requestActivate()
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0 and not self.panel.isActive():
+            self.settle()
+            time.sleep(0.01)
+        if not self.panel.isActive():
+            self.skipTest("this display does not give a test window the focus")
+        self.assertTrue(QMetaObject.invokeMethod(self.child("tray-switch-announce"), "forceActiveFocus"))
+        self.settle()
+        self.assertEqual("tray-switch-announce", self.panel.activeFocusItem().objectName())
+
+        QTest.keyClick(self.panel, Qt.Key.Key_Return)
+        self.wait_for(lambda: self.child("tray-switch-announce").property("on") is True, message="the switch")
+        self.pause(0.3)
+
+        self.assertEqual("tray-switch-announce", self.panel.activeFocusItem().objectName())
+
     def test_a_file_that_does_not_parse_disables_the_switches(self) -> None:
         self.build()
         self.path.write_text("[stt\nbroken", encoding="utf-8")

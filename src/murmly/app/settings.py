@@ -122,6 +122,66 @@ def to_value(control_id: str, raw: object, values: Mapping[str, object]) -> obje
     return raw
 
 
+def _view_values(control_id: str, raw: object) -> dict[str, object]:
+    """What `build_view`'s `values` would hold once `raw` for `control_id` is saved."""
+    control = CONTROL_BY_ID.get(control_id)
+    kind = control.kind if control is not None else ""
+    if kind == "number":
+        return {control_id: int(raw) if isinstance(raw, float) and raw.is_integer() else raw}
+    if kind == "idle":
+        return {control_id: bool(raw)}
+    if kind == "quiet":
+        if isinstance(raw, str) and raw:
+            start, end = quiet_ends(raw)
+            return {control_id: True, "quiet-from": start, "quiet-to": end}
+        return {control_id: bool(raw)}
+    if kind in ("quiet-from", "quiet-to"):
+        return {control_id: str(raw).strip()}
+    return {control_id: raw}
+
+
+class PendingChanges:
+    """What the person has asked for that the file does not say yet.
+
+    A save takes a moment, and a second click made before it comes back would
+    otherwise be worked out from the old value (two clicks on a switch would
+    write "on" twice). The file stays the only truth: this holds the view-level
+    value last asked for each control, shown over the file's until every save
+    asked for that control has come back, saved or refused, and the control then
+    shows what the file says.
+    """
+
+    def __init__(self) -> None:
+        # By control: the values asked, and how many saves are still to come back.
+        self._asked: dict[str, tuple[dict[str, object], int]] = {}
+
+    def ask(self, control_id: str, raw: object) -> None:
+        _, saves = self._asked.pop(control_id, ({}, 0))  # popped so the latest ask is applied last
+        self._asked[control_id] = (_view_values(control_id, raw), saves + 1)
+
+    def settled(self, control_id: str) -> None:
+        entry = self._asked.get(control_id)
+        if entry is None:
+            return
+        shown, saves = entry
+        if saves > 1:
+            self._asked[control_id] = (shown, saves - 1)
+        else:
+            del self._asked[control_id]
+
+    def overlay(self, view: dict[str, object]) -> dict[str, object]:
+        """`view` with the asked values over the file's; `view` itself is not altered."""
+        if not self._asked or view.get("loaded") is not True:
+            return view
+        values = dict(view["values"])  # type: ignore[call-overload]
+        for shown, _ in self._asked.values():
+            values.update(shown)
+        shown_view = {**view, "values": values}
+        if view.get("textSizeLabel") and "text-size" in values:
+            shown_view["textSizeLabel"] = f"{values['text-size']} px"
+        return shown_view
+
+
 # ---------------------------------------------------------------------------
 # Reading and writing the file
 # ---------------------------------------------------------------------------

@@ -357,6 +357,130 @@ class RefusedValueTests(SettingsQtCase):
         self.assertEqual("", self.settings.view["status"])
 
 
+class QuickClickTests(SettingsQtCase):
+    """A second click made before the first save has come back builds on the first."""
+
+    def test_two_quick_clicks_on_a_switch_leave_it_where_it_started(self) -> None:
+        self.build()
+        self.open_settings()
+
+        self.child("set-live").click()
+        self.child("set-live").click()
+        self.wait_for(lambda: self.writer.writes == 2, message="both writes")
+        time.sleep(0.2)
+        self.settle()
+
+        self.assertIsNot(True, self.data()["stt"].get("live_transcribe"))
+        self.assertFalse(self.child("set-live").property("on"))
+
+    def test_the_switch_shows_the_first_click_before_its_save_has_come_back(self) -> None:
+        self.build()
+        self.open_settings()
+
+        self.child("set-live").click()
+
+        self.assertTrue(self.child("set-live").property("on"))
+
+    def test_two_quick_clicks_on_smaller_text_take_two_steps(self) -> None:
+        self.build()
+        self.open_settings()
+
+        self.child("set-text-size-less").click()
+        self.child("set-text-size-less").click()
+        self.assertEqual("11 px", self.text("set-text-size-value"))
+        self.wait_for(lambda: self.writer.writes == 2, message="both writes")
+        time.sleep(0.2)
+        self.settle()
+
+        self.assertEqual(11, self.data()["overlay"]["text_size_px"])
+        self.assertEqual("11 px", self.text("set-text-size-value"))
+
+    def test_a_refused_save_puts_the_control_back(self) -> None:
+        from murmly.config import SettingValueError
+
+        self.build()
+        self.open_settings()
+
+        def refuse(key, value):
+            raise SettingValueError("stt.live_transcribe must be true or false.")
+
+        self.writer.set = refuse
+        self.child("set-live").click()
+        self.assertTrue(self.child("set-live").property("on"))
+        self.wait_for(lambda: self.settings.view.get("message", "") != "", message="the refusal")
+
+        self.assertFalse(self.child("set-live").property("on"))
+        self.assertIs(False, self.settings.view["values"]["live"])
+
+    def test_the_first_of_two_saves_coming_back_does_not_flicker_the_control(self) -> None:
+        self.build()
+        self.open_settings()
+        shown: list[bool] = []
+        self.settings.viewChanged.connect(lambda: shown.append(self.settings.view["values"]["live"]))
+
+        self.child("set-live").click()
+        self.child("set-live").click()
+        self.wait_for(lambda: self.writer.writes == 2, message="both writes")
+        time.sleep(0.2)
+        self.settle()
+
+        self.assertEqual([True], shown[:1])
+        self.assertNotIn(True, shown[1:])
+
+
+class TimeFieldTypingTests(SettingsQtCase):
+    def activate(self) -> None:
+        self.window.requestActivate()
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0 and not self.window.isActive():
+            self.settle()
+            time.sleep(0.01)
+        if not self.window.isActive():
+            self.skipTest("this display does not give a test window the focus")
+
+    def type_into(self, field, text: str) -> None:
+        from PySide6.QtCore import QMetaObject, Qt
+        from PySide6.QtTest import QTest
+
+        self.assertTrue(QMetaObject.invokeMethod(field, "forceActiveFocus"))
+        self.settle()
+        field.setProperty("text", "")
+        for letter in text:
+            key = Qt.Key.Key_Colon if letter == ":" else Qt.Key(ord(letter))
+            QTest.keyClick(self.window, key, Qt.KeyboardModifier.NoModifier)
+        self.settle()
+
+    def test_a_time_being_typed_survives_while_a_restart_waits(self) -> None:
+        self.build()
+        self.open_settings()
+        self.activate()
+        self.child("set-live").click()
+        self.wait_for(lambda: "will apply when Murmly is idle" in self.text("settings-status"), message="waiting")
+        self.show_speech()
+        field = self.child("set-quiet-from")
+
+        self.type_into(field, "21:3")
+        polled = self.service.statuses
+        self.wait_for(lambda: self.service.statuses >= polled + 3, message="three ticks of the restart")
+
+        self.assertTrue(field.property("activeFocus"))
+        self.assertEqual("21:3", field.property("text"))
+
+    def test_with_the_focus_gone_a_change_from_outside_shows(self) -> None:
+        self.build()
+        self.open_settings()
+        self.activate()
+        self.show_speech()
+        field = self.child("set-quiet-from")
+
+        self.type_into(field, "21:3")
+        self.emit(self.child("set-speak"), "forceActiveFocus")
+        self.wait_for(lambda: field.property("text") == "22:00", message="the refused time to go")
+        self.path.write_text(ORIGINAL.replace("22:00-07:00", "20:00-07:00"), encoding="utf-8")
+
+        self.wait_for(lambda: field.property("text") == "20:00", message="the edit to show")
+
+
 class UnreadableFileTests(SettingsQtCase):
     BROKEN = b'[stt\nmodel_profile = "fast"\n'
 

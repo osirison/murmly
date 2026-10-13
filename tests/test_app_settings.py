@@ -383,5 +383,90 @@ class ViewTests(SettingsCase):
         self.assertEqual("two hours", settings.idle_period(7200))
 
 
+class PendingChangesTests(unittest.TestCase):
+    def view(self, **values: object) -> dict:
+        return {"loaded": True, "values": dict(values), "textSizeLabel": "13 px"}
+
+    def test_a_change_asked_but_not_yet_saved_shows_over_the_files_value(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("live", True)
+
+        shown = pending.overlay(self.view(live=False, rate=100))
+
+        self.assertEqual({"live": True, "rate": 100}, shown["values"])
+
+    def test_the_view_it_is_given_is_not_altered(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("live", True)
+        view = self.view(live=False)
+
+        pending.overlay(view)
+
+        self.assertEqual({"live": False}, view["values"])
+
+    def test_once_the_save_is_settled_the_files_value_shows_again(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("live", True)
+        pending.settled("live")
+
+        self.assertEqual({"live": False}, pending.overlay(self.view(live=False))["values"])
+
+    def test_with_two_saves_in_flight_the_latest_stays_until_the_last_one_settles(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("text-size", 12)
+        pending.ask("text-size", 11)
+
+        pending.settled("text-size")
+        self.assertEqual(11, pending.overlay(self.view(**{"text-size": 12}))["values"]["text-size"])
+
+        pending.settled("text-size")
+        self.assertEqual(12, pending.overlay(self.view(**{"text-size": 12}))["values"]["text-size"])
+
+    def test_a_value_is_shown_the_way_the_view_holds_it(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("quiet", "23:30-06:00")
+        pending.ask("unload", False)
+        pending.ask("pause", 750.0)
+
+        values = pending.overlay(self.view())["values"]
+
+        self.assertIs(True, values["quiet"])
+        self.assertEqual(("23:30", "06:00"), (values["quiet-from"], values["quiet-to"]))
+        self.assertIs(False, values["unload"])
+        self.assertEqual(750, values["pause"])
+        self.assertIsInstance(values["pause"], int)
+
+    def test_a_later_end_of_the_window_wins_over_an_earlier_whole_window(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("quiet-to", "04:00")
+        pending.ask("quiet", "23:30-06:00")
+        pending.ask("quiet-to", "05:00")
+        pending.ask("quiet-from", " 21:30 ")
+
+        values = pending.overlay(self.view())["values"]
+
+        self.assertEqual(("21:30", "05:00"), (values["quiet-from"], values["quiet-to"]))
+
+    def test_the_text_size_label_follows_the_asked_size(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("text-size", 12)
+
+        self.assertEqual("12 px", pending.overlay(self.view())["textSizeLabel"])
+
+    def test_nothing_is_changed_before_the_file_is_read(self) -> None:
+        pending = settings.PendingChanges()
+        pending.ask("live", True)
+        view = settings.build_view(None)
+
+        self.assertEqual(view, pending.overlay(view))
+
+    def test_settling_a_control_nothing_asked_about_is_harmless(self) -> None:
+        pending = settings.PendingChanges()
+
+        pending.settled("live")
+
+        self.assertEqual({"live": False}, pending.overlay(self.view(live=False))["values"])
+
+
 if __name__ == "__main__":
     unittest.main()

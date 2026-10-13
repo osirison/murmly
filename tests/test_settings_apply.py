@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import socket
+import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 from murmly.daemon import DaemonNotRespondingError
 from murmly.installer import InstallError, LaunchdUserService, UserService, WindowsUserService
@@ -244,6 +250,46 @@ class RestartWhenIdleTests(unittest.TestCase):
     def test_without_a_config_or_a_status_function_it_refuses_to_start(self) -> None:
         with self.assertRaises(ValueError):
             RestartWhenIdle(restart=self.restart)
+
+
+class SilentDaemonTests(unittest.TestCase):
+    @unittest.skipUnless(hasattr(socket, "AF_UNIX"), "needs a UNIX socket")
+    def test_a_daemon_that_accepts_and_never_answers_does_not_hold_the_poll(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = str(Path(directory.name) / "d.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(path)
+        server.listen(4)
+        held: list[socket.socket] = []
+
+        def accept() -> None:
+            try:
+                while True:
+                    held.append(server.accept()[0])
+            except OSError:
+                pass
+
+        threading.Thread(target=accept, daemon=True).start()
+        self.addCleanup(lambda: [connection.close() for connection in held])
+        restarts: list[int] = []
+        applier = RestartWhenIdle(
+            SimpleNamespace(socket_path=path), restart=lambda: restarts.append(1) or True
+        )
+        applier.request()
+        outcomes: list[object] = []
+        poll = threading.Thread(target=lambda: outcomes.append(applier.tick()), daemon=True)
+
+        started = time.monotonic()
+        poll.start()
+        poll.join(5.0)
+
+        self.assertFalse(poll.is_alive(), "the poll is still waiting for an answer")
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertEqual(RestartStatus.WAITING, outcomes[0].status)
+        self.assertEqual([], restarts)
+        self.assertTrue(applier.pending)
 
 
 class DefaultRestartTests(unittest.TestCase):
