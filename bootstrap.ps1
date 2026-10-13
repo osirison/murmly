@@ -222,7 +222,9 @@ function Invoke-Sync {
     if ($script:ExitCode -ne 0) {
         return
     }
-    Invoke-Murmly -Arguments (@("sync") + @($SyncOptions))
+    # Filtered, because an empty list arriving here as `$null` would otherwise
+    # become one empty argument.
+    Invoke-Murmly -Arguments (@("sync") + @($SyncOptions | Where-Object { $_ }))
 }
 
 # What `upgrade` does: sync, then the model. The exit code answers whether the
