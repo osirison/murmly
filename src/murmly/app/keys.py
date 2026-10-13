@@ -55,6 +55,9 @@ HINT_CHANGE = "Click here to record different keys"
 HINT_RECORDING = "Press your keys now. Escape cancels."
 HINT_NEEDS_MODIFIER = "Add Meta, Ctrl or Alt, so ordinary typing never sets it off."
 HINT_UNSUPPORTED = "Murmly cannot use that key. Try a letter, a digit, a function key or Space."
+# Shift+1 reaches the app as "!", and Qt's key event does not say which key it came
+# from, so the digit cannot be recovered; the person is told to leave Shift out.
+HINT_UNSUPPORTED_SHIFTED = "Murmly cannot use that key with Shift. Try it without Shift, or a letter or a function key."
 
 # ---------------------------------------------------------------------------
 # From a Qt key event to Murmly's key string
@@ -156,7 +159,8 @@ def read_event(key: int, modifiers: int, profile: object | None = None) -> Press
     try:
         spec = decode_kde_keycode(key | modifiers)
     except HotkeyError:
-        return Press("refused", True, message=HINT_UNSUPPORTED)
+        shifted = bool(modifiers & SHIFT_MODIFIER)
+        return Press("refused", True, message=HINT_UNSUPPORTED_SHIFTED if shifted else HINT_UNSUPPORTED)
     text = encode_for_kde(spec).portable
     try:
         validate(text, profile)

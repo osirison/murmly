@@ -124,7 +124,13 @@ class ReadEventTests(unittest.TestCase):
     def test_a_shifted_symbol_is_refused_rather_than_guessed(self) -> None:
         press = self.read(KEY_EXCLAM, META | SHIFT)
 
-        self.assertEqual(("refused", keys.HINT_UNSUPPORTED), (press.kind, press.message))
+        self.assertEqual(("refused", keys.HINT_UNSUPPORTED_SHIFTED), (press.kind, press.message))
+        self.assertIn("without Shift", press.message)
+
+    def test_the_hint_for_a_key_with_no_shift_still_offers_the_digit(self) -> None:
+        press = self.read(KEY_EXCLAM, META)
+
+        self.assertEqual(keys.HINT_UNSUPPORTED, press.message)
 
     def test_a_key_this_platform_cannot_register_is_refused_in_the_installers_words(self) -> None:
         f25 = KEY_F1 + 24
