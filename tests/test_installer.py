@@ -2445,6 +2445,22 @@ class AppShortcutTests(unittest.TestCase):
         self.assertTrue(shortcut.register(Path("/bin/murmly")))
         self.assertTrue(shortcut.is_present)
 
+    def test_only_a_kde_desktop_is_asked_to_rebuild_its_menu_cache(self) -> None:
+        from murmly.installer import Installer
+        from murmly.platform import Desktop, OperatingSystem, PlatformProfile
+
+        env = {"HOME": str(self.applications.parent), "XDG_DATA_HOME": str(self.applications.parent)}
+        for desktop, expected in ((Desktop.PLASMA, True), (Desktop.GNOME, False), (Desktop.OTHER, False)):
+            profile = PlatformProfile(
+                operating_system=OperatingSystem.LINUX, architecture="x86_64", libc="glibc", desktop=desktop
+            )
+            installer = Installer(profile=profile, env=env)
+
+            app = installer._app
+
+            self.assertIsNotNone(app, desktop)
+            self.assertEqual(expected, app._run_command is not None, desktop)
+
     def test_a_runner_that_does_not_expect_the_cache_builder_does_not_fail_the_install(self) -> None:
         from murmly.installer import AppShortcut
 

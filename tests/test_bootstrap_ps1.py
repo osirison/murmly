@@ -148,8 +148,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
         result = self._run(
             'function uv { $global:UvCallArgs = $args -join " "; $global:LASTEXITCODE = 0 }\n'
             f'. "{BOOTSTRAP_PS1}"\n'
-            '$exitCode = Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "CALLARGS:[$UvCallArgs]"\n'
         )
 
@@ -162,8 +162,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
             'function uv { $global:LASTEXITCODE = 0 }\n'
             f'. "{BOOTSTRAP_PS1}"\n'
             "function Install-Uv { $global:InstallCalled = $true }\n"
-            '$exitCode = Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "INSTALLCALLED:[$([bool]$InstallCalled)]"\n'
         )
 
@@ -186,8 +186,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
             "        $global:LASTEXITCODE = 0\n"
             "    }\n"
             "}\n"
-            '$exitCode = Invoke-Bootstrap -Arguments @("upgrade")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("upgrade")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "CALLARGS:[$UvCallArgs]"\n',
             hide_real_uv=True,
         )
@@ -212,8 +212,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
             f'. "{BOOTSTRAP_PS1}"\n'
             'function Install-Uv { Write-Host "install attempted" }\n'
             "try {\n"
-            '    $exitCode = Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
-            '    Write-Output "EXITCODE:[$exitCode]"\n'
+            '    Invoke-Bootstrap -Arguments @("install", "Meta+X")\n'
+            '    Write-Output "EXITCODE:[$script:ExitCode]"\n'
             "} catch {\n"
             '    Write-Output "CAUGHT:[$($_.Exception.Message)]"\n'
             "}\n",
@@ -229,8 +229,8 @@ class BootstrapPs1ArgumentHandlingTests(unittest.TestCase):
         result = self._run(
             'function uv { $global:UvCallArgs = $args -join " "; $global:LASTEXITCODE = 0 }\n'
             f'. "{BOOTSTRAP_PS1}"\n'
-            '$exitCode = Invoke-Bootstrap -Arguments @("uninstall", "--purge", "--yes")\n'
-            'Write-Output "EXITCODE:[$exitCode]"\n'
+            'Invoke-Bootstrap -Arguments @("uninstall", "--purge", "--yes")\n'
+            'Write-Output "EXITCODE:[$script:ExitCode]"\n'
             'Write-Output "CALLARGS:[$UvCallArgs]"\n'
         )
 
@@ -487,6 +487,26 @@ class BootstrapPs1CommandTests(unittest.TestCase):
         self.assertIn("FETCHES:[1]", result.stdout)
         self.assertEqual(["sync", "install Meta+X"], self._murmly_calls(result.stdout))
         self.assertRegex(result.stdout, r"UVCALL:\[run --no-sync --project .+ murmly install Meta\+X\]")
+
+    def test_the_sync_options_go_to_the_sync_and_not_to_install(self) -> None:
+        result = self._run("install --cuda --yes Meta+X Meta+A")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            ["sync --cuda --yes", "install Meta+X Meta+A"], self._murmly_calls(result.stdout)
+        )
+
+    def test_upgrade_forwards_the_sync_options_too(self) -> None:
+        result = self._run("upgrade --no-tts --yes")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sync --no-tts --yes"], self._murmly_calls(result.stdout))
+
+    def test_a_plain_sync_keeps_its_own_arguments(self) -> None:
+        result = self._run("sync --cuda")
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["sync --cuda"], self._murmly_calls(result.stdout))
 
     def test_install_does_nothing_more_when_the_sync_fails(self) -> None:
         result = self._run("install Meta+X", sync_fails=True)

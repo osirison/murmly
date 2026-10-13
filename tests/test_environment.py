@@ -414,6 +414,30 @@ class AppToolkitGlibcFloorTests(unittest.TestCase):
         self.assertIsNotNone(floor)
 
 
+class DetectedGlibcTests(unittest.TestCase):
+    def test_a_version_is_read_as_major_and_minor(self) -> None:
+        from unittest import mock
+
+        from murmly.environment import detected_glibc
+
+        with mock.patch("platform.libc_ver", return_value=("glibc", "2.34")):
+            self.assertEqual((2, 34), detected_glibc())
+        with mock.patch("platform.libc_ver", return_value=("glibc", "2.17.1")):
+            self.assertEqual((2, 17), detected_glibc())
+
+    def test_nothing_is_claimed_where_it_is_not_glibc_or_cannot_be_read(self) -> None:
+        from unittest import mock
+
+        from murmly.environment import detected_glibc
+
+        with mock.patch("platform.libc_ver", return_value=("", "")):
+            self.assertIsNone(detected_glibc())
+        with mock.patch("platform.libc_ver", return_value=("glibc", "unknown")):
+            self.assertIsNone(detected_glibc())
+        with mock.patch("platform.libc_ver", side_effect=OSError("cannot read the interpreter")):
+            self.assertIsNone(detected_glibc())
+
+
 class SyncEnvironmentGlibcFloorTests(unittest.TestCase):
     LOCK = lock_with_toolkit("manylinux_2_34_x86_64", "manylinux_2_39_aarch64")
 

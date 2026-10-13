@@ -297,7 +297,12 @@ def installed_package(project_dir: Path, name: str, run_command: RunCommand) -> 
 
 def detected_glibc() -> GlibcVersion | None:
     """This machine's glibc as (major, minor), or None where it is not glibc or unreadable."""
-    name, version = stdlib_platform.libc_ver()
+    try:
+        name, version = stdlib_platform.libc_ver()
+    except OSError:
+        # It reads the interpreter's own file when nothing else answers. A
+        # machine that cannot be read is not one the sync should stop on.
+        return None
     if name != "glibc":
         return None
     match = re.match(r"(\d+)\.(\d+)", version)

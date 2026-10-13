@@ -99,6 +99,14 @@ hotkey, the overlay and the app. Every other command `bootstrap.ps1` hands to mu
 runs without syncing, so nothing it does puts the CPU build of ONNX Runtime back over
 the GPU one.
 
+The sync asks the same two questions as on Linux (the GPU runtime, and speech output on the
+GPU). `--cuda`/`--no-cuda`, `--tts`/`--no-tts` and `--yes` given to `install` or `upgrade`
+go to that sync and answer them up front, for an unattended run:
+
+```powershell
+.\bootstrap.ps1 install --cuda --yes Meta+X
+```
+
 If PySide6 is ever missing, only the overlay and the app are missing — recording,
 transcription, clipboard, and paste handling all keep working, the same rule Linux's
 missing GTK4 packages follow. `.\bootstrap.ps1 sync` adds it without a full install. The

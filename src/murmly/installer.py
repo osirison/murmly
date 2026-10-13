@@ -1472,7 +1472,7 @@ class Installer:
         fakes, and must not reach the real applications directory, and the
         in-process platforms have no menu entry code at all.
         """
-        from murmly.platform import hotkey_mechanism_is_in_process
+        from murmly.platform import Desktop, hotkey_mechanism_is_in_process
 
         if self._pinned_app_shortcut is not None:
             return self._pinned_app_shortcut
@@ -1483,10 +1483,11 @@ class Installer:
         ):
             return None
         if self._app_entry is None:
-            self._app_entry = AppShortcut(
-                env=self._env,
-                run_command=self._run_command if self._run_command is not None else subprocess.run,
-            )
+            # The menu cache is KDE's; no other desktop is asked to rebuild it.
+            runner = None
+            if self._profile.desktop is Desktop.PLASMA:
+                runner = self._run_command if self._run_command is not None else subprocess.run
+            self._app_entry = AppShortcut(env=self._env, run_command=runner)
         return self._app_entry
 
     def _install_app_shortcut(self, entrypoint: Path, messages: list[str]) -> None:
