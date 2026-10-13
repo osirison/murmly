@@ -2445,6 +2445,17 @@ class AppShortcutTests(unittest.TestCase):
         self.assertTrue(shortcut.register(Path("/bin/murmly")))
         self.assertTrue(shortcut.is_present)
 
+    def test_a_runner_that_does_not_expect_the_cache_builder_does_not_fail_the_install(self) -> None:
+        from murmly.installer import AppShortcut
+
+        def unexpected(argv, **kwargs):
+            raise ValueError("a runner that only knows gsettings")
+
+        shortcut = AppShortcut(applications_dir=self.applications, run_command=unexpected)
+
+        self.assertTrue(shortcut.register(Path("/bin/murmly")))
+        self.assertTrue(shortcut.unregister())
+
     def test_installing_after_the_checkout_moved_rewrites_the_command(self) -> None:
         self.install(self.installer())
 

@@ -1110,7 +1110,8 @@ def rebuild_desktop_cache(run_command: RunCommand, cache_builder: str = "kbuilds
     """Ask KDE to re-read its menu, quietly where it is not there or fails.
 
     Plasma also notices a change to the applications directory on its own, so
-    this only hurries it; nothing waits on the result.
+    this only hurries it; nothing waits on the result. Any failure at all is
+    swallowed: the menu entry is a convenience and must not fail an install.
     """
     try:
         result = run_command(
@@ -1122,7 +1123,7 @@ def rebuild_desktop_cache(run_command: RunCommand, cache_builder: str = "kbuilds
             check=False,
             timeout=COMMAND_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except Exception as error:  # noqa: BLE001 -- best effort, see above
         logger.debug("Desktop service cache rebuild did not run: %s", error)
         return
     if result.returncode != 0:
