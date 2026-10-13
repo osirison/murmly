@@ -68,8 +68,8 @@ COLORS: dict[str, dict[str, str]] = {
     "text-2": {"dark": "#c9d0da", "light": "#374151"},
     "text-3": {"dark": "#99a2ae", "light": "#4b5563"},
     "text-4": {"dark": "#828b98", "light": "#4b5563"},
-    "text-5": {"dark": "#6d7783", "light": "#6b7280"},
-    "text-label": {"dark": "#626b78", "light": "#6b7280"},
+    "text-5": {"dark": "#7a8593", "light": "#656c79"},
+    "text-label": {"dark": "#757f8f", "light": "#6b7280"},
     "text-disabled": {"dark": "#4e5661", "light": "#b9bec6"},
 
     # Listening: warm, your voice going in
@@ -117,7 +117,7 @@ COLORS: dict[str, dict[str, str]] = {
     "destructive-input-border": {"dark": "rgba(255, 59, 59, 0.35)", "light": "rgba(220, 38, 38, 0.35)"},
     "destructive-input-bg": {"dark": "#0a0b0d", "light": "#ffffff"},
     "destructive-armed-border": {"dark": "rgba(255, 59, 59, 0.5)", "light": "rgba(220, 38, 38, 0.5)"},
-    "btn-destructive-bg": {"dark": "#ff3b3b", "light": "#dc2626"},
+    "btn-destructive-bg": {"dark": "#e02d2d", "light": "#dc2626"},
     "btn-destructive-text": {"dark": "#ffffff", "light": "#ffffff"},
     "btn-destructive-disabled-text": {"dark": "#8a5a5a", "light": "#c08a8a"},
 

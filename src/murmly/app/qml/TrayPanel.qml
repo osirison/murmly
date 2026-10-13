@@ -36,6 +36,9 @@ Window {
         id: content
         anchors.fill: parent
         implicitHeight: column.implicitHeight + 2
+        // Holds the focus until Tab moves it, so Escape closes the panel at once;
+        // it still does after, because an unhandled key goes up to here.
+        focus: true
         Keys.onEscapePressed: tray.hidePanel()
 
         Rectangle {

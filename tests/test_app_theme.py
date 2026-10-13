@@ -106,5 +106,93 @@ class TypeSpacingRadiusTests(unittest.TestCase):
         self.assertEqual(99, theme.radii()["rPill"])
 
 
+SURFACES = ("surface", "panel", "panel-alt", "panel-raised")
+# The tints a band or a card lays over a surface.
+TINTS = ("note-band-bg", "needs-you-band-bg", "needs-you-card-bg", "destructive-card-bg")
+# Every text token and the backgrounds it is drawn on. A tinted background (a
+# band, a tinted button) is laid over a surface, so it is checked over each one.
+TEXT_ON = {
+    "text": SURFACES,
+    "text-bright": SURFACES + TINTS,
+    "text-2": SURFACES + TINTS,
+    "text-3": SURFACES + TINTS,
+    "text-4": SURFACES + TINTS,
+    "text-5": SURFACES + TINTS,
+    "text-label": SURFACES,
+    "needs-you-text": SURFACES + ("needs-you-band-bg", "needs-you-btn-bg"),
+    "destructive-text": SURFACES + ("destructive-btn-bg",),
+    "note": SURFACES + ("note-band-bg",),
+    "listening-label": SURFACES,
+    "writing-label": SURFACES,
+    "btn-quiet-text": SURFACES,
+    "btn-secondary-text": SURFACES + ("btn-secondary-bg", "btn-secondary-bg-alt"),
+    "btn-primary-text": ("btn-primary-bg",),
+    "btn-destructive-text": ("btn-destructive-bg",),
+}
+
+
+def _channels(css: str) -> tuple[tuple[int, int, int], float]:
+    hexed = theme.qml_color(css)
+    if len(hexed) == 7:
+        hexed = "#ff" + hexed[1:]
+    alpha, *rgb = (int(hexed[i : i + 2], 16) for i in (1, 3, 5, 7))
+    return (rgb[0], rgb[1], rgb[2]), alpha / 255
+
+
+def _laid_over(top: str, under: tuple[float, float, float], scheme: str) -> tuple[float, float, float]:
+    rgb, alpha = _channels(theme.COLORS[top][scheme])
+    return tuple(alpha * rgb[i] + (1 - alpha) * under[i] for i in range(3))
+
+
+def _luminance(rgb) -> float:
+    def linear(value: float) -> float:
+        value /= 255
+        return value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (linear(v) for v in rgb)
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def contrast(foreground, background) -> float:
+    lighter, darker = sorted((_luminance(foreground), _luminance(background)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _pairs(foreground: str, backgrounds, scheme: str):
+    """(background name, foreground colour, background colour) for each way it is drawn."""
+    for name in backgrounds:
+        _, alpha = _channels(theme.COLORS[name][scheme])
+        unders = SURFACES if alpha < 1 else (None,)
+        for under in unders:
+            base = _channels(theme.COLORS[under][scheme])[0] if under else (0, 0, 0)
+            back = _laid_over(name, base, scheme)
+            front = _laid_over(foreground, back, scheme)
+            yield (f"{name} over {under}" if under else name), front, back
+
+
+class ContrastTests(unittest.TestCase):
+    def test_every_text_colour_reaches_4_5_to_1_on_each_background_it_is_drawn_on(self) -> None:
+        for scheme in theme.SCHEMES:
+            for token, backgrounds in TEXT_ON.items():
+                for label, front, back in _pairs(token, backgrounds, scheme):
+                    with self.subTest(scheme=scheme, text=token, on=label):
+                        self.assertGreaterEqual(contrast(front, back), 4.5)
+
+    def test_the_focus_ring_reaches_3_to_1_on_every_surface(self) -> None:
+        for scheme in theme.SCHEMES:
+            for label, front, back in _pairs("focus-ring", SURFACES, scheme):
+                with self.subTest(scheme=scheme, on=label):
+                    self.assertGreaterEqual(contrast(front, back), 3.0)
+
+    def test_the_dimmer_text_steps_stay_in_order(self) -> None:
+        for scheme in theme.SCHEMES:
+            surface = _channels(theme.COLORS["surface"][scheme])[0]
+            ratios = [
+                contrast(_channels(theme.COLORS[name][scheme])[0], surface) for name in ("text-4", "text-5", "text-label")
+            ]
+            with self.subTest(scheme=scheme):
+                self.assertEqual(ratios, sorted(ratios, reverse=True))
+
+
 if __name__ == "__main__":
     unittest.main()

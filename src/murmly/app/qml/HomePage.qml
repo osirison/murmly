@@ -16,13 +16,11 @@ Item {
     readonly property bool refused: state === "needs_you"
     readonly property bool stopped: state === "not_running"
 
-    Flickable {
+    FocusFlickable {
         id: scroller
         anchors.fill: parent
         contentWidth: width
         contentHeight: column.implicitHeight + theme.space.space34 + theme.space.space40
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
         ScrollBar.vertical: ScrollBar {}
 
         ColumnLayout {

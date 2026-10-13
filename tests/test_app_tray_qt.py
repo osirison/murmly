@@ -420,6 +420,47 @@ class SwitchTests(TrayQtCase):
 
         self.assertEqual("tray-switch-announce", self.panel.activeFocusItem().objectName())
 
+    def test_escape_closes_the_panel_the_moment_it_opens(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        self.build()
+        self.open_panel()
+        self.panel.requestActivate()
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0 and not self.panel.isActive():
+            self.settle()
+            time.sleep(0.01)
+        if not self.panel.isActive():
+            self.skipTest("this display does not give a test window the focus")
+
+        QTest.keyClick(self.panel, Qt.Key.Key_Escape)
+        self.settle()
+
+        self.assertFalse(self.panel.property("visible"))
+
+    def test_escape_still_closes_the_panel_once_tab_has_moved_the_focus(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        self.build()
+        self.open_panel()
+        self.panel.requestActivate()
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0 and not self.panel.isActive():
+            self.settle()
+            time.sleep(0.01)
+        if not self.panel.isActive():
+            self.skipTest("this display does not give a test window the focus")
+
+        QTest.keyClick(self.panel, Qt.Key.Key_Tab)
+        self.settle()
+        self.assertNotEqual("", self.panel.activeFocusItem().objectName())
+        QTest.keyClick(self.panel, Qt.Key.Key_Escape)
+        self.settle()
+
+        self.assertFalse(self.panel.property("visible"))
+
     def test_a_file_that_does_not_parse_disables_the_switches(self) -> None:
         self.build()
         self.path.write_text("[stt\nbroken", encoding="utf-8")
