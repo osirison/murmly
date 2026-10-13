@@ -68,6 +68,16 @@ def file_stamp(path: Path) -> FileStamp:
     return (info.st_mtime_ns, info.st_size, hashlib.sha256(data).hexdigest())
 
 
+def _is_dangling_link(path: Path) -> bool:
+    """A link (a symbolic link, or a Windows junction) whose target does not exist.
+
+    A link to a folder that exists is ordinary (`/home -> var/home`, a linked
+    `XDG_CONFIG_HOME`, macOS's `/var`); only one that leads nowhere is refused.
+    """
+    is_junction = getattr(path, "is_junction", lambda: False)
+    return (path.is_symlink() or is_junction()) and not path.exists()
+
+
 class SettingsWriter:
     """Sets one key at a time in the configuration file Murmly is using.
 
@@ -199,7 +209,7 @@ class SettingsWriter:
         temporary: str | None = None
         try:
             target = Path(os.path.realpath(self.path))
-            if not target.parent.is_dir() and any(part.is_symlink() for part in (self.path, *self.path.parents)):
+            if not target.parent.is_dir() and any(_is_dangling_link(part) for part in (self.path, *self.path.parents)):
                 raise SettingsFileError(
                     f"{self.path} leads through a link to {target}, and the folder {target.parent} does not exist."
                 )

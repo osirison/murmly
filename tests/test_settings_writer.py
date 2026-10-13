@@ -387,7 +387,7 @@ class SymlinkedFileTests(WriterTestCase):
         with self.assertRaises(SettingsFileError) as raised:
             SettingsWriter(self.path).set("stt.model_profile", "accurate")
 
-        self.assertIn(str(target.parent), str(raised.exception))
+        self.assertIn(os.path.realpath(target.parent), str(raised.exception))
         self.assertFalse((self.directory / "gone").exists())
         self.assertEqual(["config.toml"], [entry.name for entry in self.path.parent.iterdir()])
 
@@ -398,8 +398,50 @@ class SymlinkedFileTests(WriterTestCase):
         with self.assertRaises(SettingsFileError) as raised:
             SettingsWriter(self.path).set("stt.model_profile", "accurate")
 
-        self.assertIn(str(target), str(raised.exception))
+        self.assertIn(os.path.realpath(target), str(raised.exception))
         self.assertFalse((self.directory / "gone").exists())
+
+    def written(self, path: Path) -> str:
+        return tomllib.loads(path.read_text(encoding="utf-8"))["stt"]["model_profile"]
+
+    def test_a_first_run_through_a_live_link_creates_the_folders_below_it(self) -> None:
+        real = self.directory / "var" / "home"
+        real.mkdir(parents=True)
+        os.symlink(real, self.directory / "home", target_is_directory=True)
+        path = self.directory / "home" / ".config" / "murmly" / "config.toml"
+
+        SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", self.written(real / ".config" / "murmly" / "config.toml"))
+
+    def test_a_live_link_with_only_the_murmly_folder_missing_creates_it(self) -> None:
+        real = self.directory / "var" / "home"
+        (real / ".config").mkdir(parents=True)
+        os.symlink(real, self.directory / "home", target_is_directory=True)
+        path = self.directory / "home" / ".config" / "murmly" / "config.toml"
+
+        SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", self.written(real / ".config" / "murmly" / "config.toml"))
+
+    def test_a_linked_xdg_config_home_creates_the_murmly_folder(self) -> None:
+        real = self.directory / "dotconfig"
+        real.mkdir()
+        os.symlink(real, self.directory / "xdg", target_is_directory=True)
+        path = self.directory / "xdg" / "murmly" / "config.toml"
+
+        SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertEqual("accurate", self.written(real / "murmly" / "config.toml"))
+
+    def test_a_dangling_link_higher_up_the_path_is_refused_and_creates_nothing(self) -> None:
+        os.symlink(self.directory / "nowhere", self.directory / "home", target_is_directory=True)
+        path = self.directory / "home" / ".config" / "murmly" / "config.toml"
+
+        with self.assertRaises(SettingsFileError):
+            SettingsWriter(path).set("stt.model_profile", "accurate")
+
+        self.assertFalse((self.directory / "nowhere").exists())
 
     def test_a_link_in_place_of_the_folder_to_a_real_folder_is_written_through(self) -> None:
         target = self.directory / "dotfiles" / "murmly"
