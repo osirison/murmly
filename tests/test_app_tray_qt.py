@@ -32,6 +32,17 @@ quiet_hours = ""
 NO_TRAY_SENTENCE = "No system tray was found, so murmly runs from its window only."
 
 
+class CountingWriter(SettingsWriter):
+    """Counts the writes that have reached the file."""
+
+    writes = 0
+
+    def set(self, key, value):
+        result = super().set(key, value)
+        self.writes += 1
+        return result
+
+
 class TrayQtCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -52,11 +63,12 @@ class TrayQtCase(unittest.TestCase):
         self.assertEqual([], qt.prepare_application())
         self.channel = FakeChannel()
         self.service = FakeService()
+        self.writer = CountingWriter(self.path)
         self.copied: list[str] = []
         self.home = controller.HomeController(home.HomeModel(self.channel), copy_text=self.copied.append)
         self.health = controller.HealthController(FakeHealthModel())
         self.settings = controller.SettingsController(
-            settings.SettingsModel(SettingsWriter(self.path)),
+            settings.SettingsModel(self.writer),
             lambda: RestartWhenIdle(status=self.service.status, restart=self.service.restart),
         )
         self.available = available
@@ -276,16 +288,18 @@ class PanelContentTests(TrayQtCase):
 
 class SwitchTests(TrayQtCase):
     def toggled(self, switch: str, key: str, expected: object) -> None:
-        # What the panel shows once the change is saved and the file read again.
-        # Waiting on that, not on reading the file every few milliseconds from this
-        # thread, keeps the test from holding the file open while the worker swaps
-        # a new one in (Windows refuses to replace a file that is open).
+        # The switch shows a click before it is saved, so what it shows says nothing
+        # about the file. Wait for the write itself, counted, not for reading the file
+        # every few milliseconds from this thread, which would hold it open while the
+        # worker swaps a new one in (Windows refuses to replace a file that is open).
         on = expected not in (False, "", "off")
+        writes = self.writer.writes
         self.child(f"tray-switch-{switch}").click()
         self.wait_for(
-            lambda: self.child(f"tray-switch-{switch}").property("on") is on,
+            lambda: self.writer.writes == writes + 1,
             message=f"{key} to be written ({self.child('tray-message').property('text')!r})",
         )
+        self.wait_for(lambda: self.child(f"tray-switch-{switch}").property("on") is on, message=switch)
         self.assertEqual(expected, self.lookup(key))
 
     def lookup(self, key: str) -> object:
@@ -340,6 +354,71 @@ class SwitchTests(TrayQtCase):
         self.assertEqual(0, self.service.restarts)
         self.service.state = "IDLE"
         self.wait_for(lambda: self.service.restarts == 1, message="the restart once idle")
+
+    def two_quick_clicks(self, switch: str, key: str, off: object) -> None:
+        self.build()
+        self.open_panel()
+        self.child(f"tray-switch-{switch}").click()
+        # The panel is given new rows on a change: find the switch again.
+        self.child(f"tray-switch-{switch}").click()
+        self.pause(0.6)
+
+        self.assertIs(False, self.child(f"tray-switch-{switch}").property("on"))
+        self.assertEqual(off, self.lookup(key))
+
+    def test_two_quick_clicks_on_live_leave_it_and_the_file_where_they_started(self) -> None:
+        self.two_quick_clicks("live", "stt.live_transcribe", False)
+
+    def test_two_quick_clicks_on_quiet_hours_leave_them_and_the_file_where_they_started(self) -> None:
+        self.two_quick_clicks("quiet", "tts.quiet_hours", "")
+
+    def test_two_quick_clicks_on_stop_when_i_pause_leave_it_and_the_file_where_it_started(self) -> None:
+        self.two_quick_clicks("finish", "stt.auto_transcribe", "off")
+
+    def test_a_time_asked_for_and_refused_is_not_what_quiet_hours_comes_back_to(self) -> None:
+        self.build()
+        self.path.write_text('[tts]\nquiet_hours = "22:00-07:00"\n', encoding="utf-8")
+        self.open_panel()
+        self.wait_for(lambda: self.child("tray-switch-quiet").property("on") is True, message="quiet on")
+        self.assertEqual("22:00-07:00", self.tray._memory.last("quiet"))
+
+        # The refused time and the click that switches quiet hours off are both asked
+        # before either save has come back, so the file never holds "25:00".
+        self.settings.change("quiet-from", "25:00")
+        self.toggled("quiet", "tts.quiet_hours", "")
+
+        self.toggled("quiet", "tts.quiet_hours", "22:00-07:00")
+
+    def test_the_switch_shows_a_click_before_its_save_has_come_back(self) -> None:
+        self.build()
+        self.open_panel()
+
+        self.child("tray-switch-live").click()
+
+        self.assertIs(True, self.child("tray-switch-live").property("on"))
+
+    def test_a_keyboard_toggle_leaves_the_focus_on_the_same_switch(self) -> None:
+        from PySide6.QtCore import QMetaObject, Qt
+        from PySide6.QtTest import QTest
+
+        self.build()
+        self.open_panel()
+        self.panel.requestActivate()
+        started = time.monotonic()
+        while time.monotonic() - started < 2.0 and not self.panel.isActive():
+            self.settle()
+            time.sleep(0.01)
+        if not self.panel.isActive():
+            self.skipTest("this display does not give a test window the focus")
+        self.assertTrue(QMetaObject.invokeMethod(self.child("tray-switch-announce"), "forceActiveFocus"))
+        self.settle()
+        self.assertEqual("tray-switch-announce", self.panel.activeFocusItem().objectName())
+
+        QTest.keyClick(self.panel, Qt.Key.Key_Return)
+        self.wait_for(lambda: self.child("tray-switch-announce").property("on") is True, message="the switch")
+        self.pause(0.3)
+
+        self.assertEqual("tray-switch-announce", self.panel.activeFocusItem().objectName())
 
     def test_a_file_that_does_not_parse_disables_the_switches(self) -> None:
         self.build()

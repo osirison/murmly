@@ -175,9 +175,8 @@ class TrayController(QObject):
     # -- plumbing -------------------------------------------------------------
 
     def _remember(self) -> None:
-        values = self._settings.view.get("values")
-        if isinstance(values, dict):
-            self._memory.observe(values)
+        # The file's values: a value asked for and then refused is not one to restore.
+        self._memory.observe(self._settings.file_values)
 
     def _settings_changed(self) -> None:
         self._remember()

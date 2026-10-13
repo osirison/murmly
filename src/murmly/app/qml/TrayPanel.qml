@@ -194,12 +194,15 @@ Window {
                     }
 
                     Repeater {
-                        model: panel.switchView.switches ? panel.switchView.switches : []
+                        // A count, not the list: the list is a new one on every change,
+                        // which would rebuild the rows and drop the focus from a switch
+                        // that was just toggled with the keyboard.
+                        model: panel.switchView.switches ? panel.switchView.switches.length : 0
 
                         Item {
                             id: row
-                            required property var modelData
                             required property int index
+                            readonly property var modelData: panel.switchView.switches[index]
 
                             Layout.fillWidth: true
                             implicitHeight: rowLayout.implicitHeight + theme.space.space10 * 2

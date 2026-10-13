@@ -397,7 +397,9 @@ class SettingsController(QObject):
         self._notice = ""
         self._outcome: settings.SaveOutcome | None = None
         self._restart_text = ""
+        self._pending = settings.PendingChanges()
         self._view: dict = settings.build_view(None)
+        self._file_values: dict = {}
         self._timer = QTimer(self)
         self._timer.setInterval(SETTINGS_TICK_MS)
         self._timer.timeout.connect(self._tick)
@@ -406,6 +408,11 @@ class SettingsController(QObject):
     @Property("QVariantMap", notify=viewChanged)
     def view(self) -> dict:
         return self._view
+
+    @property
+    def file_values(self) -> dict:
+        """The view's `values` as the file says them, without what is asked and not yet saved."""
+        return self._file_values
 
     @property
     def executor(self) -> ThreadPoolExecutor:
@@ -449,10 +456,16 @@ class SettingsController(QObject):
 
     @Slot(str, "QVariant")
     def change(self, control_id: str, value: object) -> None:
-        """A control was changed: write its key. The result comes back by `view`."""
-        if self._frozen:
+        """A control was changed: write its key. The result comes back by `view`.
+
+        The view shows the asked value at once, and until the save comes back a
+        second change is worked out from it, not from the file's older value.
+        """
+        if self._frozen or self._closed:
             return
+        self._pending.ask(control_id, value)
         self._submit("save", lambda: self._save(control_id, value), control_id=control_id)
+        self._rebuild()
 
     @Slot()
     def freeze(self) -> None:
@@ -540,6 +553,8 @@ class SettingsController(QObject):
                 outcome = text
             else:
                 outcome = None
+        if kind == "save":
+            outcome = (*outcome, control_id)  # type: ignore[misc]
         if not self._closed:
             self._resultReady.emit(kind, outcome)
 
@@ -556,7 +571,8 @@ class SettingsController(QObject):
             self._take_state(outcome)  # type: ignore[arg-type]
         elif kind == "restart":
             self._background_busy = False
-            self._take_restart(outcome)
+            if not self._take_restart(outcome):
+                return  # still waiting: nothing the page shows has changed
         else:
             self._take_save(*outcome)  # type: ignore[misc]
         self._rebuild()
@@ -565,7 +581,10 @@ class SettingsController(QObject):
         self._state = state
         self._notice = settings.NOTICE_FILE_CHANGED if state.changed else self._notice
 
-    def _take_save(self, outcome: settings.SaveOutcome, state, restart_error: str) -> None:
+    def _take_save(
+        self, outcome: settings.SaveOutcome, state, restart_error: str, control_id: str
+    ) -> None:
+        self._pending.settled(control_id)
         self._outcome = outcome
         if state is not None:
             self._state = state
@@ -580,7 +599,8 @@ class SettingsController(QObject):
         self._restart_text = "waiting"
         self._timer.start()
 
-    def _take_restart(self, outcome: object) -> None:
+    def _take_restart(self, outcome: object) -> bool:
+        """Take the restart attempt's outcome; False when it leaves the page as it was."""
         if isinstance(outcome, str):
             text: str | None = outcome
         elif outcome is None:
@@ -590,22 +610,25 @@ class SettingsController(QObject):
         if text is None:
             self._waiting = False
         elif text == "waiting":
-            return
+            return False
         else:
             self._waiting = False
             self._restart_text = text
         if not self._waiting and not self._active:
             self._timer.stop()
+        return True
 
     def _rebuild(self) -> None:
         # Always announced, even when nothing about the view differs: a refused value
         # changes no file value, and the control that was moved must snap back to it.
-        self._view = settings.build_view(
+        view = settings.build_view(
             self._state,
             notice=self._notice,
             outcome=self._outcome,
             restart=self._restart_text,
         )
+        self._file_values = view["values"]  # type: ignore[assignment]
+        self._view = self._pending.overlay(view)
         self.viewChanged.emit()
 
 
