@@ -39,7 +39,7 @@ Item {
         var shown = 0
         for (var i = 0; i < strip.children.length; i++) {
             var part = strip.children[i]
-            if (part.visible) {
+            if (part.visible && part.implicitWidth > 0) {
                 width += part.implicitWidth
                 shown++
             }
@@ -223,30 +223,26 @@ Item {
         width: field.width
         spacing: theme.space.space10
 
-        // The keys now bound.
-        RowLayout {
-            visible: !field.recording && field.row.parts.length > 0
-            spacing: 8
+        // The keys now bound: each with the "+" before it, so the strip can wrap between them.
+        Repeater {
+            model: field.row.parts
 
-            Repeater {
-                model: field.row.parts
+            RowLayout {
+                required property var modelData
+                required property int index
+                visible: !field.recording
+                spacing: 8
 
-                RowLayout {
-                    required property var modelData
-                    required property int index
-                    spacing: 8
-
-                    AppText {
-                        visible: index > 0
-                        role: "monoFile"
-                        font.pixelSize: 13
-                        text: "+"
-                        color: theme.colors.text5
-                    }
-                    KeyCap {
-                        objectName: "keycap"
-                        text: modelData
-                    }
+                AppText {
+                    visible: index > 0
+                    role: "monoFile"
+                    font.pixelSize: 13
+                    text: "+"
+                    color: theme.colors.text5
+                }
+                KeyCap {
+                    objectName: "keycap"
+                    text: modelData
                 }
             }
         }

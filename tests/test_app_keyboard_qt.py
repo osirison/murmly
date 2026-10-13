@@ -112,16 +112,39 @@ class KeyboardMixin:
         self.settle()
         self.assertEqual(name, self.focus_name())
 
-    def assert_in_view(self, item) -> None:
+    def outside_view(self, item) -> str:
+        """Why `item` is not wholly in view, or "" when it is."""
         from PySide6.QtCore import QRectF
 
         rect = item.mapRectToScene(QRectF(0, 0, item.width(), item.height())).adjusted(0, -RING, 0, RING)
         for view in flickables(item):
             port = view.mapRectToScene(QRectF(0, 0, view.width(), view.height())).adjusted(-1, -0.5, 1, 0.5)
-            self.assertTrue(
-                port.contains(rect),
-                f"{item.objectName()} at {rect} is outside the view {port} of {view.objectName() or view}",
-            )
+            if not port.contains(rect):
+                return f"{item.objectName()} at {rect} is outside the view {port} of {view.objectName() or view}"
+        return ""
+
+    def assert_in_view(self, item) -> None:
+        self.assertEqual("", self.outside_view(item))
+
+    def wait_laid_out(self, name: str) -> None:
+        """Until `name` is shown and the scrolling view it sits in has grown to hold it."""
+
+        def laid_out() -> bool:
+            item = self.find(name)
+            if item is None or not item.isVisible() or item.height() <= 0:
+                return False
+            view = next(flickables(item))
+            bottom = item.mapToItem(view.property("contentItem"), 0, item.height()).y()
+            return bottom <= view.property("contentHeight")
+
+        self.wait_for(laid_out, message=f"{name} to be laid out")
+        self.pause(0.1)
+
+    def pause(self, seconds: float = 0.3) -> None:
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self.settle()
+            time.sleep(0.01)
 
     def tab_through_in_view(self, limit: int = 150) -> list[str]:
         start = self.focus_name()
@@ -290,6 +313,7 @@ class ScrollIntoViewTests(KeyboardMixin, KeysQtCase):
         self.click(self.child("nav-settings"))
         self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
         self.child("settings-go-speech").click()
+        self.wait_laid_out("set-tts-device-cpu")
 
         visited = self.tab_through_in_view()
 
@@ -317,12 +341,6 @@ class SettingsSubNavTests(KeyboardMixin, KeysQtCase):
         self.resize_window(1040, 480)
         self.click(self.child("nav-settings"))
         self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
-
-    def pause(self, seconds: float = 0.3) -> None:
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            self.settle()
-            time.sleep(0.01)
 
     def assert_section_at_top(self, section: str) -> None:
         """The section starts at the top of the view, or the page is scrolled as far as it goes."""
@@ -386,15 +404,94 @@ class SettingsSubNavTests(KeyboardMixin, KeysQtCase):
         row = button.parentItem()
         while row.property("keyLine") is None:
             row = row.parentItem()
-        right = button.mapToScene(QPointF(button.width(), 0)).x()
         edge = row.mapToScene(QPointF(row.width(), 0)).x()
-        self.assertLessEqual(right, edge, f"the Change button ends {right - edge:.0f} px past its card")
+        caps = []
+        pending = [self.child("settings-key-window")]
+        while pending:
+            item = pending.pop()
+            if item.objectName() == "keycap" and item.isVisible():
+                caps.append(item)
+            pending.extend(item.childItems())
+        self.assertEqual(len(keys.split("+")), len(caps))
+        for item in [button, *caps]:
+            right = item.mapToScene(QPointF(item.width(), 0)).x()
+            self.assertLessEqual(right, edge, f"{item.objectName()} ends {right - edge:.0f} px past its card")
 
     def test_a_long_key_row_fits_its_card_at_the_narrowest_window(self) -> None:
         self.assert_key_row_fits("Ctrl+Alt+Shift+D")
 
     def test_a_key_with_a_long_name_fits_its_card_at_the_narrowest_window(self) -> None:
         self.assert_key_row_fits("Meta+Shift+Space")
+
+    def test_five_keys_fit_their_card_at_the_narrowest_window(self) -> None:
+        self.assert_key_row_fits("Meta+Shift+Ctrl+Alt+Space")
+
+
+class ReflowTests(KeyboardMixin, KeysQtCase):
+    """The layout moving under a control that was just revealed."""
+
+    def open_settings(self) -> None:
+        self.build(show_first_run=False, record=KEYS)
+        self.activate_window()
+        self.resize_window(1040, 480)
+        self.click(self.child("nav-settings"))
+        self.wait_for(lambda: self.settings.view.get("loaded") is True, message="the file to be read")
+        self.wait_laid_out("set-overlay")
+
+    def grow_above(self) -> None:
+        # The section above the indicator gets taller, as when a banner appears in it.
+        self.assertTrue(self.child("settings-section-delivery").setProperty("spacing", 240))
+
+    def scroller(self):
+        return next(flickables(self.child("set-overlay")))
+
+    def wheel(self, delta: int) -> None:
+        from PySide6.QtCore import QPoint, QPointF, Qt
+        from PySide6.QtGui import QGuiApplication, QWheelEvent
+
+        view = self.scroller()
+        where = view.mapToScene(QPointF(view.width() / 2, view.height() / 2))
+        event = QWheelEvent(
+            where, self.window.mapToGlobal(where.toPoint()), QPoint(0, 0), QPoint(0, delta),
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier, Qt.ScrollPhase.NoScrollPhase, False,
+        )
+        QGuiApplication.sendEvent(self.window, event)
+        self.settle()
+        # The view coasts a little after a wheel turn; measure once it has stopped.
+        self.wait_for(lambda: not view.property("moving") and not view.property("flicking"), message="the view to stop")
+
+    def test_a_control_stays_in_view_when_the_layout_above_it_changes_after_the_focus_moved(self) -> None:
+        self.open_settings()
+        self.focus("set-overlay")
+        self.assert_in_view(self.child("set-overlay"))
+
+        self.grow_above()
+
+        self.wait_for(lambda: self.outside_view(self.child("set-overlay")) == "", message="the control to be shown again")
+
+    def test_a_scroll_by_the_person_is_kept_when_the_layout_changes_after_it(self) -> None:
+        self.open_settings()
+        self.focus("set-overlay")
+        self.wheel(120)
+        kept = self.scroller().property("contentY")
+        self.assertNotEqual(0, kept)
+
+        self.grow_above()
+        self.pause(0.5)
+
+        self.assertEqual(kept, self.scroller().property("contentY"))
+
+    def test_a_scroll_after_the_settling_time_is_kept_too(self) -> None:
+        self.open_settings()
+        self.focus("set-overlay")
+        self.pause(0.8)
+        self.wheel(120)
+        kept = self.scroller().property("contentY")
+
+        self.grow_above()
+        self.pause(0.5)
+
+        self.assertEqual(kept, self.scroller().property("contentY"))
 
 
 class HomeScrollTests(KeyboardMixin, HomeQtCase):
