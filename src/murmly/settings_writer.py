@@ -15,7 +15,7 @@ from typing import TypeVar
 import tomlkit
 from tomlkit.items import InlineTable, Table
 
-from murmly.config import default_config_path, validate_setting
+from murmly.config import SettingValueError, default_config_path, validate_setting
 
 #: How many times a write starts over because the file changed under it. A hand
 #: edit landing inside the few milliseconds of one write is rare; three in a row
@@ -129,6 +129,11 @@ class SettingsWriter:
 
     def set(self, key: str, value: object) -> WriteResult:
         validate_setting(key, value)
+        if isinstance(value, str):
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise SettingValueError(f"{key} must be text that can be written as UTF-8.") from error
         table_name, _, name = key.partition(".")
 
         file_changed = self._has_read and self._stamp_now() != self._read_stamp
@@ -191,9 +196,13 @@ class SettingsWriter:
         link's final target and replaces that, so the link stays and the target
         has the new content. A link to a missing file creates the file there.
         """
-        target = Path(os.path.realpath(self.path))
         temporary: str | None = None
         try:
+            target = Path(os.path.realpath(self.path))
+            if not target.parent.is_dir() and self.path.is_symlink():
+                raise SettingsFileError(
+                    f"{self.path} is a link to {target}, and the folder {target.parent} does not exist."
+                )
             target.parent.mkdir(parents=True, exist_ok=True)
             mode = stat.S_IMODE(target.stat().st_mode) if existed else 0o644
             descriptor, temporary = tempfile.mkstemp(
@@ -205,8 +214,17 @@ class SettingsWriter:
                 os.fsync(handle.fileno())
             os.chmod(temporary, mode)
             self.retrying(lambda: self._replace_file(temporary, target))
+            temporary = None
         except OSError as error:
+            if isinstance(error, PermissionError):
+                hint = (
+                    " Another program may have it open."
+                    if self._retry
+                    else " Murmly is not allowed to write the file or its folder."
+                )
+            else:
+                hint = ""
+            raise SettingsFileError(f"Unable to write {self.path}: {error}.{hint}") from error
+        finally:
             if temporary is not None:
                 Path(temporary).unlink(missing_ok=True)
-            hint = " Another program may have it open." if isinstance(error, PermissionError) else ""
-            raise SettingsFileError(f"Unable to write {self.path}: {error}.{hint}") from error
